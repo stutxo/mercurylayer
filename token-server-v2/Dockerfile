@@ -1,8 +1,7 @@
 # First stage: builder
-FROM debian:bullseye-slim as builder
+FROM rust:1.92-bullseye AS builder
 RUN apt-get update && apt-get install -y curl build-essential protobuf-compiler libprotobuf-dev pkg-config libssl-dev
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-ENV PATH="/root/.cargo/bin:${PATH}"
+ENV RUSTUP_TOOLCHAIN=1.92.0
 WORKDIR /mercurylayer
 RUN echo "[workspace]\nmembers = [\"token-server-v2\"]" > ./Cargo.toml
 COPY ./Cargo.lock ./Cargo.lock

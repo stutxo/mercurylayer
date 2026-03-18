@@ -1,12 +1,9 @@
-# Use a base image that has the required GLIBC version
-FROM debian:bullseye-slim as builder
+# Use an explicit Rust toolchain that supports current dependency editions.
+FROM rust:1.92-bullseye AS builder
 
 # Install Rust, protobuf compiler, and library dependencies
 RUN apt-get update && apt-get install -y curl build-essential protobuf-compiler libprotobuf-dev pkg-config libssl-dev
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-
-# Set the environment path for Rust
-ENV PATH="/root/.cargo/bin:${PATH}"
+ENV RUSTUP_TOOLCHAIN=1.92.0
 
 # Create a working directory
 WORKDIR /mercurylayer

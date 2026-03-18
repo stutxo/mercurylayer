@@ -2,3 +2,4 @@
 .vscode
 /server/.env
 /token-server/.env
+/data_bitcoin_regtest
