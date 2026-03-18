@@ -4,7 +4,6 @@ pub mod withdraw;
 pub mod wallet;
 pub mod utils;
 pub mod transaction;
-pub mod unifii_interface;
 pub mod error;
 
 use std::str::FromStr;
@@ -14,9 +13,6 @@ use bip39::Mnemonic;
 use bitcoin::{bip32::{ChildNumber, DerivationPath, ExtendedPrivKey}, secp256k1::{ffi::types::AlignedType, AllPreallocated, PublicKey, Secp256k1, SecretKey}, Address};
 
 use error::MercuryError;
-
-#[cfg(feature = "bindings")]
-uniffi::setup_scaffolding!();
 
 const MAINNET_HRP : &str = "ml";
 const TESTNET_HRP : &str = "tml";
@@ -104,7 +100,6 @@ pub fn get_sc_address(mnemonic: &str, index: u32, network: &str) -> core::result
     encode_sc_address(&user_pubkey, &auth_pubkey, network)
 }
 
-#[cfg_attr(feature = "bindings", uniffi::export)]
 pub fn validate_address(address: &str, network: &str) -> core::result::Result<bool, MercuryError> {
 
     let network = utils::get_network(network)?;

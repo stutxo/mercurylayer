@@ -7,14 +7,12 @@ use serde::{Serialize, Deserialize};
 use crate::{decode_transfer_address, error::MercuryError, utils::{self, get_network}, wallet::Coin};
 
 #[derive(Serialize, Deserialize, Debug)]
-#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct SignFirstRequestPayload {
     pub statechain_id: String,
     pub signed_statechain_id: String,
 }
 
 #[derive(Serialize, Deserialize)]
-#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct CoinNonce {
     pub secret_nonce: String,
     pub public_nonce: String,
@@ -23,13 +21,11 @@ pub struct CoinNonce {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct SignFirstResponsePayload {
     pub server_pubnonce: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct PartialSignatureMsg1 {
     pub msg: String,
     pub output_pubkey: String, // the tweaked pubkey
@@ -40,7 +36,6 @@ pub struct PartialSignatureMsg1 {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct PartialSignatureRequestPayload {
     pub statechain_id: String,
     pub negate_seckey: u8,
@@ -50,18 +45,15 @@ pub struct PartialSignatureRequestPayload {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct ServerPublicNonceResponsePayload {
     pub server_pubnonce: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct PartialSignatureResponsePayload {
     pub partial_sig: String,
 }
 
-#[cfg_attr(feature = "bindings", uniffi::export)]
 pub fn create_and_commit_nonces(coin: &Coin) -> core::result::Result<CoinNonce, MercuryError>{
     
     let secp = Secp256k1::new();
@@ -151,7 +143,6 @@ pub fn calculate_block_height(
     Ok(block_height)
 }
 
-#[cfg_attr(feature = "bindings", uniffi::export)]
 pub fn get_user_backup_address(coin: &Coin, network: String) -> core::result::Result<String, MercuryError> {
 
     let network = get_network(&network)?;
@@ -161,7 +152,6 @@ pub fn get_user_backup_address(coin: &Coin, network: String) -> core::result::Re
     Ok(to_address.to_string())
 }
 
-#[cfg_attr(feature = "bindings", uniffi::export)]
 pub fn get_partial_sig_request(
     coin: &Coin, 
     block_height: u32, 
@@ -366,7 +356,6 @@ pub fn calculate_musig_session(
     })
 }
 
-#[cfg_attr(feature = "bindings", uniffi::export)]
 pub fn create_signature(
     msg: String,
     client_partial_sig_hex: String,
@@ -400,7 +389,6 @@ pub fn create_signature(
     Ok(sig.to_string())
 }
 
-#[cfg_attr(feature = "bindings", uniffi::export)]
 pub fn new_backup_transaction(
     encoded_unsigned_tx: String,
     signature_hex: String,

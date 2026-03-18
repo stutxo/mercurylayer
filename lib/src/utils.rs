@@ -6,7 +6,6 @@ use serde::{Serialize, Deserialize};
 use crate::{wallet::{BackupTx, Coin}, MercuryError};
 
 #[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct ServerConfig {
     pub initlock: u32,
     pub interval: u32,
@@ -15,7 +14,6 @@ pub struct ServerConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct InfoConfig {
     pub initlock: u32,
     pub interval: u32,
@@ -23,7 +21,6 @@ pub struct InfoConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct PubKeyInfo {
     pub server_pubkey: String,
     pub tx_n: u32,
@@ -31,7 +28,6 @@ pub struct PubKeyInfo {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct KeyListResponsePayload {
     pub list_keyinfo: Vec<PubKeyInfo>,
 }
@@ -46,7 +42,6 @@ pub fn get_network(network: &str) -> Result<bitcoin::Network, MercuryError> {
     }
 }
 
-#[cfg_attr(feature = "bindings", uniffi::export)]
 pub fn get_blockheight(bkp_tx: &BackupTx) -> Result<u32, MercuryError> {
     let tx_bytes = hex::decode(&bkp_tx.tx)?;
     let tx1 = bitcoin::consensus::deserialize::<Transaction>(&tx_bytes)?;
@@ -60,7 +55,6 @@ pub fn get_blockheight(bkp_tx: &BackupTx) -> Result<u32, MercuryError> {
     Ok(block_height)
 }
 
-#[cfg_attr(feature = "bindings", uniffi::export)]
 pub fn is_enclave_pubkey_part_of_coin(coin: &Coin, enclave_pubkey: &str) -> Result<bool, MercuryError> {
 
     if coin.aggregated_pubkey.is_none() {

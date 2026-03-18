@@ -6,7 +6,6 @@ use super::{BackupTx, Coin};
 use bitcoin::{Transaction, Address, TxOut, Txid, OutPoint, TxIn, ScriptBuf, Witness, absolute, psbt::{Psbt, Input, PsbtSighashType, self}, bip32::{Fingerprint, DerivationPath}, Amount, Network, sighash::{TapSighashType, SighashCache, self, TapSighash}, taproot::{TapLeafHash, self}, secp256k1, key::TapTweak, PrivateKey};
 use secp256k1_zkp::{Secp256k1, SecretKey, PublicKey, XOnlyPublicKey};
 
-#[cfg_attr(feature = "bindings", uniffi::export)]
 pub fn latest_backup_tx_pays_to_user_pubkey(backup_txs: &Vec<BackupTx>, coin: &Coin, network: &str) -> Result<BackupTx, MercuryError> {
 
     let network = get_network(network)?;
@@ -42,7 +41,6 @@ pub fn latest_backup_tx_pays_to_user_pubkey(backup_txs: &Vec<BackupTx>, coin: &C
 }
 
 
-#[cfg_attr(feature = "bindings", uniffi::export)]
 pub fn create_cpfp_tx(backup_tx: &BackupTx, coin: &Coin, to_address: &str, fee_rate_sats_per_byte: f64, network: &str) -> Result<String, MercuryError> {
 
     let network = get_network(network)?;

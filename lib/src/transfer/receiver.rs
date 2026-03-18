@@ -9,7 +9,6 @@ use crate::{error::MercuryError, utils::get_network, wallet::{get_previous_outpo
 use super::{TransferMsg, TxOutpoint};
 
 #[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct TransferUnlockRequestPayload { 
     pub statechain_id: String,
     pub auth_sig: String, // signed_statechain_id
@@ -17,7 +16,6 @@ pub struct TransferUnlockRequestPayload {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct TransferReceiverRequestPayload { 
     pub statechain_id: String,
     pub batch_data: Option<String>,
@@ -26,27 +24,23 @@ pub struct TransferReceiverRequestPayload {
 }
 
 #[derive(Serialize, Deserialize)]
-#[cfg_attr(feature = "bindings", derive(uniffi::Enum))]
 pub enum TransferReceiverError {
     StatecoinBatchLockedError,
     ExpiredBatchTimeError,
 }
 
 #[derive(Serialize, Deserialize)]
-#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct TransferReceiverErrorResponsePayload {
     pub code: TransferReceiverError,
     pub message: String,
 }
 
 #[derive(Serialize, Deserialize)]
-#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct TransferReceiverPostResponsePayload {
     pub server_pubkey: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct KeyUpdateResponsePayload { 
     pub statechain_id: String,
     pub t2: String,
@@ -54,13 +48,11 @@ pub struct KeyUpdateResponsePayload {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct GetMsgAddrResponsePayload {
     pub list_enc_transfer_msg: Vec<String>,
 }
  
 #[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct StatechainInfo {
     pub statechain_id: String,
     pub server_pubnonce: String,
@@ -69,7 +61,6 @@ pub struct StatechainInfo {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct StatechainInfoResponsePayload {
     pub enclave_public_key: String,
     pub num_sigs: u32,
@@ -78,7 +69,6 @@ pub struct StatechainInfoResponsePayload {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct NewKeyInfo {
     pub aggregate_pubkey: String,
     pub aggregate_address: String,
@@ -86,7 +76,6 @@ pub struct NewKeyInfo {
     pub amount: u32,
 }
 
-#[cfg_attr(feature = "bindings", uniffi::export)]
 pub fn duplicate_coin_to_initialized_state(wallet: &Wallet, auth_pubkey: &str) -> Result<Coin, MercuryError> {
 
     let coin = wallet.coins.iter().find(|coin| coin.auth_pubkey == auth_pubkey.to_string());
@@ -143,7 +132,6 @@ pub fn decrypt_transfer_msg(encrypted_message: &str, private_key_wif: &str) -> R
     Ok(transfer_msg)
 }
 
-#[cfg_attr(feature = "bindings", uniffi::export)]
 pub fn get_tx0_outpoint(backup_transactions: &Vec<BackupTx>) -> Result<TxOutpoint, MercuryError> {
 
     let mut backup_transactions = backup_transactions.clone();
@@ -225,7 +213,6 @@ pub fn verify_latest_backup_tx_pays_to_user_pubkey(transfer_msg: &TransferMsg, c
     Ok(output.script_pubkey == aggregate_address.script_pubkey())
 }
 
-#[cfg_attr(feature = "bindings", uniffi::export)]
 pub fn get_output_address_from_tx0(tx0_outpoint: &TxOutpoint, tx0_hex: &str, network: &str) -> Result<String, MercuryError> {
 
     let network = get_network(&network)?;
@@ -241,7 +228,6 @@ pub fn get_output_address_from_tx0(tx0_outpoint: &TxOutpoint, tx0_hex: &str, net
     Ok(address.to_string())
 }
 
-#[cfg_attr(feature = "bindings", uniffi::export)]
 pub fn get_amount_from_tx0(tx0_hex: &str, tx0_outpoint: &TxOutpoint,) -> Result<u64, MercuryError> {
 
     let tx0: Transaction = bitcoin::consensus::encode::deserialize(&hex::decode(&tx0_hex)?)?;
@@ -251,7 +237,6 @@ pub fn get_amount_from_tx0(tx0_hex: &str, tx0_outpoint: &TxOutpoint,) -> Result<
     Ok(tx0.output[tx0_outpoint.vout as usize].value)
 }
 
-#[cfg_attr(feature = "bindings", uniffi::export)]
 pub fn validate_signature_scheme(
     backup_transactions: &Vec<BackupTx>, 
     statechain_info: &StatechainInfoResponsePayload, 
@@ -336,7 +321,6 @@ pub fn validate_signature_scheme(
     Ok(previous_lock_time.unwrap())
 }
 
-#[cfg_attr(feature = "bindings", uniffi::export)]
 pub fn verify_transaction_signature(tx_n_hex: &str, tx0_hex: &str, fee_rate_tolerance: f64, current_fee_rate_sats_per_byte: f64) -> Result<(), MercuryError> {
 
     let tx_n: Transaction = bitcoin::consensus::encode::deserialize(&hex::decode(&tx_n_hex)?)?;
@@ -390,7 +374,6 @@ pub fn verify_transaction_signature(tx_n_hex: &str, tx0_hex: &str, fee_rate_tole
 
 }
 
-#[cfg_attr(feature = "bindings", uniffi::export)]
 pub fn verify_transaction_sequence(tx_n_hex: &str) -> Result<(), MercuryError> {
 
     let tx_n: Transaction = bitcoin::consensus::encode::deserialize(&hex::decode(&tx_n_hex)?)?;
@@ -501,7 +484,6 @@ fn get_tx_hash(tx_0: &Transaction, tx_n: &Transaction) -> Result<Message, Mercur
     Ok(msg)
 }
 
-#[cfg_attr(feature = "bindings", uniffi::export)]
 pub fn verify_blinded_musig_scheme(backup_tx: &BackupTx, tx0_hex: &str, statechain_info: &StatechainInfo) -> Result<(), MercuryError> {
 
     let client_public_nonce = MusigPubNonce::from_slice(hex::decode(&backup_tx.client_public_nonce)?.as_slice())?;
@@ -616,7 +598,6 @@ pub fn create_transfer_receiver_request_payload(statechain_info: &StatechainInfo
 
 }
 
-#[cfg_attr(feature = "bindings", uniffi::export)]
 pub fn sign_message(message: &str, coin: &Coin) -> Result<String, MercuryError> {
 
     let client_auth_key = PrivateKey::from_wif(&coin.auth_privkey)?.inner;
@@ -630,7 +611,6 @@ pub fn sign_message(message: &str, coin: &Coin) -> Result<String, MercuryError> 
     Ok(signed_message.to_string())
 }
 
-#[cfg_attr(feature = "bindings", uniffi::export)]
 pub fn get_new_key_info(server_public_key_hex: &str, coin: &Coin, statechain_id: &str, tx0_outpoint: &TxOutpoint, tx0_hex: &str, network: &str) -> Result<NewKeyInfo, MercuryError> {
     
     let network = get_network(&network)?;

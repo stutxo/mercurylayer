@@ -45,9 +45,3 @@ services:
       - LNMACAROON = ""
     ports:
       - "18080:18080"
-  explorer:
-    build:
-      context: explorer
-      dockerfile: Dockerfile
-    ports:
-      - "80:80"

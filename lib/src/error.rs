@@ -1,39 +1,7 @@
-/*
-The simplified struct below cannot be used because the errors from other libs are not compatible with uniffi.
-TODO: Look for a way to make the errors compatible with uniffi.
-
-#[derive(Debug, thiserror::Error)]
-#[cfg_attr(feature = "bindings", derive(uniffi::Error))]
-pub enum MercuryError {
-    #[error("BIP39 Error: {0}")]
-    Bip39Error(#[from] bip39::Error),
-
-    #[error("BIP32 Error: {0}")]
-    Bip32Error(#[from] bip32::Error),
-
-    #[error("Invalid bitcoin network: `{0}`")]
-    NetworkConversionError(String),
-
-    #[error("Secp256k1UpstreamError Error: {0}")]
-    Secp256k1UpstreamError(#[from] UpstreamError),
-
-    #[error("KeyError Error: {0}")]
-    KeyError(#[from] bitcoin::key::Error),
-
-    #[error("Bech32Error Error: {0}")]
-    Bech32Error(#[from] bech32::Error),
-}
- */
-
 use bitcoin::{bip32, sighash::SighashTypeParseError};
 use secp256k1_zkp::{musig::{MusigNonceGenError, MusigSignError, ParseError}, scalar::OutOfRangeError, UpstreamError};
 
-// TODO: UniFFI apparently does not support adding fields to the error enum variants.
-//       For example, NetworkConversionError(String) is not supported.
-//       This makes it impossible to detail the error message. Look into this issue.
-
 #[derive(Debug, thiserror::Error)]
-#[cfg_attr(feature = "bindings", derive(uniffi::Error))]
 pub enum MercuryError {
     Bip39Error,
     Bip32Error,

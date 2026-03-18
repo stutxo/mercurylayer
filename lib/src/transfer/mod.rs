@@ -100,7 +100,6 @@ pub struct TransferMsg {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct TxOutpoint {
     pub txid: String,
     pub vout: u32,
