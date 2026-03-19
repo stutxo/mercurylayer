@@ -1,38 +1,40 @@
 # Usage
 
-## Simulation mode
+## Regtest stack
 
-### Bulid and run docker containers
-
-```bash
-$ cd mercurylayer
-$ docker compose -f docker-compose-sim.yml up --build
-```
-### Add mmnemonics
-
-```bash
-$ docker exec -it mercurylayer-enclave-sgx-1 bash
-$ curl -X POST http://0.0.0.0:18080/add_mnemonic \
--H "Content-Type: application/json" \
--d '{
-    "mnemonic": "achieve merry hidden lyrics element brand student armed dismiss vague fury avocado grief crazy garlic gallery blur spider bag bless motor crawl surround copper",
-    "password": "b1gHKyfXTzs6",
-    "index": 0,
-    "threshold": 2
-}'
-```
-
-## Hardware Mode
+### Build and run the retained services
 
 ```bash
 $ cd mercurylayer
-$ ./build_compose_hw_run.sh
+$ docker compose -f docker-compose-token-servers.yml up --build
 ```
 
-Add mnemonics in the same way as above.
+### Initialize the regtest wallet
+
+```bash
+$ container_id=$(docker ps -qf "name=esplora-container")
+$ wallet_name="esplora_wallet"
+$ docker exec $container_id cli createwallet $wallet_name
+$ address=$(docker exec $container_id cli getnewaddress $wallet_name)
+$ docker exec $container_id cli generatetoaddress 101 "$address"
+```
+
+### Run the Rust integration suite
+
+```bash
+$ cd clients/tests/rust
+$ RUSTUP_TOOLCHAIN=1.92.0 cargo run
+```
+
+## Lockbox-only local stack
+
+```bash
+$ cd mercurylayer
+$ docker compose -f docker-compose-lockbox.yml up --build
+```
 
 ## Compose down
 
-`docker compose -f docker-compose-sim.yml down -v` in simulation mode
+`docker compose -f docker-compose-token-servers.yml down -v` for the regtest stack
 
-`docker compose -f docker-compose-hw.yml down -v` in hardware mode
+`docker compose -f docker-compose-lockbox.yml down -v` for the local lockbox stack

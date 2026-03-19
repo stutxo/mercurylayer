@@ -1,4 +1,7 @@
 [workspace]
 members = ["clients/apps/rust", "clients/libs/rust", "server", "lib", "token-server", "clients/tests/rust", "token-server-v2"]
-exclude = ["docs", "enclave", "keylistCron"]
+exclude = ["docs", "keylistCron"]
 resolver = "2"
+
+[patch.crates-io]
+secp256k1 = { git = "https://github.com/w0xlt/rust-secp256k1.git", branch = "mercury-blinded-musig-port" }

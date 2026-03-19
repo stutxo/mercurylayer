@@ -4,8 +4,8 @@ Mercury Layer Server is a RESTful HTTP service exposing an API for the Mercury L
 
 # Running
 
-1. Run the `enclave` project and set the url in the `lockbox` property in `Setting.toml`.
-2. Set the Postgres `connection_string` property in `Setting.toml`.
+1. Run the `lockbox` service and point the server at it via the `ENCLAVES` setting.
+2. Set the Postgres connection settings for the server.
 3. `cargo run`
 
 This is a work in progress. Several changes to the project are expected.

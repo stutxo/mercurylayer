@@ -4,8 +4,8 @@ Mercury layer client provides a user interface to the Mercury Layer protocol, vi
 
 # Running
 
-1. Run the `enclave` project on localhost
-2. Run the `server` project on localhost
+1. Run the `lockbox` and `server` projects on localhost, or start the local stack with `docker compose -f docker-compose-lockbox.yml up --build`.
+2. Ensure the Mercury server is reachable on localhost.
 3. Run one of the commands below
 
 # Some commands

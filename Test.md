@@ -14,7 +14,7 @@ $ docker exec $container_id cli generatetoaddress 101 "$address"
 
 3. `cd clients/tests/rust/` 
 
-4. `cargo run`
+4. `RUSTUP_TOOLCHAIN=1.92.0 cargo run`
 
 # Other Environments
 

@@ -2,12 +2,12 @@
 
 Mercury Layer is a Layer 2 protocol for Bitcoin that enables the self-custodial transfer of coins (UTXOs) without on-chain transactions.
 
-This repository contains the server, Rust client, lockbox, and enclave implementations. The *enclave* is a trusted platform app utilising Intel SGX that stores key shares, performs partial signatures and ensures secure key share deletion. The enclave is connected to the server which exposes a public RESTful HTTP API and connects to a Postgres database. The client is run by the user as a standalone Rust application that makes HTTP requests to the server API.
+This repository contains the server, Rust client, and lockbox implementations. Lockbox stores key material, performs partial signatures, and exposes the signer HTTP API consumed by the Mercury server. The client is run by the user as a standalone Rust application that makes HTTP requests to the server API.
 
 ```mermaid
 graph LR;
     Server-->Client;
-    Enclave-->Server
+    Lockbox-->Server
 ```
 
 # License
