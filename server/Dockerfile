@@ -8,7 +8,14 @@ ENV RUSTUP_TOOLCHAIN=1.92.0
 # Create a working directory
 WORKDIR /mercurylayer
 
-RUN echo "[workspace]\nmembers = [\"server\", \"lib\"]" > ./Cargo.toml
+RUN printf '%s\n' \
+  '[workspace]' \
+  'members = ["server", "lib"]' \
+  'resolver = "2"' \
+  '' \
+  '[patch.crates-io]' \
+  'secp256k1 = { git = "https://github.com/w0xlt/rust-secp256k1.git", branch = "mercury-blinded-musig-port" }' \
+  > ./Cargo.toml
 COPY ./Cargo.lock ./Cargo.lock
 
 # Copy the server source code

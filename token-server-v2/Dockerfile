@@ -3,7 +3,14 @@ FROM rust:1.92-bullseye AS builder
 RUN apt-get update && apt-get install -y curl build-essential protobuf-compiler libprotobuf-dev pkg-config libssl-dev
 ENV RUSTUP_TOOLCHAIN=1.92.0
 WORKDIR /mercurylayer
-RUN echo "[workspace]\nmembers = [\"token-server-v2\"]" > ./Cargo.toml
+RUN printf '%s\n' \
+  '[workspace]' \
+  'members = ["token-server-v2"]' \
+  'resolver = "2"' \
+  '' \
+  '[patch.crates-io]' \
+  'secp256k1 = { git = "https://github.com/w0xlt/rust-secp256k1.git", branch = "mercury-blinded-musig-port" }' \
+  > ./Cargo.toml
 COPY ./Cargo.lock ./Cargo.lock
 COPY ./token-server-v2 ./token-server-v2
 COPY ./token-server-v2/Rocket.toml ./token-server-v2/Rocket.toml

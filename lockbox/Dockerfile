@@ -1,5 +1,5 @@
 # Start with Ubuntu as base image
-FROM ubuntu:22.04
+FROM ubuntu:22.04 AS builder
 
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
@@ -41,6 +41,19 @@ COPY . .
 RUN mkdir -p build && cd build
 RUN cd build && cmake --preset=vcpkg ..
 RUN cd build && cmake --build .
+RUN test -s ./build/MercuryLockbox && test -s ./build/libLockboxLibrary.a
 
-# Set the default command
-CMD ["./build/MercuryLockbox"]
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /app/build/MercuryLockbox /usr/local/bin/MercuryLockbox
+
+CMD ["/usr/local/bin/MercuryLockbox"]

@@ -146,7 +146,7 @@ mod tests {
         let expected_sc_address = "tml1qqpgha2armzyvwwglqty24ztegut27neyvlkpu3894adsgascq96tjqr78gy6adlzsre3fqyrxdx8n68henrd6fzcgfwcltu3sesuh05nvxslxjnxw";
         assert_eq!(sc_address, expected_sc_address);
        
-        let network = "mainnet";
+        let network = "bitcoin";
         let sc_address = get_sc_address(&mnemonic, 0, network).unwrap();
         let expected_sc_address = "ml1qqpgha2armzyvwwglqty24ztegut27neyvlkpu3894adsgascq96tjqr78gy6adlzsre3fqyrxdx8n68henrd6fzcgfwcltu3sesuh05nvxs2dd888";
         assert_eq!(sc_address, expected_sc_address);
