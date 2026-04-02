@@ -2,9 +2,26 @@ mod common;
 
 use anyhow::{Context, Result};
 use reqwest::StatusCode;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::common::lockbox;
+
+fn dummy_session_hex() -> String {
+    "00".repeat(133)
+}
+
+async fn assert_missing_statechain_error(response: reqwest::Response, context: &str) -> Result<()> {
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .with_context(|| format!("failed to read {} body", context))?;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(body.contains("Failed to load aggregated key data"));
+
+    Ok(())
+}
 
 #[tokio::test]
 #[ignore = "requires lockbox docker stack"]
@@ -82,6 +99,27 @@ async fn get_partial_signature_validates_session_length() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires lockbox docker stack"]
+async fn get_partial_signature_requires_existing_statechain() -> Result<()> {
+    let _guard = common::test_guard();
+    let client = lockbox::http_client();
+    lockbox::wait_until_ready(&client).await?;
+
+    let response = lockbox::post_json(
+        &client,
+        "get_partial_signature",
+        json!({
+            "statechain_id": lockbox::new_statechain_id("missing-sign"),
+            "negate_seckey": 0,
+            "session": dummy_session_hex(),
+        }),
+    )
+    .await?;
+
+    assert_missing_statechain_error(response, "missing partial signature").await
+}
+
+#[tokio::test]
+#[ignore = "requires lockbox docker stack"]
 async fn keyupdate_validates_t2_and_x1_lengths() -> Result<()> {
     let _guard = common::test_guard();
     let client = lockbox::http_client();
@@ -118,6 +156,57 @@ async fn keyupdate_validates_t2_and_x1_lengths() -> Result<()> {
 
     assert_eq!(bad_x1_status, StatusCode::BAD_REQUEST);
     assert_eq!(bad_x1_body, "Invalid x1 length. Must be 32 bytes!");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires lockbox docker stack"]
+async fn keyupdate_requires_existing_statechain() -> Result<()> {
+    let _guard = common::test_guard();
+    let client = lockbox::http_client();
+    lockbox::wait_until_ready(&client).await?;
+
+    let response = lockbox::post_json(
+        &client,
+        "keyupdate",
+        json!({
+            "statechain_id": lockbox::new_statechain_id("missing-key"),
+            "t2": hex::encode([5u8; 32]),
+            "x1": hex::encode([6u8; 32]),
+        }),
+    )
+    .await?;
+
+    assert_missing_statechain_error(response, "missing keyupdate").await
+}
+
+#[tokio::test]
+#[ignore = "requires lockbox docker stack"]
+async fn signature_count_for_missing_statechain_returns_json_number() -> Result<()> {
+    let _guard = common::test_guard();
+    let client = lockbox::http_client();
+    lockbox::wait_until_ready(&client).await?;
+
+    let response = lockbox::get(
+        &client,
+        &format!(
+            "signature_count/{}",
+            lockbox::new_statechain_id("missing-count")
+        ),
+    )
+    .await?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .context("failed to read missing signature_count body")?;
+
+    assert_eq!(status, StatusCode::OK);
+
+    let payload: Value = serde_json::from_str(&body)?;
+    assert!(payload.get("sig_count").is_some());
+    assert!(payload["sig_count"].is_number());
 
     Ok(())
 }
@@ -252,6 +341,91 @@ async fn keyupdate_state_survives_lockbox_restart() -> Result<()> {
     );
 
     lockbox::delete_statechain(&client, &statechain_id).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires lockbox docker stack"]
+async fn delete_statechain_is_idempotent_and_deleted_statechain_cannot_be_used() -> Result<()> {
+    let _guard = common::test_guard();
+    let client = lockbox::http_client();
+    lockbox::wait_until_ready(&client).await?;
+
+    let statechain_id = lockbox::new_statechain_id("delete-state");
+    let _created = lockbox::create_statechain(&client, &statechain_id).await?;
+
+    let delete_response =
+        lockbox::delete(&client, &format!("delete_statechain/{}", statechain_id)).await?;
+    let delete_status = delete_response.status();
+    let delete_body = delete_response
+        .text()
+        .await
+        .context("failed to read first delete_statechain body")?;
+
+    assert_eq!(delete_status, StatusCode::OK);
+    assert_eq!(delete_body, "Statechain deleted.");
+
+    let second_delete_response =
+        lockbox::delete(&client, &format!("delete_statechain/{}", statechain_id)).await?;
+    let second_delete_status = second_delete_response.status();
+    let second_delete_body = second_delete_response
+        .text()
+        .await
+        .context("failed to read second delete_statechain body")?;
+
+    assert_eq!(second_delete_status, StatusCode::OK);
+    assert_eq!(second_delete_body, "Statechain deleted.");
+
+    let nonce_response = lockbox::post_json(
+        &client,
+        "get_public_nonce",
+        json!({ "statechain_id": statechain_id }),
+    )
+    .await?;
+    assert_missing_statechain_error(nonce_response, "post-delete get_public_nonce").await?;
+
+    let partial_signature_response = lockbox::post_json(
+        &client,
+        "get_partial_signature",
+        json!({
+            "statechain_id": statechain_id,
+            "negate_seckey": 0,
+            "session": dummy_session_hex(),
+        }),
+    )
+    .await?;
+    assert_missing_statechain_error(
+        partial_signature_response,
+        "post-delete get_partial_signature",
+    )
+    .await?;
+
+    let keyupdate_response = lockbox::post_json(
+        &client,
+        "keyupdate",
+        json!({
+            "statechain_id": statechain_id,
+            "t2": hex::encode([7u8; 32]),
+            "x1": hex::encode([8u8; 32]),
+        }),
+    )
+    .await?;
+    assert_missing_statechain_error(keyupdate_response, "post-delete keyupdate").await?;
+
+    let sig_count_response =
+        lockbox::get(&client, &format!("signature_count/{}", statechain_id)).await?;
+    let sig_count_status = sig_count_response.status();
+    let sig_count_body = sig_count_response
+        .text()
+        .await
+        .context("failed to read post-delete signature_count body")?;
+
+    assert_eq!(sig_count_status, StatusCode::OK);
+
+    let sig_count_payload: Value = serde_json::from_str(&sig_count_body)?;
+    assert!(sig_count_payload.get("sig_count").is_some());
+    assert!(sig_count_payload["sig_count"].is_number());
 
     Ok(())
 }
