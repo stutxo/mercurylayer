@@ -18,7 +18,7 @@ hex = "0.4.3"
 rand = "0.8.5"
 reqwest = { version = "0.11.16", features = ["blocking", "json", "socks"] }
 schemars = { version = "0.8.12", features = ["chrono", "uuid"] }
-secp256k1-zkp = { git = "https://github.com/ssantos21/rust-secp256k1-zkp.git", branch = "blinded-musig-scheme", features = [ "rand-std", "bitcoin_hashes", "std" ] }
+secp256k1 = { git = "https://github.com/w0xlt/rust-secp256k1.git", branch = "mercury-blinded-musig-port", features = [ "rand-std", "bitcoin_hashes", "std" ] }
 serde = { version = "1.0.163", features = ["derive"] }
 serde_json = "1.0.96"
 sqlx = { version = "0.8.1", features = [ "runtime-tokio", "sqlite", "time", "uuid" ] }

@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use secp256k1_zkp::XOnlyPublicKey;
+use secp256k1::XOnlyPublicKey;
 use sqlx::Row;
 
 pub async fn insert_paymenthash(

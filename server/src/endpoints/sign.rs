@@ -1,6 +1,6 @@
 use mercurylib::transaction::SignFirstRequestPayload;
 use rocket::{http::Status, response::status, serde::json::Json, State};
-use secp256k1_zkp::musig::MusigSession;
+use secp256k1::musig::Session as MusigSession;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 

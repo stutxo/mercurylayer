@@ -23,8 +23,8 @@ add_executable(MercuryLockbox src/main.cpp)
 # Add the cmake directory to the module path
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 
-# Include the secp256k1_zkp configuration
-include(secp256k1_zkp)
+# Include the secp256k1 configuration
+include(secp256k1)
 
 add_library(LockboxLibrary 
     src/server.cpp 
@@ -54,7 +54,7 @@ target_link_libraries(LockboxLibrary
     google-cloud-cpp::storage 
     google-cloud-cpp::kms 
     google-cloud-cpp::secretmanager 
-    secp256k1_zkp
+    secp256k1
     OpenSSL::SSL 
     OpenSSL::Crypto)
 
@@ -92,7 +92,7 @@ target_link_libraries(MercuryLockbox PRIVATE
     google-cloud-cpp::storage 
     google-cloud-cpp::kms 
     google-cloud-cpp::secretmanager 
-    secp256k1_zkp
+    secp256k1
     OpenSSL::SSL 
     OpenSSL::Crypto)
 

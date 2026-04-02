@@ -4,7 +4,7 @@ use crate::{error::MercuryError, utils::get_network};
 
 use super::{BackupTx, Coin};
 use bitcoin::{Transaction, Address, TxOut, Txid, OutPoint, TxIn, ScriptBuf, Witness, absolute, psbt::{Psbt, Input, PsbtSighashType, self}, bip32::{Fingerprint, DerivationPath}, Amount, Network, sighash::{TapSighashType, SighashCache, self, TapSighash}, taproot::{TapLeafHash, self}, secp256k1, key::TapTweak, PrivateKey};
-use secp256k1_zkp::{Secp256k1, SecretKey, PublicKey, XOnlyPublicKey};
+use secp256k1::{Secp256k1, SecretKey, PublicKey, XOnlyPublicKey, Message};
 
 pub fn latest_backup_tx_pays_to_user_pubkey(backup_txs: &Vec<BackupTx>, coin: &Coin, network: &str) -> Result<BackupTx, MercuryError> {
 
@@ -215,7 +215,8 @@ fn sign_psbt_taproot(
         Some(_) => keypair, // no tweak for script spend
     };
 
-    let sig = secp.sign_schnorr(&hash.into(), &keypair);
+    let msg: Message = hash.into();
+    let sig = secp.sign_schnorr(msg.as_ref(), &keypair);
 
     let final_signature = taproot::Signature { sig, hash_ty };
 

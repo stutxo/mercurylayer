@@ -1,4 +1,4 @@
-use secp256k1_zkp::{PublicKey, XOnlyPublicKey};
+use secp256k1::{PublicKey, XOnlyPublicKey};
 use sqlx::Row;
 
 pub async fn get_token_status(pool: &sqlx::PgPool, token_id: &str) -> Option<bool> {

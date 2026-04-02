@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use bitcoin::{Transaction, secp256k1::PublicKey};
-use secp256k1_zkp::musig::{MusigPubNonce, BlindingFactor};
+use secp256k1::musig::{PublicNonce as MusigPubNonce, BlindingFactor};
 use serde::{Deserialize, Serialize};
 
 use crate::wallet::BackupTx;

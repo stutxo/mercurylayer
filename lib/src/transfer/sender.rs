@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use bitcoin::{secp256k1, hashes::sha256, Txid, PrivateKey};
-use secp256k1_zkp::{Secp256k1, Message, Scalar};
+use secp256k1::{Secp256k1, Message, Scalar};
 use serde::{Serialize, Deserialize};
 use serde_json::json;
 
@@ -74,7 +74,7 @@ pub fn create_transfer_signature(recipient_address: &str, input_txid: &str, inpu
     data_to_sign.extend_from_slice(&recipient_user_pubkey.serialize()[..]);
 
     let msg = Message::from_hashed_data::<sha256::Hash>(&data_to_sign);
-    let signature = secp.sign_schnorr(&msg, &keypair);
+    let signature = secp.sign_schnorr(msg.as_ref(), &keypair);
 
     Ok(signature.to_string())
 }

@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use bitcoin::{hashes::{sha256, Hash}, sighash::{self, SighashCache, TapSighashType}, taproot::TapTweakHash, Address, PrivateKey, Sequence, Transaction, TxOut, Txid};
-use secp256k1_zkp::{PublicKey, schnorr::Signature, Secp256k1, Message, XOnlyPublicKey, musig::{MusigPubNonce, BlindingFactor, blinded_musig_pubkey_xonly_tweak_add, MusigAggNonce, MusigSession}, SecretKey, Scalar, KeyPair};
+use secp256k1::{PublicKey, schnorr::Signature, Secp256k1, Message, XOnlyPublicKey, musig::{PublicNonce as MusigPubNonce, BlindingFactor, blinded_musig_pubkey_xonly_tweak_add, AggregatedNonce as MusigAggNonce, Session as MusigSession}, SecretKey, Scalar, KeyPair};
 use serde::{Serialize, Deserialize};
 
 use crate::{error::MercuryError, utils::get_network, wallet::{get_previous_outpoint, BackupTx, Coin, CoinStatus, Wallet}};
@@ -162,7 +162,7 @@ pub fn verify_transfer_signature(new_user_pubkey: &str, tx0_outpoint: &TxOutpoin
 
     let msg = Message::from_hashed_data::<sha256::Hash>(&data_to_verify);
 
-    Ok(secp.verify_schnorr(&signature, &msg, &sender_public_key).is_ok())
+    Ok(secp.verify_schnorr(&signature, msg.as_ref(), &sender_public_key).is_ok())
 }
 
 pub fn validate_tx0_output_pubkey(enclave_public_key: &str, transfer_msg: &TransferMsg, tx0_outpoint: &TxOutpoint, tx0_hex: &str, network: &str) -> Result<bool, MercuryError> {
@@ -366,7 +366,7 @@ pub fn verify_transaction_signature(tx_n_hex: &str, tx0_hex: &str, fee_rate_tole
         return Err(MercuryError::FeeTooHigh);
     }
 
-    if !Secp256k1::new().verify_schnorr(&signature, &msg, &xonly_pubkey).is_ok() {
+    if !Secp256k1::new().verify_schnorr(&signature, msg.as_ref(), &xonly_pubkey).is_ok() {
         return Err(MercuryError::InvalidSignature);
     }
 
@@ -507,7 +507,7 @@ pub fn verify_blinded_musig_scheme(backup_tx: &BackupTx, tx0_hex: &str, statecha
 
     let (_, output_pubkey, out_tweak32) = blinded_musig_pubkey_xonly_tweak_add(&secp, &aggregate_pubkey, tweak);
     
-    let aggnonce = MusigAggNonce::new(&secp, &[client_public_nonce, server_public_nonce]);
+    let aggnonce = MusigAggNonce::new(&[&client_public_nonce, &server_public_nonce]);
 
     let tx_0: Transaction = bitcoin::consensus::encode::deserialize(&hex::decode(&tx0_hex)?)?;
 
@@ -585,7 +585,7 @@ pub fn create_transfer_receiver_request_payload(statechain_info: &StatechainInfo
 
     let client_auth_keypair = KeyPair::from_seckey_slice(&secp, client_auth_key.as_ref())?;
     let msg = Message::from_hashed_data::<sha256::Hash>(t2_hex.as_bytes());
-    let auth_sig = secp.sign_schnorr(&msg, &client_auth_keypair);
+    let auth_sig = secp.sign_schnorr(msg.as_ref(), &client_auth_keypair);
 
     let transfer_receiver_request_payload = TransferReceiverRequestPayload {
         statechain_id: transfer_msg.statechain_id.clone(),
@@ -606,7 +606,7 @@ pub fn sign_message(message: &str, coin: &Coin) -> Result<String, MercuryError> 
 
     let client_auth_keypair = KeyPair::from_seckey_slice(&secp, client_auth_key.as_ref())?;
     let hashed_msg = Message::from_hashed_data::<sha256::Hash>(message.to_string().as_bytes());
-    let signed_message = secp.sign_schnorr(&hashed_msg, &client_auth_keypair);
+    let signed_message = secp.sign_schnorr(hashed_msg.as_ref(), &client_auth_keypair);
 
     Ok(signed_message.to_string())
 }
@@ -645,7 +645,7 @@ pub fn get_new_key_info(server_public_key_hex: &str, coin: &Coin, statechain_id:
 
     let client_auth_keypair = KeyPair::from_seckey_slice(&secp, client_auth_key.as_ref())?;
     let msg = Message::from_hashed_data::<sha256::Hash>(statechain_id.to_string().as_bytes());
-    let signed_statechain_id = secp.sign_schnorr(&msg, &client_auth_keypair);
+    let signed_statechain_id = secp.sign_schnorr(msg.as_ref(), &client_auth_keypair);
 
     Ok(NewKeyInfo {
         aggregate_pubkey: aggregate_pubkey.to_string(),

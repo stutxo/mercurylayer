@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use bitcoin::hashes::{sha256, Hash};
 use rocket::{serde::json::Json, response::status, State, http::Status};
-use secp256k1_zkp::{XOnlyPublicKey, schnorr::Signature, Message, Secp256k1, PublicKey};
+use secp256k1::{XOnlyPublicKey, schnorr::Signature, Message, Secp256k1, PublicKey};
 use serde::{Serialize, Deserialize};
 use serde_json::{Value, json};
 use crate::{server::StateChainEntity, server_config::Enclave};
@@ -187,7 +187,7 @@ pub async fn post_deposit(statechain_entity: &State<StateChainEntity>, deposit_m
     let msg = Message::from_hashed_data::<sha256::Hash>(token_id.to_string().as_bytes());
 
     let secp = Secp256k1::new();
-    if !secp.verify_schnorr(&signed_token_id, &msg, &auth_key).is_ok() {
+    if !secp.verify_schnorr(&signed_token_id, msg.as_ref(), &auth_key).is_ok() {
 
         let response_body = json!({
             "message": "Signature does not match authentication key."

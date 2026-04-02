@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use bip39::Mnemonic;
 use bitcoin::{bip32::{ExtendedPrivKey, DerivationPath, ExtendedPubKey, ChildNumber}, Address, PrivateKey};
-use secp256k1_zkp::{SecretKey, PublicKey, ffi::types::AlignedType, Secp256k1};
+use secp256k1::{SecretKey, PublicKey, ffi::types::AlignedType, Secp256k1};
 
 use crate::{encode_sc_address, error::MercuryError, utils::get_network, wallet::{Coin, CoinStatus, Wallet}};
 
@@ -58,7 +58,7 @@ impl Wallet {
         let derivation_path = format!("{}/{}/{}", derivation_path, change_index, address_index );
 
         let secret_key = child.derive_priv(&secp, &[change_index_number, address_index_number])?.private_key;
-        let public_key: secp256k1_zkp::PublicKey = xpub.derive_pub(&secp, &[change_index_number, address_index_number])?.public_key;
+        let public_key: secp256k1::PublicKey = xpub.derive_pub(&secp, &[change_index_number, address_index_number])?.public_key;
 
         Ok(KeyData {
             secret_key,

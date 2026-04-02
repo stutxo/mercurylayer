@@ -5,7 +5,7 @@ use std::{fmt, str::FromStr};
 
 use bip39::{Mnemonic, Language};
 use bitcoin::Transaction;
-use secp256k1_zkp::rand::{self, Rng};
+use secp256k1::rand::{self, Rng};
 use serde::{Serialize, Deserialize};
 
 use crate::{transfer::TxOutpoint, utils::ServerConfig, MercuryError};

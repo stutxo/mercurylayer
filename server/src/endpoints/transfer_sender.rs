@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use mercurylib::transfer::sender::{TransferSenderRequestPayload, TransferSenderResponsePayload, TransferUpdateMsgRequestPayload};
 use rocket::{State, serde::json::Json, response::status, http::Status};
-use secp256k1_zkp::{PublicKey, Scalar, SecretKey};
+use secp256k1::{PublicKey, Scalar, SecretKey};
 use serde_json::{Value, json};
 
 use crate::server::StateChainEntity;
@@ -126,7 +126,10 @@ pub async fn transfer_sender(statechain_entity: &State<StateChainEntity>, transf
         return status::Custom(Status::BadRequest, Json(response_body));
     }
 
-    let secret_x1 = SecretKey::new(&mut rand::thread_rng());
+    let secret_x1 = {
+        let mut rng = secp256k1::rand::rng();
+        SecretKey::new(&mut rng)
+    };
 
     let s_x1 = Scalar::from(secret_x1);
     let x1 = s_x1.to_be_bytes();

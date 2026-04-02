@@ -4,7 +4,7 @@ use chrono::Duration;
 use mercurylib::transfer::sender::{PaymentHashRequestPayload, PaymentHashResponsePayload, TransferPreimageRequestPayload, TransferPreimageResponsePayload};
 use rand::Rng;
 use rocket::{State, serde::json::Json, response::status, http::Status};
-use secp256k1_zkp::PublicKey;
+use secp256k1::PublicKey;
 use serde_json::{json, Value};
 
 use sha2::{Sha256, Digest};

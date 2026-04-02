@@ -1,5 +1,5 @@
 use mercurylib::transfer::receiver::StatechainInfo;
-use secp256k1_zkp::{PublicKey, Secp256k1, XOnlyPublicKey, SecretKey};
+use secp256k1::{PublicKey, Secp256k1, XOnlyPublicKey, SecretKey};
 
 use sqlx::Row;
 

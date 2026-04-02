@@ -2,10 +2,10 @@ use std::str::FromStr;
 
 use bitcoin::hashes::sha256;
 use rocket::{State, response::status, http::Status, serde::json::Json};
-use secp256k1_zkp::{schnorr::Signature, Message, Secp256k1, XOnlyPublicKey};
+use secp256k1::{schnorr::Signature, Message, Secp256k1, XOnlyPublicKey};
 use serde_json::{json, Value};
 use sqlx::Row;
-use secp256k1_zkp::PublicKey;
+use secp256k1::PublicKey;
 
 use crate::server::StateChainEntity;
 
@@ -40,7 +40,7 @@ pub async fn validate_signature_given_public_key(signed_message_hex: &str, state
     let msg = Message::from_hashed_data::<sha256::Hash>(statechain_id.to_string().as_bytes());
 
     let secp = Secp256k1::new();
-    secp.verify_schnorr(&signed_message, &msg, &auth_key).is_ok()
+    secp.verify_schnorr(&signed_message, msg.as_ref(), &auth_key).is_ok()
 }
 
 pub async fn validate_signature(pool: &sqlx::PgPool, signed_message_hex: &str, statechain_id: &str) -> bool {
@@ -51,7 +51,7 @@ pub async fn validate_signature(pool: &sqlx::PgPool, signed_message_hex: &str, s
     let msg = Message::from_hashed_data::<sha256::Hash>(statechain_id.to_string().as_bytes());
 
     let secp = Secp256k1::new();
-    secp.verify_schnorr(&signed_message, &msg, &auth_key).is_ok()
+    secp.verify_schnorr(&signed_message, msg.as_ref(), &auth_key).is_ok()
 }
 
 #[get("/info/config")]

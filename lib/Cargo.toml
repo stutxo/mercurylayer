@@ -15,5 +15,5 @@ ecies = {version = "0.2.7", default-features = false, features = ["pure"]}
 hex = "0.4.3"
 serde = { version = "1.0.163", features = ["derive"] }
 serde_json = "1.0.96"
-secp256k1-zkp = { git = "https://github.com/ssantos21/rust-secp256k1-zkp.git", branch = "blinded-musig-scheme", features = [ "rand-std", "bitcoin_hashes", "std" ] }
+secp256k1 = { git = "https://github.com/w0xlt/rust-secp256k1.git", branch = "mercury-blinded-musig-port", features = [ "rand-std", "bitcoin_hashes", "std" ] }
 thiserror = "1.0.59"

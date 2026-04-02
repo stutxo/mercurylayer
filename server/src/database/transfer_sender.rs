@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use secp256k1_zkp::PublicKey;
+use secp256k1::PublicKey;
 
 use sqlx::Row;
 

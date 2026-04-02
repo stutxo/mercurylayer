@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use crate::{error::MercuryError, utils::get_network, wallet::Coin};
 use bitcoin::{hashes::sha256, PrivateKey, secp256k1, Address};
-use secp256k1_zkp::{Message, Secp256k1, PublicKey};
+use secp256k1::{Message, Secp256k1, PublicKey};
 use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -51,7 +51,7 @@ pub fn create_deposit_msg1(coin: &Coin, token_id: &str) -> Result<DepositMsg1, M
     let secp = Secp256k1::new();
     let auth_secret_key = PrivateKey::from_wif(&coin.auth_privkey)?.inner;
     let keypair = secp256k1::KeyPair::from_seckey_slice(&secp, auth_secret_key.as_ref())?;
-    let signed_token_id = secp.sign_schnorr(&msg, &keypair);
+    let signed_token_id = secp.sign_schnorr(msg.as_ref(), &keypair);
 
     let auth_xonly_pubkey = PublicKey::from_str(&coin.auth_pubkey)?.x_only_public_key().0;
 
@@ -76,7 +76,7 @@ pub fn handle_deposit_msg_1_response(coin: &Coin, deposit_msg_1_response: &Depos
     let keypair = secp256k1::KeyPair::from_seckey_slice(&secp, auth_secret_key.as_ref()).unwrap();
 
     let msg = Message::from_hashed_data::<sha256::Hash>(statechain_id.to_string().as_bytes());
-    let signed_statechain_id = secp.sign_schnorr(&msg, &keypair);
+    let signed_statechain_id = secp.sign_schnorr(msg.as_ref(), &keypair);
 
     Ok(DepositInitResult {
         server_pubkey: server_pubkey_share.to_string(),

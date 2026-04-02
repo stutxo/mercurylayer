@@ -2,7 +2,7 @@ use electrum_client::ElectrumApi;
 use mercurylib::{transaction::{SignFirstRequestPayload, PartialSignatureRequestPayload, PartialSignatureResponsePayload, get_partial_sig_request, create_signature, new_backup_transaction}, wallet::Coin};
 use anyhow::Result;
 use reqwest::StatusCode;
-use secp256k1_zkp::musig::MusigPartialSignature;
+use secp256k1::musig::PartialSignature as MusigPartialSignature;
 use serde_json::Value;
 use crate::client_config::ClientConfig;
 

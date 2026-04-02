@@ -3,7 +3,7 @@ use std::str::FromStr;
 use bitcoin::hashes::sha256;
 use mercurylib::transfer::receiver::{GetMsgAddrResponsePayload, StatechainInfoResponsePayload, TransferReceiverError, TransferReceiverErrorResponsePayload, TransferReceiverPostResponsePayload, TransferReceiverRequestPayload, TransferUnlockRequestPayload};
 use rocket::{State, response::status, serde::json::Json, http::Status};
-use secp256k1_zkp::{PublicKey, schnorr::Signature, Message, Secp256k1};
+use secp256k1::{PublicKey, schnorr::Signature, Message, Secp256k1};
 use serde_json::{Value, json};
 
 use crate::server::StateChainEntity;
@@ -236,7 +236,7 @@ pub async fn transfer_receiver(statechain_entity: &State<StateChainEntity>, tran
 
     let secp = Secp256k1::new();
     
-    if !secp.verify_schnorr(&signed_message, &msg, &auth_pubkey).is_ok() {
+    if !secp.verify_schnorr(&signed_message, msg.as_ref(), &auth_pubkey).is_ok() {
 
         let response_body = json!({
             "message": "Signature does not match authentication key."

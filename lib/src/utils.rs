@@ -61,15 +61,15 @@ pub fn is_enclave_pubkey_part_of_coin(coin: &Coin, enclave_pubkey: &str) -> Resu
         return Err(MercuryError::NoAggregatedPubkeyError);
     }
 
-    let enclave_pubkey = secp256k1_zkp::PublicKey::from_str(enclave_pubkey)?;
+    let enclave_pubkey = secp256k1::PublicKey::from_str(enclave_pubkey)?;
 
-    let user_public_key = secp256k1_zkp::PublicKey::from_str(&coin.user_pubkey)?;
+    let user_public_key = secp256k1::PublicKey::from_str(&coin.user_pubkey)?;
 
     let aggregate_enclave_pubkey = user_public_key.combine(&enclave_pubkey)?;
 
     let coin_aggregated_pubkey = coin.aggregated_pubkey.as_ref().unwrap();
 
-    let coin_aggregated_pubkey = secp256k1_zkp::PublicKey::from_str(coin_aggregated_pubkey)?;
+    let coin_aggregated_pubkey = secp256k1::PublicKey::from_str(coin_aggregated_pubkey)?;
 
     return Ok(aggregate_enclave_pubkey == coin_aggregated_pubkey);
 }

@@ -1,7 +1,7 @@
 use std::{str::FromStr, collections::BTreeMap};
 
 use bitcoin::{Txid, ScriptBuf, Transaction, absolute, TxIn, OutPoint, Witness, TxOut, psbt::{Psbt, Input, PsbtSighashType}, sighash::{TapSighashType, SighashCache, self, TapSighash}, taproot::{TapTweakHash, self}, hashes::Hash, Address, PrivateKey, Network};
-use secp256k1_zkp::{SecretKey, PublicKey,  Secp256k1, schnorr::Signature, Message, musig::{MusigSessionId, MusigPubNonce, BlindingFactor, MusigSession, MusigPartialSignature, blinded_musig_pubkey_xonly_tweak_add, blinded_musig_negate_seckey, MusigAggNonce, MusigSecNonce}, new_musig_nonce_pair, KeyPair, rand::{self, Rng}};
+use secp256k1::{SecretKey, PublicKey,  Secp256k1, schnorr::Signature, Message, musig::{MusigSessionId, PublicNonce as MusigPubNonce, BlindingFactor, Session as MusigSession, PartialSignature as MusigPartialSignature, blinded_musig_pubkey_xonly_tweak_add, blinded_musig_negate_seckey, AggregatedNonce as MusigAggNonce, SecretNonce as MusigSecNonce, new_musig_nonce_pair}, KeyPair, rand::{self, Rng}};
 use serde::{Serialize, Deserialize};
 
 use crate::{decode_transfer_address, error::MercuryError, utils::{self, get_network}, wallet::Coin};
@@ -285,7 +285,7 @@ pub fn calculate_musig_session(
     let server_pub_nonce_bytes = hex::decode(&server_pubnonce_hex)?;
     let server_pub_nonce = MusigPubNonce::from_slice(server_pub_nonce_bytes.as_slice())?;
 
-    let aggnonce = MusigAggNonce::new(&secp, &[client_pub_nonce, server_pub_nonce]);
+    let aggnonce = MusigAggNonce::new(&[&client_pub_nonce, &server_pub_nonce]);
 
     let blinding_factor_bytes = hex::decode(coin.blinding_factor.as_ref().unwrap())?;
     let blinding_factor = BlindingFactor::from_slice(blinding_factor_bytes.as_slice())?;
@@ -363,8 +363,6 @@ pub fn create_signature(
     session_hex: String,
     output_pubkey_hex: String) -> core::result::Result<String, MercuryError> 
 {
-    let secp = Secp256k1::new();
-
     let msg = Message::from_slice(hex::decode(msg)?.as_slice())?;
 
     let server_partial_sig_bytes = hex::decode(server_partial_sig_hex)?;
@@ -376,15 +374,15 @@ pub fn create_signature(
     let session_bytes: [u8; 133] = hex::decode(&session_hex)?.try_into().unwrap();
     let session = MusigSession::from_slice(session_bytes);
 
-    let sig = session.partial_sig_agg(&[client_partial_sig, server_partial_sig]);
+    let aggregated_sig = session.partial_sig_agg(&[&client_partial_sig, &server_partial_sig]);
 
     let output_pubkey = PublicKey::from_str(&output_pubkey_hex)?;
 
     let x_only_key_tweaked = output_pubkey.x_only_public_key().0;
 
-    if !secp.verify_schnorr(&sig, &msg, &x_only_key_tweaked).is_ok() {
-        return Err(MercuryError::SchnorrSignatureValidationError);
-    }
+    let sig = aggregated_sig
+        .verify(&x_only_key_tweaked, msg.as_ref())
+        .map_err(|_| MercuryError::SchnorrSignatureValidationError)?;
 
     Ok(sig.to_string())
 }
