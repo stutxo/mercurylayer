@@ -23,7 +23,7 @@ $ docker exec $container_id cli generatetoaddress 101 "$address"
 
 ```bash
 $ cd clients/tests/rust
-$ RUSTUP_TOOLCHAIN=1.92.0 cargo run
+$ RUSTUP_TOOLCHAIN=1.92.0 cargo test --test functional -- --ignored --test-threads=1
 ```
 
 ## Lockbox-only local stack

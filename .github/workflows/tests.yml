@@ -47,7 +47,7 @@ jobs:
       - name: Run retained integration suite
         run: |
           cd clients/tests/rust
-          cargo run
+          cargo test --test functional -- --ignored --test-threads=1
 
       - name: Tear down
         if: always()

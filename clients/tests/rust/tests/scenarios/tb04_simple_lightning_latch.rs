@@ -1,8 +1,8 @@
-use std::{env, process::Command, thread, time::Duration};
+use std::{thread, time::Duration};
 use anyhow::{Result, Ok};
 use mercuryrustlib::{client_config::ClientConfig, CoinStatus, Wallet};
 
-use crate::{bitcoin_core, electrs};
+use crate::common::{bitcoin_core, electrs, utils};
 
 use sha2::{Sha256, Digest};
 
@@ -14,7 +14,7 @@ pub async fn tb04(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wall
 
     let token_response = mercuryrustlib::deposit::get_token(client_config).await?;
 
-    let token_id = crate::utils::handle_token_response(client_config, &token_response).await?;
+    let token_id = utils::handle_token_response(client_config, &token_response).await?;
 
     let deposit_address = mercuryrustlib::deposit::get_deposit_bitcoin_address(&client_config, &wallet1.name, &token_id, amount).await?;
 
@@ -81,13 +81,11 @@ pub async fn tb04(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wall
     Ok(())
 }
 
-pub async fn execute() -> Result<()> {
-
-    let _ = Command::new("rm").arg("wallet.db").arg("wallet.db-shm").arg("wallet.db-wal").output().expect("failed to execute process");
-
-    env::set_var("ML_NETWORK", "regtest");
-
-    let client_config = mercuryrustlib::client_config::load().await;
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires docker regtest stack"]
+async fn tb04_simple_lightning_latch() -> Result<()> {
+    let _guard = crate::common::test_guard();
+    let client_config = crate::common::prepare_test_env().await?;
 
     let wallet1 = mercuryrustlib::wallet::create_wallet(
         "wallet1", 

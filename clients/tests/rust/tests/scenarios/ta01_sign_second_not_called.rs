@@ -1,8 +1,8 @@
-use std::{env, process::Command, thread, time::Duration};
+use std::{thread, time::Duration};
 use anyhow::{anyhow, Result, Ok};
 use mercuryrustlib::{client_config::ClientConfig, create_and_commit_nonces, decode_transfer_address, sqlite_manager::get_wallet, Coin, CoinStatus, SignFirstRequestPayload, SignFirstResponsePayload, TransferSenderRequestPayload, TransferSenderResponsePayload, Wallet};
 
-use crate::{bitcoin_core, electrs};
+use crate::common::{bitcoin_core, electrs, utils};
 
 /// This function gets the server public nonce from the statechain entity.
 pub async fn sign_first(client_config: &ClientConfig, sign_first_request_payload: &SignFirstRequestPayload) -> Result<String> {
@@ -116,7 +116,7 @@ async fn ta01(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wallet) 
 
     let token_response = mercuryrustlib::deposit::get_token(client_config).await?;
 
-    let token_id = crate::utils::handle_token_response(client_config, &token_response).await?;
+    let token_id = utils::handle_token_response(client_config, &token_response).await?;
 
     let address = mercuryrustlib::deposit::get_deposit_bitcoin_address(&client_config, &wallet1.name, &token_id, amount).await?;
 
@@ -186,13 +186,11 @@ async fn ta01(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wallet) 
     Ok(())
 }
 
-pub async fn execute() -> Result<()> {
-
-    let _ = Command::new("rm").arg("wallet.db").arg("wallet.db-shm").arg("wallet.db-wal").output().expect("failed to execute process");
-
-    env::set_var("ML_NETWORK", "regtest");
-
-    let client_config = mercuryrustlib::client_config::load().await;
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires docker regtest stack"]
+async fn ta01_sign_second_not_called() -> Result<()> {
+    let _guard = crate::common::test_guard();
+    let client_config = crate::common::prepare_test_env().await?;
 
     let wallet1 = mercuryrustlib::wallet::create_wallet(
         "wallet1", 

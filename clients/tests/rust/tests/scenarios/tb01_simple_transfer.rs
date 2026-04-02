@@ -1,10 +1,10 @@
 
-use std::{env, process::Command, thread, time::Duration};
+use std::{thread, time::Duration};
 
 use anyhow::{anyhow, Result, Ok};
 use mercuryrustlib::{client_config::ClientConfig, CoinStatus, Wallet};
 
-use crate::{bitcoin_core, electrs};
+use crate::common::{bitcoin_core, electrs, utils};
 
 async fn try_to_send_unconfirmed_coin(client_config: &ClientConfig, to_address: &str, wallet: &Wallet, statechain_id: &str) -> Result<()> {
 
@@ -29,7 +29,7 @@ async fn sucessfully_transfer(client_config: &ClientConfig, wallet1: &Wallet, wa
 
     let token_response = mercuryrustlib::deposit::get_token(client_config).await?;
 
-    let token_id = crate::utils::handle_token_response(client_config, &token_response).await?;
+    let token_id = utils::handle_token_response(client_config, &token_response).await?;
 
     let amount = 1000;
 
@@ -175,13 +175,11 @@ async fn sucessfully_transfer(client_config: &ClientConfig, wallet1: &Wallet, wa
     Ok(())
 }
 
-pub async fn execute() -> Result<()> {
-
-    let _ = Command::new("rm").arg("wallet.db").arg("wallet.db-shm").arg("wallet.db-wal").output().expect("failed to execute process");
-
-    env::set_var("ML_NETWORK", "regtest");
-
-    let client_config = mercuryrustlib::client_config::load().await;
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires docker regtest stack"]
+async fn tb01_simple_transfer() -> Result<()> {
+    let _guard = crate::common::test_guard();
+    let client_config = crate::common::prepare_test_env().await?;
 
     let wallet1 = mercuryrustlib::wallet::create_wallet(
         "wallet1", 

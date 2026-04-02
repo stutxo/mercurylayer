@@ -3,7 +3,7 @@ use std::{thread, time::Duration};
 use anyhow::{Result, Ok};
 use mercuryrustlib::{client_config::ClientConfig,TokenResponse};
 
-use crate::{bitcoin_core, electrs};
+use crate::common::{bitcoin_core, electrs};
 
 pub async fn handle_token_response(client_config: &ClientConfig,  token_response: &TokenResponse) -> Result<String> {
 
