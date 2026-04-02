@@ -33,6 +33,13 @@ $ cd mercurylayer
 $ docker compose -f docker-compose-lockbox.yml up --build
 ```
 
+### Run the lockbox compatibility suite
+
+```bash
+$ cd clients/tests/rust
+$ RUSTUP_TOOLCHAIN=1.92.0 cargo test --test lockbox_compatibility -- --ignored --test-threads=1
+```
+
 ## Compose down
 
 `docker compose -f docker-compose-token-servers.yml down -v` for the regtest stack

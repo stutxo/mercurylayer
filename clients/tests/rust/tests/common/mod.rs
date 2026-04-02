@@ -8,6 +8,7 @@ use mercuryrustlib::client_config::ClientConfig;
 
 pub mod bitcoin_core;
 pub mod electrs;
+pub mod lockbox;
 pub mod utils;
 
 static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();

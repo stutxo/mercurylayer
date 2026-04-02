@@ -16,6 +16,14 @@ $ docker exec $container_id cli generatetoaddress 101 "$address"
 
 4. `RUSTUP_TOOLCHAIN=1.92.0 cargo test --test functional -- --ignored --test-threads=1`
 
+# Running lockbox compatibility tests
+
+1. `$ docker compose -f docker-compose-lockbox.yml up --build` to run the lockbox-only stack.
+
+2. `cd clients/tests/rust/`
+
+3. `RUSTUP_TOOLCHAIN=1.92.0 cargo test --test lockbox_compatibility -- --ignored --test-threads=1`
+
 # Other Environments
 
 The `docker compose -f docker-compose-token-servers.yml` file can be used to build a Mercury Layer infrastructure in test or production environments as it has all the necessary servers including Lockbox, Electrs/Esplora, Token, and Mercury.
