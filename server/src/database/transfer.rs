@@ -2,8 +2,10 @@ use chrono::{DateTime, Utc};
 
 use sqlx::Row;
 
-pub async fn get_batch_id_and_time_by_statechain_id(pool: &sqlx::PgPool, statechain_id: &str) -> Option<(String, DateTime<Utc>)> {
-
+pub async fn get_batch_id_and_time_by_statechain_id(
+    pool: &sqlx::PgPool,
+    statechain_id: &str,
+) -> Option<(String, DateTime<Utc>)> {
     let query = "\
         SELECT batch_id, batch_time \
         FROM statechain_transfer \
@@ -23,12 +25,11 @@ pub async fn get_batch_id_and_time_by_statechain_id(pool: &sqlx::PgPool, statech
             let batch_time: DateTime<Utc> = row.get(1);
             Some((batch_id, batch_time))
         }
-        None => None
+        None => None,
     }
 }
 
 pub async fn is_all_coins_unlocked(pool: &sqlx::PgPool, batch_id: &str) -> bool {
-
     let query = "\
         SELECT locked, locked2 \
         FROM statechain_transfer \

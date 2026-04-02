@@ -1,18 +1,30 @@
-
 use std::{thread, time::Duration};
 
-use anyhow::{anyhow, Result, Ok};
+use anyhow::{anyhow, Ok, Result};
 use mercuryrustlib::{client_config::ClientConfig, CoinStatus, Wallet};
 
 use crate::common::{bitcoin_core, electrs, utils};
 
-async fn try_to_send_unconfirmed_coin(client_config: &ClientConfig, to_address: &str, wallet: &Wallet, statechain_id: &str) -> Result<()> {
-
+async fn try_to_send_unconfirmed_coin(
+    client_config: &ClientConfig,
+    to_address: &str,
+    wallet: &Wallet,
+    statechain_id: &str,
+) -> Result<()> {
     let batch_id = None;
 
     let force_send = false;
 
-    let result = mercuryrustlib::transfer_sender::execute(&client_config, to_address, &wallet.name, &statechain_id, None, force_send, batch_id).await;
+    let result = mercuryrustlib::transfer_sender::execute(
+        &client_config,
+        to_address,
+        &wallet.name,
+        &statechain_id,
+        None,
+        force_send,
+        batch_id,
+    )
+    .await;
 
     assert!(result.is_err());
 
@@ -25,19 +37,29 @@ async fn try_to_send_unconfirmed_coin(client_config: &ClientConfig, to_address: 
     Ok(())
 }
 
-async fn sucessfully_transfer(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wallet) -> Result<()> {
-
+async fn sucessfully_transfer(
+    client_config: &ClientConfig,
+    wallet1: &Wallet,
+    wallet2: &Wallet,
+) -> Result<()> {
     let token_response = mercuryrustlib::deposit::get_token(client_config).await?;
 
     let token_id = utils::handle_token_response(client_config, &token_response).await?;
 
     let amount = 1000;
 
-    let address = mercuryrustlib::deposit::get_deposit_bitcoin_address(&client_config, &wallet1.name, &token_id, amount).await?;
+    let address = mercuryrustlib::deposit::get_deposit_bitcoin_address(
+        &client_config,
+        &wallet1.name,
+        &token_id,
+        amount,
+    )
+    .await?;
 
     mercuryrustlib::coin_status::update_coins(&client_config, &wallet1.name).await?;
 
-    let wallet: mercuryrustlib::Wallet = mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet1.name).await?;
+    let wallet: mercuryrustlib::Wallet =
+        mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet1.name).await?;
 
     // let mut coins_json = Vec::new();
 
@@ -58,7 +80,10 @@ async fn sucessfully_transfer(client_config: &ClientConfig, wallet1: &Wallet, wa
     // let coins_json_string = serde_json::to_string_pretty(&coins_json).unwrap();
     // println!("{}", coins_json_string);
 
-    let new_coin = wallet.coins.iter().find(|&coin| coin.aggregated_address == Some(address.clone()));
+    let new_coin = wallet
+        .coins
+        .iter()
+        .find(|&coin| coin.aggregated_address == Some(address.clone()));
 
     if new_coin.is_none() {
         return Err(anyhow!("Coin not found in wallet"));
@@ -82,39 +107,68 @@ async fn sucessfully_transfer(client_config: &ClientConfig, wallet1: &Wallet, wa
 
     mercuryrustlib::coin_status::update_coins(&client_config, &wallet1.name).await?;
 
-    let wallet: mercuryrustlib::Wallet = mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet1.name).await?;
+    let wallet: mercuryrustlib::Wallet =
+        mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet1.name).await?;
 
-    let new_coin = wallet.coins.iter().find(|&coin| coin.aggregated_address == Some(address.clone())).unwrap();
+    let new_coin = wallet
+        .coins
+        .iter()
+        .find(|&coin| coin.aggregated_address == Some(address.clone()))
+        .unwrap();
 
     assert!(new_coin.status == CoinStatus::IN_MEMPOOL);
 
-    let wallet2_transfer_adress = mercuryrustlib::transfer_receiver::new_transfer_address(&client_config, &wallet2.name).await?;
+    let wallet2_transfer_adress =
+        mercuryrustlib::transfer_receiver::new_transfer_address(&client_config, &wallet2.name)
+            .await?;
 
     let statechain_id = new_coin.statechain_id.as_ref().unwrap();
 
-    try_to_send_unconfirmed_coin(&client_config, &wallet2_transfer_adress, &wallet1, statechain_id).await?;
+    try_to_send_unconfirmed_coin(
+        &client_config,
+        &wallet2_transfer_adress,
+        &wallet1,
+        statechain_id,
+    )
+    .await?;
 
     let core_wallet_address = bitcoin_core::getnewaddress()?;
     let _ = bitcoin_core::generatetoaddress(1, &core_wallet_address)?;
 
     mercuryrustlib::coin_status::update_coins(&client_config, &wallet1.name).await?;
 
-    let wallet: mercuryrustlib::Wallet = mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet1.name).await?;
+    let wallet: mercuryrustlib::Wallet =
+        mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet1.name).await?;
 
-    let new_coin = wallet.coins.iter().find(|&coin| coin.aggregated_address == Some(address.clone())).unwrap();
+    let new_coin = wallet
+        .coins
+        .iter()
+        .find(|&coin| coin.aggregated_address == Some(address.clone()))
+        .unwrap();
 
     assert!(new_coin.status == CoinStatus::UNCONFIRMED);
 
-    try_to_send_unconfirmed_coin(&client_config, &wallet2_transfer_adress, &wallet1, statechain_id).await?;
+    try_to_send_unconfirmed_coin(
+        &client_config,
+        &wallet2_transfer_adress,
+        &wallet1,
+        statechain_id,
+    )
+    .await?;
 
     let remaining_blocks = client_config.confirmation_target - 1;
     let _ = bitcoin_core::generatetoaddress(remaining_blocks, &core_wallet_address)?;
 
     mercuryrustlib::coin_status::update_coins(&client_config, &wallet1.name).await?;
 
-    let wallet: mercuryrustlib::Wallet = mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet1.name).await?;
+    let wallet: mercuryrustlib::Wallet =
+        mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet1.name).await?;
 
-    let new_coin = wallet.coins.iter().find(|&coin| coin.aggregated_address == Some(address.clone())).unwrap();
+    let new_coin = wallet
+        .coins
+        .iter()
+        .find(|&coin| coin.aggregated_address == Some(address.clone()))
+        .unwrap();
 
     assert!(new_coin.status == CoinStatus::CONFIRMED);
 
@@ -122,53 +176,97 @@ async fn sucessfully_transfer(client_config: &ClientConfig, wallet1: &Wallet, wa
 
     let force_send = false;
 
-    let result = mercuryrustlib::transfer_sender::execute(&client_config, &wallet2_transfer_adress, &wallet.name, &statechain_id, None, force_send, batch_id).await;
+    let result = mercuryrustlib::transfer_sender::execute(
+        &client_config,
+        &wallet2_transfer_adress,
+        &wallet.name,
+        &statechain_id,
+        None,
+        force_send,
+        batch_id,
+    )
+    .await;
 
     assert!(result.is_ok());
 
     mercuryrustlib::coin_status::update_coins(&client_config, &wallet1.name).await?;
 
-    let wallet: mercuryrustlib::Wallet = mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet1.name).await?;
+    let wallet: mercuryrustlib::Wallet =
+        mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet1.name).await?;
 
-    let new_coin = wallet.coins.iter().find(|&coin| coin.aggregated_address == Some(address.clone())).unwrap();
+    let new_coin = wallet
+        .coins
+        .iter()
+        .find(|&coin| coin.aggregated_address == Some(address.clone()))
+        .unwrap();
 
     assert!(new_coin.status == CoinStatus::IN_TRANSFER);
 
-    let transfer_receive_result = mercuryrustlib::transfer_receiver::execute(&client_config, &wallet2.name).await?;
+    let transfer_receive_result =
+        mercuryrustlib::transfer_receiver::execute(&client_config, &wallet2.name).await?;
     let received_statechain_ids = transfer_receive_result.received_statechain_ids;
 
     assert!(received_statechain_ids.contains(&statechain_id.to_string()));
     assert!(received_statechain_ids.len() == 1);
 
     mercuryrustlib::coin_status::update_coins(&client_config, &wallet1.name).await?;
-    let wallet: mercuryrustlib::Wallet = mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet1.name).await?;
-    let new_coin = wallet.coins.iter().find(|&coin| coin.aggregated_address == Some(address.clone())).unwrap();
+    let wallet: mercuryrustlib::Wallet =
+        mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet1.name).await?;
+    let new_coin = wallet
+        .coins
+        .iter()
+        .find(|&coin| coin.aggregated_address == Some(address.clone()))
+        .unwrap();
 
     assert!(new_coin.status == CoinStatus::TRANSFERRED);
 
     mercuryrustlib::coin_status::update_coins(&client_config, &wallet2.name).await?;
-    let local_wallet_2: mercuryrustlib::Wallet = mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet2.name).await?;
-    let new_coin = local_wallet_2.coins.iter().find(|&coin| coin.aggregated_address == Some(address.clone())).unwrap();
+    let local_wallet_2: mercuryrustlib::Wallet =
+        mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet2.name).await?;
+    let new_coin = local_wallet_2
+        .coins
+        .iter()
+        .find(|&coin| coin.aggregated_address == Some(address.clone()))
+        .unwrap();
 
     assert!(new_coin.status == CoinStatus::CONFIRMED);
 
     let fee_rate = None;
 
-    let result = mercuryrustlib::withdraw::execute(&client_config, &wallet2.name, &statechain_id, &core_wallet_address, fee_rate, None).await;
+    let result = mercuryrustlib::withdraw::execute(
+        &client_config,
+        &wallet2.name,
+        &statechain_id,
+        &core_wallet_address,
+        fee_rate,
+        None,
+    )
+    .await;
 
     assert!(result.is_ok());
 
     mercuryrustlib::coin_status::update_coins(&client_config, &wallet2.name).await?;
-    let local_wallet_2: mercuryrustlib::Wallet = mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet2.name).await?;
-    let new_coin = local_wallet_2.coins.iter().find(|&coin| coin.aggregated_address == Some(address.clone())).unwrap();
+    let local_wallet_2: mercuryrustlib::Wallet =
+        mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet2.name).await?;
+    let new_coin = local_wallet_2
+        .coins
+        .iter()
+        .find(|&coin| coin.aggregated_address == Some(address.clone()))
+        .unwrap();
 
     assert!(new_coin.status == CoinStatus::WITHDRAWING);
 
-    let _ = bitcoin_core::generatetoaddress(client_config.confirmation_target, &core_wallet_address)?;
+    let _ =
+        bitcoin_core::generatetoaddress(client_config.confirmation_target, &core_wallet_address)?;
 
     mercuryrustlib::coin_status::update_coins(&client_config, &wallet2.name).await?;
-    let local_wallet_2: mercuryrustlib::Wallet = mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet2.name).await?;
-    let new_coin = local_wallet_2.coins.iter().find(|&coin| coin.aggregated_address == Some(address.clone())).unwrap();
+    let local_wallet_2: mercuryrustlib::Wallet =
+        mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet2.name).await?;
+    let new_coin = local_wallet_2
+        .coins
+        .iter()
+        .find(|&coin| coin.aggregated_address == Some(address.clone()))
+        .unwrap();
 
     assert!(new_coin.status == CoinStatus::WITHDRAWN);
 
@@ -181,15 +279,11 @@ async fn tb01_simple_transfer() -> Result<()> {
     let _guard = crate::common::test_guard();
     let client_config = crate::common::prepare_test_env().await?;
 
-    let wallet1 = mercuryrustlib::wallet::create_wallet(
-        "wallet1", 
-        &client_config).await?;
+    let wallet1 = mercuryrustlib::wallet::create_wallet("wallet1", &client_config).await?;
 
     mercuryrustlib::sqlite_manager::insert_wallet(&client_config.pool, &wallet1).await?;
 
-    let wallet2 = mercuryrustlib::wallet::create_wallet(
-        "wallet2", 
-        &client_config).await?;
+    let wallet2 = mercuryrustlib::wallet::create_wallet("wallet2", &client_config).await?;
 
     mercuryrustlib::sqlite_manager::insert_wallet(&client_config.pool, &wallet2).await?;
 

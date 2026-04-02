@@ -2,11 +2,15 @@ mod endpoints;
 mod server_config;
 mod server_state;
 
-#[macro_use] extern crate rocket;
+#[macro_use]
+extern crate rocket;
 
-use rocket::{serde::json::{Value, json}, Request, Response};
 use rocket::fairing::{Fairing, Info, Kind};
 use rocket::http::Header;
+use rocket::{
+    serde::json::{json, Value},
+    Request, Response,
+};
 use server_state::TokenServerState;
 
 #[catch(500)]
@@ -26,21 +30,19 @@ fn not_found(req: &Request) -> Value {
 
 #[rocket::main]
 async fn main() {
-
     let token_server = TokenServerState::new().await;
 
     let _ = rocket::build()
-        .mount("/", routes![
-            /* endpoints::token::token_init, */
-            endpoints::token::token_verify,
-            endpoints::token::token_gen,
-            all_options,
-        ])
-        .register("/", catchers![
-            not_found,
-            internal_error, 
-            bad_request,
-        ])
+        .mount(
+            "/",
+            routes![
+                /* endpoints::token::token_init, */
+                endpoints::token::token_verify,
+                endpoints::token::token_gen,
+                all_options,
+            ],
+        )
+        .register("/", catchers![not_found, internal_error, bad_request,])
         .manage(token_server)
         .attach(Cors)
         // .attach(MercuryPgDatabase::fairing())
@@ -48,7 +50,6 @@ async fn main() {
         .launch()
         .await;
 }
-
 
 /// Catches all OPTION requests in order to get the CORS related Fairing triggered.
 #[options("/<_..>")]
@@ -77,4 +78,3 @@ impl Fairing for Cors {
         response.set_header(Header::new("Access-Control-Allow-Credentials", "true"));
     }
 }
-

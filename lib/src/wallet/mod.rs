@@ -1,12 +1,12 @@
-pub mod key_derivation;
 pub mod cpfp_tx;
+pub mod key_derivation;
 
 use std::{fmt, str::FromStr};
 
-use bip39::{Mnemonic, Language};
+use bip39::{Language, Mnemonic};
 use bitcoin::Transaction;
 use secp256k1::rand::{self, Rng};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 use crate::{transfer::TxOutpoint, utils::ServerConfig, MercuryError};
 
@@ -43,7 +43,7 @@ pub struct Settings {
     pub electrumPort: String,
     pub electrumType: String,
     pub notifications: bool,
-    pub tutorials: bool
+    pub tutorials: bool,
 }
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Token {
@@ -62,12 +62,11 @@ pub struct Activity {
     pub utxo: String,
     pub amount: u32,
     pub action: String,
-    pub date: String
+    pub date: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Coin {
-    
     pub index: u32,
     pub user_privkey: String,
     pub user_pubkey: String,
@@ -107,32 +106,36 @@ pub struct Coin {
 #[allow(non_camel_case_types)]
 pub enum CoinStatus {
     INITIALISED, //  address generated but no Tx0 yet
-    IN_MEMPOOL, // Tx0 in mempool
+    IN_MEMPOOL,  // Tx0 in mempool
     UNCONFIRMED, // Tx0 is awaiting more confirmations before coin is available to be sent
-    CONFIRMED, // Tx0 confirmed and coin available to be sent
+    CONFIRMED,   // Tx0 confirmed and coin available to be sent
     IN_TRANSFER, // transfer-sender performed, but receiver hasn't completed transfer-receiver
     WITHDRAWING, // withdrawal tx signed and broadcast but not yet confirmed
     TRANSFERRED, // the coin was transferred
-    WITHDRAWN, // the coin was withdrawn
-    DUPLICATED, // the coin was duplicated
+    WITHDRAWN,   // the coin was withdrawn
+    DUPLICATED,  // the coin was duplicated
     INVALIDATED, // the coin was invalidated (duplicated but not transferred)
 }
 
 impl fmt::Display for CoinStatus {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         // Match the enum variants
-        write!(f, "{}", match self {
-            Self::INITIALISED => "INITIALISED",
-            Self::IN_MEMPOOL => "IN_MEMPOOL",
-            Self::UNCONFIRMED => "UNCONFIRMED",
-            Self::CONFIRMED => "CONFIRMED",
-            Self::IN_TRANSFER => "IN_TRANSFER",
-            Self::WITHDRAWING => "WITHDRAWING",
-            Self::TRANSFERRED => "TRANSFERRED",
-            Self::WITHDRAWN => "WITHDRAWN",
-            Self::DUPLICATED => "DUPLICATED",
-            Self::INVALIDATED => "INVALIDATED",
-        })
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::INITIALISED => "INITIALISED",
+                Self::IN_MEMPOOL => "IN_MEMPOOL",
+                Self::UNCONFIRMED => "UNCONFIRMED",
+                Self::CONFIRMED => "CONFIRMED",
+                Self::IN_TRANSFER => "IN_TRANSFER",
+                Self::WITHDRAWING => "WITHDRAWING",
+                Self::TRANSFERRED => "TRANSFERRED",
+                Self::WITHDRAWN => "WITHDRAWN",
+                Self::DUPLICATED => "DUPLICATED",
+                Self::INVALIDATED => "INVALIDATED",
+            }
+        )
     }
 }
 
@@ -169,7 +172,7 @@ impl FromStr for CoinStatus {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StatechainBackupTxs {
     pub statechain_id: String,
-    pub backup_txs: Vec<BackupTx>
+    pub backup_txs: Vec<BackupTx>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -184,8 +187,8 @@ pub struct BackupTx {
 }
 
 pub fn get_previous_outpoint(backup_tx: &BackupTx) -> Result<TxOutpoint, MercuryError> {
-    
-    let tx1: Transaction = bitcoin::consensus::encode::deserialize(&hex::decode(backup_tx.tx.clone())?)?;
+    let tx1: Transaction =
+        bitcoin::consensus::encode::deserialize(&hex::decode(backup_tx.tx.clone())?)?;
 
     if tx1.input.len() > 1 {
         return Err(MercuryError::Tx1HasMoreThanOneInput);
@@ -198,7 +201,10 @@ pub fn get_previous_outpoint(backup_tx: &BackupTx) -> Result<TxOutpoint, Mercury
     let tx0_txid = tx1.input[0].previous_output.txid;
     let tx0_vout = tx1.input[0].previous_output.vout as u32;
 
-    Ok(TxOutpoint{ txid: tx0_txid.to_string(), vout: tx0_vout })
+    Ok(TxOutpoint {
+        txid: tx0_txid.to_string(),
+        vout: tx0_vout,
+    })
 }
 
 pub fn set_config(wallet: &mut Wallet, config: &ServerConfig) {

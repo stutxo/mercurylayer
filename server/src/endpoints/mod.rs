@@ -1,15 +1,14 @@
 use chrono::{DateTime, Duration, Utc};
 
 pub mod deposit;
-pub mod sign;
-pub mod utils;
-pub mod transfer_sender;
-pub mod transfer_receiver;
-pub mod withdraw;
 pub mod lightning_latch;
+pub mod sign;
+pub mod transfer_receiver;
+pub mod transfer_sender;
+pub mod utils;
+pub mod withdraw;
 
 fn is_batch_expired(batch_time: DateTime<Utc>) -> bool {
-
     let config = crate::server_config::ServerConfig::load();
 
     let batch_timeout = config.batch_timeout;
@@ -18,5 +17,5 @@ fn is_batch_expired(batch_time: DateTime<Utc>) -> bool {
 
     let now = chrono::Utc::now();
 
-    return now > expiration_time
+    return now > expiration_time;
 }

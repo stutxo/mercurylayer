@@ -1,10 +1,9 @@
-use rocket::{State, serde::json::Json, response::status, http::Status};
+use rocket::{http::Status, response::status, serde::json::Json, State};
 use serde_json::{json, Value};
 
 use crate::server::StateChainEntity;
 
-async fn delete_statechain_db(pool: &sqlx::PgPool,  statechain_id: &String)  {
-
+async fn delete_statechain_db(pool: &sqlx::PgPool, statechain_id: &String) {
     let mut transaction = pool.begin().await.unwrap();
 
     let _ = sqlx::query("DELETE FROM statechain_transfer WHERE statechain_id = $1")
@@ -28,24 +27,39 @@ async fn delete_statechain_db(pool: &sqlx::PgPool,  statechain_id: &String)  {
     transaction.commit().await.unwrap();
 }
 
-#[post("/withdraw/complete", format = "json", data = "<delete_statechain_payload>")]
-pub async fn withdraw_complete(statechain_entity: &State<StateChainEntity>, delete_statechain_payload: Json<mercurylib::withdraw::WithdrawCompletePayload>) -> status::Custom<Json<Value>>  {
-
+#[post(
+    "/withdraw/complete",
+    format = "json",
+    data = "<delete_statechain_payload>"
+)]
+pub async fn withdraw_complete(
+    statechain_entity: &State<StateChainEntity>,
+    delete_statechain_payload: Json<mercurylib::withdraw::WithdrawCompletePayload>,
+) -> status::Custom<Json<Value>> {
     let statechain_id = delete_statechain_payload.0.statechain_id.clone();
     let signed_statechain_id = delete_statechain_payload.0.signed_statechain_id.clone();
 
-    if !crate::endpoints::utils::validate_signature(&statechain_entity.pool, &signed_statechain_id, &statechain_id).await {
-
+    if !crate::endpoints::utils::validate_signature(
+        &statechain_entity.pool,
+        &signed_statechain_id,
+        &statechain_id,
+    )
+    .await
+    {
         let response_body = json!({
             "message": "Signature does not match authentication key."
         });
-    
+
         return status::Custom(Status::InternalServerError, Json(response_body));
     }
 
     let config = crate::server_config::ServerConfig::load();
 
-    let enclave_index = crate::database::utils::get_enclave_index_from_database(&statechain_entity.pool, &statechain_id).await;
+    let enclave_index = crate::database::utils::get_enclave_index_from_database(
+        &statechain_entity.pool,
+        &statechain_id,
+    )
+    .await;
 
     let enclave_index = match enclave_index {
         Some(index) => index,
@@ -53,7 +67,7 @@ pub async fn withdraw_complete(statechain_entity: &State<StateChainEntity>, dele
             let response_body = json!({
                 "message": format!("Enclave index for statechain {} ID not found.", statechain_id)
             });
-        
+
             return status::Custom(Status::InternalServerError, Json(response_body));
         }
     };
@@ -69,7 +83,6 @@ pub async fn withdraw_complete(statechain_entity: &State<StateChainEntity>, dele
     let response = request.send().await;
 
     if response.is_err() {
-
         let response_body = json!({
             "error": "Internal Server Error",
             "message": response.err().unwrap().to_string()
@@ -85,5 +98,4 @@ pub async fn withdraw_complete(statechain_entity: &State<StateChainEntity>, dele
     });
 
     return status::Custom(Status::Ok, Json(response_body));
-
 }

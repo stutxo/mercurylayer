@@ -1,7 +1,9 @@
 use sqlx::Row;
 
-pub async fn get_server_pubnonce_from_null_challenge(pool: &sqlx::PgPool, statechain_id: &str) -> Option<String> {
-
+pub async fn get_server_pubnonce_from_null_challenge(
+    pool: &sqlx::PgPool,
+    statechain_id: &str,
+) -> Option<String> {
     let query = "SELECT server_pubnonce \
         FROM statechain_signature_data \
         WHERE statechain_id = $1 \
@@ -14,8 +16,7 @@ pub async fn get_server_pubnonce_from_null_challenge(pool: &sqlx::PgPool, statec
         .await
         .unwrap();
 
-    if row.is_none()
-    {
+    if row.is_none() {
         return None;
     }
 
@@ -26,8 +27,11 @@ pub async fn get_server_pubnonce_from_null_challenge(pool: &sqlx::PgPool, statec
     Some(server_pubnonce)
 }
 
-pub async fn insert_new_signature_data(pool: &sqlx::PgPool, server_pubnonce: &str, statechain_id: &str)  {
-
+pub async fn insert_new_signature_data(
+    pool: &sqlx::PgPool,
+    server_pubnonce: &str,
+    statechain_id: &str,
+) {
     let mut transaction = pool.begin().await.unwrap();
 
     // FOR UPDATE is used to lock the row for the duration of the transaction
@@ -64,8 +68,12 @@ pub async fn insert_new_signature_data(pool: &sqlx::PgPool, server_pubnonce: &st
     transaction.commit().await.unwrap();
 }
 
-pub async fn update_signature_data_challenge(pool: &sqlx::PgPool, server_pub_nonce: &str, challenge: &str, statechain_id: &str)  {
-
+pub async fn update_signature_data_challenge(
+    pool: &sqlx::PgPool,
+    server_pub_nonce: &str,
+    challenge: &str,
+    statechain_id: &str,
+) {
     let query = "\
         UPDATE statechain_signature_data \
         SET challenge = $1 \

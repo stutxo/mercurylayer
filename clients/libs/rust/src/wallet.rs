@@ -2,24 +2,27 @@ use anyhow::Result;
 use electrum_client::ElectrumApi;
 use mercurylib::wallet::{generate_mnemonic, Settings, Wallet};
 
-use crate::{utils::info_config, client_config::ClientConfig};
+use crate::{client_config::ClientConfig, utils::info_config};
 
-pub async fn create_wallet(
-    name: &str, 
-    client_config: &ClientConfig
-) -> Result<Wallet> {
+pub async fn create_wallet(name: &str, client_config: &ClientConfig) -> Result<Wallet> {
     let mnemonic = generate_mnemonic()?;
 
     let server_info = info_config(&client_config).await?;
 
-    let block_header = client_config.electrum_client.block_headers_subscribe_raw()?;
+    let block_header = client_config
+        .electrum_client
+        .block_headers_subscribe_raw()?;
     let blockheight = block_header.height as u32;
 
     let electrum_endpoint = client_config.electrum_server_url.to_string();
-    let (electrum_protocol, rest) = electrum_endpoint.split_once("://").expect("Could not find protocol separator");
+    let (electrum_protocol, rest) = electrum_endpoint
+        .split_once("://")
+        .expect("Could not find protocol separator");
 
-    let (electrum_host, electrum_port) = rest.rsplit_once(':').expect("Could not find port separator");
-    
+    let (electrum_host, electrum_port) = rest
+        .rsplit_once(':')
+        .expect("Could not find port separator");
+
     let notifications = false;
     let tutorials = false;
 

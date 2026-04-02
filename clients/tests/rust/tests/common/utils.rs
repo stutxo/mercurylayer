@@ -1,16 +1,17 @@
 use std::{thread, time::Duration};
 
-use anyhow::{Result, Ok};
-use mercuryrustlib::{client_config::ClientConfig,TokenResponse};
+use anyhow::{Ok, Result};
+use mercuryrustlib::{client_config::ClientConfig, TokenResponse};
 
 use crate::common::{bitcoin_core, electrs};
 
-pub async fn handle_token_response(client_config: &ClientConfig,  token_response: &TokenResponse) -> Result<String> {
-
+pub async fn handle_token_response(
+    client_config: &ClientConfig,
+    token_response: &TokenResponse,
+) -> Result<String> {
     let token_id = token_response.token_id.clone();
 
     if token_response.payment_method == "onchain" {
-
         let remaining_blocks = token_response.confirmation_target;
         let deposit_address = token_response.deposit_address.clone().unwrap();
 

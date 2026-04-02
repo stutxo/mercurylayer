@@ -2,19 +2,19 @@ use std::str::FromStr;
 
 use electrum_client::{ElectrumApi, ListUnspentRes};
 use miniscript::{Descriptor, DescriptorPublicKey};
-use rocket::{serde::json::Json, response::status, State, http::Status};
-use serde::{Serialize, Deserialize};
-use serde_json::{Value, json};
+use rocket::{http::Status, response::status, serde::json::Json, State};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use sqlx::Row;
 
 use crate::server_state::TokenServerState;
 
 pub async fn insert_new_token(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, 
-    token_id: &str, 
-    onchain_address: &str, 
-    descriptor_checksum: &str, 
-    onchain_address_index: i32
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    token_id: &str,
+    onchain_address: &str,
+    descriptor_checksum: &str,
+    onchain_address_index: i32,
 ) {
     let query = "INSERT INTO tokens (token_id, onchain_address, descriptor_checksum, onchain_address_index, confirmed, spent) \
                  VALUES ($1, $2, $3, $4, $5, $6)";
@@ -31,10 +31,12 @@ pub async fn insert_new_token(
 }
 
 #[get("/token/token_gen")]
-pub async fn token_gen(token_server_state: &State<TokenServerState>) -> status::Custom<Json<Value>> {
-
+pub async fn token_gen(
+    token_server_state: &State<TokenServerState>,
+) -> status::Custom<Json<Value>> {
     let server_config = &token_server_state.server_config;
-    let descriptor = Descriptor::<DescriptorPublicKey>::from_str(&server_config.public_key_descriptor).unwrap();
+    let descriptor =
+        Descriptor::<DescriptorPublicKey>::from_str(&server_config.public_key_descriptor).unwrap();
     let network = miniscript::bitcoin::Network::from_str(server_config.network.as_str()).unwrap();
     let checksum = &token_server_state.checksum;
 
@@ -65,7 +67,7 @@ pub async fn token_gen(token_server_state: &State<TokenServerState>) -> status::
         "fee": server_config.fee,
         "confirmation_target": server_config.confirmation_target,
     });
-    
+
     status::Custom(Status::Ok, Json(response_body))
 }
 
@@ -77,14 +79,14 @@ struct TokenInfo {
 }
 
 async fn get_token_info(pool: &sqlx::PgPool, token_id: &str) -> Option<TokenInfo> {
-
     let row = sqlx::query(
         "SELECT confirmed, spent, onchain_address \
         FROM tokens \
-        WHERE token_id = $1")
-        .bind(&token_id)
-        .fetch_one(pool)
-        .await;
+        WHERE token_id = $1",
+    )
+    .bind(&token_id)
+    .fetch_one(pool)
+    .await;
 
     if row.is_err() {
         match row.err().unwrap() {
@@ -98,17 +100,15 @@ async fn get_token_info(pool: &sqlx::PgPool, token_id: &str) -> Option<TokenInfo
     let confirmed: bool = row.get(0);
     let spent: bool = row.get(1);
     let onchain_address: String = row.get(2);
-    
+
     Some(TokenInfo {
         confirmed,
         spent,
         onchain_address,
     })
-
 }
 
-pub async fn set_token_confirmed(pool: &sqlx::PgPool, token_id: &str)  {
-
+pub async fn set_token_confirmed(pool: &sqlx::PgPool, token_id: &str) {
     let mut transaction = pool.begin().await.unwrap();
 
     let query = "UPDATE tokens \
@@ -125,8 +125,10 @@ pub async fn set_token_confirmed(pool: &sqlx::PgPool, token_id: &str)  {
 }
 
 #[get("/token/token_verify/<token_id>")]
-pub async fn token_verify(token_server_state: &State<TokenServerState>, token_id: String) -> status::Custom<Json<Value>> {
-
+pub async fn token_verify(
+    token_server_state: &State<TokenServerState>,
+    token_id: String,
+) -> status::Custom<Json<Value>> {
     let token_info = get_token_info(&token_server_state.pool, &token_id).await;
 
     if token_info.is_none() {
@@ -174,7 +176,7 @@ pub async fn token_verify(token_server_state: &State<TokenServerState>, token_id
 
     let electrum_client = server_config.get_electrum_client();
 
-    let utxo_list =  electrum_client.script_list_unspent(&address.script_pubkey());
+    let utxo_list = electrum_client.script_list_unspent(&address.script_pubkey());
 
     if utxo_list.is_err() {
         let response_body = json!({
@@ -184,7 +186,7 @@ pub async fn token_verify(token_server_state: &State<TokenServerState>, token_id
     }
 
     let utxo_list = utxo_list.unwrap();
-    
+
     let mut utxo: Option<ListUnspentRes> = None;
 
     for unspent in utxo_list {
@@ -256,5 +258,4 @@ pub async fn token_verify(token_server_state: &State<TokenServerState>, token_id
     });
 
     return status::Custom(Status::Ok, Json(response_body));
-    
 }

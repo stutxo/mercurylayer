@@ -1,5 +1,9 @@
 use bitcoin::{bip32, sighash::SighashTypeParseError};
-use secp256k1::{musig::{MusigNonceGenError, MusigSignError, ParseError}, scalar::OutOfRangeError, Error as UpstreamError};
+use secp256k1::{
+    musig::{MusigNonceGenError, MusigSignError, ParseError},
+    scalar::OutOfRangeError,
+    Error as UpstreamError,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MercuryError {

@@ -1,5 +1,5 @@
 use config::{Config as ConfigRs, Environment, File};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgConnectOptions;
 use std::{env, fs};
 
@@ -51,17 +51,33 @@ impl Default for ServerConfig {
 impl From<ConfigRs> for ServerConfig {
     fn from(config: ConfigRs) -> Self {
         ServerConfig {
-            processor_url: config.get::<String>("processor_url").unwrap_or_else(|_| String::new()),
-            api_key: config.get::<String>("api_key").unwrap_or_else(|_| String::new()),
-            unit: config.get::<String>("unit").unwrap_or_else(|_| String::new()),
-            fee: config.get::<String>("fee").unwrap_or_else(|_| String::new()),
+            processor_url: config
+                .get::<String>("processor_url")
+                .unwrap_or_else(|_| String::new()),
+            api_key: config
+                .get::<String>("api_key")
+                .unwrap_or_else(|_| String::new()),
+            unit: config
+                .get::<String>("unit")
+                .unwrap_or_else(|_| String::new()),
+            fee: config
+                .get::<String>("fee")
+                .unwrap_or_else(|_| String::new()),
             delay: config.get::<u64>("delay").unwrap_or(0),
             tnc: fs::read_to_string("tnc.html").unwrap_or_else(|_| String::from("")),
-            db_user: config.get::<String>("db_user").unwrap_or_else(|_| String::new()),
-            db_password: config.get::<String>("db_password").unwrap_or_else(|_| String::new()),
-            db_host: config.get::<String>("db_host").unwrap_or_else(|_| String::new()),
+            db_user: config
+                .get::<String>("db_user")
+                .unwrap_or_else(|_| String::new()),
+            db_password: config
+                .get::<String>("db_password")
+                .unwrap_or_else(|_| String::new()),
+            db_host: config
+                .get::<String>("db_host")
+                .unwrap_or_else(|_| String::new()),
             db_port: config.get::<u16>("db_port").unwrap_or(0),
-            db_name: config.get::<String>("db_name").unwrap_or_else(|_| String::new()),
+            db_name: config
+                .get::<String>("db_name")
+                .unwrap_or_else(|_| String::new()),
         }
     }
 }
@@ -81,7 +97,7 @@ impl ServerConfig {
             .add_source(File::with_name("Settings"))
             .build()
             .unwrap();
-        
+
         // Function to fetch a setting from the environment or fallback to the config file
         let get_env_or_config = |key: &str, env_var: &str| -> String {
             env::var(env_var).unwrap_or_else(|_| settings.get_string(key).unwrap())
@@ -97,7 +113,9 @@ impl ServerConfig {
             db_user: get_env_or_config("db_user", "DB_USER"),
             db_password: get_env_or_config("db_password", "DB_PASSWORD"),
             db_host: get_env_or_config("db_host", "DB_HOST"),
-            db_port: get_env_or_config("db_port", "DB_PORT").parse::<u16>().unwrap(),
+            db_port: get_env_or_config("db_port", "DB_PORT")
+                .parse::<u16>()
+                .unwrap(),
             db_name: get_env_or_config("db_name", "DB_NAME"),
         }
     }
@@ -111,4 +129,3 @@ impl ServerConfig {
             .database(&self.db_name)
     }
 }
-

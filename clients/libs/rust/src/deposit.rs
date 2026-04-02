@@ -1,10 +1,24 @@
-use anyhow::{anyhow, Result, Ok};
-use mercurylib::{deposit::{create_deposit_msg1, create_aggregated_address}, wallet::{Wallet, BackupTx, Coin}, transaction:: get_user_backup_address, utils::get_blockheight};
+use anyhow::{anyhow, Ok, Result};
+use mercurylib::{
+    deposit::{create_aggregated_address, create_deposit_msg1},
+    transaction::get_user_backup_address,
+    utils::get_blockheight,
+    wallet::{BackupTx, Coin, Wallet},
+};
 
-use crate::{client_config::ClientConfig, sqlite_manager::{get_wallet, update_wallet}, transaction::new_transaction, utils::info_config};
+use crate::{
+    client_config::ClientConfig,
+    sqlite_manager::{get_wallet, update_wallet},
+    transaction::new_transaction,
+    utils::info_config,
+};
 
-pub async fn get_deposit_bitcoin_address(client_config: &ClientConfig, wallet_name: &str, token_id: &str, amount: u32) -> Result<String> {
-
+pub async fn get_deposit_bitcoin_address(
+    client_config: &ClientConfig,
+    wallet_name: &str,
+    token_id: &str,
+    amount: u32,
+) -> Result<String> {
     let token_id = uuid::Uuid::parse_str(&token_id)?;
     // println!("Deposit: {} {} {}", wallet_name, token_id, amount);
     let wallet = get_wallet(&client_config.pool, &wallet_name).await?;
@@ -24,30 +38,36 @@ pub async fn get_deposit_bitcoin_address(client_config: &ClientConfig, wallet_na
 }
 
 // When sending duplicated coins, the tx_n of the backup_tx must be different
-pub async fn create_tx1(client_config: &ClientConfig, coin: &mut Coin, wallet_netwotk: &str, tx_n: u32) -> Result<BackupTx> {
-
+pub async fn create_tx1(
+    client_config: &ClientConfig,
+    coin: &mut Coin,
+    wallet_netwotk: &str,
+    tx_n: u32,
+) -> Result<BackupTx> {
     let to_address = get_user_backup_address(&coin, wallet_netwotk.to_string())?;
 
     let server_info = info_config(&client_config).await?;
 
-    let fee_rate_sats_per_byte = if server_info.fee_rate_sats_per_byte > client_config.max_fee_rate {
+    let fee_rate_sats_per_byte = if server_info.fee_rate_sats_per_byte > client_config.max_fee_rate
+    {
         client_config.max_fee_rate
     } else {
         server_info.fee_rate_sats_per_byte
     };
 
     let signed_tx = new_transaction(
-        &client_config, 
-        coin, 
-        &to_address, 
-        0, 
-        false, 
-        None, 
-        wallet_netwotk, 
-        fee_rate_sats_per_byte, 
+        &client_config,
+        coin,
+        &to_address,
+        0,
+        false,
+        None,
+        wallet_netwotk,
+        fee_rate_sats_per_byte,
         server_info.initlock,
-        server_info.interval
-    ).await?;
+        server_info.interval,
+    )
+    .await?;
 
     if coin.public_nonce.is_none() {
         return Err(anyhow::anyhow!("coin.public_nonce is None"));
@@ -77,8 +97,11 @@ pub async fn create_tx1(client_config: &ClientConfig, coin: &mut Coin, wallet_ne
     Ok(backup_tx)
 }
 
-pub async fn init(client_config: &ClientConfig, wallet: &Wallet, token_id: uuid::Uuid) -> Result<Wallet> {
-
+pub async fn init(
+    client_config: &ClientConfig,
+    wallet: &Wallet,
+    token_id: uuid::Uuid,
+) -> Result<Wallet> {
     let mut wallet = wallet.clone();
 
     let coin = wallet.get_new_coin()?;
@@ -106,9 +129,11 @@ pub async fn init(client_config: &ClientConfig, wallet: &Wallet, token_id: uuid:
 
     let value = response.text().await?;
 
-    let deposit_msg_1_response: mercurylib::deposit::DepositMsg1Response = serde_json::from_str(value.as_str())?;
+    let deposit_msg_1_response: mercurylib::deposit::DepositMsg1Response =
+        serde_json::from_str(value.as_str())?;
 
-    let deposit_init_result = mercurylib::deposit::handle_deposit_msg_1_response(&coin, &deposit_msg_1_response)?;
+    let deposit_init_result =
+        mercurylib::deposit::handle_deposit_msg_1_response(&coin, &deposit_msg_1_response)?;
 
     let coin = wallet.coins.last_mut().unwrap();
 
@@ -122,7 +147,6 @@ pub async fn init(client_config: &ClientConfig, wallet: &Wallet, token_id: uuid:
 }
 
 pub async fn get_token(client_config: &ClientConfig) -> Result<mercurylib::deposit::TokenResponse> {
-
     let endpoint = client_config.statechain_entity.clone();
     let path = "deposit/get_token";
 

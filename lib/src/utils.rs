@@ -1,9 +1,12 @@
 use std::str::FromStr;
 
 use bitcoin::Transaction;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
-use crate::{wallet::{BackupTx, Coin}, MercuryError};
+use crate::{
+    wallet::{BackupTx, Coin},
+    MercuryError,
+};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ServerConfig {
@@ -38,7 +41,7 @@ pub fn get_network(network: &str) -> Result<bitcoin::Network, MercuryError> {
         "testnet" => Ok(bitcoin::Network::Testnet),
         "regtest" => Ok(bitcoin::Network::Regtest),
         "bitcoin" => Ok(bitcoin::Network::Bitcoin),
-        _ => Err(MercuryError::NetworkConversionError)
+        _ => Err(MercuryError::NetworkConversionError),
     }
 }
 
@@ -55,8 +58,10 @@ pub fn get_blockheight(bkp_tx: &BackupTx) -> Result<u32, MercuryError> {
     Ok(block_height)
 }
 
-pub fn is_enclave_pubkey_part_of_coin(coin: &Coin, enclave_pubkey: &str) -> Result<bool, MercuryError> {
-
+pub fn is_enclave_pubkey_part_of_coin(
+    coin: &Coin,
+    enclave_pubkey: &str,
+) -> Result<bool, MercuryError> {
     if coin.aggregated_pubkey.is_none() {
         return Err(MercuryError::NoAggregatedPubkeyError);
     }

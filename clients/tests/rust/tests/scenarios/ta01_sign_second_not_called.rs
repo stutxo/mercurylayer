@@ -1,21 +1,33 @@
+use anyhow::{anyhow, Ok, Result};
+use mercuryrustlib::{
+    client_config::ClientConfig, create_and_commit_nonces, decode_transfer_address,
+    sqlite_manager::get_wallet, Coin, CoinStatus, SignFirstRequestPayload,
+    SignFirstResponsePayload, TransferSenderRequestPayload, TransferSenderResponsePayload, Wallet,
+};
 use std::{thread, time::Duration};
-use anyhow::{anyhow, Result, Ok};
-use mercuryrustlib::{client_config::ClientConfig, create_and_commit_nonces, decode_transfer_address, sqlite_manager::get_wallet, Coin, CoinStatus, SignFirstRequestPayload, SignFirstResponsePayload, TransferSenderRequestPayload, TransferSenderResponsePayload, Wallet};
 
 use crate::common::{bitcoin_core, electrs, utils};
 
 /// This function gets the server public nonce from the statechain entity.
-pub async fn sign_first(client_config: &ClientConfig, sign_first_request_payload: &SignFirstRequestPayload) -> Result<String> {
-
+pub async fn sign_first(
+    client_config: &ClientConfig,
+    sign_first_request_payload: &SignFirstRequestPayload,
+) -> Result<String> {
     let endpoint = client_config.statechain_entity.clone();
     let path = "sign/first";
 
     let client = client_config.get_reqwest_client()?;
     let request = client.post(&format!("{}/{}", endpoint, path));
 
-    let value = request.json(&sign_first_request_payload).send().await?.text().await?;
+    let value = request
+        .json(&sign_first_request_payload)
+        .send()
+        .await?
+        .text()
+        .await?;
 
-    let sign_first_response_payload: SignFirstResponsePayload = serde_json::from_str(value.as_str())?;
+    let sign_first_response_payload: SignFirstResponsePayload =
+        serde_json::from_str(value.as_str())?;
 
     let mut server_pubnonce_hex = sign_first_response_payload.server_pubnonce.to_string();
 
@@ -27,9 +39,9 @@ pub async fn sign_first(client_config: &ClientConfig, sign_first_request_payload
 }
 
 pub async fn new_transaction_only_sign_first(
-    client_config: &ClientConfig, 
-    coin: &mut Coin) -> Result<()> {
-
+    client_config: &ClientConfig,
+    coin: &mut Coin,
+) -> Result<()> {
     let coin_nonce = create_and_commit_nonces(&coin)?;
     coin.secret_nonce = Some(coin_nonce.secret_nonce);
     coin.public_nonce = Some(coin_nonce.public_nonce);
@@ -41,22 +53,24 @@ pub async fn new_transaction_only_sign_first(
 }
 
 pub async fn execute_only_sign_first(
-    client_config: &ClientConfig, 
-    recipient_address: &str, 
-    wallet_name: &str, 
-    statechain_id: &str, 
-    batch_id: Option<String>) -> Result<()> 
-{
-
+    client_config: &ClientConfig,
+    recipient_address: &str,
+    wallet_name: &str,
+    statechain_id: &str,
+    batch_id: Option<String>,
+) -> Result<()> {
     let mut wallet = get_wallet(&client_config.pool, &wallet_name).await?;
 
-    let coin = wallet.coins
+    let coin = wallet
+        .coins
         .iter_mut()
         .filter(|tx| tx.statechain_id == Some(statechain_id.to_string())) // Filter coins with the specified statechain_id
         .min_by_key(|tx| tx.locktime.unwrap_or(u32::MAX)); // Find the one with the lowest locktime
 
     if coin.is_none() {
-        return Err(anyhow!("No coins associated with this statechain ID were found"));
+        return Err(anyhow!(
+            "No coins associated with this statechain ID were found"
+        ));
     }
 
     let coin = coin.unwrap();
@@ -64,17 +78,28 @@ pub async fn execute_only_sign_first(
     let statechain_id = coin.statechain_id.as_ref().unwrap();
     let signed_statechain_id = coin.signed_statechain_id.as_ref().unwrap();
 
-    let (_, _, recipient_auth_pubkey) = decode_transfer_address(recipient_address)?;  
-    let _ = get_new_x1(&client_config,  statechain_id, signed_statechain_id, &recipient_auth_pubkey.to_string(), batch_id).await?;
+    let (_, _, recipient_auth_pubkey) = decode_transfer_address(recipient_address)?;
+    let _ = get_new_x1(
+        &client_config,
+        statechain_id,
+        signed_statechain_id,
+        &recipient_auth_pubkey.to_string(),
+        batch_id,
+    )
+    .await?;
 
     let _ = new_transaction_only_sign_first(client_config, coin).await?;
 
     Ok(())
-
 }
 
-async fn get_new_x1(client_config: &ClientConfig,  statechain_id: &str, signed_statechain_id: &str, recipient_auth_pubkey: &str, batch_id: Option<String>) -> Result<String> {
-    
+async fn get_new_x1(
+    client_config: &ClientConfig,
+    statechain_id: &str,
+    signed_statechain_id: &str,
+    recipient_auth_pubkey: &str,
+    batch_id: Option<String>,
+) -> Result<String> {
     let endpoint = client_config.statechain_entity.clone();
     let path = "transfer/sender";
 
@@ -90,35 +115,50 @@ async fn get_new_x1(client_config: &ClientConfig,  statechain_id: &str, signed_s
 
     let value = match request.json(&transfer_sender_request_payload).send().await {
         std::result::Result::Ok(response) => {
-
             let status = response.status();
-            let text = response.text().await.unwrap_or("Unexpected error".to_string());
+            let text = response
+                .text()
+                .await
+                .unwrap_or("Unexpected error".to_string());
 
             if status.is_success() {
                 text
             } else {
-                return Err(anyhow::anyhow!(format!("status: {}, error: {}", status, text)));
+                return Err(anyhow::anyhow!(format!(
+                    "status: {}, error: {}",
+                    status, text
+                )));
             }
-        },
+        }
         Err(err) => {
-            return Err(anyhow::anyhow!(format!("status: {}, error: {}", err.status().unwrap(),err.to_string())));
-        },
+            return Err(anyhow::anyhow!(format!(
+                "status: {}, error: {}",
+                err.status().unwrap(),
+                err.to_string()
+            )));
+        }
     };
 
-    let response: TransferSenderResponsePayload = serde_json::from_str(value.as_str()).expect(&format!("failed to parse: {}", value.as_str()));
+    let response: TransferSenderResponsePayload = serde_json::from_str(value.as_str())
+        .expect(&format!("failed to parse: {}", value.as_str()));
 
     Ok(response.x1)
 }
 
 async fn ta01(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wallet) -> Result<()> {
-
     let amount = 1000;
 
     let token_response = mercuryrustlib::deposit::get_token(client_config).await?;
 
     let token_id = utils::handle_token_response(client_config, &token_response).await?;
 
-    let address = mercuryrustlib::deposit::get_deposit_bitcoin_address(&client_config, &wallet1.name, &token_id, amount).await?;
+    let address = mercuryrustlib::deposit::get_deposit_bitcoin_address(
+        &client_config,
+        &wallet1.name,
+        &token_id,
+        amount,
+    )
+    .await?;
 
     let _ = bitcoin_core::sendtoaddress(amount, &address)?;
 
@@ -135,8 +175,13 @@ async fn ta01(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wallet) 
     }
 
     mercuryrustlib::coin_status::update_coins(&client_config, &wallet1.name).await?;
-    let wallet1 = mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet1.name).await?;
-    let new_coin = wallet1.coins.iter().find(|&coin| coin.aggregated_address == Some(address.clone())).unwrap();
+    let wallet1 =
+        mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet1.name).await?;
+    let new_coin = wallet1
+        .coins
+        .iter()
+        .find(|&coin| coin.aggregated_address == Some(address.clone()))
+        .unwrap();
 
     assert!(new_coin.status == CoinStatus::CONFIRMED);
 
@@ -144,44 +189,69 @@ async fn ta01(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wallet) 
 
     let batch_id = None;
 
-    let wallet2_transfer_adress = mercuryrustlib::transfer_receiver::new_transfer_address(&client_config, &wallet2.name).await?;
+    let wallet2_transfer_adress =
+        mercuryrustlib::transfer_receiver::new_transfer_address(&client_config, &wallet2.name)
+            .await?;
 
     execute_only_sign_first(
-        &client_config, 
-        &wallet2_transfer_adress, 
-        &wallet1.name, 
-        &statechain_id, 
-        batch_id).await?;
+        &client_config,
+        &wallet2_transfer_adress,
+        &wallet1.name,
+        &statechain_id,
+        batch_id,
+    )
+    .await?;
 
     mercuryrustlib::coin_status::update_coins(&client_config, &wallet1.name).await?;
-    let wallet1 = mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet1.name).await?;
+    let wallet1 =
+        mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet1.name).await?;
 
     let batch_id = None;
 
     let force_send = false;
 
-    let result = mercuryrustlib::transfer_sender::execute(&client_config, &wallet2_transfer_adress, &wallet1.name, &statechain_id, None, force_send, batch_id).await;
+    let result = mercuryrustlib::transfer_sender::execute(
+        &client_config,
+        &wallet2_transfer_adress,
+        &wallet1.name,
+        &statechain_id,
+        None,
+        force_send,
+        batch_id,
+    )
+    .await;
 
     assert!(result.is_ok());
 
-    let transfer_receive_result = mercuryrustlib::transfer_receiver::execute(&client_config, &wallet2.name).await?;
+    let transfer_receive_result =
+        mercuryrustlib::transfer_receiver::execute(&client_config, &wallet2.name).await?;
     let received_statechain_ids = transfer_receive_result.received_statechain_ids;
 
     assert!(received_statechain_ids.contains(&statechain_id.to_string()));
     assert!(received_statechain_ids.len() == 1);
 
-    let wallet2 = mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet2.name).await?;
+    let wallet2 =
+        mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet2.name).await?;
 
-    let new_coin = wallet2.coins.iter().find(|&coin| coin.statechain_id == Some(statechain_id.to_string())).unwrap();
+    let new_coin = wallet2
+        .coins
+        .iter()
+        .find(|&coin| coin.statechain_id == Some(statechain_id.to_string()))
+        .unwrap();
 
     assert!(new_coin.status == CoinStatus::CONFIRMED);
 
     mercuryrustlib::coin_status::update_coins(&client_config, &wallet1.name).await?;
-    let wallet1 = mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet1.name).await?;
+    let wallet1 =
+        mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet1.name).await?;
 
-    let new_coin = wallet1.coins.iter().find(|&coin| coin.statechain_id == Some(statechain_id.to_string())).unwrap();
+    let new_coin = wallet1
+        .coins
+        .iter()
+        .find(|&coin| coin.statechain_id == Some(statechain_id.to_string()))
+        .unwrap();
 
-    assert!(new_coin.status == CoinStatus::TRANSFERRED);    
+    assert!(new_coin.status == CoinStatus::TRANSFERRED);
 
     Ok(())
 }
@@ -192,15 +262,11 @@ async fn ta01_sign_second_not_called() -> Result<()> {
     let _guard = crate::common::test_guard();
     let client_config = crate::common::prepare_test_env().await?;
 
-    let wallet1 = mercuryrustlib::wallet::create_wallet(
-        "wallet1", 
-        &client_config).await?;
+    let wallet1 = mercuryrustlib::wallet::create_wallet("wallet1", &client_config).await?;
 
     mercuryrustlib::sqlite_manager::insert_wallet(&client_config.pool, &wallet1).await?;
 
-    let wallet2 = mercuryrustlib::wallet::create_wallet(
-        "wallet2", 
-        &client_config).await?;
+    let wallet2 = mercuryrustlib::wallet::create_wallet("wallet2", &client_config).await?;
 
     mercuryrustlib::sqlite_manager::insert_wallet(&client_config.pool, &wallet2).await?;
 

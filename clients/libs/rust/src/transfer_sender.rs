@@ -1,19 +1,32 @@
 use std::{cmp::Ordering, str::FromStr};
 
-use crate::{client_config::ClientConfig, deposit::create_tx1, sqlite_manager::{get_backup_txs, get_wallet, update_backup_txs, update_wallet}, transaction::new_transaction, utils::info_config};
+use crate::{
+    client_config::ClientConfig,
+    deposit::create_tx1,
+    sqlite_manager::{get_backup_txs, get_wallet, update_backup_txs, update_wallet},
+    transaction::new_transaction,
+    utils::info_config,
+};
 use anyhow::{anyhow, Result};
 use chrono::Utc;
-use mercurylib::{decode_transfer_address, transfer::sender::{create_transfer_signature, create_transfer_update_msg, TransferSenderRequestPayload, TransferSenderResponsePayload}, utils::get_blockheight, wallet::{get_previous_outpoint, Activity, BackupTx, Coin, CoinStatus, Wallet}};
 use electrum_client::ElectrumApi;
+use mercurylib::{
+    decode_transfer_address,
+    transfer::sender::{
+        create_transfer_signature, create_transfer_update_msg, TransferSenderRequestPayload,
+        TransferSenderResponsePayload,
+    },
+    utils::get_blockheight,
+    wallet::{get_previous_outpoint, Activity, BackupTx, Coin, CoinStatus, Wallet},
+};
 
 pub async fn create_backup_transactions(
-    client_config: &ClientConfig, 
+    client_config: &ClientConfig,
     recipient_address: &str,
     wallet: &mut Wallet,
     statechain_id: &str,
     duplicated_indexes: Option<Vec<u32>>,
 ) -> Result<Vec<BackupTx>> {
-
     // throw error if duplicated_indexes contains an index that does not exist in wallet.coins
     // this can be moved to the caller function
     if duplicated_indexes.is_some() {
@@ -22,23 +35,25 @@ pub async fn create_backup_transactions(
                 return Err(anyhow!("Index {} does not exist in wallet.coins", index));
             }
         }
-    }  
+    }
 
     let mut coin_list: Vec<&mut Coin> = Vec::new();
 
-    let backup_transactions = get_backup_txs(&client_config.pool, &wallet.name, &statechain_id).await?;
+    let backup_transactions =
+        get_backup_txs(&client_config.pool, &wallet.name, &statechain_id).await?;
 
     // Get coins that already have a backup transaction
     for coin in wallet.coins.iter_mut() {
         // Check if coin matches any backup transaction and has one of the specified statuses
         let has_matching_tx = backup_transactions.iter().any(|backup_tx| {
             if let Ok(tx_outpoint) = get_previous_outpoint(backup_tx) {
-                if let (Some(utxo_txid), Some(utxo_vout)) = (coin.utxo_txid.clone(), coin.utxo_vout) {
-                    (coin.status == CoinStatus::DUPLICATED ||
-                     coin.status == CoinStatus::CONFIRMED ||
-                     coin.status == CoinStatus::IN_TRANSFER) &&
-                    tx_outpoint.txid == utxo_txid &&
-                    tx_outpoint.vout == utxo_vout
+                if let (Some(utxo_txid), Some(utxo_vout)) = (coin.utxo_txid.clone(), coin.utxo_vout)
+                {
+                    (coin.status == CoinStatus::DUPLICATED
+                        || coin.status == CoinStatus::CONFIRMED
+                        || coin.status == CoinStatus::IN_TRANSFER)
+                        && tx_outpoint.txid == utxo_txid
+                        && tx_outpoint.vout == utxo_vout
                 } else {
                     false
                 }
@@ -50,13 +65,20 @@ pub async fn create_backup_transactions(
         let mut coin_to_add = false;
 
         if duplicated_indexes.is_some() {
-            if coin.statechain_id == Some(statechain_id.to_string()) && 
-            (coin.status == CoinStatus::CONFIRMED || coin.status == CoinStatus::IN_TRANSFER) {
+            if coin.statechain_id == Some(statechain_id.to_string())
+                && (coin.status == CoinStatus::CONFIRMED || coin.status == CoinStatus::IN_TRANSFER)
+            {
                 coin_to_add = true;
             }
 
-            if coin.statechain_id == Some(statechain_id.to_string()) && coin.status == CoinStatus::DUPLICATED && 
-                duplicated_indexes.is_some() && duplicated_indexes.as_ref().unwrap().contains(&coin.duplicate_index) {
+            if coin.statechain_id == Some(statechain_id.to_string())
+                && coin.status == CoinStatus::DUPLICATED
+                && duplicated_indexes.is_some()
+                && duplicated_indexes
+                    .as_ref()
+                    .unwrap()
+                    .contains(&coin.duplicate_index)
+            {
                 coin_to_add = true;
             }
         }
@@ -65,12 +87,18 @@ pub async fn create_backup_transactions(
             if coin.locktime.is_none() {
                 return Err(anyhow::anyhow!("coin.locktime is None"));
             }
-        
-            let block_header = client_config.electrum_client.block_headers_subscribe_raw()?;
+
+            let block_header = client_config
+                .electrum_client
+                .block_headers_subscribe_raw()?;
             let current_blockheight = block_header.height as u32;
-        
-            if current_blockheight > coin.locktime.unwrap()  {
-                return Err(anyhow::anyhow!("The coin is expired. Coin locktime is {} and current blockheight is {}", coin.locktime.unwrap(), current_blockheight));
+
+            if current_blockheight > coin.locktime.unwrap() {
+                return Err(anyhow::anyhow!(
+                    "The coin is expired. Coin locktime is {} and current blockheight is {}",
+                    coin.locktime.unwrap(),
+                    current_blockheight
+                ));
             }
 
             coin_list.push(coin);
@@ -81,24 +109,36 @@ pub async fn create_backup_transactions(
     // So it is exepcted that the coin with duplicate_index == 0 is in the list since it must have at least one backup transaction
     let coins_with_zero_index = coin_list
         .iter()
-        .filter(|coin| coin.duplicate_index == 0 && (coin.status == CoinStatus::CONFIRMED || coin.status == CoinStatus::IN_TRANSFER))
+        .filter(|coin| {
+            coin.duplicate_index == 0
+                && (coin.status == CoinStatus::CONFIRMED || coin.status == CoinStatus::IN_TRANSFER)
+        })
         .collect::<Vec<_>>();
 
     if coins_with_zero_index.len() != 1 {
-        return Err(anyhow!("There must be at least one coin with duplicate_index == 0"));
+        return Err(anyhow!(
+            "There must be at least one coin with duplicate_index == 0"
+        ));
     }
 
     for coin in coin_list.iter_mut() {
         if coin.status == CoinStatus::DUPLICATED {
-            let address = bitcoin::Address::from_str(&coin.aggregated_address.as_ref().unwrap())?.require_network(client_config.network)?;
-            let utxo_list =  client_config.electrum_client.script_list_unspent(&address.script_pubkey())?;
+            let address = bitcoin::Address::from_str(&coin.aggregated_address.as_ref().unwrap())?
+                .require_network(client_config.network)?;
+            let utxo_list = client_config
+                .electrum_client
+                .script_list_unspent(&address.script_pubkey())?;
 
             for unspent in utxo_list {
-                if coin.utxo_txid == Some(unspent.tx_hash.to_string()) && coin.utxo_vout == Some(unspent.tx_pos as u32) {
-                    let mut is_confirmed =  false;
+                if coin.utxo_txid == Some(unspent.tx_hash.to_string())
+                    && coin.utxo_vout == Some(unspent.tx_pos as u32)
+                {
+                    let mut is_confirmed = false;
 
                     if unspent.height > 0 {
-                        let block_header = client_config.electrum_client.block_headers_subscribe_raw()?;
+                        let block_header = client_config
+                            .electrum_client
+                            .block_headers_subscribe_raw()?;
                         let blockheight = block_header.height;
 
                         let confirmations = blockheight - unspent.height + 1;
@@ -119,28 +159,27 @@ pub async fn create_backup_transactions(
     }
 
     // Move the coin with CONFIRMED status to the first position
-    coin_list.sort_by(|a, b| {
-        match (&a.status, &b.status) {
-            (CoinStatus::CONFIRMED, _) => Ordering::Less,
-            (_, CoinStatus::CONFIRMED) => Ordering::Greater,
-            _ => Ordering::Equal,
-        }
+    coin_list.sort_by(|a, b| match (&a.status, &b.status) {
+        (CoinStatus::CONFIRMED, _) => Ordering::Less,
+        (_, CoinStatus::CONFIRMED) => Ordering::Greater,
+        _ => Ordering::Equal,
     });
 
     let mut new_backup_transactions = Vec::new();
 
     // create backup transaction for every coin
-    let backup_transactions = get_backup_txs(&client_config.pool, &wallet.name, &statechain_id).await?;
+    let backup_transactions =
+        get_backup_txs(&client_config.pool, &wallet.name, &statechain_id).await?;
 
     let mut new_tx_n = backup_transactions.len() as u32;
 
     for coin in coin_list {
-
         let mut filtered_transactions: Vec<BackupTx> = Vec::new();
 
         for backup_tx in &backup_transactions {
             if let Ok(tx_outpoint) = get_previous_outpoint(&backup_tx) {
-                if let (Some(utxo_txid), Some(utxo_vout)) = (coin.utxo_txid.clone(), coin.utxo_vout) {
+                if let (Some(utxo_txid), Some(utxo_vout)) = (coin.utxo_txid.clone(), coin.utxo_vout)
+                {
                     if tx_outpoint.txid == utxo_txid && tx_outpoint.vout == utxo_vout {
                         filtered_transactions.push(backup_tx.clone());
                     }
@@ -162,7 +201,15 @@ pub async fn create_backup_transactions(
 
         let bkp_tx1 = &filtered_transactions[0];
 
-        let signed_tx = create_backup_tx_to_receiver(client_config, coin, bkp_tx1, recipient_address, qt_backup_tx, &wallet.network).await?;
+        let signed_tx = create_backup_tx_to_receiver(
+            client_config,
+            coin,
+            bkp_tx1,
+            recipient_address,
+            qt_backup_tx,
+            &wallet.network,
+        )
+        .await?;
 
         let backup_tx = BackupTx {
             tx_n: new_tx_n,
@@ -191,15 +238,16 @@ pub async fn create_backup_transactions(
 }
 
 pub async fn execute(
-    client_config: &ClientConfig, 
-    recipient_address: &str, 
-    wallet_name: &str, 
+    client_config: &ClientConfig,
+    recipient_address: &str,
+    wallet_name: &str,
     statechain_id: &str,
     duplicated_indexes: Option<Vec<u32>>,
     force_send: bool,
-    batch_id: Option<String>) -> Result<()> 
-{
-    let mut wallet: mercurylib::wallet::Wallet = get_wallet(&client_config.pool, &wallet_name).await?;
+    batch_id: Option<String>,
+) -> Result<()> {
+    let mut wallet: mercurylib::wallet::Wallet =
+        get_wallet(&client_config.pool, &wallet_name).await?;
 
     let is_address_valid = mercurylib::validate_address(recipient_address, &wallet.network)?;
 
@@ -208,8 +256,7 @@ pub async fn execute(
     }
 
     let is_coin_duplicated = wallet.coins.iter().any(|c| {
-        c.statechain_id == Some(statechain_id.to_string()) &&
-        c.status == CoinStatus::DUPLICATED
+        c.statechain_id == Some(statechain_id.to_string()) && c.status == CoinStatus::DUPLICATED
     });
 
     if is_coin_duplicated && !force_send {
@@ -218,9 +265,9 @@ pub async fn execute(
     }
 
     let are_there_duplicate_coins_withdrawn = wallet.coins.iter().any(|c| {
-        c.statechain_id == Some(statechain_id.to_string()) &&
-        (c.status == CoinStatus::WITHDRAWING || c.status == CoinStatus::WITHDRAWING) &&
-        c.duplicate_index > 0
+        c.statechain_id == Some(statechain_id.to_string())
+            && (c.status == CoinStatus::WITHDRAWING || c.status == CoinStatus::WITHDRAWING)
+            && c.duplicate_index > 0
     });
 
     if are_there_duplicate_coins_withdrawn {
@@ -229,12 +276,14 @@ pub async fn execute(
         This coin can be withdrawn, however."));
     }
 
-    let coin = &wallet.coins
+    let coin = &wallet
+        .coins
         .iter()
-        .filter(|c| 
-            c.statechain_id == Some(statechain_id.to_string()) && 
-            (c.status == CoinStatus::CONFIRMED || c.status == CoinStatus::IN_TRANSFER) && 
-            c.duplicate_index == 0) // Filter coins with the specified statechain_id
+        .filter(|c| {
+            c.statechain_id == Some(statechain_id.to_string())
+                && (c.status == CoinStatus::CONFIRMED || c.status == CoinStatus::IN_TRANSFER)
+                && c.duplicate_index == 0
+        }) // Filter coins with the specified statechain_id
         .min_by_key(|c| c.locktime.unwrap_or(u32::MAX)); // Find the one with the lowest locktime
 
     if coin.is_none() {
@@ -246,8 +295,15 @@ pub async fn execute(
     let statechain_id = coin.statechain_id.as_ref().unwrap().clone();
     let signed_statechain_id = coin.signed_statechain_id.as_ref().unwrap().clone();
 
-    let (_, _, recipient_auth_pubkey) = decode_transfer_address(recipient_address)?;  
-    let x1 = get_new_x1(&client_config, &statechain_id, &signed_statechain_id, &recipient_auth_pubkey.to_string(), batch_id).await?;
+    let (_, _, recipient_auth_pubkey) = decode_transfer_address(recipient_address)?;
+    let x1 = get_new_x1(
+        &client_config,
+        &statechain_id,
+        &signed_statechain_id,
+        &recipient_auth_pubkey.to_string(),
+        batch_id,
+    )
+    .await?;
 
     let input_txid = coin.utxo_txid.as_ref().unwrap();
     let input_vout = coin.utxo_vout.unwrap();
@@ -255,11 +311,25 @@ pub async fn execute(
 
     let coin_amount = coin.amount.unwrap();
 
-    let transfer_signature = create_transfer_signature(recipient_address, &input_txid, input_vout, &client_seckey)?; 
+    let transfer_signature =
+        create_transfer_signature(recipient_address, &input_txid, input_vout, &client_seckey)?;
 
-    let backup_transactions = create_backup_transactions(client_config, recipient_address, &mut wallet, &statechain_id, duplicated_indexes).await?;
+    let backup_transactions = create_backup_transactions(
+        client_config,
+        recipient_address,
+        &mut wallet,
+        &statechain_id,
+        duplicated_indexes,
+    )
+    .await?;
 
-    let transfer_update_msg_request_payload = create_transfer_update_msg(&x1, recipient_address, &coin, &transfer_signature, &backup_transactions)?;
+    let transfer_update_msg_request_payload = create_transfer_update_msg(
+        &x1,
+        recipient_address,
+        &coin,
+        &transfer_signature,
+        &backup_transactions,
+    )?;
 
     let endpoint = client_config.statechain_entity.clone();
     let path = "transfer/update_msg";
@@ -267,13 +337,25 @@ pub async fn execute(
     let client = client_config.get_reqwest_client()?;
     let request = client.post(&format!("{}/{}", endpoint, path));
 
-    let status = request.json(&transfer_update_msg_request_payload).send().await?.status();
+    let status = request
+        .json(&transfer_update_msg_request_payload)
+        .send()
+        .await?
+        .status();
 
     if !status.is_success() {
-        return Err(anyhow::anyhow!("Failed to update transfer message".to_string()));
+        return Err(anyhow::anyhow!(
+            "Failed to update transfer message".to_string()
+        ));
     }
 
-    update_backup_txs(&client_config.pool, &wallet.name, &coin.statechain_id.as_ref().unwrap(), &backup_transactions).await?;
+    update_backup_txs(
+        &client_config.pool,
+        &wallet.name,
+        &coin.statechain_id.as_ref().unwrap(),
+        &backup_transactions,
+    )
+    .await?;
 
     let date = Utc::now(); // This will get the current date and time in UTC
     let iso_string = date.to_rfc3339(); // Converts the date to an ISO 8601 string
@@ -284,7 +366,7 @@ pub async fn execute(
         utxo,
         amount: coin_amount,
         action: "Transfer".to_string(),
-        date: iso_string
+        date: iso_string,
     };
 
     wallet.activities.push(activity);
@@ -294,13 +376,20 @@ pub async fn execute(
     Ok(())
 }
 
-async fn create_backup_tx_to_receiver(client_config: &ClientConfig, coin: &mut Coin, bkp_tx1: &BackupTx, recipient_address: &str, qt_backup_tx: u32, network: &str) -> Result<String> {
-
+async fn create_backup_tx_to_receiver(
+    client_config: &ClientConfig,
+    coin: &mut Coin,
+    bkp_tx1: &BackupTx,
+    recipient_address: &str,
+    qt_backup_tx: u32,
+    network: &str,
+) -> Result<String> {
     let block_height = Some(get_blockheight(bkp_tx1)?);
 
     let server_info = info_config(&client_config).await?;
 
-    let fee_rate_sats_per_byte = if server_info.fee_rate_sats_per_byte > client_config.max_fee_rate {
+    let fee_rate_sats_per_byte = if server_info.fee_rate_sats_per_byte > client_config.max_fee_rate
+    {
         client_config.max_fee_rate
     } else {
         server_info.fee_rate_sats_per_byte
@@ -308,22 +397,29 @@ async fn create_backup_tx_to_receiver(client_config: &ClientConfig, coin: &mut C
 
     let is_withdrawal = false;
     let signed_tx = new_transaction(
-        client_config, 
-        coin, 
-        recipient_address, 
-        qt_backup_tx, 
-        is_withdrawal, 
-        block_height, 
-        network, 
-        fee_rate_sats_per_byte, 
+        client_config,
+        coin,
+        recipient_address,
+        qt_backup_tx,
+        is_withdrawal,
+        block_height,
+        network,
+        fee_rate_sats_per_byte,
         server_info.initlock,
-        server_info.interval).await?;
+        server_info.interval,
+    )
+    .await?;
 
     Ok(signed_tx)
 }
 
-async fn get_new_x1(client_config: &ClientConfig,  statechain_id: &str, signed_statechain_id: &str, recipient_auth_pubkey: &str, batch_id: Option<String>) -> Result<String> {
-    
+async fn get_new_x1(
+    client_config: &ClientConfig,
+    statechain_id: &str,
+    signed_statechain_id: &str,
+    recipient_auth_pubkey: &str,
+    batch_id: Option<String>,
+) -> Result<String> {
     let endpoint = client_config.statechain_entity.clone();
     let path = "transfer/sender";
 
@@ -339,24 +435,32 @@ async fn get_new_x1(client_config: &ClientConfig,  statechain_id: &str, signed_s
 
     let value = match request.json(&transfer_sender_request_payload).send().await {
         Ok(response) => {
-
             let status = response.status();
-            let text = response.text().await.unwrap_or("Unexpected error".to_string());
+            let text = response
+                .text()
+                .await
+                .unwrap_or("Unexpected error".to_string());
 
             if status.is_success() {
                 text
             } else {
-                return Err(anyhow::anyhow!(format!("status: {}, error: {}", status, text)));
+                return Err(anyhow::anyhow!(format!(
+                    "status: {}, error: {}",
+                    status, text
+                )));
             }
-        },
+        }
         Err(err) => {
-            return Err(anyhow::anyhow!(format!("status: {}, error: {}", err.status().unwrap(),err.to_string())));
-        },
+            return Err(anyhow::anyhow!(format!(
+                "status: {}, error: {}",
+                err.status().unwrap(),
+                err.to_string()
+            )));
+        }
     };
 
-    let response: TransferSenderResponsePayload = serde_json::from_str(value.as_str()).expect(&format!("failed to parse: {}", value.as_str()));
+    let response: TransferSenderResponsePayload = serde_json::from_str(value.as_str())
+        .expect(&format!("failed to parse: {}", value.as_str()));
 
     Ok(response.x1)
 }
-
-

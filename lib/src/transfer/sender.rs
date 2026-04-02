@@ -1,11 +1,15 @@
 use std::str::FromStr;
 
-use bitcoin::{secp256k1, hashes::sha256, Txid, PrivateKey};
-use secp256k1::{Secp256k1, Message, Scalar};
-use serde::{Serialize, Deserialize};
+use bitcoin::{hashes::sha256, secp256k1, PrivateKey, Txid};
+use secp256k1::{Message, Scalar, Secp256k1};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::{decode_transfer_address, error::MercuryError, wallet::{BackupTx, Coin}};
+use crate::{
+    decode_transfer_address,
+    error::MercuryError,
+    wallet::{BackupTx, Coin},
+};
 
 use super::TransferMsg;
 
@@ -52,12 +56,16 @@ pub struct TransferPreimageRequestPayload {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TransferPreimageResponsePayload {
-    pub preimage: String,// signed_statechain_id
+    pub preimage: String, // signed_statechain_id
 }
 
 // Step 7. Owner 1 then concatinates the Tx0 outpoint with the Owner 2 public key (O2) and signs it with their key o1 to generate SC_sig_1.
-pub fn create_transfer_signature(recipient_address: &str, input_txid: &str, input_vout: u32, client_seckey: &str) ->  Result<String, MercuryError> {
-
+pub fn create_transfer_signature(
+    recipient_address: &str,
+    input_txid: &str,
+    input_vout: u32,
+    client_seckey: &str,
+) -> Result<String, MercuryError> {
     // new_user_pubkey: PublicKey, input_txid: &Txid, input_vout: u32, client_seckey: &SecretKey
 
     let (_, recipient_user_pubkey, _) = decode_transfer_address(recipient_address)?;
@@ -79,9 +87,14 @@ pub fn create_transfer_signature(recipient_address: &str, input_txid: &str, inpu
     Ok(signature.to_string())
 }
 
-pub fn create_transfer_update_msg(x1: &str, recipient_address: &str, coin: &Coin, transfer_signature: &str, backup_transactions: &Vec<BackupTx>) -> Result<TransferUpdateMsgRequestPayload, MercuryError> {
-
-    let (_, _, recipient_auth_pubkey) = decode_transfer_address(recipient_address)?;  
+pub fn create_transfer_update_msg(
+    x1: &str,
+    recipient_address: &str,
+    coin: &Coin,
+    transfer_signature: &str,
+    backup_transactions: &Vec<BackupTx>,
+) -> Result<TransferUpdateMsgRequestPayload, MercuryError> {
+    let (_, _, recipient_auth_pubkey) = decode_transfer_address(recipient_address)?;
 
     let client_seckey = PrivateKey::from_wif(&coin.user_privkey)?.inner;
     let client_public_key = coin.user_pubkey.to_string();
@@ -89,7 +102,7 @@ pub fn create_transfer_update_msg(x1: &str, recipient_address: &str, coin: &Coin
     let x1 = hex::decode(x1)?;
     let x1: [u8; 32] = x1.try_into().unwrap();
     let x1 = Scalar::from_be_bytes(x1)?;
-    
+
     let t1 = client_seckey.add_tweak(&x1)?;
 
     let statechain_id = coin.statechain_id.as_ref().unwrap();
@@ -129,4 +142,3 @@ pub fn create_transfer_update_msg(x1: &str, recipient_address: &str, coin: &Coin
 
     Ok(transfer_update_msg_request_payload)
 }
- 

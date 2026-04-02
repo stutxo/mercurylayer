@@ -1,9 +1,9 @@
 use std::env;
 
+use anyhow::Result;
 use bitcoin::Network;
 use config::Config;
-use sqlx::{Sqlite, migrate::MigrateDatabase, SqlitePool};
-use anyhow::Result;
+use sqlx::{migrate::MigrateDatabase, Sqlite, SqlitePool};
 
 /// Config struct storing all StataChain Entity config
 pub struct ClientConfig {
@@ -40,7 +40,6 @@ fn check_and_set_settings() -> String {
 
 impl ClientConfig {
     pub async fn load() -> Self {
-
         let settings_filename = check_and_set_settings();
 
         let settings = Config::builder()
@@ -63,19 +62,19 @@ impl ClientConfig {
         };
         // Open database connection pool
 
-        if !Sqlite::database_exists(&database_file).await.unwrap_or(false) {
+        if !Sqlite::database_exists(&database_file)
+            .await
+            .unwrap_or(false)
+        {
             match Sqlite::create_database(&database_file).await {
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(error) => panic!("error: {}", error),
             }
         }
-    
+
         let pool: sqlx::Pool<Sqlite> = SqlitePool::connect(&database_file).await.unwrap();
-    
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .unwrap();
+
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
 
         // Convert network string to Network enum
 
@@ -101,21 +100,17 @@ impl ClientConfig {
             confirmation_target,
             pool,
             tor_proxy,
-            max_fee_rate
+            max_fee_rate,
         }
     }
 
     pub fn get_reqwest_client(&self) -> Result<reqwest::Client> {
-
         match self.tor_proxy {
             Some(ref proxy) => {
                 let proxy = reqwest::Proxy::all(proxy)?;
-                Ok(reqwest::Client::builder()
-                    .proxy(proxy)
-                    .build()?)
-            },
+                Ok(reqwest::Client::builder().proxy(proxy).build()?)
+            }
             None => Ok(reqwest::Client::new()),
-            
         }
     }
 }

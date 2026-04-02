@@ -1,10 +1,9 @@
 use mercurylib::transfer::receiver::StatechainInfo;
-use secp256k1::{PublicKey, Secp256k1, XOnlyPublicKey, SecretKey};
+use secp256k1::{PublicKey, Secp256k1, SecretKey, XOnlyPublicKey};
 
 use sqlx::Row;
 
-pub async fn get_statechain_info(pool: &sqlx::PgPool, statechain_id: &str) -> Vec::<StatechainInfo> {
-
+pub async fn get_statechain_info(pool: &sqlx::PgPool, statechain_id: &str) -> Vec<StatechainInfo> {
     let mut result = Vec::<StatechainInfo>::new();
 
     let query = "\
@@ -41,7 +40,6 @@ pub async fn get_statechain_info(pool: &sqlx::PgPool, statechain_id: &str) -> Ve
 }
 
 pub async fn get_enclave_pubkey(pool: &sqlx::PgPool, statechain_id: &str) -> Option<PublicKey> {
-
     let query = "SELECT server_public_key \
         FROM statechain_data \
         WHERE statechain_id = $1";
@@ -65,7 +63,6 @@ pub async fn get_enclave_pubkey(pool: &sqlx::PgPool, statechain_id: &str) -> Opt
 }
 
 pub async fn get_x1pub(pool: &sqlx::PgPool, statechain_id: &str) -> Option<PublicKey> {
-
     let query = "SELECT x1 \
         FROM statechain_transfer \
         WHERE statechain_id = $1";
@@ -88,8 +85,10 @@ pub async fn get_x1pub(pool: &sqlx::PgPool, statechain_id: &str) -> Option<Publi
     Some(secret_x1.public_key(&Secp256k1::new()))
 }
 
-pub async fn get_statechain_transfer_messages(pool: &sqlx::PgPool, new_user_auth_key: &PublicKey) -> Vec::<String> {
-
+pub async fn get_statechain_transfer_messages(
+    pool: &sqlx::PgPool,
+    new_user_auth_key: &PublicKey,
+) -> Vec<String> {
     let query = "\
         SELECT encrypted_transfer_msg \
         FROM statechain_transfer \
@@ -113,8 +112,10 @@ pub async fn get_statechain_transfer_messages(pool: &sqlx::PgPool, new_user_auth
     result
 }
 
-pub async fn get_auth_pubkey_and_x1(pool: &sqlx::PgPool, statechain_id: &str) -> Option<(PublicKey, Vec<u8>)> {
-
+pub async fn get_auth_pubkey_and_x1(
+    pool: &sqlx::PgPool,
+    statechain_id: &str,
+) -> Option<(PublicKey, Vec<u8>)> {
     let query = "\
         SELECT new_user_auth_public_key, x1 \
         FROM statechain_transfer \
@@ -139,7 +140,6 @@ pub async fn get_auth_pubkey_and_x1(pool: &sqlx::PgPool, statechain_id: &str) ->
 }
 
 pub async fn is_key_already_updated(pool: &sqlx::PgPool, statechain_id: &str) -> bool {
-
     let query = "\
         SELECT key_updated \
         FROM statechain_transfer \
@@ -157,7 +157,6 @@ pub async fn is_key_already_updated(pool: &sqlx::PgPool, statechain_id: &str) ->
 }
 
 pub async fn get_server_public_key(pool: &sqlx::PgPool, statechain_id: &str) -> Option<PublicKey> {
-
     let query = "\
         SELECT server_public_key \
         FROM statechain_data \
@@ -180,8 +179,12 @@ pub async fn get_server_public_key(pool: &sqlx::PgPool, statechain_id: &str) -> 
     Some(server_public_key)
 }
 
-pub async fn update_statechain(pool: &sqlx::PgPool, auth_key: &XOnlyPublicKey, server_public_key: &PublicKey, statechain_id: &str)  {
-
+pub async fn update_statechain(
+    pool: &sqlx::PgPool,
+    auth_key: &XOnlyPublicKey,
+    server_public_key: &PublicKey,
+    statechain_id: &str,
+) {
     let mut transaction = pool.begin().await.unwrap();
 
     let query = "UPDATE statechain_data \
@@ -209,13 +212,23 @@ pub async fn update_statechain(pool: &sqlx::PgPool, auth_key: &XOnlyPublicKey, s
     transaction.commit().await.unwrap();
 }
 
-pub async fn update_unlock_transfer(pool: &sqlx::PgPool, is_current_owner: bool, statechain_id: &str)  {
+pub async fn update_unlock_transfer(
+    pool: &sqlx::PgPool,
+    is_current_owner: bool,
+    statechain_id: &str,
+) {
+    let locked_field = if is_current_owner {
+        "locked2"
+    } else {
+        "locked"
+    };
 
-    let locked_field = if is_current_owner { "locked2" } else { "locked" };
-
-    let query = format!("UPDATE statechain_transfer \
+    let query = format!(
+        "UPDATE statechain_transfer \
         SET {} = false, updated_at = NOW() \
-        WHERE statechain_id = $1", locked_field);
+        WHERE statechain_id = $1",
+        locked_field
+    );
 
     let _ = sqlx::query(&query)
         .bind(statechain_id)
@@ -223,39 +236,33 @@ pub async fn update_unlock_transfer(pool: &sqlx::PgPool, is_current_owner: bool,
         .await
         .unwrap();
 
-
-        let query = "SELECT locked, locked2, batch_id \
+    let query = "SELECT locked, locked2, batch_id \
             FROM statechain_transfer \
             WHERE statechain_id = $1";
 
-        let row = sqlx::query(query)
-            .bind(statechain_id)
-            .fetch_one(pool)
-            .await
-            .unwrap();
+    let row = sqlx::query(query)
+        .bind(statechain_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
 
-        let locked: bool = row.get(0);
-        let locked2: bool = row.get(1);
-        let batch_id: Option<String> = row.get(2);
+    let locked: bool = row.get(0);
+    let locked2: bool = row.get(1);
+    let batch_id: Option<String> = row.get(2);
 
-        // if there is no lightning latch operation, the update below will have no effect
+    // if there is no lightning latch operation, the update below will have no effect
 
-        if batch_id.is_some() && !locked && !locked2 {
-            let query = "UPDATE lightning_latch \
+    if batch_id.is_some() && !locked && !locked2 {
+        let query = "UPDATE lightning_latch \
                 SET locked = false, updated_at = NOW() \
                 WHERE statechain_id = $1
                 AND batch_id = $2";
 
-            let _ = sqlx::query(query)
-                .bind(statechain_id)
-                .bind(batch_id.unwrap())
-                .execute(pool)
-                .await
-                .unwrap();
-
-        
-        }
-
-    
-
+        let _ = sqlx::query(query)
+            .bind(statechain_id)
+            .bind(batch_id.unwrap())
+            .execute(pool)
+            .await
+            .unwrap();
+    }
 }

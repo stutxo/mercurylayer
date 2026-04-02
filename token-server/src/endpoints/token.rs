@@ -1,14 +1,14 @@
 use std::{collections::HashMap, str::FromStr};
 
-use rocket::{serde::json::Json, response::status, State, http::Status};
-use serde::{Serialize, Deserialize};
-use serde_json::{Value, json};
+use rocket::{http::Status, response::status, serde::json::Json, State};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use sqlx::Row;
 
 use crate::server::TokenServer;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct Invoice{
+pub struct Invoice {
     pub id: String,
     pub pr: String,
     pub checkoutUrl: String,
@@ -16,7 +16,7 @@ pub struct Invoice{
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct ReqInvoice{
+pub struct ReqInvoice {
     pub title: String,
     pub description: String,
     pub amount: String,
@@ -30,12 +30,12 @@ pub struct ReqInvoice{
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct Extra{
+pub struct Extra {
     pub tag: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct RTLInvoice{
+pub struct RTLInvoice {
     pub id: String,
     pub pr: String,
     pub checkoutUrl: String,
@@ -45,7 +45,7 @@ pub struct RTLInvoice{
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct RTLData{
+pub struct RTLData {
     pub label: String,
     pub bolt11: String,
     pub payment_hash: String,
@@ -53,11 +53,11 @@ pub struct RTLData{
     pub amount_msat: String,
     pub status: String,
     pub description: String,
-    pub expires_at: u64
+    pub expires_at: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct RTLQuery{
+pub struct RTLQuery {
     pub createdAt: u64,
     pub delay: u64,
     pub pr: Option<String>,
@@ -102,19 +102,21 @@ pub struct PODStatus {
     pub expiry: u64,
 }
 
-
 #[get("/token/token_init/<token_id>")]
-pub async fn token_init(token_server: &State<TokenServer>, token_id: String) -> status::Custom<Json<Value>>  {
-
+pub async fn token_init(
+    token_server: &State<TokenServer>,
+    token_id: String,
+) -> status::Custom<Json<Value>> {
     set_tnc_accepted(&token_server.pool, &token_id).await;
 
     let row = sqlx::query(
         "SELECT token_id, invoice, onchain_address, processor_id \
         FROM public.tokens \
-        WHERE token_id = $1")
-        .bind(&token_id)
-        .fetch_one(&token_server.pool)
-        .await;
+        WHERE token_id = $1",
+    )
+    .bind(&token_id)
+    .fetch_one(&token_server.pool)
+    .await;
 
     let row = row.unwrap();
 
@@ -132,9 +134,8 @@ pub async fn token_init(token_server: &State<TokenServer>, token_id: String) -> 
 }
 
 #[get("/token/token_gen")]
-pub async fn token_gen(token_server: &State<TokenServer>) -> status::Custom<Json<Value>>  {
-
-    let token_id = uuid::Uuid::new_v4().to_string();   
+pub async fn token_gen(token_server: &State<TokenServer>) -> status::Custom<Json<Value>> {
+    let token_id = uuid::Uuid::new_v4().to_string();
 
     let invoice: Invoice = get_lightning_invoice(token_server, token_id.clone()).await;
 
@@ -146,7 +147,14 @@ pub async fn token_gen(token_server: &State<TokenServer>) -> status::Custom<Json
         processor_id: invoice.id.clone(),
     };
 
-    insert_new_token(&token_server.pool, &token_id, &invoice.pr.clone(), &invoice.onChainAddr, &invoice.id).await;
+    insert_new_token(
+        &token_server.pool,
+        &token_id,
+        &invoice.pr.clone(),
+        &invoice.onChainAddr,
+        &invoice.id,
+    )
+    .await;
 
     let config = crate::server_config::ServerConfig::load();
 
@@ -159,15 +167,18 @@ pub async fn token_gen(token_server: &State<TokenServer>) -> status::Custom<Json
 }
 
 #[get("/token/token_verify/<token_id>")]
-pub async fn token_verify(token_server: &State<TokenServer>, token_id: String) -> status::Custom<Json<Value>> {
-
+pub async fn token_verify(
+    token_server: &State<TokenServer>,
+    token_id: String,
+) -> status::Custom<Json<Value>> {
     let row = sqlx::query(
         "SELECT processor_id, confirmed, spent \
         FROM public.tokens \
-        WHERE token_id = $1")
-        .bind(&token_id)
-        .fetch_one(&token_server.pool)
-        .await;
+        WHERE token_id = $1",
+    )
+    .bind(&token_id)
+    .fetch_one(&token_server.pool)
+    .await;
 
     let row = row.unwrap();
 
@@ -181,7 +192,7 @@ pub async fn token_verify(token_server: &State<TokenServer>, token_id: String) -
             expiry: 0 as u64,
         };
         let response_body = json!(pod_status);
-        return status::Custom(Status::Ok, Json(response_body));            
+        return status::Custom(Status::Ok, Json(response_body));
     }
 
     if confirmed {
@@ -190,7 +201,7 @@ pub async fn token_verify(token_server: &State<TokenServer>, token_id: String) -
             expiry: 0 as u64,
         };
         let response_body = json!(pod_status);
-        return status::Custom(Status::Ok, Json(response_body));            
+        return status::Custom(Status::Ok, Json(response_body));
     } else {
         let expiry = query_lightning_payment(token_server, &processor_id).await;
         if expiry == 0 {
@@ -200,7 +211,7 @@ pub async fn token_verify(token_server: &State<TokenServer>, token_id: String) -
                 expiry: expiry,
             };
             let response_body = json!(pod_status);
-            return status::Custom(Status::Ok, Json(response_body));  
+            return status::Custom(Status::Ok, Json(response_body));
         } else {
             let pod_status = PODStatus {
                 confirmed: false,
@@ -212,8 +223,13 @@ pub async fn token_verify(token_server: &State<TokenServer>, token_id: String) -
     }
 }
 
-pub async fn insert_new_token(pool: &sqlx::PgPool, token_id: &str, invoice: &str, onchain_address: &str, processor_id: &str)  {
-
+pub async fn insert_new_token(
+    pool: &sqlx::PgPool,
+    token_id: &str,
+    invoice: &str,
+    onchain_address: &str,
+    processor_id: &str,
+) {
     let query = "INSERT INTO tokens (token_id, invoice, onchain_address, processor_id, confirmed, spent) VALUES ($1, $2, $3, $4, $5, $6)";
 
     let _ = sqlx::query(query)
@@ -228,9 +244,7 @@ pub async fn insert_new_token(pool: &sqlx::PgPool, token_id: &str, invoice: &str
         .unwrap();
 }
 
-
 pub async fn get_lightning_invoice(token_server: &State<TokenServer>, token_id: String) -> Invoice {
-
     let processor_url = token_server.config.processor_url.clone();
     let api_key = token_server.config.api_key.clone();
     let path: &str = "checkout";
@@ -252,10 +266,20 @@ pub async fn get_lightning_invoice(token_server: &State<TokenServer>, token_id: 
 
     let client: reqwest::Client = reqwest::Client::new();
     let request = client.post(&format!("{}/{}", processor_url, path));
-    
-    let value = request.header("Api-Key", api_key).header("encodingtype","hex").json(&inv_request).send().await.unwrap().text().await.unwrap(); 
 
-    let ret_invoice: RTLInvoice = serde_json::from_str(value.as_str()).expect(&format!("failed to parse: {}", value.as_str()));
+    let value = request
+        .header("Api-Key", api_key)
+        .header("encodingtype", "hex")
+        .json(&inv_request)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    let ret_invoice: RTLInvoice = serde_json::from_str(value.as_str())
+        .expect(&format!("failed to parse: {}", value.as_str()));
 
     let invoice = Invoice {
         id: ret_invoice.id,
@@ -266,8 +290,10 @@ pub async fn get_lightning_invoice(token_server: &State<TokenServer>, token_id: 
     return invoice;
 }
 
-pub async fn query_lightning_payment(token_server: &State<TokenServer>, processor_id: &String) -> u64 {
-
+pub async fn query_lightning_payment(
+    token_server: &State<TokenServer>,
+    processor_id: &String,
+) -> u64 {
     let processor_url = token_server.config.processor_url.clone();
     let api_key = token_server.config.api_key.clone();
     let path: String = "checkout/".to_string() + processor_id;
@@ -275,9 +301,18 @@ pub async fn query_lightning_payment(token_server: &State<TokenServer>, processo
     let client: reqwest::Client = reqwest::Client::new();
     let request = client.get(&format!("{}/{}", processor_url, path));
 
-    let value = request.header("Api-Key", api_key).header("encodingtype","hex").send().await.unwrap().text().await.unwrap();
+    let value = request
+        .header("Api-Key", api_key)
+        .header("encodingtype", "hex")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
 
-    let ret_invoice: RTLQuery = serde_json::from_str(value.as_str()).expect(&format!("failed to parse: {}", value.as_str()));
+    let ret_invoice: RTLQuery = serde_json::from_str(value.as_str())
+        .expect(&format!("failed to parse: {}", value.as_str()));
 
     if ret_invoice.isPaid {
         return 0;
@@ -286,8 +321,7 @@ pub async fn query_lightning_payment(token_server: &State<TokenServer>, processo
     }
 }
 
-pub async fn set_token_confirmed(pool: &sqlx::PgPool, token_id: &str)  {
-
+pub async fn set_token_confirmed(pool: &sqlx::PgPool, token_id: &str) {
     let mut transaction = pool.begin().await.unwrap();
 
     let query = "UPDATE tokens \
@@ -303,8 +337,7 @@ pub async fn set_token_confirmed(pool: &sqlx::PgPool, token_id: &str)  {
     transaction.commit().await.unwrap();
 }
 
-pub async fn set_tnc_accepted(pool: &sqlx::PgPool, token_id: &str)  {
-
+pub async fn set_tnc_accepted(pool: &sqlx::PgPool, token_id: &str) {
     let mut transaction = pool.begin().await.unwrap();
 
     let query = "UPDATE tokens \

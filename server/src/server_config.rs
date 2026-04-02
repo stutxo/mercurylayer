@@ -1,5 +1,5 @@
 use config::{Config as ConfigRs, File};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgConnectOptions;
 use std::env;
 
@@ -77,7 +77,7 @@ impl Default for ServerConfig {
                 Enclave {
                     url: "http://0.0.0.0:18080".to_string(),
                     allow_deposit: false,
-                }
+                },
             ],
             db_user: String::from("postgres"),
             db_password: String::from("postgres"),
@@ -125,16 +125,14 @@ impl ServerConfig {
 
         // Function to fetch a setting from the environment or fallback to the config file
         let get_env_or_config = |key: &str, env_var: &str| -> String {
-            env::var(env_var).unwrap_or_else(|_| settings.as_ref().unwrap().get_string(key).unwrap())
+            env::var(env_var)
+                .unwrap_or_else(|_| settings.as_ref().unwrap().get_string(key).unwrap())
         };
 
         let get_env_or_config_enclave = |key: &str, env_var: &str| -> Vec<Enclave> {
-
             let env_enclaves = env::var(env_var);
 
-            
             if env_enclaves.is_ok() {
-
                 return serde_json::from_str::<Vec<Enclave>>(&env_enclaves.unwrap()).unwrap();
             }
 
@@ -142,31 +140,27 @@ impl ServerConfig {
         };
 
         let get_env_or_config_nostr_info = |key: &str, env_var: &str| -> Option<NostrInfo> {
-
             let env_nostr_info = env::var(env_var);
 
-            
             if env_nostr_info.is_ok() {
-
                 let res = serde_json::from_str::<NostrInfo>(&env_nostr_info.unwrap()).unwrap();
-                return Some(res)
+                return Some(res);
             }
 
             if settings.as_ref().is_none() {
-                return None
+                return None;
             }
 
             let res = settings.as_ref().unwrap().get::<NostrInfo>(key);
 
             if res.is_ok() {
-                return Some(res.unwrap())
+                return Some(res.unwrap());
             } else {
-                return None
+                return None;
             }
         };
 
         let get_optional_env_or_config = |key: &str, env_var: &str| -> Option<String> {
-
             let env_var = env::var(env_var);
 
             if env_var.is_ok() {
@@ -174,13 +168,13 @@ impl ServerConfig {
             }
 
             if settings.as_ref().is_none() {
-                return None
+                return None;
             }
 
             let res = settings.as_ref().unwrap().get::<String>(key);
 
             if res.is_ok() {
-                return Some(res.unwrap())
+                return Some(res.unwrap());
             }
 
             return None;
@@ -188,14 +182,22 @@ impl ServerConfig {
 
         ServerConfig {
             network: get_env_or_config("network", "BITCOIN_NETWORK"),
-            lockheight_init: get_env_or_config("lockheight_init", "LOCKHEIGHT_INIT").parse::<u32>().unwrap(),
-            lh_decrement: get_env_or_config("lh_decrement", "LH_DECREMENT").parse::<u32>().unwrap(),
-            batch_timeout: get_env_or_config("batch_timeout", "BATCH_TIMEOUT").parse::<u32>().unwrap(),
+            lockheight_init: get_env_or_config("lockheight_init", "LOCKHEIGHT_INIT")
+                .parse::<u32>()
+                .unwrap(),
+            lh_decrement: get_env_or_config("lh_decrement", "LH_DECREMENT")
+                .parse::<u32>()
+                .unwrap(),
+            batch_timeout: get_env_or_config("batch_timeout", "BATCH_TIMEOUT")
+                .parse::<u32>()
+                .unwrap(),
             enclaves: get_env_or_config_enclave("enclaves", "ENCLAVES"),
             db_user: get_env_or_config("db_user", "DB_USER"),
             db_password: get_env_or_config("db_password", "DB_PASSWORD"),
             db_host: get_env_or_config("db_host", "DB_HOST"),
-            db_port: get_env_or_config("db_port", "DB_PORT").parse::<u16>().unwrap(),
+            db_port: get_env_or_config("db_port", "DB_PORT")
+                .parse::<u16>()
+                .unwrap(),
             db_name: get_env_or_config("db_name", "DB_NAME"),
             nostr_info: get_env_or_config_nostr_info("nostr_info", "NOSTR_INFO"),
             token_server_url: get_optional_env_or_config("token_server_url", "TOKEN_SERVER_URL"),
