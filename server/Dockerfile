@@ -25,9 +25,6 @@ RUN rm -f ./server/Settings.toml
 COPY ./lib ./lib
 COPY ./Rocket.toml ./server/Rocket.toml
 
-# Make sure to copy Cargo.lock
-COPY ./server/Cargo.lock ./server/Cargo.lock
-
 WORKDIR /mercurylayer/server
 
 # RUN cargo build --verbose

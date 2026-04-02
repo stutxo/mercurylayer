@@ -19,9 +19,6 @@ COPY ./token-server ./token-server
 COPY ./lib ./lib
 COPY ./Rocket.toml ./token-server/Rocket.toml
 
-# Make sure to copy Cargo.lock
-COPY ./token-server/Cargo.lock ./token-server/Cargo.lock
-
 WORKDIR /mercurylayer/token-server
 
 # RUN cargo build --verbose
