@@ -1,6 +1,7 @@
-use std::{str::FromStr, time::Duration};
+use std::{path::PathBuf, process::Command, str::FromStr, time::Duration};
 
 use anyhow::{anyhow, Context, Result};
+use bitcoin::Transaction;
 use mercurylib::{
     deposit::{self, DepositMsg1Response},
     transaction::{self, PartialSignatureMsg1},
@@ -150,6 +151,101 @@ pub async fn delete_statechain(client: &Client, statechain_id: &str) -> Result<(
     ))
 }
 
+pub async fn restart_lockbox_service(client: &Client) -> Result<()> {
+    let output = Command::new("docker")
+        .args([
+            "compose",
+            "-f",
+            "docker-compose-lockbox.yml",
+            "restart",
+            "lockbox",
+        ])
+        .current_dir(repo_root())
+        .output()
+        .context("failed to restart lockbox service")?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "failed to restart lockbox service: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    wait_until_ready(client).await
+}
+
+pub async fn keyupdate(
+    client: &Client,
+    statechain_id: &str,
+    t2_bytes: [u8; 32],
+    x1_bytes: [u8; 32],
+) -> Result<ServerPubkeyResponse> {
+    let response = post_json(
+        client,
+        "keyupdate",
+        json!({
+            "statechain_id": statechain_id,
+            "t2": hex::encode(t2_bytes),
+            "x1": hex::encode(x1_bytes),
+        }),
+    )
+    .await?;
+
+    let mut result: ServerPubkeyResponse = ensure_success(response, "keyupdate").await?;
+    result.server_pubkey = normalize_hex(&result.server_pubkey);
+    Ok(result)
+}
+
+pub async fn request_partial_signature(
+    client: &Client,
+    payload: &transaction::PartialSignatureRequestPayload,
+) -> Result<String> {
+    let response = post_json(
+        client,
+        "get_partial_signature",
+        serde_json::to_value(payload)?,
+    )
+    .await?;
+    let mut result: PartialSignatureResponse =
+        ensure_success(response, "get_partial_signature").await?;
+    result.partial_sig = normalize_hex(&result.partial_sig);
+
+    Ok(result.partial_sig)
+}
+
+pub async fn get_signature_count(client: &Client, statechain_id: &str) -> Result<u32> {
+    let response = get(client, &format!("signature_count/{}", statechain_id)).await?;
+    let result: SignatureCountResponse = ensure_success(response, "signature_count").await?;
+
+    Ok(result.sig_count)
+}
+
+pub async fn complete_signing_roundtrip(
+    client: &Client,
+    statechain_id: &str,
+    server_pubkey: &str,
+    server_pubnonce: &str,
+) -> Result<Transaction> {
+    let msg1 = build_partial_signature_fixture(statechain_id, server_pubkey, server_pubnonce)?;
+    let server_partial_signature =
+        request_partial_signature(client, &msg1.partial_signature_request_payload).await?;
+
+    let aggregated_signature = transaction::create_signature(
+        msg1.msg,
+        msg1.client_partial_sig,
+        server_partial_signature,
+        msg1.encoded_session,
+        msg1.output_pubkey,
+    )?;
+    let signed_tx_hex =
+        transaction::new_backup_transaction(msg1.encoded_unsigned_tx, aggregated_signature)?;
+    let signed_tx = bitcoin::consensus::deserialize(&hex::decode(&signed_tx_hex)?)
+        .context("failed to decode signed tx")?;
+
+    Ok(signed_tx)
+}
+
 pub fn build_partial_signature_fixture(
     statechain_id: &str,
     server_pubkey: &str,
@@ -234,6 +330,10 @@ async fn ensure_success<T: DeserializeOwned>(response: Response, context: &str) 
 
     serde_json::from_str(&body)
         .with_context(|| format!("failed to decode {} response body {}", context, body))
+}
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..")
 }
 
 fn sample_wallet() -> Wallet {
