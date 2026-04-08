@@ -6,9 +6,11 @@ services:
     ports:
       - "50001:50001"
       - "50002:50002"
+      - "18443:18443"
       - "8094:80"
     volumes:
       - ./data_bitcoin_regtest:/data
+      - ./docker/bitcoin-regtest/bitcoin.conf:/srv/explorer/source/contrib/bitcoin-regtest-explorer.conf.in:ro
     environment:
       - CORS_ALLOW=*
     command: /srv/explorer/run.sh bitcoin-regtest explorer

@@ -1,4 +1,5 @@
 use std::env;
+use std::path::Path;
 
 use anyhow::Result;
 use bitcoin::Network;
@@ -9,12 +10,24 @@ use sqlx::{migrate::MigrateDatabase, Sqlite, SqlitePool};
 pub struct ClientConfig {
     /// Active lockbox server addresses
     pub statechain_entity: String,
+    /// Selected blockchain backend, e.g. `electrum` or `core`
+    pub chain_backend: String,
     /// Electrum client
     pub electrum_client: electrum_client::Client,
     /// Electrum server url
     pub electrum_server_url: String,
     /// Electrum server type (e.g. electrs, electrumx, etc.)
     pub electrum_type: String,
+    /// Bitcoin Core RPC url for future Core backend support
+    pub core_rpc_url: Option<String>,
+    /// Bitcoin Core RPC auth strategy, e.g. `userpass` or `cookie`
+    pub core_rpc_auth: Option<String>,
+    /// Bitcoin Core RPC username when using password auth
+    pub core_rpc_user: Option<String>,
+    /// Bitcoin Core RPC password when using password auth
+    pub core_rpc_password: Option<String>,
+    /// Bitcoin Core RPC cookie file when using cookie auth
+    pub core_rpc_cookie_file: Option<String>,
     /// Bitcoin network name (testnet, regtest, mainnet)
     pub network: Network,
     /// Fee rate tolerance
@@ -30,6 +43,12 @@ pub struct ClientConfig {
 }
 
 fn check_and_set_settings() -> String {
+    if let Ok(value) = env::var("ML_SETTINGS_FILE") {
+        if !value.trim().is_empty() {
+            return value;
+        }
+    }
+
     if let Ok(value) = env::var("ML_NETWORK") {
         if value == "regtest" {
             return String::from("regtest.Settings");
@@ -41,15 +60,30 @@ fn check_and_set_settings() -> String {
 impl ClientConfig {
     pub async fn load() -> Self {
         let settings_filename = check_and_set_settings();
+        let settings_source = if settings_filename.ends_with(".toml")
+            || settings_filename.contains('/')
+        {
+            config::File::from(Path::new(&settings_filename))
+        } else {
+            config::File::with_name(&settings_filename)
+        };
 
         let settings = Config::builder()
-            .add_source(config::File::with_name(&settings_filename))
+            .add_source(settings_source)
             .build()
             .unwrap();
 
         let statechain_entity = settings.get_string("statechain_entity").unwrap();
+        let chain_backend = settings
+            .get_string("chain_backend")
+            .unwrap_or_else(|_| "electrum".to_string());
         let electrum_server = settings.get_string("electrum_server").unwrap();
         let electrum_type = settings.get_string("electrum_type").unwrap();
+        let core_rpc_url = settings.get_string("core_rpc_url").ok();
+        let core_rpc_auth = settings.get_string("core_rpc_auth").ok();
+        let core_rpc_user = settings.get_string("core_rpc_user").ok();
+        let core_rpc_password = settings.get_string("core_rpc_password").ok();
+        let core_rpc_cookie_file = settings.get_string("core_rpc_cookie_file").ok();
         let network = settings.get_string("network").unwrap();
         let fee_rate_tolerance = settings.get_int("fee_rate_tolerance").unwrap() as f64;
         let database_file = settings.get_string("database_file").unwrap();
@@ -92,9 +126,15 @@ impl ClientConfig {
 
         ClientConfig {
             statechain_entity,
+            chain_backend,
             electrum_client,
             electrum_server_url: electrum_server,
             electrum_type,
+            core_rpc_url,
+            core_rpc_auth,
+            core_rpc_user,
+            core_rpc_password,
+            core_rpc_cookie_file,
             network,
             fee_rate_tolerance,
             confirmation_target,
