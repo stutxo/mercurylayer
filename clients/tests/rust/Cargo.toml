@@ -19,3 +19,4 @@ hex = "0.4.3"
 bitcoin = { version = "0.30.1", features = ["serde", "base64", "rand-std", "std"], default-features = false }
 reqwest = { version = "0.11.16", features = ["json"] }
 secp256k1 = { git = "https://github.com/w0xlt/rust-secp256k1.git", branch = "mercury-blinded-musig-port", features = [ "rand-std", "bitcoin_hashes", "std" ] }
+sqlx = { version = "0.8.1", features = [ "runtime-tokio", "postgres", "tls-rustls" ] }

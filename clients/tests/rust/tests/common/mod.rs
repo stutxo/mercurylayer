@@ -9,6 +9,7 @@ use mercuryrustlib::client_config::ClientConfig;
 pub mod bitcoin_core;
 pub mod electrs;
 pub mod lockbox;
+pub mod mercury;
 pub mod utils;
 
 static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
@@ -17,7 +18,7 @@ pub fn test_guard() -> MutexGuard<'static, ()> {
     TEST_MUTEX
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .expect("functional test mutex poisoned")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 pub async fn prepare_test_env() -> Result<ClientConfig> {

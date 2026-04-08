@@ -175,6 +175,48 @@ pub async fn restart_lockbox_service(client: &Client) -> Result<()> {
     wait_until_ready(client).await
 }
 
+pub async fn recreate_lockbox_service_with_rng_seed(
+    client: &Client,
+    rng_seed_hex: Option<&str>,
+) -> Result<()> {
+    let mut command = Command::new("docker");
+    command
+        .args([
+            "compose",
+            "-f",
+            "docker-compose-lockbox.yml",
+            "up",
+            "-d",
+            "--build",
+            "--force-recreate",
+            "lockbox",
+        ])
+        .current_dir(repo_root());
+
+    match rng_seed_hex {
+        Some(seed) => {
+            command.env("LOCKBOX_TEST_RNG_SEED", seed);
+        }
+        None => {
+            command.env_remove("LOCKBOX_TEST_RNG_SEED");
+        }
+    }
+
+    let output = command
+        .output()
+        .context("failed to recreate lockbox service")?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "failed to recreate lockbox service: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    wait_until_ready(client).await
+}
+
 pub async fn keyupdate(
     client: &Client,
     statechain_id: &str,
@@ -336,7 +378,7 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..")
 }
 
-fn sample_wallet() -> Wallet {
+pub fn sample_wallet() -> Wallet {
     Wallet {
         name: "lockbox-compat".to_string(),
         mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string(),

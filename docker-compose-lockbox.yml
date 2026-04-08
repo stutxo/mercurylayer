@@ -44,6 +44,7 @@ services:
       - HASHICORP_CONTAINER_PATH=mercury-seed
       - HASHICORP_CONTAINER_MOUNT_POINT=secret
       - HASHICORP_CONTAINER_KEY_NAME=seed
+      - LOCKBOX_TEST_RNG_SEED=${LOCKBOX_TEST_RNG_SEED:-}
     ports:
       - "18080:18080"
 

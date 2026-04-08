@@ -1,6 +1,5 @@
 #include <assert.h>
 #include "enclave.h"
-#include <openssl/rand.h>
 #include <stdexcept>
 #include <string.h>
 #include "utils.h"
@@ -19,9 +18,7 @@ void encrypt_data(
     uint8_t *ad = NULL;
     size_t ad_size = 0;
 
-    if (RAND_bytes(encrypted_data->nonce, sizeof(encrypted_data->nonce)) != 1) {
-        throw std::runtime_error("Failed to generate random bytes");
-    }
+    utils::fill_random_bytes(encrypted_data->nonce, sizeof(encrypted_data->nonce), "encrypt_data_nonce");
 
     encrypted_data->data_len = raw_data_size;
     crypto_aead_lock(encrypted_data->data, encrypted_data->mac, seed, encrypted_data->nonce, ad, ad_size, raw_data, raw_data_size);
@@ -55,9 +52,7 @@ namespace enclave {
         memset(server_privkey, 0, 32);
 
         do {
-            if (RAND_bytes(server_privkey, sizeof(server_privkey)) != 1) {
-                throw std::runtime_error("Failed to generate random bytes");
-            }
+            utils::fill_random_bytes(server_privkey, sizeof(server_privkey), "generate_new_keypair_server_privkey");
         } while (!secp256k1_ec_seckey_verify(ctx, server_privkey));
 
         secp256k1_keypair server_keypair;
@@ -115,9 +110,7 @@ namespace enclave {
 
         unsigned char session_id[32];
         memset(session_id, 0, 32);
-        if (RAND_bytes(session_id, sizeof(session_id)) != 1) {
-            throw std::runtime_error("Failed to generate random bytes");
-        }
+        utils::fill_random_bytes(session_id, sizeof(session_id), "generate_nonce_session_id");
 
         secp256k1_musig_pubnonce server_pubnonce;
         secp256k1_musig_secnonce server_secnonce;

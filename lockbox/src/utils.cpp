@@ -1,9 +1,33 @@
 #include "utils.h"
+#include <openssl/rand.h>
+#include <openssl/sha.h>
 #include <string.h>
 #include <cstring> 
+#include <mutex>
+#include <stdexcept>
 #include <toml++/toml.h>
 
 namespace utils {
+
+    namespace {
+        std::mutex deterministic_rng_mutex;
+        uint64_t deterministic_rng_counter = 0;
+
+        std::vector<uint8_t> getDeterministicSeed() {
+            const char* seed_hex = std::getenv("LOCKBOX_TEST_RNG_SEED");
+
+            if (seed_hex == nullptr || std::strlen(seed_hex) == 0) {
+                return {};
+            }
+
+            auto seed = ParseHex<uint8_t>(seed_hex);
+            if (seed.empty()) {
+                throw std::runtime_error("LOCKBOX_TEST_RNG_SEED must be a non-empty hex string");
+            }
+
+            return seed;
+        }
+    } // namespace
 
     const signed char p_util_hexdigit[256] =
     { -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
@@ -70,6 +94,46 @@ namespace utils {
 
         memset(encrypted_data.mac, 0, sizeof(encrypted_data.mac));
         memset(encrypted_data.nonce, 0, sizeof(encrypted_data.nonce));
+    }
+
+    void fill_random_bytes(unsigned char* buffer, size_t buffer_len, const std::string& purpose) {
+        auto deterministic_seed = getDeterministicSeed();
+
+        if (deterministic_seed.empty()) {
+            if (RAND_bytes(buffer, buffer_len) != 1) {
+                throw std::runtime_error("Failed to generate random bytes");
+            }
+
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(deterministic_rng_mutex);
+
+        size_t offset = 0;
+
+        while (offset < buffer_len) {
+            SHA256_CTX sha_ctx;
+            SHA256_Init(&sha_ctx);
+            SHA256_Update(&sha_ctx, deterministic_seed.data(), deterministic_seed.size());
+            SHA256_Update(&sha_ctx, purpose.data(), purpose.size());
+
+            unsigned char counter_bytes[sizeof(deterministic_rng_counter)];
+            for (size_t i = 0; i < sizeof(deterministic_rng_counter); ++i) {
+                counter_bytes[sizeof(deterministic_rng_counter) - 1 - i] =
+                    (deterministic_rng_counter >> (i * 8)) & 0xff;
+            }
+
+            SHA256_Update(&sha_ctx, counter_bytes, sizeof(counter_bytes));
+
+            unsigned char digest[SHA256_DIGEST_LENGTH];
+            SHA256_Final(digest, &sha_ctx);
+
+            size_t bytes_to_copy = std::min(buffer_len - offset, sizeof(digest));
+            memcpy(buffer + offset, digest, bytes_to_copy);
+
+            offset += bytes_to_copy;
+            deterministic_rng_counter++;
+        }
     }
 
     uint16_t convertStringToUint16(const char* value) {

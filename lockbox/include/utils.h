@@ -59,6 +59,8 @@ namespace utils {
 
     void initialize_encrypted_data(chacha20_poly1305_encrypted_data& encrypted_data, size_t data_len);
 
+    void fill_random_bytes(unsigned char* buffer, size_t buffer_len, const std::string& purpose);
+
     uint16_t getServerPort();
 
     std::string getStringConfigVar(const std::string& env_var, const std::string& toml_var_1, const std::string& toml_var_2);
