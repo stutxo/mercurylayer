@@ -6,7 +6,6 @@ use crate::{
 };
 use anyhow::{anyhow, Result};
 use chrono::Utc;
-use electrum_client::ElectrumApi;
 use mercurylib::wallet::{Activity, CoinStatus};
 
 pub async fn execute(
@@ -141,9 +140,7 @@ pub async fn execute(
     update_backup_txs(&client_config.pool, &coin.statechain_id.as_ref().unwrap(), &backup_txs).await?;*/
 
     let tx_bytes = hex::decode(&signed_tx)?;
-    let txid = client_config
-        .electrum_client
-        .transaction_broadcast_raw(&tx_bytes)?;
+    let txid = client_config.chain_client.broadcast_tx(&tx_bytes)?;
 
     coin.tx_withdraw = Some(txid.to_string());
     coin.withdrawal_address = Some(to_address.to_string());

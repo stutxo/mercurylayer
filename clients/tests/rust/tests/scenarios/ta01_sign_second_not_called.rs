@@ -6,7 +6,7 @@ use mercuryrustlib::{
 };
 use std::{thread, time::Duration};
 
-use crate::common::{bitcoin_core, electrs, utils};
+use crate::common::{bitcoin_core, chain, utils};
 
 /// This function gets the server public nonce from the statechain entity.
 pub async fn sign_first(
@@ -170,7 +170,7 @@ async fn ta01(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wallet) 
     let mut is_tx_indexed = false;
 
     while !is_tx_indexed {
-        is_tx_indexed = electrs::check_address(client_config, &address, amount).await?;
+        is_tx_indexed = chain::check_address(client_config, &address, amount).await?;
         thread::sleep(Duration::from_secs(1));
     }
 

@@ -1,6 +1,5 @@
 use crate::client_config::ClientConfig;
 use anyhow::Result;
-use electrum_client::ElectrumApi;
 use mercurylib::{
     transaction::{
         create_signature, get_partial_sig_request, new_backup_transaction,
@@ -38,12 +37,7 @@ pub async fn new_transaction(
 
     let block_height = match block_height {
         Some(block_height) => block_height,
-        None => {
-            let block_header = client_config
-                .electrum_client
-                .block_headers_subscribe_raw()?;
-            block_header.height as u32
-        }
+        None => client_config.chain_client.tip_height()?,
     };
 
     let partial_sig_request = get_partial_sig_request(

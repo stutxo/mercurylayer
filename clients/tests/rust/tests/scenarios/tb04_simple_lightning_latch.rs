@@ -2,7 +2,7 @@ use anyhow::{Ok, Result};
 use mercuryrustlib::{client_config::ClientConfig, CoinStatus, Wallet};
 use std::{thread, time::Duration};
 
-use crate::common::{bitcoin_core, electrs, utils};
+use crate::common::{bitcoin_core, chain, utils};
 
 use sha2::{Digest, Sha256};
 
@@ -33,7 +33,7 @@ pub async fn tb04(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wall
     let mut is_tx_indexed = false;
 
     while !is_tx_indexed {
-        is_tx_indexed = electrs::check_address(client_config, &deposit_address, amount).await?;
+        is_tx_indexed = chain::check_address(client_config, &deposit_address, amount).await?;
         thread::sleep(Duration::from_secs(1));
     }
 

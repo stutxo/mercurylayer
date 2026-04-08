@@ -1,10 +1,9 @@
 use std::{thread, time::Duration};
 
 use anyhow::{Ok, Result};
-use electrum_client::ElectrumApi;
 use mercuryrustlib::{client_config::ClientConfig, CoinStatus, Wallet};
 
-use crate::common::{bitcoin_core, electrs, utils};
+use crate::common::{bitcoin_core, chain, utils};
 
 pub async fn old_state_broadcasted(
     client_config: &ClientConfig,
@@ -37,7 +36,7 @@ pub async fn old_state_broadcasted(
     let mut is_tx_indexed = false;
 
     while !is_tx_indexed {
-        is_tx_indexed = electrs::check_address(client_config, &deposit_address, amount).await?;
+        is_tx_indexed = chain::check_address(client_config, &deposit_address, amount).await?;
         thread::sleep(Duration::from_secs(1));
     }
 
@@ -108,23 +107,19 @@ pub async fn old_state_broadcasted(
     assert!(bkp_tx.tx_n == 2);
 
     let tx_bytes = hex::decode(&bkp_tx.tx)?;
-    let txid = client_config
-        .electrum_client
-        .transaction_broadcast_raw(&tx_bytes);
+    let txid = client_config.chain_client.broadcast_tx(&tx_bytes);
 
     assert!(txid.is_err());
 
     let tx_lock_time = mercuryrustlib::get_blockheight(&bkp_tx)?;
 
-    let current_blockheight = electrs::get_blockheight(&client_config).await? as u32;
+    let current_blockheight = chain::get_blockheight(&client_config).await?;
 
     let height_diff = tx_lock_time - current_blockheight;
 
     let _ = bitcoin_core::generatetoaddress(height_diff, &core_wallet_address)?;
 
-    let txid = client_config
-        .electrum_client
-        .transaction_broadcast_raw(&tx_bytes);
+    let txid = client_config.chain_client.broadcast_tx(&tx_bytes);
 
     assert!(txid.is_ok());
 

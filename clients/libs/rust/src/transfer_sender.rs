@@ -9,7 +9,6 @@ use crate::{
 };
 use anyhow::{anyhow, Result};
 use chrono::Utc;
-use electrum_client::ElectrumApi;
 use mercurylib::{
     decode_transfer_address,
     transfer::sender::{
@@ -88,10 +87,7 @@ pub async fn create_backup_transactions(
                 return Err(anyhow::anyhow!("coin.locktime is None"));
             }
 
-            let block_header = client_config
-                .electrum_client
-                .block_headers_subscribe_raw()?;
-            let current_blockheight = block_header.height as u32;
+            let current_blockheight = client_config.chain_client.tip_height()?;
 
             if current_blockheight > coin.locktime.unwrap() {
                 return Err(anyhow::anyhow!(
@@ -126,20 +122,16 @@ pub async fn create_backup_transactions(
             let address = bitcoin::Address::from_str(&coin.aggregated_address.as_ref().unwrap())?
                 .require_network(client_config.network)?;
             let utxo_list = client_config
-                .electrum_client
-                .script_list_unspent(&address.script_pubkey())?;
+                .chain_client
+                .list_unspent(address.script_pubkey().as_script())?;
 
             for unspent in utxo_list {
-                if coin.utxo_txid == Some(unspent.tx_hash.to_string())
-                    && coin.utxo_vout == Some(unspent.tx_pos as u32)
+                if coin.utxo_txid == Some(unspent.txid.clone()) && coin.utxo_vout == Some(unspent.vout)
                 {
                     let mut is_confirmed = false;
 
                     if unspent.height > 0 {
-                        let block_header = client_config
-                            .electrum_client
-                            .block_headers_subscribe_raw()?;
-                        let blockheight = block_header.height;
+                        let blockheight = client_config.chain_client.tip_height()?;
 
                         let confirmations = blockheight - unspent.height + 1;
 

@@ -3,7 +3,6 @@ use crate::{
     sqlite_manager::{get_backup_txs, get_wallet, update_wallet},
 };
 use anyhow::{anyhow, Result};
-use electrum_client::ElectrumApi;
 use mercurylib::wallet::{cpfp_tx, CoinStatus};
 
 pub async fn execute(
@@ -59,14 +58,8 @@ pub async fn execute(
         let fee_rate = match fee_rate {
             Some(fee_rate) => fee_rate,
             None => {
-                let mut fee_rate_btc_per_kb = client_config.electrum_client.estimate_fee(1)?;
-
-                // Why does it happen?
-                if fee_rate_btc_per_kb <= 0.0 {
-                    fee_rate_btc_per_kb = 0.00001;
-                }
-
-                let fee_rate_sats_per_byte = fee_rate_btc_per_kb * 100000.0;
+                let fee_rate_sats_per_byte =
+                    client_config.chain_client.estimate_fee_sat_per_vbyte(1)?;
 
                 if fee_rate_sats_per_byte > client_config.max_fee_rate {
                     client_config.max_fee_rate
@@ -88,16 +81,12 @@ pub async fn execute(
     };
 
     let tx_bytes = hex::decode(&backup_tx.tx)?;
-    let mut txid = client_config
-        .electrum_client
-        .transaction_broadcast_raw(&tx_bytes)?;
+    let mut txid = client_config.chain_client.broadcast_tx(&tx_bytes)?;
 
     if cpfp_tx.is_some() {
         let cpfp_tx = cpfp_tx.unwrap();
         let tx_bytes = hex::decode(&cpfp_tx)?;
-        txid = client_config
-            .electrum_client
-            .transaction_broadcast_raw(&tx_bytes)?;
+        txid = client_config.chain_client.broadcast_tx(&tx_bytes)?;
     }
 
     coin.tx_cpfp = Some(txid.to_string());

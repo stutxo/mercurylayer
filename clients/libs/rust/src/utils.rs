@@ -1,7 +1,6 @@
 use crate::client_config::ClientConfig;
 use anyhow::{anyhow, Ok, Result};
 use chrono::Utc;
-use electrum_client::ElectrumApi;
 use mercurylib::{
     transfer::receiver::StatechainInfoResponsePayload,
     utils::{InfoConfig, ServerConfig},
@@ -24,14 +23,9 @@ pub async fn info_config(client_config: &ClientConfig) -> Result<InfoConfig> {
     let interval = server_config.interval;
 
     let number_blocks = 3;
-    let mut fee_rate_btc_per_kb = client_config.electrum_client.estimate_fee(number_blocks)?;
-
-    // Why does it happen?
-    if fee_rate_btc_per_kb <= 0.0 {
-        fee_rate_btc_per_kb = 0.00001;
-    }
-
-    let fee_rate_sats_per_byte = fee_rate_btc_per_kb * 100000.0;
+    let fee_rate_sats_per_byte = client_config
+        .chain_client
+        .estimate_fee_sat_per_vbyte(number_blocks)?;
 
     Ok(InfoConfig {
         initlock,

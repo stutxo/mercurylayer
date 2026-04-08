@@ -4,6 +4,7 @@ use std::{
 };
 
 use crate::{
+    chain::ChainClient,
     client_config::ClientConfig,
     sqlite_manager::{get_wallet, insert_or_update_backup_txs, update_wallet},
     utils,
@@ -11,7 +12,6 @@ use crate::{
 use anyhow::{anyhow, Ok, Result};
 use bitcoin::{Address, Txid};
 use chrono::Utc;
-use electrum_client::ElectrumApi;
 use mercurylib::{
     utils::{get_network, InfoConfig},
     wallet::{get_previous_outpoint, Activity, BackupTx, Coin, CoinStatus},
@@ -117,10 +117,7 @@ pub async fn execute(
 
     let mut duplicated_coins: Vec<Coin> = Vec::new();
 
-    let block_header = client_config
-        .electrum_client
-        .block_headers_subscribe_raw()?;
-    let blockheight = block_header.height as u32;
+    let blockheight = client_config.chain_client.tip_height()?;
 
     for (key, values) in &enc_msgs_per_auth_pubkey {
         let auth_pubkey = key.clone();
@@ -361,7 +358,7 @@ async fn validate_encrypted_message(
     for (index, backup_transactions) in grouped_backup_transactions.iter().enumerate() {
         let tx0_outpoint = mercurylib::transfer::receiver::get_tx0_outpoint(backup_transactions)?;
 
-        let tx0_hex = get_tx0(&client_config.electrum_client, &tx0_outpoint.txid).await?;
+        let tx0_hex = get_tx0(&client_config.chain_client, &tx0_outpoint.txid).await?;
 
         if index == 0 {
             let is_transfer_signature_valid =
@@ -416,7 +413,7 @@ async fn validate_encrypted_message(
         }
 
         let (is_tx0_output_unspent, _) = verify_tx0_output_is_unspent_and_confirmed(
-            &client_config.electrum_client,
+            &client_config.chain_client,
             &tx0_outpoint,
             &tx0_hex,
             &network,
@@ -485,14 +482,14 @@ async fn process_encrypted_message(
         if index == 0 {
             let tx0_outpoint =
                 mercurylib::transfer::receiver::get_tx0_outpoint(backup_transactions)?;
-            let tx0_hex = get_tx0(&client_config.electrum_client, &tx0_outpoint.txid).await?;
+            let tx0_hex = get_tx0(&client_config.chain_client, &tx0_outpoint.txid).await?;
 
             let statechain_info =
                 utils::get_statechain_info(&transfer_msg.statechain_id, &client_config).await?;
             let statechain_info = statechain_info.unwrap();
 
             let (_, tx0_status) = verify_tx0_output_is_unspent_and_confirmed(
-                &client_config.electrum_client,
+                &client_config.chain_client,
                 &tx0_outpoint,
                 &tx0_hex,
                 &network,
@@ -594,7 +591,7 @@ async fn process_encrypted_message(
         } else {
             let tx0_outpoint =
                 mercurylib::transfer::receiver::get_tx0_outpoint(backup_transactions)?;
-            let tx0_hex = get_tx0(&client_config.electrum_client, &tx0_outpoint.txid).await?;
+            let tx0_hex = get_tx0(&client_config.chain_client, &tx0_outpoint.txid).await?;
 
             let first_backup_tx = backup_transactions.first().unwrap();
 
@@ -617,21 +614,16 @@ async fn process_encrypted_message(
     Ok(transfer_receive_result)
 }
 
-async fn get_tx0(electrum_client: &electrum_client::Client, tx0_txid: &str) -> Result<String> {
+async fn get_tx0(chain_client: &ChainClient, tx0_txid: &str) -> Result<String> {
     let tx0_txid = Txid::from_str(tx0_txid)?;
-    let tx_bytes = electrum_client.batch_transaction_get_raw(&[tx0_txid])?;
-
-    if tx_bytes.len() == 0 {
-        return Err(anyhow!("tx0 not found"));
-    }
-
-    let tx0_hex = hex::encode(&tx_bytes[0]);
+    let tx_bytes = chain_client.get_raw_tx(&tx0_txid)?;
+    let tx0_hex = hex::encode(&tx_bytes);
 
     Ok(tx0_hex)
 }
 
 async fn verify_tx0_output_is_unspent_and_confirmed(
-    electrum_client: &electrum_client::Client,
+    chain_client: &ChainClient,
     tx0_outpoint: &mercurylib::transfer::TxOutpoint,
     tx0_hex: &str,
     network: &str,
@@ -648,16 +640,13 @@ async fn verify_tx0_output_is_unspent_and_confirmed(
     let script = address.script_pubkey();
     let script = script.as_script();
 
-    let res = electrum_client.script_list_unspent(script)?;
-
-    let block_header = electrum_client.block_headers_subscribe_raw()?;
-    let blockheight = block_header.height;
+    let res = chain_client.list_unspent(script)?;
+    let blockheight = chain_client.tip_height()?;
 
     let mut status = CoinStatus::UNCONFIRMED;
 
     for unspent in res {
-        if (unspent.tx_hash.to_string() == tx0_outpoint.txid)
-            && (unspent.tx_pos as u32 == tx0_outpoint.vout)
+        if unspent.txid == tx0_outpoint.txid && unspent.vout == tx0_outpoint.vout
         {
             let confirmations = blockheight - unspent.height + 1;
 

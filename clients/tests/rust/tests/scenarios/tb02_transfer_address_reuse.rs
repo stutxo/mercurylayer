@@ -2,7 +2,7 @@ use anyhow::{Ok, Result};
 use mercuryrustlib::{client_config::ClientConfig, CoinStatus, Wallet};
 use std::{thread, time::Duration};
 
-use crate::common::{bitcoin_core, electrs, utils};
+use crate::common::{bitcoin_core, chain, utils};
 
 async fn tb02(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wallet) -> Result<()> {
     let amount = 1000;
@@ -47,7 +47,7 @@ async fn tb02(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wallet) 
     let mut is_tx_indexed = false;
 
     while !is_tx_indexed {
-        is_tx_indexed = electrs::check_address(client_config, &address, amount).await?;
+        is_tx_indexed = chain::check_address(client_config, &address, amount).await?;
         thread::sleep(Duration::from_secs(1));
     }
 

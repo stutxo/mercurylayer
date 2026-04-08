@@ -6,14 +6,16 @@ use bitcoin::Network;
 use config::Config;
 use sqlx::{migrate::MigrateDatabase, Sqlite, SqlitePool};
 
+use crate::chain::ChainClient;
+
 /// Config struct storing all StataChain Entity config
 pub struct ClientConfig {
     /// Active lockbox server addresses
     pub statechain_entity: String,
     /// Selected blockchain backend, e.g. `electrum` or `core`
     pub chain_backend: String,
-    /// Electrum client
-    pub electrum_client: electrum_client::Client,
+    /// Active chain backend client
+    pub chain_client: ChainClient,
     /// Electrum server url
     pub electrum_server_url: String,
     /// Electrum server type (e.g. electrs, electrumx, etc.)
@@ -122,12 +124,12 @@ impl ClientConfig {
 
         // Create Electrum client
 
-        let electrum_client = electrum_client::Client::new(electrum_server.as_str()).unwrap();
+        let chain_client = ChainClient::new(&chain_backend, electrum_server.as_str()).unwrap();
 
         ClientConfig {
             statechain_entity,
             chain_backend,
-            electrum_client,
+            chain_client,
             electrum_server_url: electrum_server,
             electrum_type,
             core_rpc_url,

@@ -3,13 +3,13 @@ use std::str::FromStr;
 
 use anyhow::{anyhow, Ok, Result};
 use bitcoin::Address;
-use electrum_client::{ElectrumApi, ListUnspentRes};
 use mercurylib::{
     utils::is_enclave_pubkey_part_of_coin,
     wallet::{Activity, BackupTx, Coin, CoinStatus},
 };
 
 use crate::{
+    chain::ChainUtxo,
     client_config::ClientConfig,
     deposit::create_tx1,
     sqlite_manager::{get_wallet, insert_backup_txs, update_wallet},
@@ -35,14 +35,14 @@ async fn check_deposit(
         }
     }
 
-    let mut utxo: Option<ListUnspentRes> = None;
+    let mut utxo: Option<ChainUtxo> = None;
 
     let address = Address::from_str(&coin.aggregated_address.as_ref().unwrap())?
         .require_network(client_config.network)?;
 
     let utxo_list = client_config
-        .electrum_client
-        .script_list_unspent(&address.script_pubkey())?;
+        .chain_client
+        .list_unspent(address.script_pubkey().as_script())?;
 
     for unspent in utxo_list {
         if unspent.value == coin.amount.unwrap() as u64 {
@@ -64,16 +64,13 @@ async fn check_deposit(
         return Ok(None);
     }
 
-    let block_header = client_config
-        .electrum_client
-        .block_headers_subscribe_raw()?;
-    let blockheight = block_header.height;
+    let blockheight = client_config.chain_client.tip_height()?;
 
     let mut deposit_result: Option<DepositResult> = None;
 
     if coin.status == CoinStatus::INITIALISED {
-        let utxo_txid = utxo.tx_hash.to_string();
-        let utxo_vout = utxo.tx_pos as u32;
+        let utxo_txid = utxo.txid.clone();
+        let utxo_vout = utxo.vout;
 
         if coin.status != CoinStatus::INITIALISED {
             return Err(anyhow!(
@@ -89,7 +86,7 @@ async fn check_deposit(
 
         let backup_tx = create_tx1(client_config, coin, wallet_netwotk, 1u32).await?;
 
-        let activity_utxo = format!("{}:{}", utxo.tx_hash.to_string(), utxo.tx_pos);
+        let activity_utxo = format!("{}:{}", utxo.txid, utxo.vout);
 
         let activity = Some(create_activity(
             &activity_utxo,
@@ -168,13 +165,13 @@ async fn check_withdrawal(client_config: &ClientConfig, coin: &mut Coin) -> Resu
         .require_network(client_config.network)?;
 
     let utxo_list = client_config
-        .electrum_client
-        .script_list_unspent(&address.script_pubkey())?;
+        .chain_client
+        .list_unspent(address.script_pubkey().as_script())?;
 
-    let mut utxo: Option<ListUnspentRes> = None;
+    let mut utxo: Option<ChainUtxo> = None;
 
     for unspent in utxo_list {
-        if unspent.tx_hash.to_string() == txid {
+        if unspent.txid == txid {
             utxo = Some(unspent);
             break;
         }
@@ -189,10 +186,7 @@ async fn check_withdrawal(client_config: &ClientConfig, coin: &mut Coin) -> Resu
     let utxo = utxo.unwrap();
 
     if utxo.height > 0 {
-        let block_header = client_config
-            .electrum_client
-            .block_headers_subscribe_raw()?;
-        let blockheight = block_header.height;
+        let blockheight = client_config.chain_client.tip_height()?;
 
         let confirmations = blockheight - utxo.height + 1;
 
@@ -222,8 +216,8 @@ async fn check_for_duplicated(
             .require_network(client_config.network)?;
 
         let utxo_list = client_config
-            .electrum_client
-            .script_list_unspent(&address.script_pubkey())?;
+            .chain_client
+            .list_unspent(address.script_pubkey().as_script())?;
 
         let mut max_duplicated_index = existing_coins
             .iter()
@@ -234,8 +228,7 @@ async fn check_for_duplicated(
 
         for unspent in utxo_list {
             let utxo_exists = existing_coins.iter().any(|coin| {
-                coin.utxo_txid == Some(unspent.tx_hash.to_string())
-                    && coin.utxo_vout == Some(unspent.tx_pos as u32)
+                coin.utxo_txid == Some(unspent.txid.clone()) && coin.utxo_vout == Some(unspent.vout)
             });
 
             if utxo_exists {
@@ -246,8 +239,8 @@ async fn check_for_duplicated(
 
             let mut duplicated_coin = coin.clone();
             duplicated_coin.status = CoinStatus::DUPLICATED;
-            duplicated_coin.utxo_txid = Some(unspent.tx_hash.to_string());
-            duplicated_coin.utxo_vout = Some(unspent.tx_pos as u32);
+            duplicated_coin.utxo_txid = Some(unspent.txid);
+            duplicated_coin.utxo_vout = Some(unspent.vout);
             duplicated_coin.amount = Some(unspent.value as u32);
             duplicated_coin.duplicate_index = max_duplicated_index;
             duplicated_coin_list.push(duplicated_coin);

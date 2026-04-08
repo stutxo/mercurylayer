@@ -7,7 +7,7 @@ use anyhow::Result;
 use mercuryrustlib::client_config::ClientConfig;
 
 pub mod bitcoin_core;
-pub mod electrs;
+pub mod chain;
 pub mod lockbox;
 pub mod mercury;
 pub mod utils;

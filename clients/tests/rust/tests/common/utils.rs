@@ -3,7 +3,7 @@ use std::{thread, time::Duration};
 use anyhow::{Ok, Result};
 use mercuryrustlib::{client_config::ClientConfig, TokenResponse};
 
-use crate::common::{bitcoin_core, electrs};
+use crate::common::{bitcoin_core, chain};
 
 pub async fn handle_token_response(
     client_config: &ClientConfig,
@@ -24,7 +24,7 @@ pub async fn handle_token_response(
 
         let mut is_tx_indexed = false;
         while !is_tx_indexed {
-            is_tx_indexed = electrs::check_address(client_config, &deposit_address, amount).await?;
+            is_tx_indexed = chain::check_address(client_config, &deposit_address, amount).await?;
             thread::sleep(Duration::from_secs(1));
         }
     }

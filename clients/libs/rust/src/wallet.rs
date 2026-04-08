@@ -1,5 +1,4 @@
 use anyhow::Result;
-use electrum_client::ElectrumApi;
 use mercurylib::wallet::{generate_mnemonic, Settings, Wallet};
 
 use crate::{client_config::ClientConfig, utils::info_config};
@@ -9,10 +8,7 @@ pub async fn create_wallet(name: &str, client_config: &ClientConfig) -> Result<W
 
     let server_info = info_config(&client_config).await?;
 
-    let block_header = client_config
-        .electrum_client
-        .block_headers_subscribe_raw()?;
-    let blockheight = block_header.height as u32;
+    let blockheight = client_config.chain_client.tip_height()?;
 
     let electrum_endpoint = client_config.electrum_server_url.to_string();
     let (electrum_protocol, rest) = electrum_endpoint

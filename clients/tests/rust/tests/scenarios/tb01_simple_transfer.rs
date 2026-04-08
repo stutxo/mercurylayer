@@ -3,7 +3,7 @@ use std::{thread, time::Duration};
 use anyhow::{anyhow, Ok, Result};
 use mercuryrustlib::{client_config::ClientConfig, CoinStatus, Wallet};
 
-use crate::common::{bitcoin_core, electrs, utils};
+use crate::common::{bitcoin_core, chain, utils};
 
 async fn try_to_send_unconfirmed_coin(
     client_config: &ClientConfig,
@@ -101,7 +101,7 @@ async fn sucessfully_transfer(
     let mut is_tx_indexed = false;
 
     while !is_tx_indexed {
-        is_tx_indexed = electrs::check_address(client_config, &address, amount).await?;
+        is_tx_indexed = chain::check_address(client_config, &address, amount).await?;
         thread::sleep(Duration::from_secs(1));
     }
 
