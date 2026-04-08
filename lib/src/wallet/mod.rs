@@ -11,12 +11,14 @@ use serde::{Deserialize, Serialize};
 use crate::{transfer::TxOutpoint, utils::ServerConfig, MercuryError};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(try_from = "WalletCompat")]
 pub struct Wallet {
     pub name: String,
     pub mnemonic: String,
     pub version: String,
     pub state_entity_endpoint: String,
-    pub electrum_endpoint: String,
+    pub chain_backend: String,
+    pub chain_endpoint: String,
     pub network: String,
     pub blockheight: u32,
     pub initlock: u32,
@@ -29,6 +31,7 @@ pub struct Wallet {
 
 #[allow(non_snake_case)]
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(try_from = "SettingsCompat")]
 pub struct Settings {
     pub network: String,
     pub block_explorerURL: Option<String>,
@@ -38,12 +41,147 @@ pub struct Settings {
     pub torProxyControlPort: Option<String>,
     pub statechainEntityApi: String,
     pub torStatechainEntityApi: Option<String>,
-    pub electrumProtocol: String,
-    pub electrumHost: String,
-    pub electrumPort: String,
-    pub electrumType: String,
+    pub chainBackend: String,
+    pub chainUrl: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chainType: Option<String>,
     pub notifications: bool,
     pub tutorials: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct WalletCompat {
+    pub name: String,
+    pub mnemonic: String,
+    pub version: String,
+    pub state_entity_endpoint: String,
+    #[serde(default)]
+    pub chain_backend: Option<String>,
+    #[serde(default)]
+    pub chain_endpoint: Option<String>,
+    #[serde(default)]
+    pub electrum_endpoint: Option<String>,
+    pub network: String,
+    pub blockheight: u32,
+    pub initlock: u32,
+    pub interval: u32,
+    pub tokens: Vec<Token>,
+    pub activities: Vec<Activity>,
+    pub coins: Vec<Coin>,
+    pub settings: Settings,
+}
+
+#[allow(non_snake_case)]
+#[derive(Debug, Deserialize)]
+struct SettingsCompat {
+    pub network: String,
+    pub block_explorerURL: Option<String>,
+    pub torProxyHost: Option<String>,
+    pub torProxyPort: Option<String>,
+    pub torProxyControlPassword: Option<String>,
+    pub torProxyControlPort: Option<String>,
+    pub statechainEntityApi: String,
+    pub torStatechainEntityApi: Option<String>,
+    #[serde(default)]
+    pub chainBackend: Option<String>,
+    #[serde(default)]
+    pub chainUrl: Option<String>,
+    #[serde(default)]
+    pub chainType: Option<String>,
+    #[serde(default)]
+    pub electrumProtocol: Option<String>,
+    #[serde(default)]
+    pub electrumHost: Option<String>,
+    #[serde(default)]
+    pub electrumPort: Option<String>,
+    #[serde(default)]
+    pub electrumType: Option<String>,
+    pub notifications: bool,
+    pub tutorials: bool,
+}
+
+impl TryFrom<WalletCompat> for Wallet {
+    type Error = String;
+
+    fn try_from(value: WalletCompat) -> Result<Self, Self::Error> {
+        let settings = value.settings;
+        let chain_backend = value
+            .chain_backend
+            .unwrap_or_else(|| settings.chainBackend.clone());
+        let chain_endpoint = value
+            .chain_endpoint
+            .or(value.electrum_endpoint)
+            .unwrap_or_else(|| settings.chainUrl.clone());
+
+        if chain_endpoint.is_empty() {
+            return Err("wallet missing chain_endpoint".to_string());
+        }
+
+        Ok(Self {
+            name: value.name,
+            mnemonic: value.mnemonic,
+            version: value.version,
+            state_entity_endpoint: value.state_entity_endpoint,
+            chain_backend,
+            chain_endpoint,
+            network: value.network,
+            blockheight: value.blockheight,
+            initlock: value.initlock,
+            interval: value.interval,
+            tokens: value.tokens,
+            activities: value.activities,
+            coins: value.coins,
+            settings,
+        })
+    }
+}
+
+impl TryFrom<SettingsCompat> for Settings {
+    type Error = String;
+
+    fn try_from(value: SettingsCompat) -> Result<Self, Self::Error> {
+        let chain_backend = value.chainBackend.unwrap_or_else(default_chain_backend);
+        let chain_url = match value.chainUrl {
+            Some(chain_url) => chain_url,
+            None => build_legacy_electrum_url(
+                value.electrumProtocol.as_deref(),
+                value.electrumHost.as_deref(),
+                value.electrumPort.as_deref(),
+            )?,
+        };
+
+        Ok(Self {
+            network: value.network,
+            block_explorerURL: value.block_explorerURL,
+            torProxyHost: value.torProxyHost,
+            torProxyPort: value.torProxyPort,
+            torProxyControlPassword: value.torProxyControlPassword,
+            torProxyControlPort: value.torProxyControlPort,
+            statechainEntityApi: value.statechainEntityApi,
+            torStatechainEntityApi: value.torStatechainEntityApi,
+            chainBackend: chain_backend,
+            chainUrl: chain_url,
+            chainType: value.chainType.or(value.electrumType),
+            notifications: value.notifications,
+            tutorials: value.tutorials,
+        })
+    }
+}
+
+fn default_chain_backend() -> String {
+    "electrum".to_string()
+}
+
+fn build_legacy_electrum_url(
+    protocol: Option<&str>,
+    host: Option<&str>,
+    port: Option<&str>,
+) -> Result<String, String> {
+    match (protocol, host, port) {
+        (Some(protocol), Some(host), Some(port)) => Ok(format!("{}://{}:{}", protocol, host, port)),
+        (None, None, None) => Err("wallet settings missing chainUrl".to_string()),
+        _ => Err("wallet settings contain incomplete legacy electrum configuration".to_string()),
+    }
 }
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Token {
@@ -217,4 +355,161 @@ pub fn generate_mnemonic() -> core::result::Result<String, MercuryError> {
     let entropy = (0..16).map(|_| rng.gen::<u8>()).collect::<Vec<u8>>(); // 16 bytes of entropy for 12 words
     let mnemonic = Mnemonic::from_entropy_in(Language::English, &entropy)?;
     Ok(mnemonic.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Settings, Wallet};
+    use serde_json::Value;
+
+    #[test]
+    fn wallet_deserializes_legacy_electrum_metadata() {
+        let wallet_json = r#"
+        {
+          "name": "wallet",
+          "mnemonic": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+          "version": "0.1.0",
+          "state_entity_endpoint": "http://statechain",
+          "electrum_endpoint": "tcp://electrum:50001",
+          "network": "regtest",
+          "blockheight": 42,
+          "initlock": 1000,
+          "interval": 10,
+          "tokens": [],
+          "activities": [],
+          "coins": [],
+          "settings": {
+            "network": "regtest",
+            "block_explorerURL": null,
+            "torProxyHost": null,
+            "torProxyPort": null,
+            "torProxyControlPassword": null,
+            "torProxyControlPort": null,
+            "statechainEntityApi": "http://statechain",
+            "torStatechainEntityApi": null,
+            "electrumProtocol": "tcp",
+            "electrumHost": "electrum",
+            "electrumPort": "50001",
+            "electrumType": "electrs",
+            "notifications": false,
+            "tutorials": false
+          }
+        }
+        "#;
+
+        let wallet: Wallet = serde_json::from_str(wallet_json).unwrap();
+
+        assert_eq!(wallet.chain_backend, "electrum");
+        assert_eq!(wallet.chain_endpoint, "tcp://electrum:50001");
+        assert_eq!(wallet.settings.chainBackend, "electrum");
+        assert_eq!(wallet.settings.chainUrl, "tcp://electrum:50001");
+        assert_eq!(wallet.settings.chainType.as_deref(), Some("electrs"));
+    }
+
+    #[test]
+    fn wallet_serialization_rewrites_legacy_metadata_to_neutral_fields() {
+        let wallet_json = r#"
+        {
+          "name": "wallet",
+          "mnemonic": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+          "version": "0.1.0",
+          "state_entity_endpoint": "http://statechain",
+          "electrum_endpoint": "tcp://electrum:50001",
+          "network": "regtest",
+          "blockheight": 42,
+          "initlock": 1000,
+          "interval": 10,
+          "tokens": [],
+          "activities": [],
+          "coins": [],
+          "settings": {
+            "network": "regtest",
+            "block_explorerURL": null,
+            "torProxyHost": null,
+            "torProxyPort": null,
+            "torProxyControlPassword": null,
+            "torProxyControlPort": null,
+            "statechainEntityApi": "http://statechain",
+            "torStatechainEntityApi": null,
+            "electrumProtocol": "tcp",
+            "electrumHost": "electrum",
+            "electrumPort": "50001",
+            "electrumType": "electrs",
+            "notifications": false,
+            "tutorials": false
+          }
+        }
+        "#;
+
+        let wallet: Wallet = serde_json::from_str(wallet_json).unwrap();
+        let rewritten = serde_json::to_value(&wallet).unwrap();
+
+        assert_eq!(rewritten["chain_backend"], "electrum");
+        assert_eq!(rewritten["chain_endpoint"], "tcp://electrum:50001");
+        assert!(rewritten.get("electrum_endpoint").is_none());
+
+        let settings = rewritten
+            .get("settings")
+            .and_then(Value::as_object)
+            .unwrap();
+        assert_eq!(
+            settings.get("chainBackend").and_then(Value::as_str),
+            Some("electrum")
+        );
+        assert_eq!(
+            settings.get("chainUrl").and_then(Value::as_str),
+            Some("tcp://electrum:50001")
+        );
+        assert_eq!(
+            settings.get("chainType").and_then(Value::as_str),
+            Some("electrs")
+        );
+        assert!(!settings.contains_key("electrumProtocol"));
+        assert!(!settings.contains_key("electrumHost"));
+        assert!(!settings.contains_key("electrumPort"));
+        assert!(!settings.contains_key("electrumType"));
+    }
+
+    #[test]
+    fn wallet_deserializes_neutral_chain_metadata() {
+        let wallet = Wallet {
+            name: "wallet".to_string(),
+            mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string(),
+            version: "0.1.0".to_string(),
+            state_entity_endpoint: "http://statechain".to_string(),
+            chain_backend: "core".to_string(),
+            chain_endpoint: "http://127.0.0.1:18443".to_string(),
+            network: "regtest".to_string(),
+            blockheight: 42,
+            initlock: 1000,
+            interval: 10,
+            tokens: Vec::new(),
+            activities: Vec::new(),
+            coins: Vec::new(),
+            settings: Settings {
+                network: "regtest".to_string(),
+                block_explorerURL: None,
+                torProxyHost: None,
+                torProxyPort: None,
+                torProxyControlPassword: None,
+                torProxyControlPort: None,
+                statechainEntityApi: "http://statechain".to_string(),
+                torStatechainEntityApi: None,
+                chainBackend: "core".to_string(),
+                chainUrl: "http://127.0.0.1:18443".to_string(),
+                chainType: None,
+                notifications: false,
+                tutorials: false,
+            },
+        };
+
+        let roundtrip: Wallet =
+            serde_json::from_value(serde_json::to_value(wallet).unwrap()).unwrap();
+
+        assert_eq!(roundtrip.chain_backend, "core");
+        assert_eq!(roundtrip.chain_endpoint, "http://127.0.0.1:18443");
+        assert_eq!(roundtrip.settings.chainBackend, "core");
+        assert_eq!(roundtrip.settings.chainUrl, "http://127.0.0.1:18443");
+        assert_eq!(roundtrip.settings.chainType, None);
+    }
 }

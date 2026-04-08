@@ -10,14 +10,19 @@ pub async fn create_wallet(name: &str, client_config: &ClientConfig) -> Result<W
 
     let blockheight = client_config.chain_client.tip_height()?;
 
-    let electrum_endpoint = client_config.electrum_server_url.to_string();
-    let (electrum_protocol, rest) = electrum_endpoint
-        .split_once("://")
-        .expect("Could not find protocol separator");
-
-    let (electrum_host, electrum_port) = rest
-        .rsplit_once(':')
-        .expect("Could not find port separator");
+    let chain_backend = client_config.chain_backend.to_string();
+    let chain_endpoint = match chain_backend.as_str() {
+        "electrum" => client_config.electrum_server_url.to_string(),
+        "core" => client_config
+            .core_rpc_url
+            .clone()
+            .expect("Bitcoin Core backend selected without core_rpc_url"),
+        other => panic!("Unsupported chain backend: {}", other),
+    };
+    let chain_type = match chain_backend.as_str() {
+        "electrum" => Some(client_config.electrum_type.to_string()),
+        _ => None,
+    };
 
     let notifications = false;
     let tutorials = false;
@@ -31,10 +36,9 @@ pub async fn create_wallet(name: &str, client_config: &ClientConfig) -> Result<W
         torProxyControlPort: None,
         statechainEntityApi: client_config.statechain_entity.to_string(),
         torStatechainEntityApi: None,
-        electrumProtocol: electrum_protocol.to_string(),
-        electrumHost: electrum_host.to_string(),
-        electrumPort: electrum_port.to_string(),
-        electrumType: client_config.electrum_type.to_string(),
+        chainBackend: chain_backend.clone(),
+        chainUrl: chain_endpoint.clone(),
+        chainType: chain_type,
         notifications,
         tutorials,
     };
@@ -44,7 +48,8 @@ pub async fn create_wallet(name: &str, client_config: &ClientConfig) -> Result<W
         mnemonic,
         version: String::from("0.1.0"),
         state_entity_endpoint: client_config.statechain_entity.to_string(),
-        electrum_endpoint,
+        chain_backend,
+        chain_endpoint,
         network: client_config.network.to_string(),
         blockheight,
         initlock: server_info.initlock,

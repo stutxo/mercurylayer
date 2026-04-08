@@ -64,7 +64,7 @@ cargo run create-wallet <wallet_name>
 Running this with name `test_wallet` should return an object like:
 
 ```
-Wallet created: Wallet { name: "test_wallet", mnemonic: "core parade visual doctor region beach approve slim refuse drip rigid develop", version: "0.1.0", state_entity_endpoint: "http://test.mercurylayer.com:8500", electrum_endpoint: "tcp://mutinynet.com:50001", network: "signet", blockheight: 2820795, initlock: 25920, interval: 6, tokens: [], activities: [], coins: [] }
+Wallet created: Wallet { name: "test_wallet", mnemonic: "core parade visual doctor region beach approve slim refuse drip rigid develop", version: "0.1.0", state_entity_endpoint: "http://test.mercurylayer.com:8500", chain_backend: "electrum", chain_endpoint: "tcp://mutinynet.com:50001", network: "signet", blockheight: 2820795, initlock: 25920, interval: 6, tokens: [], activities: [], coins: [] }
 ```
 
 In order to use the mercury layer key server, an access token is required in order to create a shared key. For the test server, tokens can be generated as follows from the command line:
