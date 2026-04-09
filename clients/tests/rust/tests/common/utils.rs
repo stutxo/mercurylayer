@@ -1,5 +1,3 @@
-use std::{thread, time::Duration};
-
 use anyhow::{Ok, Result};
 use mercuryrustlib::{client_config::ClientConfig, TokenResponse};
 
@@ -22,11 +20,7 @@ pub async fn handle_token_response(
         let core_wallet_address = bitcoin_core::getnewaddress()?;
         let _ = bitcoin_core::generatetoaddress(remaining_blocks as u32, &core_wallet_address)?;
 
-        let mut is_tx_indexed = false;
-        while !is_tx_indexed {
-            is_tx_indexed = chain::check_address(client_config, &deposit_address, amount).await?;
-            thread::sleep(Duration::from_secs(1));
-        }
+        chain::wait_for_address_utxo(client_config, &deposit_address, amount).await?;
     }
 
     return Ok(token_id);

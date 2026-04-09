@@ -1,5 +1,3 @@
-use std::{thread, time::Duration};
-
 use anyhow::{Ok, Result};
 use mercuryrustlib::{client_config::ClientConfig, CoinStatus, Wallet};
 
@@ -32,13 +30,7 @@ pub async fn old_state_broadcasted(
     let remaining_blocks = client_config.confirmation_target;
     let _ = bitcoin_core::generatetoaddress(remaining_blocks, &core_wallet_address)?;
 
-    // It appears that Electrs takes a few seconds to index the transaction
-    let mut is_tx_indexed = false;
-
-    while !is_tx_indexed {
-        is_tx_indexed = chain::check_address(client_config, &deposit_address, amount).await?;
-        thread::sleep(Duration::from_secs(1));
-    }
+    chain::wait_for_address_utxo(client_config, &deposit_address, amount).await?;
 
     let wallet1_transfer_adress =
         mercuryrustlib::transfer_receiver::new_transfer_address(&client_config, &wallet1.name)
@@ -107,7 +99,7 @@ pub async fn old_state_broadcasted(
     assert!(bkp_tx.tx_n == 2);
 
     let tx_bytes = hex::decode(&bkp_tx.tx)?;
-    let txid = client_config.chain_client.broadcast_tx(&tx_bytes);
+    let txid = chain::broadcast_raw_tx(client_config, &tx_bytes);
 
     assert!(txid.is_err());
 
@@ -119,7 +111,7 @@ pub async fn old_state_broadcasted(
 
     let _ = bitcoin_core::generatetoaddress(height_diff, &core_wallet_address)?;
 
-    let txid = client_config.chain_client.broadcast_tx(&tx_bytes);
+    let txid = chain::broadcast_raw_tx(client_config, &tx_bytes);
 
     assert!(txid.is_ok());
 

@@ -1,6 +1,5 @@
 use anyhow::{Ok, Result};
 use mercuryrustlib::{client_config::ClientConfig, CoinStatus, Wallet};
-use std::{thread, time::Duration};
 
 use crate::common::{bitcoin_core, chain, utils};
 
@@ -47,15 +46,8 @@ pub async fn tb03(
     let remaining_blocks = client_config.confirmation_target;
     let _ = bitcoin_core::generatetoaddress(remaining_blocks, &core_wallet_address)?;
 
-    // It appears that Electrs takes a few seconds to index the transaction
-    let mut is_tx_indexed = false;
-
-    while !is_tx_indexed {
-        let addr1_ok = chain::check_address(client_config, &wallet1_address, amount).await?;
-        let addr2_ok = chain::check_address(client_config, &wallet2_address, amount).await?;
-        is_tx_indexed = addr1_ok && addr2_ok;
-        thread::sleep(Duration::from_secs(1));
-    }
+    chain::wait_for_address_utxo(client_config, &wallet1_address, amount).await?;
+    chain::wait_for_address_utxo(client_config, &wallet2_address, amount).await?;
 
     let batch_id = Some(uuid::Uuid::new_v4().to_string());
 
