@@ -10,9 +10,19 @@ on:
 
 jobs:
   test:
+    name: test (${{ matrix.backend }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: electrum
+            settings_file: regtest.Settings.toml
+          - backend: core
+            settings_file: regtest.core.Settings.toml
     env:
       RUSTUP_TOOLCHAIN: 1.92.0
+      ML_SETTINGS_FILE: ${{ matrix.settings_file }}
 
     steps:
       - name: Checkout code
@@ -37,12 +47,11 @@ jobs:
         run: |
           container_id=$(docker ps -qf "name=esplora-container")
           echo "Container ID: $container_id"
-          docker logs $container_id
           wallet_name="esplora_wallet"
-          docker exec $container_id cli createwallet $wallet_name
-          address=$(docker exec $container_id cli getnewaddress $wallet_name)
+          docker exec "$container_id" cli createwallet "$wallet_name" || docker exec "$container_id" cli loadwallet "$wallet_name"
+          address=$(docker exec "$container_id" cli -rpcwallet="$wallet_name" getnewaddress)
           echo "New Wallet Address: $address"
-          docker exec $container_id cli generatetoaddress 101 "$address"
+          docker exec "$container_id" cli generatetoaddress 101 "$address"
 
       - name: Run retained integration suite
         run: |
