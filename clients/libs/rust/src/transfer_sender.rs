@@ -126,7 +126,8 @@ pub async fn create_backup_transactions(
                 .list_unspent(address.script_pubkey().as_script())?;
 
             for unspent in utxo_list {
-                if coin.utxo_txid == Some(unspent.txid.clone()) && coin.utxo_vout == Some(unspent.vout)
+                if coin.utxo_txid == Some(unspent.txid.clone())
+                    && coin.utxo_vout == Some(unspent.vout)
                 {
                     let mut is_confirmed = false;
 

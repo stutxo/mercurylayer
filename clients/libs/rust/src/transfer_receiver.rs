@@ -646,8 +646,7 @@ async fn verify_tx0_output_is_unspent_and_confirmed(
     let mut status = CoinStatus::UNCONFIRMED;
 
     for unspent in res {
-        if unspent.txid == tx0_outpoint.txid && unspent.vout == tx0_outpoint.vout
-        {
+        if unspent.txid == tx0_outpoint.txid && unspent.vout == tx0_outpoint.vout {
             let confirmations = blockheight - unspent.height + 1;
 
             if confirmations as u32 >= confirmation_target {

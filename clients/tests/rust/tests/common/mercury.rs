@@ -39,7 +39,11 @@ pub fn http_client() -> Client {
 
 pub async fn wait_until_ready(client: &Client) -> Result<()> {
     for _ in 0..READY_TIMEOUT_SECONDS {
-        if let Ok(response) = client.get(format!("{}/info/config", MERCURY_URL)).send().await {
+        if let Ok(response) = client
+            .get(format!("{}/info/config", MERCURY_URL))
+            .send()
+            .await
+        {
             if response.status() == StatusCode::OK {
                 return Ok(());
             }
@@ -48,7 +52,9 @@ pub async fn wait_until_ready(client: &Client) -> Result<()> {
         sleep(Duration::from_secs(1)).await;
     }
 
-    Err(anyhow!("mercury server did not become ready within 180 seconds"))
+    Err(anyhow!(
+        "mercury server did not become ready within 180 seconds"
+    ))
 }
 
 pub async fn get_token(client: &Client) -> Result<TokenResponse> {

@@ -38,7 +38,9 @@ impl ElectrumChainClient {
     }
 
     pub fn get_raw_tx(&self, txid: &Txid) -> Result<Vec<u8>> {
-        let txs = self.client.batch_transaction_get_raw(std::slice::from_ref(txid))?;
+        let txs = self
+            .client
+            .batch_transaction_get_raw(std::slice::from_ref(txid))?;
 
         txs.into_iter()
             .next()

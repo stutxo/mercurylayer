@@ -477,8 +477,8 @@ async fn deterministic_lockbox_vectors_match_golden_outputs() -> Result<()> {
         lockbox::request_partial_signature(&client, &partial_signature_payload).await?;
     let first_updated_server_pubkey =
         lockbox::keyupdate(&client, statechain_id, [9u8; 32], [10u8; 32])
-        .await?
-        .server_pubkey;
+            .await?
+            .server_pubkey;
     lockbox::delete_statechain(&client, statechain_id).await?;
 
     let first = DeterministicVector {
@@ -618,7 +618,10 @@ async fn concurrent_partial_signature_replays_increment_signature_count() -> Res
 
     assert_eq!(partial_sigs.len(), 2);
     assert_eq!(partial_sigs[0], partial_sigs[1]);
-    assert_eq!(lockbox::get_signature_count(&client, &statechain_id).await?, 2);
+    assert_eq!(
+        lockbox::get_signature_count(&client, &statechain_id).await?,
+        2
+    );
 
     lockbox::delete_statechain(&client, &statechain_id).await?;
 
@@ -725,7 +728,10 @@ async fn mercury_signing_routes_nonce_and_partial_signature_through_lockbox() ->
     let repeated_first_response =
         mercury::sign_first(&mercury_client, &coin_nonce.sign_first_request_payload).await?;
 
-    assert_eq!(first_response.server_pubnonce, repeated_first_response.server_pubnonce);
+    assert_eq!(
+        first_response.server_pubnonce,
+        repeated_first_response.server_pubnonce
+    );
 
     coin.secret_nonce = Some(coin_nonce.secret_nonce);
     coin.public_nonce = Some(coin_nonce.public_nonce);
@@ -750,7 +756,10 @@ async fn mercury_signing_routes_nonce_and_partial_signature_through_lockbox() ->
     .await?;
 
     assert_eq!(partial_signature_response.partial_sig.len(), 64);
-    assert_eq!(lockbox::get_signature_count(&lockbox_client, &statechain_id).await?, 1);
+    assert_eq!(
+        lockbox::get_signature_count(&lockbox_client, &statechain_id).await?,
+        1
+    );
 
     let statechain_info = mercury::statechain_info(&mercury_client, &statechain_id).await?;
     assert_eq!(statechain_info.num_sigs, 1);
