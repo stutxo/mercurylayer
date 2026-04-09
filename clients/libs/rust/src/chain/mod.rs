@@ -1,9 +1,12 @@
+mod core;
 mod electrum;
 
 use anyhow::{anyhow, Result};
 use bitcoin::{Script, Txid};
 
+use self::core::CoreChainClient;
 use self::electrum::ElectrumChainClient;
+pub(crate) use self::core::{CoreRpcAuth, CoreRpcConfig};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChainUtxo {
@@ -15,13 +18,22 @@ pub struct ChainUtxo {
 
 pub enum ChainClient {
     Electrum(ElectrumChainClient),
+    Core(CoreChainClient),
 }
 
 impl ChainClient {
-    pub fn new(chain_backend: &str, electrum_server: &str) -> Result<Self> {
+    pub fn new(
+        chain_backend: &str,
+        electrum_server: &str,
+        core_rpc_config: Option<CoreRpcConfig>,
+    ) -> Result<Self> {
         match chain_backend {
             "electrum" => Ok(Self::Electrum(ElectrumChainClient::new(electrum_server)?)),
-            "core" => Err(anyhow!("Bitcoin Core backend is not implemented yet")),
+            "core" => Ok(Self::Core(CoreChainClient::new(
+                core_rpc_config.ok_or_else(|| {
+                    anyhow!("Bitcoin Core backend selected without RPC configuration")
+                })?,
+            )?)),
             other => Err(anyhow!("Unsupported chain backend: {}", other)),
         }
     }
@@ -29,12 +41,14 @@ impl ChainClient {
     pub fn tip_height(&self) -> Result<u32> {
         match self {
             Self::Electrum(client) => client.tip_height(),
+            Self::Core(client) => client.tip_height(),
         }
     }
 
     pub fn estimate_fee_sat_per_vbyte(&self, number_blocks: usize) -> Result<f64> {
         let fee_rate_btc_per_kb = match self {
             Self::Electrum(client) => client.estimate_fee_btc_per_kb(number_blocks)?,
+            Self::Core(client) => client.estimate_fee_btc_per_kb(number_blocks)?,
         };
 
         Ok(normalize_fee_rate_sats_per_byte(fee_rate_btc_per_kb))
@@ -43,18 +57,21 @@ impl ChainClient {
     pub fn list_unspent(&self, script: &Script) -> Result<Vec<ChainUtxo>> {
         match self {
             Self::Electrum(client) => client.list_unspent(script),
+            Self::Core(client) => client.list_unspent(script),
         }
     }
 
     pub fn get_raw_tx(&self, txid: &Txid) -> Result<Vec<u8>> {
         match self {
             Self::Electrum(client) => client.get_raw_tx(txid),
+            Self::Core(client) => client.get_raw_tx(txid),
         }
     }
 
     pub fn broadcast_tx(&self, tx_bytes: &[u8]) -> Result<Txid> {
         match self {
             Self::Electrum(client) => client.broadcast_tx(tx_bytes),
+            Self::Core(client) => client.broadcast_tx(tx_bytes),
         }
     }
 }

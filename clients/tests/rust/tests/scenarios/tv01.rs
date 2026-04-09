@@ -5,6 +5,15 @@ use mercuryrustlib::{client_config::ClientConfig, CoinStatus, Wallet};
 
 use crate::common::{bitcoin_core, chain, utils};
 
+fn is_expected_early_broadcast_error(err_msg: &str) -> bool {
+    let err_msg = err_msg.to_lowercase();
+
+    err_msg.contains("non-final")
+        || err_msg.contains("non-bip68-final")
+        || err_msg.contains("locktime requirement not satisfied")
+        || err_msg.contains("non-mandatory-script-verify-flag")
+}
+
 async fn w1_transfer_to_w2(
     client_config: &ClientConfig,
     wallet1: &Wallet,
@@ -107,14 +116,9 @@ async fn w1_transfer_to_w2(
     assert!(result.is_err());
 
     let err = result.err().unwrap();
-
-    let electrs_msg_err = "Electrum server error: {\"code\":2,\"message\":\"non-final\"}";
-
-    let esplora_msg_err = r#"Electrum server error: "sendrawtransaction RPC error: {\"code\":-26,\"message\":\"non-final\"}""#;
-
     let err_msg = err.to_string();
 
-    assert!(err_msg == electrs_msg_err || err_msg == esplora_msg_err);
+    assert!(is_expected_early_broadcast_error(&err_msg), "{}", err_msg);
 
     let _ = bitcoin_core::generatetoaddress(990, &core_wallet_address.clone().unwrap())?;
 

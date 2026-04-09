@@ -1,12 +1,12 @@
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use bitcoin::Network;
 use config::Config;
 use sqlx::{migrate::MigrateDatabase, Sqlite, SqlitePool};
 
-use crate::chain::ChainClient;
+use crate::chain::{ChainClient, CoreRpcAuth, CoreRpcConfig};
 
 /// Config struct storing all StataChain Entity config
 pub struct ClientConfig {
@@ -59,16 +59,91 @@ fn check_and_set_settings() -> String {
     "Settings".to_string()
 }
 
+fn settings_path(settings_filename: &str) -> PathBuf {
+    let path = PathBuf::from(settings_filename);
+
+    if path.extension().is_some() || settings_filename.contains('/') {
+        path
+    } else {
+        PathBuf::from(format!("{}.toml", settings_filename))
+    }
+}
+
+fn resolve_relative_to_settings(settings_dir: &Path, value: Option<String>) -> Option<String> {
+    value.map(|value| {
+        let path = PathBuf::from(&value);
+
+        if path.is_absolute() {
+            value
+        } else {
+            settings_dir.join(path).to_string_lossy().into_owned()
+        }
+    })
+}
+
+fn build_core_rpc_config(
+    chain_backend: &str,
+    core_rpc_url: &Option<String>,
+    core_rpc_auth: &Option<String>,
+    core_rpc_user: &Option<String>,
+    core_rpc_password: &Option<String>,
+    core_rpc_cookie_file: &Option<String>,
+) -> Result<Option<CoreRpcConfig>> {
+    if chain_backend != "core" {
+        return Ok(None);
+    }
+
+    let url = core_rpc_url
+        .clone()
+        .ok_or_else(|| anyhow!("Bitcoin Core backend selected without core_rpc_url"))?;
+
+    let auth = match core_rpc_auth.as_deref() {
+        Some("none") => CoreRpcAuth::None,
+        Some("userpass") => CoreRpcAuth::UserPass {
+            username: core_rpc_user
+                .clone()
+                .ok_or_else(|| anyhow!("Bitcoin Core userpass auth selected without core_rpc_user"))?,
+            password: core_rpc_password.clone().ok_or_else(|| {
+                anyhow!("Bitcoin Core userpass auth selected without core_rpc_password")
+            })?,
+        },
+        Some("cookie") => CoreRpcAuth::CookieFile(PathBuf::from(
+            core_rpc_cookie_file.clone().ok_or_else(|| {
+                anyhow!("Bitcoin Core cookie auth selected without core_rpc_cookie_file")
+            })?,
+        )),
+        Some(other) => {
+            return Err(anyhow!(
+                "Unsupported Bitcoin Core auth strategy: {}",
+                other
+            ))
+        }
+        None => match (
+            core_rpc_user.as_ref(),
+            core_rpc_password.as_ref(),
+            core_rpc_cookie_file.as_ref(),
+        ) {
+            (Some(username), Some(password), _) => CoreRpcAuth::UserPass {
+                username: username.clone(),
+                password: password.clone(),
+            },
+            (_, _, Some(cookie_file)) => CoreRpcAuth::CookieFile(PathBuf::from(cookie_file)),
+            _ => CoreRpcAuth::None,
+        },
+    };
+
+    Ok(Some(CoreRpcConfig { url, auth }))
+}
+
 impl ClientConfig {
     pub async fn load() -> Self {
         let settings_filename = check_and_set_settings();
-        let settings_source = if settings_filename.ends_with(".toml")
-            || settings_filename.contains('/')
-        {
-            config::File::from(Path::new(&settings_filename))
-        } else {
-            config::File::with_name(&settings_filename)
-        };
+        let settings_path = settings_path(&settings_filename);
+        let settings_dir = settings_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let settings_source = config::File::from(settings_path.as_path());
 
         let settings = Config::builder()
             .add_source(settings_source)
@@ -79,13 +154,20 @@ impl ClientConfig {
         let chain_backend = settings
             .get_string("chain_backend")
             .unwrap_or_else(|_| "electrum".to_string());
-        let electrum_server = settings.get_string("electrum_server").unwrap();
-        let electrum_type = settings.get_string("electrum_type").unwrap();
+        let electrum_server = settings
+            .get_string("electrum_server")
+            .unwrap_or_default();
+        let electrum_type = settings
+            .get_string("electrum_type")
+            .unwrap_or_else(|_| "electrs".to_string());
         let core_rpc_url = settings.get_string("core_rpc_url").ok();
         let core_rpc_auth = settings.get_string("core_rpc_auth").ok();
         let core_rpc_user = settings.get_string("core_rpc_user").ok();
         let core_rpc_password = settings.get_string("core_rpc_password").ok();
-        let core_rpc_cookie_file = settings.get_string("core_rpc_cookie_file").ok();
+        let core_rpc_cookie_file = resolve_relative_to_settings(
+            &settings_dir,
+            settings.get_string("core_rpc_cookie_file").ok(),
+        );
         let network = settings.get_string("network").unwrap();
         let fee_rate_tolerance = settings.get_int("fee_rate_tolerance").unwrap() as f64;
         let database_file = settings.get_string("database_file").unwrap();
@@ -124,7 +206,21 @@ impl ClientConfig {
 
         // Create Electrum client
 
-        let chain_client = ChainClient::new(&chain_backend, electrum_server.as_str()).unwrap();
+        let core_rpc_config = build_core_rpc_config(
+            &chain_backend,
+            &core_rpc_url,
+            &core_rpc_auth,
+            &core_rpc_user,
+            &core_rpc_password,
+            &core_rpc_cookie_file,
+        )
+        .unwrap();
+        let chain_client = ChainClient::new(
+            &chain_backend,
+            electrum_server.as_str(),
+            core_rpc_config,
+        )
+        .unwrap();
 
         ClientConfig {
             statechain_entity,

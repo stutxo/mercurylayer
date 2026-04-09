@@ -13,6 +13,7 @@ services:
       - ./docker/bitcoin-regtest/bitcoin.conf:/srv/explorer/source/contrib/bitcoin-regtest-explorer.conf.in:ro
     environment:
       - CORS_ALLOW=*
+      - ELECTRS_ARGS=--cookie mercury:mercury
     command: /srv/explorer/run.sh bitcoin-regtest explorer
 
   vault:
