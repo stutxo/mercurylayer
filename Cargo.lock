@@ -333,8 +333,7 @@ dependencies = [
 [[package]]
 name = "bitcoin"
 version = "0.30.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1945a5048598e4189e239d3f809b19bdad4845c4b2ba400d304d2dcf26d2c462"
+source = "git+https://github.com/w0xlt/rust-bitcoin?branch=inquisition-bip448-support-0.30.2#fa687ecd59ed2de49c32a3b85115ce4024406766"
 dependencies = [
  "base64 0.13.1",
  "bech32 0.9.1",
@@ -382,8 +381,7 @@ checksum = "2dee39a0ee5b4095224a0cfc6bf4cc1baf0f9624b96b367e53b66d974e51d953"
 [[package]]
 name = "bitcoin-private"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73290177011694f38ec25e165d0387ab7ea749a4b81cd4c80dae5988229f7a57"
+source = "git+https://github.com/w0xlt/rust-bitcoin?branch=inquisition-bip448-support-0.30.2#fa687ecd59ed2de49c32a3b85115ce4024406766"
 
 [[package]]
 name = "bitcoin-units"
@@ -398,8 +396,7 @@ dependencies = [
 [[package]]
 name = "bitcoin_hashes"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d7066118b13d4b20b23645932dfb3a81ce7e29f95726c2036fa33cd7b092501"
+source = "git+https://github.com/w0xlt/rust-bitcoin?branch=inquisition-bip448-support-0.30.2#fa687ecd59ed2de49c32a3b85115ce4024406766"
 dependencies = [
  "bitcoin-private",
  "serde",
