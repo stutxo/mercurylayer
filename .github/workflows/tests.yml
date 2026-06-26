@@ -16,9 +16,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - backend: electrum
-            settings_file: regtest.Settings.toml
-          - backend: core
+          - backend: inquisition-core
             settings_file: regtest.core.Settings.toml
     env:
       RUSTUP_TOOLCHAIN: 1.92.0
@@ -43,15 +41,20 @@ jobs:
         run: |
           timeout 180 bash -c 'until curl -sf http://127.0.0.1:8000/info/config >/dev/null; do sleep 2; done'
 
+      - name: Wait for Inquisition node
+        run: |
+          container_id=$(docker ps -qf "name=mercurylayer-inquisition-1")
+          timeout 180 bash -c 'until docker exec "'"$container_id"'" bitcoin-cli -regtest -rpcuser=mercury -rpcpassword=mercury getblockchaininfo >/dev/null; do sleep 2; done'
+
       - name: Initialize regtest wallet
         run: |
-          container_id=$(docker ps -qf "name=esplora-container")
+          container_id=$(docker ps -qf "name=mercurylayer-inquisition-1")
           echo "Container ID: $container_id"
-          wallet_name="esplora_wallet"
-          docker exec "$container_id" cli createwallet "$wallet_name" || docker exec "$container_id" cli loadwallet "$wallet_name"
-          address=$(docker exec "$container_id" cli -rpcwallet="$wallet_name" getnewaddress)
+          wallet_name="mercury_test"
+          docker exec "$container_id" bitcoin-cli -regtest -rpcuser=mercury -rpcpassword=mercury createwallet "$wallet_name" || docker exec "$container_id" bitcoin-cli -regtest -rpcuser=mercury -rpcpassword=mercury loadwallet "$wallet_name"
+          address=$(docker exec "$container_id" bitcoin-cli -regtest -rpcuser=mercury -rpcpassword=mercury -rpcwallet="$wallet_name" getnewaddress)
           echo "New Wallet Address: $address"
-          docker exec "$container_id" cli generatetoaddress 101 "$address"
+          docker exec "$container_id" bitcoin-cli -regtest -rpcuser=mercury -rpcpassword=mercury generatetoaddress 101 "$address"
 
       - name: Run retained integration suite
         run: |
