@@ -1,6 +1,11 @@
 public_key_descriptor="wpkh([656a457c/84'/1'/0']tpubDCTXiLu1wcqUwQK6QMPPUTBzbRjsqMABzCvd5vG22KGoA95cTG1VkszQQJyx24UP8KEJVKrKRDRtUPodHVV59CfNqUkXjKUagowHJVSWq4C/0/*)#vn0n5xcd"
 network = "regtest" # bitcoin, testnet, testnet4, signet or regtest
-electrum_server = "tcp://localhost:50001"
+core_rpc_url = "http://localhost:18443"
+core_rpc_auth = "userpass"
+core_rpc_user = "mercury"
+core_rpc_password = "mercury"
+core_rpc_wallet = "mercury_tokens"
+core_rpc_wallet_create = true
 fee = 10000 # in satoshis
 confirmation_target = 2
 db_user = "postgres"

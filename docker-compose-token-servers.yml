@@ -90,7 +90,12 @@ services:
     environment:
       PUBLIC_KEY_DESCRIPTOR: wpkh([656a457c/84'/1'/0']tpubDCTXiLu1wcqUwQK6QMPPUTBzbRjsqMABzCvd5vG22KGoA95cTG1VkszQQJyx24UP8KEJVKrKRDRtUPodHVV59CfNqUkXjKUagowHJVSWq4C/0/*)#vn0n5xcd
       BITCOIN_NETWORK: regtest
-      ELECTRUM_SERVER: tcp://unused-electrum:50001
+      CORE_RPC_URL: http://inquisition:18443
+      CORE_RPC_AUTH: userpass
+      CORE_RPC_USER: mercury
+      CORE_RPC_PASSWORD: mercury
+      CORE_RPC_WALLET: mercury_tokens
+      CORE_RPC_WALLET_CREATE: true
       FEE: 10000
       CONFIRMATION_TARGET: 2
       DB_USER: postgres
@@ -101,7 +106,10 @@ services:
     ports:
       - "8001:8001"
     depends_on:
-      - db_server
+      db_server:
+        condition: service_started
+      inquisition:
+        condition: service_healthy
 
   mercury-server:
     build:

@@ -1,7 +1,5 @@
 use std::str::FromStr;
 
-use electrum_client::{ElectrumApi, ListUnspentRes};
-use miniscript::{Descriptor, DescriptorPublicKey};
 use rocket::{http::Status, response::status, serde::json::Json, State};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -13,16 +11,12 @@ pub async fn insert_new_token(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     token_id: &str,
     onchain_address: &str,
-    descriptor_checksum: &str,
-    onchain_address_index: i32,
 ) {
-    let query = "INSERT INTO tokens (token_id, onchain_address, descriptor_checksum, onchain_address_index, confirmed, spent) \
-                 VALUES ($1, $2, $3, $4, $5, $6)";
+    let query = "INSERT INTO tokens (token_id, onchain_address, confirmed, spent) \
+                 VALUES ($1, $2, $3, $4)";
     sqlx::query(query)
         .bind(token_id)
         .bind(onchain_address)
-        .bind(descriptor_checksum)
-        .bind(onchain_address_index)
         .bind(false)
         .bind(false)
         .execute(&mut **tx)
@@ -35,28 +29,28 @@ pub async fn token_gen(
     token_server_state: &State<TokenServerState>,
 ) -> status::Custom<Json<Value>> {
     let server_config = &token_server_state.server_config;
-    let descriptor =
-        Descriptor::<DescriptorPublicKey>::from_str(&server_config.public_key_descriptor).unwrap();
-    let network = miniscript::bitcoin::Network::from_str(server_config.network.as_str()).unwrap();
-    let checksum = &token_server_state.checksum;
 
     // Start a transaction
     let mut tx = token_server_state.pool.begin().await.unwrap();
 
-    // Get and increment index - The lock is released immediately
-    let index = {
-        let mut key_index = token_server_state.key_index.lock().unwrap();
-        *key_index += 1;
-        *key_index
-    }; // MutexGuard is dropped here
+    let onchain_address = match token_server_state
+        .core_rpc_client
+        .get_new_address(&server_config.token_wallet.name)
+        .await
+    {
+        Ok(address) => address,
+        Err(error) => {
+            let response_body = json!({
+                "message": format!("Error generating token payment address: {}", error)
+            });
+            return status::Custom(Status::InternalServerError, Json(response_body));
+        }
+    };
 
-    let derived_desc = descriptor.at_derivation_index(index as u32).unwrap();
-    let address = derived_desc.address(network).unwrap();
     let token_id = uuid::Uuid::new_v4().to_string();
-    let onchain_address = address.to_string();
 
     // Insert within the same transaction
-    insert_new_token(&mut tx, &token_id, &onchain_address, checksum, index as i32).await;
+    insert_new_token(&mut tx, &token_id, &onchain_address).await;
 
     // Commit the transaction
     tx.commit().await.unwrap();
@@ -174,27 +168,23 @@ pub async fn token_verify(
 
     let address = address.unwrap();
 
-    let electrum_client = server_config.get_electrum_client();
-
-    let utxo_list = electrum_client.script_list_unspent(&address.script_pubkey());
-
-    if utxo_list.is_err() {
-        let response_body = json!({
-            "message": "Error fetching UTXO list."
-        });
-        return status::Custom(Status::InternalServerError, Json(response_body));
-    }
-
-    let utxo_list = utxo_list.unwrap();
-
-    let mut utxo: Option<ListUnspentRes> = None;
-
-    for unspent in utxo_list {
-        if unspent.value == server_config.fee {
-            utxo = Some(unspent);
-            break;
+    let utxo_list = match token_server_state
+        .core_rpc_client
+        .list_unspent(&server_config.token_wallet.name, &address.to_string())
+        .await
+    {
+        Ok(utxos) => utxos,
+        Err(error) => {
+            let response_body = json!({
+                "message": format!("Error fetching UTXO list: {}", error)
+            });
+            return status::Custom(Status::InternalServerError, Json(response_body));
         }
-    }
+    };
+
+    let utxo = utxo_list
+        .into_iter()
+        .find(|unspent| unspent.amount_sats == server_config.fee);
 
     if utxo.is_none() {
         let response_body = json!({
@@ -217,30 +207,7 @@ pub async fn token_verify(
         return status::Custom(Status::Ok, Json(response_body));
     }
 
-    if utxo.height == 0 {
-        let response_body = json!({
-            "confirmed": false,
-            "spent": false,
-        });
-        return status::Custom(Status::Ok, Json(response_body));
-    }
-
-    let block_header = electrum_client.block_headers_subscribe_raw();
-
-    if block_header.is_err() {
-        let response_body = json!({
-            "message": "Error fetching block header."
-        });
-        return status::Custom(Status::InternalServerError, Json(response_body));
-    }
-
-    let block_header = block_header.unwrap();
-
-    let blockheight = block_header.height;
-
-    let confirmations = blockheight - utxo.height + 1;
-
-    let confirmed = confirmations as u32 >= server_config.confirmation_target;
+    let confirmed = utxo.confirmations >= server_config.confirmation_target;
 
     if !confirmed {
         let response_body = json!({

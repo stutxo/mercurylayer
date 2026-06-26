@@ -1,6 +1,8 @@
 use config::{Config as ConfigRs, File};
 use sqlx::postgres::PgConnectOptions;
-use std::env;
+use std::{env, path::PathBuf};
+
+use crate::core_rpc::{CoreRpcAuth, CoreRpcConfig, TokenWalletConfig};
 
 /// Config struct storing all StataChain Entity config
 pub struct ServerConfig {
@@ -8,8 +10,10 @@ pub struct ServerConfig {
     pub public_key_descriptor: String,
     /// Bitcoin network
     pub network: String,
-    /// Electrum client
-    pub electrum_server_url: String,
+    /// Bitcoin Core/Inquisition RPC connection.
+    pub core_rpc: CoreRpcConfig,
+    /// Dedicated token payment wallet configuration.
+    pub token_wallet: TokenWalletConfig,
     /// Token fee value (satoshis)
     pub fee: u64,
     /// Confirmation target
@@ -39,8 +43,67 @@ impl ServerConfig {
                 .unwrap_or_else(|_| settings.as_ref().unwrap().get_string(key).unwrap())
         };
 
-        let electrum_server_url = get_env_or_config("electrum_server", "ELECTRUM_SERVER");
-        // let electrum_client: electrum_client::Client = electrum_client::Client::new(electrum_server_url.as_str()).unwrap();
+        let get_optional_env_or_config = |key: &str, env_var: &str| -> Option<String> {
+            env::var(env_var).ok().or_else(|| {
+                settings
+                    .as_ref()
+                    .and_then(|config| config.get_string(key).ok())
+            })
+        };
+
+        let get_bool_env_or_config = |key: &str, env_var: &str, default: bool| -> bool {
+            get_optional_env_or_config(key, env_var)
+                .map(|value| value.parse::<bool>().unwrap())
+                .unwrap_or(default)
+        };
+
+        let core_rpc_url = get_env_or_config("core_rpc_url", "CORE_RPC_URL");
+        let core_rpc_auth = get_optional_env_or_config("core_rpc_auth", "CORE_RPC_AUTH");
+        let core_rpc_user = get_optional_env_or_config("core_rpc_user", "CORE_RPC_USER");
+        let core_rpc_password =
+            get_optional_env_or_config("core_rpc_password", "CORE_RPC_PASSWORD");
+        let core_rpc_cookie_file =
+            get_optional_env_or_config("core_rpc_cookie_file", "CORE_RPC_COOKIE_FILE");
+
+        let core_rpc_auth = match core_rpc_auth.as_deref() {
+            Some("none") => CoreRpcAuth::None,
+            Some("userpass") => CoreRpcAuth::UserPass {
+                username: core_rpc_user
+                    .clone()
+                    .expect("CORE_RPC_AUTH=userpass requires CORE_RPC_USER"),
+                password: core_rpc_password
+                    .clone()
+                    .expect("CORE_RPC_AUTH=userpass requires CORE_RPC_PASSWORD"),
+            },
+            Some("cookie") => CoreRpcAuth::CookieFile(PathBuf::from(
+                core_rpc_cookie_file
+                    .clone()
+                    .expect("CORE_RPC_AUTH=cookie requires CORE_RPC_COOKIE_FILE"),
+            )),
+            Some(other) => panic!("Unsupported Bitcoin Core auth strategy: {}", other),
+            None => match (
+                core_rpc_user.as_ref(),
+                core_rpc_password.as_ref(),
+                core_rpc_cookie_file.as_ref(),
+            ) {
+                (Some(username), Some(password), _) => CoreRpcAuth::UserPass {
+                    username: username.clone(),
+                    password: password.clone(),
+                },
+                (_, _, Some(cookie_file)) => CoreRpcAuth::CookieFile(PathBuf::from(cookie_file)),
+                _ => CoreRpcAuth::None,
+            },
+        };
+
+        let token_wallet = TokenWalletConfig {
+            name: get_optional_env_or_config("core_rpc_wallet", "CORE_RPC_WALLET")
+                .unwrap_or_else(|| "mercury_tokens".to_string()),
+            create: get_bool_env_or_config(
+                "core_rpc_wallet_create",
+                "CORE_RPC_WALLET_CREATE",
+                true,
+            ),
+        };
 
         ServerConfig {
             db_user: get_env_or_config("db_user", "DB_USER"),
@@ -55,16 +118,16 @@ impl ServerConfig {
                 "PUBLIC_KEY_DESCRIPTOR",
             ),
             network: get_env_or_config("network", "BITCOIN_NETWORK"),
-            electrum_server_url,
+            core_rpc: CoreRpcConfig {
+                url: core_rpc_url,
+                auth: core_rpc_auth,
+            },
+            token_wallet,
             fee: get_env_or_config("fee", "FEE").parse::<u64>().unwrap(),
             confirmation_target: get_env_or_config("confirmation_target", "CONFIRMATION_TARGET")
                 .parse::<u32>()
                 .unwrap(),
         }
-    }
-
-    pub fn get_electrum_client(&self) -> electrum_client::Client {
-        electrum_client::Client::new(&self.electrum_server_url.as_str()).unwrap()
     }
 
     pub fn build_postgres_connection_string(&self) -> PgConnectOptions {

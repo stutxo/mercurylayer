@@ -1,3 +1,4 @@
+mod core_rpc;
 mod endpoints;
 mod server_config;
 mod server_state;
