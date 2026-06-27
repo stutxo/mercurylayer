@@ -13,7 +13,6 @@ bip39 = "2.0"
 clap = { version = "4.2.5", features = ["derive"]}
 chrono = "0.4.31"
 config = "0.13.1"
-electrum-client = "0.18.0"
 hex = "0.4.3"
 rand = "0.8.5"
 reqwest = { version = "0.11.16", features = ["blocking", "json", "socks"] }
