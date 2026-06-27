@@ -1,7 +1,5 @@
 statechain_entity = "http://127.0.0.1:8000"
 chain_backend = "core"
-electrum_server = "tcp://localhost:50001"
-electrum_type = "electrs"
 core_rpc_url = "http://127.0.0.1:18443"
 core_rpc_auth = "userpass"
 core_rpc_user = "mercury"
