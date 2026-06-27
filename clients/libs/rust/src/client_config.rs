@@ -12,15 +12,11 @@ use crate::chain::{ChainClient, CoreRpcAuth, CoreRpcConfig};
 pub struct ClientConfig {
     /// Active lockbox server addresses
     pub statechain_entity: String,
-    /// Selected blockchain backend, e.g. `electrum` or `core`
+    /// Selected blockchain backend. Only `core` is supported.
     pub chain_backend: String,
     /// Active chain backend client
     pub chain_client: ChainClient,
-    /// Electrum server url
-    pub electrum_server_url: String,
-    /// Electrum server type (e.g. electrs, electrumx, etc.)
-    pub electrum_type: String,
-    /// Bitcoin Core RPC url for future Core backend support
+    /// Bitcoin Core RPC url
     pub core_rpc_url: Option<String>,
     /// Bitcoin Core RPC auth strategy, e.g. `userpass` or `cookie`
     pub core_rpc_auth: Option<String>,
@@ -82,17 +78,12 @@ fn resolve_relative_to_settings(settings_dir: &Path, value: Option<String>) -> O
 }
 
 fn build_core_rpc_config(
-    chain_backend: &str,
     core_rpc_url: &Option<String>,
     core_rpc_auth: &Option<String>,
     core_rpc_user: &Option<String>,
     core_rpc_password: &Option<String>,
     core_rpc_cookie_file: &Option<String>,
-) -> Result<Option<CoreRpcConfig>> {
-    if chain_backend != "core" {
-        return Ok(None);
-    }
-
+) -> Result<CoreRpcConfig> {
     let url = core_rpc_url
         .clone()
         .ok_or_else(|| anyhow!("Bitcoin Core backend selected without core_rpc_url"))?;
@@ -100,24 +91,19 @@ fn build_core_rpc_config(
     let auth = match core_rpc_auth.as_deref() {
         Some("none") => CoreRpcAuth::None,
         Some("userpass") => CoreRpcAuth::UserPass {
-            username: core_rpc_user
-                .clone()
-                .ok_or_else(|| anyhow!("Bitcoin Core userpass auth selected without core_rpc_user"))?,
+            username: core_rpc_user.clone().ok_or_else(|| {
+                anyhow!("Bitcoin Core userpass auth selected without core_rpc_user")
+            })?,
             password: core_rpc_password.clone().ok_or_else(|| {
                 anyhow!("Bitcoin Core userpass auth selected without core_rpc_password")
             })?,
         },
-        Some("cookie") => CoreRpcAuth::CookieFile(PathBuf::from(
-            core_rpc_cookie_file.clone().ok_or_else(|| {
-                anyhow!("Bitcoin Core cookie auth selected without core_rpc_cookie_file")
-            })?,
-        )),
-        Some(other) => {
-            return Err(anyhow!(
-                "Unsupported Bitcoin Core auth strategy: {}",
-                other
-            ))
+        Some("cookie") => {
+            CoreRpcAuth::CookieFile(PathBuf::from(core_rpc_cookie_file.clone().ok_or_else(
+                || anyhow!("Bitcoin Core cookie auth selected without core_rpc_cookie_file"),
+            )?))
         }
+        Some(other) => return Err(anyhow!("Unsupported Bitcoin Core auth strategy: {}", other)),
         None => match (
             core_rpc_user.as_ref(),
             core_rpc_password.as_ref(),
@@ -132,7 +118,17 @@ fn build_core_rpc_config(
         },
     };
 
-    Ok(Some(CoreRpcConfig { url, auth }))
+    Ok(CoreRpcConfig { url, auth })
+}
+
+fn ensure_supported_chain_backend(chain_backend: &str) -> Result<()> {
+    match chain_backend {
+        "core" => Ok(()),
+        "electrum" => Err(anyhow!(
+            "Electrum backend is no longer supported; use chain_backend = \"core\""
+        )),
+        other => Err(anyhow!("Unsupported chain backend: {}", other)),
+    }
 }
 
 impl ClientConfig {
@@ -153,13 +149,8 @@ impl ClientConfig {
         let statechain_entity = settings.get_string("statechain_entity").unwrap();
         let chain_backend = settings
             .get_string("chain_backend")
-            .unwrap_or_else(|_| "electrum".to_string());
-        let electrum_server = settings
-            .get_string("electrum_server")
-            .unwrap_or_default();
-        let electrum_type = settings
-            .get_string("electrum_type")
-            .unwrap_or_else(|_| "electrs".to_string());
+            .unwrap_or_else(|_| "core".to_string());
+        ensure_supported_chain_backend(&chain_backend).unwrap();
         let core_rpc_url = settings.get_string("core_rpc_url").ok();
         let core_rpc_auth = settings.get_string("core_rpc_auth").ok();
         let core_rpc_user = settings.get_string("core_rpc_user").ok();
@@ -204,10 +195,9 @@ impl ClientConfig {
             _ => panic!("Invalid network name"),
         };
 
-        // Create Electrum client
+        // Create Core/Inquisition chain client
 
         let core_rpc_config = build_core_rpc_config(
-            &chain_backend,
             &core_rpc_url,
             &core_rpc_auth,
             &core_rpc_user,
@@ -215,19 +205,12 @@ impl ClientConfig {
             &core_rpc_cookie_file,
         )
         .unwrap();
-        let chain_client = ChainClient::new(
-            &chain_backend,
-            electrum_server.as_str(),
-            core_rpc_config,
-        )
-        .unwrap();
+        let chain_client = ChainClient::new(&chain_backend, core_rpc_config).unwrap();
 
         ClientConfig {
             statechain_entity,
             chain_backend,
             chain_client,
-            electrum_server_url: electrum_server,
-            electrum_type,
             core_rpc_url,
             core_rpc_auth,
             core_rpc_user,

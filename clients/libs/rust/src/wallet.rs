@@ -11,18 +11,10 @@ pub async fn create_wallet(name: &str, client_config: &ClientConfig) -> Result<W
     let blockheight = client_config.chain_client.tip_height()?;
 
     let chain_backend = client_config.chain_backend.to_string();
-    let chain_endpoint = match chain_backend.as_str() {
-        "electrum" => client_config.electrum_server_url.to_string(),
-        "core" => client_config
-            .core_rpc_url
-            .clone()
-            .expect("Bitcoin Core backend selected without core_rpc_url"),
-        other => panic!("Unsupported chain backend: {}", other),
-    };
-    let chain_type = match chain_backend.as_str() {
-        "electrum" => Some(client_config.electrum_type.to_string()),
-        _ => None,
-    };
+    let chain_endpoint = client_config
+        .core_rpc_url
+        .clone()
+        .expect("Bitcoin Core backend selected without core_rpc_url");
 
     let notifications = false;
     let tutorials = false;
@@ -38,7 +30,7 @@ pub async fn create_wallet(name: &str, client_config: &ClientConfig) -> Result<W
         torStatechainEntityApi: None,
         chainBackend: chain_backend.clone(),
         chainUrl: chain_endpoint.clone(),
-        chainType: chain_type,
+        chainType: None,
         notifications,
         tutorials,
     };

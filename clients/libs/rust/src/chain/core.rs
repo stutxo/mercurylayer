@@ -4,9 +4,7 @@ use std::path::PathBuf;
 use std::thread;
 
 use anyhow::{anyhow, Context, Result};
-use bitcoin::{
-    consensus::deserialize, Amount, Denomination, OutPoint, Script, Transaction, Txid,
-};
+use bitcoin::{consensus::deserialize, Amount, Denomination, OutPoint, Script, Transaction, Txid};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -140,16 +138,12 @@ impl CoreChainClient {
     {
         self.run_async(async {
             let response = self
-                .apply_auth(
-                    self.client
-                        .post(&self.config.url)
-                        .json(&json!({
-                            "jsonrpc": "1.0",
-                            "id": "mercury-client",
-                            "method": method,
-                            "params": params,
-                        })),
-                )?
+                .apply_auth(self.client.post(&self.config.url).json(&json!({
+                    "jsonrpc": "1.0",
+                    "id": "mercury-client",
+                    "method": method,
+                    "params": params,
+                })))?
                 .send()
                 .await
                 .with_context(|| format!("Bitcoin Core RPC {} request failed", method))?;
@@ -190,10 +184,7 @@ impl CoreChainClient {
         })
     }
 
-    fn apply_auth(
-        &self,
-        request: reqwest::RequestBuilder,
-    ) -> Result<reqwest::RequestBuilder> {
+    fn apply_auth(&self, request: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
         match &self.config.auth {
             CoreRpcAuth::None => Ok(request),
             CoreRpcAuth::UserPass { username, password } => {
@@ -201,7 +192,10 @@ impl CoreChainClient {
             }
             CoreRpcAuth::CookieFile(path) => {
                 let cookie = std::fs::read_to_string(path).with_context(|| {
-                    format!("failed to read Bitcoin Core RPC cookie file {}", path.display())
+                    format!(
+                        "failed to read Bitcoin Core RPC cookie file {}",
+                        path.display()
+                    )
                 })?;
                 let (username, password) = cookie
                     .trim()
@@ -288,11 +282,9 @@ where
         Value::String(string) => Amount::from_str_in(&string, Denomination::Bitcoin)
             .map(|amount| amount.to_sat())
             .map_err(serde::de::Error::custom),
-        other => {
-            Err(serde::de::Error::custom(format!(
-                "unexpected BTC amount value {}",
-                other
-            )))
-        }
+        other => Err(serde::de::Error::custom(format!(
+            "unexpected BTC amount value {}",
+            other
+        ))),
     }
 }
