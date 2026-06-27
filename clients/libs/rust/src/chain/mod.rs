@@ -1,6 +1,6 @@
 mod core;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use bitcoin::{Script, Txid};
 
 use self::core::CoreChainClient;
@@ -19,16 +19,10 @@ pub struct ChainClient {
 }
 
 impl ChainClient {
-    pub fn new(chain_backend: &str, core_rpc_config: CoreRpcConfig) -> Result<Self> {
-        match chain_backend {
-            "core" => Ok(Self {
-                core: CoreChainClient::new(core_rpc_config)?,
-            }),
-            "electrum" => Err(anyhow!(
-                "Electrum backend is no longer supported; use chain_backend = \"core\""
-            )),
-            other => Err(anyhow!("Unsupported chain backend: {}", other)),
-        }
+    pub fn new(core_rpc_config: CoreRpcConfig) -> Result<Self> {
+        Ok(Self {
+            core: CoreChainClient::new(core_rpc_config)?,
+        })
     }
 
     pub fn tip_height(&self) -> Result<u32> {

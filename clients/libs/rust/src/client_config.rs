@@ -124,9 +124,6 @@ fn build_core_rpc_config(
 fn ensure_supported_chain_backend(chain_backend: &str) -> Result<()> {
     match chain_backend {
         "core" => Ok(()),
-        "electrum" => Err(anyhow!(
-            "Electrum backend is no longer supported; use chain_backend = \"core\""
-        )),
         other => Err(anyhow!("Unsupported chain backend: {}", other)),
     }
 }
@@ -205,7 +202,7 @@ impl ClientConfig {
             &core_rpc_cookie_file,
         )
         .unwrap();
-        let chain_client = ChainClient::new(&chain_backend, core_rpc_config).unwrap();
+        let chain_client = ChainClient::new(core_rpc_config).unwrap();
 
         ClientConfig {
             statechain_entity,
