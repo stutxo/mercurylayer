@@ -6,17 +6,17 @@
 
 ```bash
 $ cd mercurylayer
-$ docker compose -f docker-compose-token-servers.yml up --build
+$ docker compose -f docker-compose-token-servers.yml --profile token-server up --build
 ```
 
 ### Initialize the regtest wallet
 
 ```bash
-$ container_id=$(docker ps -qf "name=esplora-container")
-$ wallet_name="esplora_wallet"
-$ docker exec $container_id cli createwallet $wallet_name
-$ address=$(docker exec $container_id cli getnewaddress $wallet_name)
-$ docker exec $container_id cli generatetoaddress 101 "$address"
+$ bitcoin_cli="bitcoin-cli -regtest -rpcuser=mercury -rpcpassword=mercury"
+$ docker exec mercurylayer-inquisition-1 $bitcoin_cli createwallet mercury_test || \
+    docker exec mercurylayer-inquisition-1 $bitcoin_cli loadwallet mercury_test
+$ address=$(docker exec mercurylayer-inquisition-1 $bitcoin_cli -rpcwallet=mercury_test getnewaddress)
+$ docker exec mercurylayer-inquisition-1 $bitcoin_cli generatetoaddress 101 "$address"
 ```
 
 ### Run the Rust integration suite

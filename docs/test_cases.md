@@ -11,7 +11,7 @@
 05. Confirm the amount is correct
 06. Confirm there is a statechain id
 07. Send funds to the address of the new coin
-08. Wait for Electrs to index this deposit transaction
+08. Wait for the configured Core/Inquisition backend to observe this deposit transaction
 09. Confirm that the coin status changed to `IN_MEMPOOL` status
 11. Try to transfer the coin. It must fail.
 12. Generate a new block
@@ -38,7 +38,7 @@
 03. Generate wallet 1 deposit address with this token (2x)
 04. Send funds to the address of the new coin (2x)
 05. Generate blocks enough to confirm the coin (according to the client's Settings.toml)
-06. Wait for Electrs to index this deposit transaction
+06. Wait for the configured Core/Inquisition backend to observe this deposit transaction
 07. Confirm wallet 1 has two coins
 08. Confirm these two coins have the `CONFIRMED` status 
 09. Wallet 2 generates a new transfer address.
@@ -69,7 +69,7 @@
 03. Generate wallet 1 deposit address with this token
 04. Send funds to the address of the new coin
 05. Generate blocks enough to confirm the coin (according to the client's Settings.toml)
-06. Wait for Electrs to index this deposit transaction
+06. Wait for the configured Core/Inquisition backend to observe this deposit transaction
 07. Confirm wallet 1 has a coin
 08. Wallet 2 generates a new transfer address.
 09. Wallet 1 calls `transfer/send` and `sign/first` but not `sign/second` using the coin' statechain id and the transfer address of wallet 2
@@ -86,7 +86,7 @@
 02. Create a token
 03. Generate wallet 1 deposit address with this token
 04. Generate blocks enough to confirm the coin (according to the client's Settings.toml)
-05. Wait for Electrs to index this deposit transaction
+05. Wait for the configured Core/Inquisition backend to observe this deposit transaction
 06. Confirm that there is a coin in `CONFIRMED` status in wallet 1
 07. Wallet 2 generates a new transfer address.
 08. Wallet 1 sends the coin to this wallet 2's address.

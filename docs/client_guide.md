@@ -2,7 +2,7 @@
 
 These instructions describe setting up and using the standalone Rust client to send testnet coins on Mercury Layer.
 
-This guide describes the use of the client implimentations to deposit, transfer and withdraw bitcoins via a test enviroment. The clients communicate with the bitcoin network via an Electrum server, where the electrum server type and URL need to be specified in the client config. 
+This guide describes the use of the client implimentations to deposit, transfer and withdraw bitcoins via a test enviroment. The clients communicate with the bitcoin network through a Bitcoin Core/Inquisition RPC endpoint configured in the client settings.
 
 For the purposes of the examples in this guide, a version of the bitcoin signet is used to simulate the main bitcoin network. 
 
@@ -36,20 +36,25 @@ Then change directory to the standalone client:
 cd /clients/apps/rust
 ```
 
-In this directory is the `Settings.toml` file for the client. This needs to be edited (using any text editor, e.g. vi or nano) to set the mercury server endpoint and Electrum server URL. 
+In this directory is the `Settings.toml` file for the client. This needs to be edited (using any text editor, e.g. vi or nano) to set the mercury server endpoint and Bitcoin Core/Inquisition RPC connection.
 
 For the purposes of demonstration, use the following `Settings.toml`: 
 
 ```
 statechain_entity = "http://test.mercurylayer.com:8500"
-electrum_server = "tcp://mutinynet.com:50001"
-electrum_type = "electrs"
+chain_backend = "core"
+core_rpc_url = "http://127.0.0.1:38332"
+core_rpc_auth = "userpass"
+core_rpc_user = "mercury"
+core_rpc_password = "mercury"
 network = "signet"
 fee_rate_tolerance = 5
 database_file="wallet.db"
 confirmation_target = 2
 max_fee_rate = 1
 ```
+
+The Core/Inquisition RPC endpoint must be your own signet node or another trusted node you operate; the values above assume a local signet RPC service.
 
 The test mercury key server URL is: `http://test.mercurylayer.com:8500`
 
@@ -64,7 +69,7 @@ cargo run create-wallet <wallet_name>
 Running this with name `test_wallet` should return an object like:
 
 ```
-Wallet created: Wallet { name: "test_wallet", mnemonic: "core parade visual doctor region beach approve slim refuse drip rigid develop", version: "0.1.0", state_entity_endpoint: "http://test.mercurylayer.com:8500", chain_backend: "electrum", chain_endpoint: "tcp://mutinynet.com:50001", network: "signet", blockheight: 2820795, initlock: 25920, interval: 6, tokens: [], activities: [], coins: [] }
+Wallet created: Wallet { name: "test_wallet", mnemonic: "core parade visual doctor region beach approve slim refuse drip rigid develop", version: "0.1.0", state_entity_endpoint: "http://test.mercurylayer.com:8500", chain_backend: "core", chain_endpoint: "http://127.0.0.1:38332", network: "signet", blockheight: 2820795, initlock: 25920, interval: 6, tokens: [], activities: [], coins: [] }
 ```
 
 In order to use the mercury layer key server, an access token is required in order to create a shared key. For the test server, tokens can be generated as follows from the command line:

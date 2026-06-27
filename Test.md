@@ -1,15 +1,15 @@
 # Running Rust tests
 
-1. `$ docker compose -f docker-compose-token-servers.yml up --build` to run the Mercury and token servers. This also starts a Esplora node.
+1. `$ docker compose -f docker-compose-token-servers.yml --profile token-server up --build` to run the Mercury and token servers. This also starts a Bitcoin Inquisition regtest node.
 
 2. Run the commands below to start the Bitcoin network.
 
 ```bash
-$ container_id=$(docker ps -qf "name=esplora-container")
-$ wallet_name="esplora_wallet"
-$ docker exec $container_id cli createwallet $wallet_name
-$ address=$(docker exec $container_id cli getnewaddress $wallet_name)
-$ docker exec $container_id cli generatetoaddress 101 "$address"
+$ bitcoin_cli="bitcoin-cli -regtest -rpcuser=mercury -rpcpassword=mercury"
+$ docker exec mercurylayer-inquisition-1 $bitcoin_cli createwallet mercury_test || \
+    docker exec mercurylayer-inquisition-1 $bitcoin_cli loadwallet mercury_test
+$ address=$(docker exec mercurylayer-inquisition-1 $bitcoin_cli -rpcwallet=mercury_test getnewaddress)
+$ docker exec mercurylayer-inquisition-1 $bitcoin_cli generatetoaddress 101 "$address"
 ```
 
 3. `cd clients/tests/rust/` 
@@ -26,5 +26,5 @@ $ docker exec $container_id cli generatetoaddress 101 "$address"
 
 # Other Environments
 
-The `docker compose -f docker-compose-token-servers.yml` file can be used to build a Mercury Layer infrastructure in test or production environments as it has all the necessary servers including Lockbox, Electrs/Esplora, Token, and Mercury.
+The `docker compose -f docker-compose-token-servers.yml` file can be used to build a Mercury Layer test infrastructure with Lockbox, Token, Mercury, and Bitcoin Inquisition services.
 The default values ​​of this file however must be changed.

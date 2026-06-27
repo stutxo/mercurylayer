@@ -51,7 +51,13 @@ services:
     environment:
       PUBLIC_KEY_DESCRIPTOR: wpkh([656a457c/84'/1'/0']tpubDCTXiLu1wcqUwQK6QMPPUTBzbRjsqMABzCvd5vG22KGoA95cTG1VkszQQJyx24UP8KEJVKrKRDRtUPodHVV59CfNqUkXjKUagowHJVSWq4C/0/*)#vn0n5xcd
       BITCOIN_NETWORK: mainnet
-      ELECTRUM_SERVER: tcp://blockstream.info:50001
+      CORE_RPC_URL: ${CORE_RPC_URL:?set CORE_RPC_URL}
+      CORE_RPC_AUTH: ${CORE_RPC_AUTH:?set CORE_RPC_AUTH to userpass or cookie}
+      CORE_RPC_USER: ${CORE_RPC_USER:-}
+      CORE_RPC_PASSWORD: ${CORE_RPC_PASSWORD:-}
+      CORE_RPC_COOKIE_FILE: ${CORE_RPC_COOKIE_FILE:-}
+      CORE_RPC_WALLET: ${CORE_RPC_WALLET:-mercury_tokens}
+      CORE_RPC_WALLET_CREATE: ${CORE_RPC_WALLET_CREATE:-false}
       FEE: 10000
       CONFIRMATION_TARGET: 2
       DB_USER: postgres
