@@ -37,13 +37,13 @@ jobs:
             push: true
             tags: mercurylayer/mercury-server:${{ env.COMMIT_HASH }}
         -
-          name: Build and push for token-server
+          name: Build and push for token-server-v2
           uses: docker/build-push-action@v5
           with:
             context: .
-            file: ./token-server/Dockerfile
+            file: ./token-server-v2/Dockerfile
             push: true
-            tags: mercurylayer/token-server:${{ env.COMMIT_HASH }}
+            tags: mercurylayer/token-server-v2:${{ env.COMMIT_HASH }}
         -
           name: Build and push for mercury-explorer
           uses: docker/build-push-action@v5

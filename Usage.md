@@ -6,7 +6,7 @@
 
 ```bash
 $ cd mercurylayer
-$ docker compose -f docker-compose-token-servers.yml --profile token-server up --build
+$ docker compose -f docker-compose-token-servers.yml up --build
 ```
 
 ### Initialize the regtest wallet

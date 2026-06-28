@@ -81,8 +81,6 @@ services:
       - "18080:18080"
 
   token-server-v2:
-    profiles:
-      - token-server
     build:
       context: .
       dockerfile: ./token-server-v2/Dockerfile
@@ -119,6 +117,7 @@ services:
     depends_on:
       - db_server
       - lockbox
+      - token-server-v2
     environment:
       BITCOIN_NETWORK: regtest
       LOCKHEIGHT_INIT: 1000
@@ -142,6 +141,7 @@ services:
         "fee": 0.0001,
         "unit": "BTC"
         }'
+      TOKEN_SERVER_URL: http://token-server-v2:8001
     ports:
       - "8000:8000"
 

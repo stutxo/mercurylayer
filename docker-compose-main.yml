@@ -46,7 +46,7 @@ services:
       - "18080:18080"
 
   token-server-v2:
-    image: mercurylayer/token-server:latest
+    image: mercurylayer/token-server-v2:latest
     container_name: mercurylayer-token-server-v2-1
     environment:
       PUBLIC_KEY_DESCRIPTOR: wpkh([656a457c/84'/1'/0']tpubDCTXiLu1wcqUwQK6QMPPUTBzbRjsqMABzCvd5vG22KGoA95cTG1VkszQQJyx24UP8KEJVKrKRDRtUPodHVV59CfNqUkXjKUagowHJVSWq4C/0/*)#vn0n5xcd

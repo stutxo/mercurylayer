@@ -1,6 +1,6 @@
 # Running Rust tests
 
-1. `$ docker compose -f docker-compose-token-servers.yml --profile token-server up --build` to run the Mercury and token servers. This also starts a Bitcoin Inquisition regtest node.
+1. `$ docker compose -f docker-compose-token-servers.yml up --build` to run Mercury and token-server-v2. This also starts a Bitcoin Inquisition regtest node.
 
 2. Run the commands below to start the Bitcoin network.
 
@@ -26,5 +26,5 @@ $ docker exec mercurylayer-inquisition-1 $bitcoin_cli generatetoaddress 101 "$ad
 
 # Other Environments
 
-The `docker compose -f docker-compose-token-servers.yml` file can be used to build a Mercury Layer test infrastructure with Lockbox, Token, Mercury, and Bitcoin Inquisition services.
+The `docker compose -f docker-compose-token-servers.yml` file can be used to build a Mercury Layer test infrastructure with Lockbox, token-server-v2, Mercury, and Bitcoin Inquisition services.
 The default values ​​of this file however must be changed.

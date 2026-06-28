@@ -23,7 +23,7 @@ use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
 use tokio::time::sleep;
 
-use crate::common::lockbox;
+use crate::common::{bitcoin_core, lockbox};
 
 pub const MERCURY_URL: &str = "http://127.0.0.1:8000";
 const MERCURY_DATABASE_URL: &str = "postgres://postgres:postgres@127.0.0.1:5432/mercury";
@@ -152,6 +152,7 @@ pub async fn create_deposited_coin(client: &Client) -> Result<(Wallet, Coin)> {
 
         let mut coin = wallet.get_new_coin()?;
         let token = get_token(client).await?;
+        pay_token_if_required(&token)?;
         let deposit_msg1 = deposit::create_deposit_msg1(&coin, &token.token_id)?;
 
         match deposit_init(client, &deposit_msg1).await {
@@ -172,6 +173,25 @@ pub async fn create_deposited_coin(client: &Client) -> Result<(Wallet, Coin)> {
     Err(anyhow!(
         "failed to create a deposited coin with a unique auth key after 32 attempts"
     ))
+}
+
+fn pay_token_if_required(token: &TokenResponse) -> Result<()> {
+    if token.payment_method != "onchain" {
+        return Ok(());
+    }
+
+    let deposit_address = token
+        .deposit_address
+        .as_ref()
+        .context("onchain token response missing deposit_address")?;
+    let amount = u32::try_from(token.fee).context("token fee does not fit in u32")?;
+
+    bitcoin_core::sendtoaddress(amount, deposit_address)?;
+
+    let mining_address = bitcoin_core::getnewaddress()?;
+    bitcoin_core::generatetoaddress(token.confirmation_target as u32, &mining_address)?;
+
+    Ok(())
 }
 
 pub async fn insert_statechain_transfer_row(
