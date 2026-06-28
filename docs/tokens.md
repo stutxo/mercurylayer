@@ -1,65 +1,119 @@
 # Token payment system
 
-To enable many ways to give permission to deposit coins, the deposit permission system will utilize tokens that can be issued separately to the deposit process and then redeemed on deposit. This will enable fees to be paid via any mechanism and also managed separately. 
+Deposit tokens authorize creation of a statechain deposit. In production, tokens are paid onchain through `token-server-v2`. The token server does not sign transactions and does not hold private keys; it uses a Bitcoin Core/Inquisition watch-only descriptor wallet to generate receive addresses and verify payment UTXOs.
 
-## Tokens
+## Components
 
-**Deposit tokens** will be managed via a new table `tokens` (which is a separate DB to the main `mercury` DB so separate permissions can be applied). This table will have 4 columns: `token_id` (Uuid), `processor_id` (string), `confirmed` (boolean) and `spent` (boolean). 
+- Mercury server exposes `/deposit/get_token` and `/deposit/init/pod`.
+- `token-server-v2` exposes `/token/token_gen` and `/token/token_verify/<token_id>`.
+- Bitcoin Core/Inquisition provides token payment addresses and UTXO confirmation status through wallet RPC.
+- The token database stores `token_id`, `onchain_address`, `confirmed`, and `spent`.
 
-The `tokens` table will be interacted with via two new mercury server functions: `token_init` and `token_verify`. 
+## Token generation
 
-The `token_init` function will take no arguments. This function will generate a new random `token_id` (Uuid) and then call the payment processor API (`https://docs.swiss-bitcoin-pay.ch/checkout`) with this as the label and the fixed configured fee. The payment processor API will then return a JSON object containing the `processor_id`. 
-This `processor_id` will then be added to the token DB with the `token_id` and `confirmed = false` and `spent = false`. The `token_id` and `processor_id` are returned to the client. 
+Clients request tokens through Mercury:
 
-The client/wallet then retrieves/displays the payment information (Lightning invoice and on-chain address) from the payment processor API using `processor_id` (e.g. `https://checkout.swiss-bitcoin-pay.ch/{processor_id}`). 
+```text
+GET /deposit/get_token
+```
 
-The `token_verify` function will take one argument (`token_id`) and return a boolean (`valid`). This function will first query the `tokens` table with the `token_id`. If no entry found, it will return an error. If a row is found, it will return false if `spent = true`. If `spent = false` and `confirmed = true` it will return `true`. If `spent = false` and `confirmed = false` it will then query the payment processor API with the `processor_id` to verify payment: if confirmed it will update `confirmed = true` and return `true`. 
+If `TOKEN_SERVER_URL` is configured, Mercury calls `token-server-v2`:
 
-### Deposit process
+```text
+GET /token/token_gen
+```
 
-The new deposit process will verify that a valid (i.e. confirmed and unspent) token is in the `tokens` table before creating a `statechain_id`. 
-When `deposit_init` is called, a `token_id` must now be supplied as an argument. This function will then query the `tokens` table with the `token_id`. 
+`token-server-v2` then:
+
+1. Gets a new address from the configured Core/Inquisition token wallet.
+2. Generates a UUID `token_id`.
+3. Inserts a token row with `confirmed = false` and `spent = false`.
+4. Returns the token payment details.
+
+Mercury returns the token response to the client in this shape:
+
+```json
+{
+  "token_id": "...",
+  "payment_method": "onchain",
+  "deposit_address": "...",
+  "fee": 10000,
+  "confirmation_target": 2
+}
+```
+
+For local non-mainnet development, if `TOKEN_SERVER_URL` is not configured, Mercury can issue a free token directly from its own database. Free token generation is not supported on mainnet.
+
+## Token payment and verification
+
+The client pays exactly `fee` sats to `deposit_address` and waits for the configured `confirmation_target` confirmations.
+
+During verification, `token-server-v2`:
+
+1. Loads the token row by `token_id`.
+2. Returns the stored status immediately if the token is already confirmed or spent.
+3. Validates the stored onchain address against the configured Bitcoin network.
+4. Calls Core/Inquisition wallet RPC `listunspent` for that address.
+5. Looks for a UTXO with `amount_sats == fee`.
+6. Checks that the UTXO has at least `confirmation_target` confirmations.
+7. Marks the token confirmed once payment is found with enough confirmations.
+
+The verification response is:
+
+```json
+{
+  "confirmed": true,
+  "spent": false
+}
+```
+
+or:
+
+```json
+{
+  "confirmed": false,
+  "spent": false
+}
+```
+
+## Deposit process
+
+When a client initializes a deposit, it signs the `token_id` with its auth key and sends the signed token to Mercury:
+
+```text
+POST /deposit/init/pod
+```
+
+Mercury verifies the auth signature over the `token_id`. If `TOKEN_SERVER_URL` is configured, Mercury then calls `token-server-v2`:
+
+```text
+GET /token/token_verify/<token_id>
+```
+
+The deposit proceeds only if the token is confirmed and unspent. After a successful deposit, Mercury marks the token spent in its database.
 
 ## Sequence
 
 ```mermaid
 sequenceDiagram
-    participant Server
     participant Client
-    Client->>Server: GET /token/init
-    note over Server: Get processor_id from payment processor
-    note over Server: Generate random token_id
-    note over Server: Add to Token DB
-    Server-->>Client: {token_id, processor_id}
-    note over Client: Use processor_id to get payment details from processor API
-    note over Client: Display invoice/address
-    note over Client: Enable user to manually enter different token_id 
-    note over Client: Wait until payment received redirect or user continue button pressed
-    Client->>Server: GET /token/verify/{token_id}
-    note over Server: Get processor_id from DB
-    note over Server: Verify payment via processor API with processor_id
-    note over Server: Update DB with confirmation
-    Server-->>Client: {true/false}
-    note over Client: If true, continue with /deposit/init/pod with token_id
-    note over Client: If false, 'Payment not verified' message
+    participant Mercury
+    participant TokenServer as token-server-v2
+    participant Core as Bitcoin Core/Inquisition
+
+    Client->>Mercury: GET /deposit/get_token
+    Mercury->>TokenServer: GET /token/token_gen
+    TokenServer->>Core: getnewaddress
+    TokenServer-->>Mercury: {token_id, deposit_address, fee, confirmation_target}
+    Mercury-->>Client: TokenResponse
+    Client->>Core: Pay fee sats to deposit_address
+    Client->>Mercury: POST /deposit/init/pod {token_id, auth_key, signed_token_id}
+    Mercury->>TokenServer: GET /token/token_verify/{token_id}
+    TokenServer->>Core: listunspent for deposit_address
+    TokenServer-->>Mercury: {confirmed, spent}
+    Mercury-->>Client: Deposit init response or token error
 ```
 
-## Wallet token management
+## Removed legacy flow
 
-Clients (wallets) keep the wallet state in the named wallet JSON object. This object contains a `tokens` array, where each element has the fields:
-
-```
-{
-token_id,
-processor_id,
-confirmed,
-spent
-}
-```
-
-The logic for initialising a statecoin deposit proceeds as follows:
-
-1. First deposit screen: user selects statecoin deposit amount
-2. Wallet accesses `tokens` array. If there is a `token_id` with `confirmed = true` and `spent = false`, then deposit init is performed using this `token_id`. Once deposit init has completed, that `token_id` in the tokens array is updated as status `spent = true` and the wallet saved.
-3. If there is a `token_id` with `confirmed = false` and `spent = false`, then the `token/token_verify/<token_id>` endpoint is called. If it returns `true`, then update `token_id` entry in `tokens` to `confirmed = true` and save the wallet. Then deposit init is performed using this `token_id`. Once deposit init has completed, that `token_id` in the tokens array is updated as status `spent = true` and the wallet saved. If `token/token_verify/<token_id>` returns `false`, go to next step.
-4. Otherwise, call `token/token_init` endpoint. Save returned `token_id` and `processor_id` in `tokens` array with `confirmed = false` and `spent = false`. Use `processor_id` to get invoice and fee address from the payment processor and display (as QR codes) in the wallet UI. Then poll `token/token_verify/<token_id>` until it returns `true`, and then update `token_id` entry in `tokens` to `confirmed = true` and save the wallet. Then deposit init is performed using this `token_id`. Once deposit init has completed, that `token_id` in the tokens array is updated as status `spent = true` and the wallet saved.
+The current token flow does not use a payment processor, `processor_id`, Lightning invoice, or `token_init` endpoint. Token payment verification is based on Core/Inquisition wallet UTXOs for the generated onchain address.
