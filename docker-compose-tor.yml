@@ -112,7 +112,7 @@ services:
     command: >
       --hidden-service /var/lib/tor/hidden_service
       --hidden-service-dir /var/lib/tor/hidden_service
-      --hidden-service-port 80=rest_server:8000
+      --hidden-service-port 80=mercury-server:8000
     depends_on:
       - mercury-server
 

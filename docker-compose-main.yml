@@ -129,7 +129,7 @@ services:
     container_name: tor_service
     restart: unless-stopped
     volumes:
-      - ./tor:/etc/tor:rw
+      - ./torrc:/etc/tor/torrc:ro
       - ./hidden_service:/var/lib/tor/hidden_service
     entrypoint: /usr/bin/tor -f /etc/tor/torrc
     depends_on:
