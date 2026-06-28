@@ -1,34 +1,6 @@
 use secp256k1::{PublicKey, XOnlyPublicKey};
 use sqlx::Row;
 
-pub async fn get_token_status(pool: &sqlx::PgPool, token_id: &str) -> Option<bool> {
-    let row = sqlx::query(
-        "SELECT confirmed, spent \
-        FROM public.tokens \
-        WHERE token_id = $1",
-    )
-    .bind(&token_id)
-    .fetch_one(pool)
-    .await;
-
-    if row.is_err() {
-        match row.err().unwrap() {
-            sqlx::Error::RowNotFound => return None,
-            _ => return None, // this case should be treated as unexpected error
-        }
-    }
-
-    let row = row.unwrap();
-
-    let confirmed: bool = row.get(0);
-    let spent: bool = row.get(1);
-    if confirmed && !spent {
-        return Some(true);
-    } else {
-        return Some(false);
-    }
-}
-
 pub struct TokenInfo {
     pub confirmed: bool,
     pub spent: bool,

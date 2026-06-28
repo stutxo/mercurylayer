@@ -46,7 +46,6 @@ pub async fn create_wallet(name: &str, client_config: &ClientConfig) -> Result<W
         blockheight,
         initlock: server_info.initlock,
         interval: server_info.interval,
-        tokens: Vec::new(),
         activities: Vec::new(),
         coins: Vec::new(),
         settings,

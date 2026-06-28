@@ -1,1011 +1,839 @@
 openapi: 3.0.0
 info:
-  title: mercury server
+  title: Mercury Layer APIs
   version: 0.5.0
+  description: Current Mercury server routes and token-server-v2 routes.
+tags:
+  - name: Mercury
+    description: Mercury server API
+  - name: token-server-v2
+    description: Token payment API used by Mercury when TOKEN_SERVER_URL is configured
 paths:
+  /deposit/get_token:
+    get:
+      tags:
+        - Mercury
+      summary: Get a deposit token
+      operationId: deposit_get_token
+      description: Returns a free non-mainnet token when TOKEN_SERVER_URL is unset, or proxies token generation to token-server-v2 when configured.
+      responses:
+        '200':
+          description: Token response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse'
+        '500':
+          $ref: '#/components/responses/Error'
+
   /deposit/init/pod:
     post:
-      summary: >-
-        Pay On Deposit: Initiate a statechain deposit and generate a statechain ID and server public key share
-      operationId: deposit_deposit_init_pod
+      tags:
+        - Mercury
+      summary: Initialize a statechain deposit
+      operationId: deposit_init_pod
       requestBody:
+        required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/DepositMsg1POD'
-        required: true
+              $ref: '#/components/schemas/DepositMsg1'
       responses:
         '200':
-          description: ''
+          description: Deposit initialized
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/DepositInitResponse'
+                $ref: '#/components/schemas/DepositMsg1Response'
+        '400':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+        '410':
+          $ref: '#/components/responses/Error'
         '500':
-          description: >-
-            # [500 Internal Server
-            Error](https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500)
+          $ref: '#/components/responses/Error'
 
-            This response is given when the server has an internal error that it
-            could not recover from.
-
-
-            If you get this response please report this as an issue at
-            github.com/commerceblock/mercury.
   /sign/first:
     post:
-      summary: >-
-        First round of the signing protocol: commitments to blinding nonce and R2, and receipt of R1
+      tags:
+        - Mercury
+      summary: Start the signing protocol
       operationId: sign_first
       requestBody:
+        required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/SignMsg1'
-        required: true
+              $ref: '#/components/schemas/SignFirstRequestPayload'
       responses:
         '200':
-          description: ''
+          description: Server public nonce
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SignReply1'
+                $ref: '#/components/schemas/SignFirstResponsePayload'
+        '401':
+          $ref: '#/components/responses/Error'
         '500':
-          description: >-
-            # [500 Internal Server
-            Error](https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500)
+          $ref: '#/components/responses/Error'
 
-            This response is given when the server has an internal error that it
-            could not recover from.
-
-
-            If you get this response please report this as an issue at
-            github.com/commerceblock/mercury.
   /sign/second:
     post:
-      summary: 'Second round of the signing protocol: partial signature generated from blinded challenge'
+      tags:
+        - Mercury
+      summary: Complete the signing protocol
       operationId: sign_second
       requestBody:
+        required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/SignMsg2'
-        required: true
+              $ref: '#/components/schemas/PartialSignatureRequestPayload'
       responses:
         '200':
-          description: ''
+          description: Server partial signature
           content:
             application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/PartialSignatureResponsePayload'
+        '401':
+          $ref: '#/components/responses/Error'
         '500':
-          description: >-
-            # [500 Internal Server
-            Error](https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500)
+          $ref: '#/components/responses/Error'
 
-            This response is given when the server has an internal error that it
-            could not recover from.
-
-
-            If you get this response please report this as an issue at
-            github.com/commerceblock/mercury.
-  /info/coins:
+  /info/config:
     get:
-      summary: Get the current statecoin amount histogram
-      operationId: util_get_coin_info
+      tags:
+        - Mercury
+      summary: Get Mercury server operating parameters
+      operationId: info_config
       responses:
         '200':
-          description: ''
+          description: Mercury server configuration
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/CoinValueInfo'
+                $ref: '#/components/schemas/InfoConfigResponse'
         '500':
-          description: >-
-            # [500 Internal Server
-            Error](https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500)
+          $ref: '#/components/responses/Error'
 
-            This response is given when the server has an internal error that it
-            could not recover from.
-
-
-            If you get this response please report this as an issue at
-            github.com/commerceblock/mercury.
-  /info/fee:
-    get:
-      summary: Get statechain entity operating information
-      operationId: util_get_fees
-      responses:
-        '200':
-          description: ''
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/StateEntityFeeInfoAPI'
-        '500':
-          description: >-
-            # [500 Internal Server
-            Error](https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500)
-
-            This response is given when the server has an internal error that it
-            could not recover from.
-
-
-            If you get this response please report this as an issue at
-            github.com/commerceblock/mercury.
   /info/keylist:
     get:
-      summary: Get the published list of SE public key shares
-      operationId: util_get_key_list
+      tags:
+        - Mercury
+      summary: Get the current server public key share list
+      operationId: info_keylist
       responses:
         '200':
-          description: ''
+          description: Key list
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/KeyList'
-                nullable: true
+                $ref: '#/components/schemas/KeyListResponsePayload'
         '500':
-          description: >-
-            # [500 Internal Server
-            Error](https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500)
+          $ref: '#/components/responses/Error'
 
-            This response is given when the server has an internal error that it
-            could not recover from.
-
-
-            If you get this response please report this as an issue at
-            github.com/commerceblock/mercury.
   /info/statechain/{statechain_id}:
     get:
-      summary: Get current statechain information for specified statechain ID
-      operationId: util_get_statechain
+      tags:
+        - Mercury
+      summary: Get current statechain information
+      operationId: info_statechain
       parameters:
-        - name: statechain_id
+        - $ref: '#/components/parameters/StatechainId'
+      responses:
+        '200':
+          description: Statechain information
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatechainInfoResponsePayload'
+        '404':
+          $ref: '#/components/responses/Error'
+        '500':
+          $ref: '#/components/responses/Error'
+
+  /transfer/get_msg_addr/{new_auth_key}:
+    get:
+      tags:
+        - Mercury
+      summary: Get encrypted transfer messages for a recipient auth key
+      operationId: transfer_get_msg_addr
+      parameters:
+        - name: new_auth_key
           in: path
           required: true
           schema:
             type: string
       responses:
         '200':
-          description: ''
+          description: Encrypted transfer messages
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/StateChainDataAPI'
+                $ref: '#/components/schemas/GetMsgAddrResponsePayload'
         '500':
-          description: >-
-            # [500 Internal Server
-            Error](https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500)
+          $ref: '#/components/responses/Error'
 
-            This response is given when the server has an internal error that it
-            could not recover from.
-
-
-            If you get this response please report this as an issue at
-            github.com/commerceblock/mercury.
-  /pod/token/init/{value}:
-    get:
-      summary: Initialize a pay-on-demand token
-      operationId: pay_on_deposit_pod_token_init
-      parameters:
-        - name: value
-          in: path
-          required: true
-          schema:
-            type: integer
-            format: uint64
-            minimum: 0
-      responses:
-        '200':
-          description: ''
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PODInfo'
-        '500':
-          description: >-
-            # [500 Internal Server
-            Error](https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500)
-
-            This response is given when the server has an internal error that it
-            could not recover from.
-
-
-            If you get this response please report this as an issue at
-            github.com/commerceblock/mercury.
-  /pod/token/verify/{pod_token_id}:
-    get:
-      summary: Verify confirmed and spent status of pod token
-      operationId: pay_on_deposit_pod_token_verify
-      parameters:
-        - name: pod_token_id
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        '200':
-          description: ''
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PODStatus'
-        '500':
-          description: >-
-            # [500 Internal Server
-            Error](https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500)
-
-            This response is given when the server has an internal error that it
-            could not recover from.
-
-
-            If you get this response please report this as an issue at
-            github.com/commerceblock/mercury.
-  /transfer/get_msg_addr/{auth_key}:
-    get:
-      summary: Get stored transfer message (TransferMsg3) for specified auth key
-      operationId: transfer_transfer_get_msg_addr
-      parameters:
-        - name: auth_key
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        '200':
-          description: ''
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  $ref: '#/components/schemas/TransferMsg3'
-        '500':
-          description: >-
-            # [500 Internal Server
-            Error](https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500)
-
-            This response is given when the server has an internal error that it
-            could not recover from.
-
-
-            If you get this response please report this as an issue at
-            github.com/commerceblock/mercury.
-  /transfer/receiver:
-    post:
-      summary: >-
-        Transfer completing by receiver: retreival of signature verification key
-        information and key share update
-      operationId: transfer_transfer_receiver
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/TransferMsg4'
-        required: true
-      responses:
-        '200':
-          description: ''
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TransferMsg5'
-        '500':
-          description: >-
-            # [500 Internal Server
-            Error](https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500)
-
-            This response is given when the server has an internal error that it
-            could not recover from.
-
-
-            If you get this response please report this as an issue at
-            github.com/commerceblock/mercury.
   /transfer/sender:
     post:
-      summary: >-
-        Transfer initiation by sender: get x1 transfer nonce and authorise
-        reciver auth key
-      operationId: transfer_transfer_sender
+      tags:
+        - Mercury
+      summary: Initialize a statechain transfer as sender
+      operationId: transfer_sender
       requestBody:
+        required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TransferMsg1'
-        required: true
+              $ref: '#/components/schemas/TransferSenderRequestPayload'
       responses:
         '200':
-          description: ''
+          description: Transfer sender nonce material
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TransferMsg2'
+                $ref: '#/components/schemas/TransferSenderResponsePayload'
+        '400':
+          $ref: '#/components/responses/Error'
         '500':
-          description: >-
-            # [500 Internal Server
-            Error](https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500)
+          $ref: '#/components/responses/Error'
 
-            This response is given when the server has an internal error that it
-            could not recover from.
-
-
-            If you get this response please report this as an issue at
-            github.com/commerceblock/mercury.
   /transfer/update_msg:
     post:
-      summary: Update stored transfer message (TransferMsg3)
-      operationId: transfer_transfer_update_msg
+      tags:
+        - Mercury
+      summary: Store encrypted transfer message
+      operationId: transfer_update_msg
       requestBody:
+        required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TransferMsg3'
-        required: true
+              $ref: '#/components/schemas/TransferUpdateMsgRequestPayload'
       responses:
         '200':
-          description: ''
+          description: Transfer message update status
           content:
             application/json:
               schema:
-                type: 'boolean'
+                $ref: '#/components/schemas/TransferUpdateMsgResponse'
         '500':
-          description: >-
-            # [500 Internal Server
-            Error](https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500)
+          $ref: '#/components/responses/Error'
 
-            This response is given when the server has an internal error that it
-            could not recover from.
-
-
-            If you get this response please report this as an issue at
-            github.com/commerceblock/mercury.
-  /withdraw/confirm:
+  /transfer/unlock:
     post:
-      summary: 'Complete the withdrawal process: confirm withdrawal transaction'
-      operationId: withdraw_withdraw_confirm
+      tags:
+        - Mercury
+      summary: Unlock a pending transfer
+      operationId: transfer_unlock
       requestBody:
+        required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/WithdrawMsg'
-        required: true
+              $ref: '#/components/schemas/TransferUnlockRequestPayload'
       responses:
         '200':
-          description: ''
+          description: Transfer unlocked
           content:
             application/json:
               schema:
-                type: 'boolean'
+                $ref: '#/components/schemas/MessageResponse'
+        '403':
+          $ref: '#/components/responses/Error'
         '500':
-          description: >-
-            # [500 Internal Server
-            Error](https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500)
+          $ref: '#/components/responses/Error'
 
-            This response is given when the server has an internal error that it
-            could not recover from.
+  /transfer/receiver:
+    post:
+      tags:
+        - Mercury
+      summary: Complete a statechain transfer as receiver
+      operationId: transfer_receiver
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransferReceiverRequestPayload'
+      responses:
+        '200':
+          description: Receiver transfer completion response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferReceiverPostResponsePayload'
+        '400':
+          description: Transfer batch validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferReceiverErrorResponsePayload'
+        '404':
+          $ref: '#/components/responses/Error'
+        '500':
+          $ref: '#/components/responses/Error'
 
+  /transfer/paymenthash/{batch_id}:
+    get:
+      tags:
+        - Mercury
+      summary: Get payment hash for a lightning latch batch
+      operationId: transfer_get_paymenthash
+      parameters:
+        - name: batch_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Payment hash
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentHashResponsePayload'
+        '404':
+          $ref: '#/components/responses/Error'
 
-            If you get this response please report this as an issue at
-            github.com/commerceblock/mercury.
+  /transfer/paymenthash:
+    post:
+      tags:
+        - Mercury
+      summary: Create payment hash for a lightning latch batch
+      operationId: transfer_post_paymenthash
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentHashRequestPayload'
+      responses:
+        '200':
+          description: Payment hash
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentHashResponsePayload'
+        '500':
+          $ref: '#/components/responses/Error'
+
+  /transfer/transfer_preimage:
+    post:
+      tags:
+        - Mercury
+      summary: Retrieve a lightning latch transfer preimage
+      operationId: transfer_preimage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransferPreimageRequestPayload'
+      responses:
+        '200':
+          description: Transfer preimage
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferPreimageResponsePayload'
+        '403':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+
+  /withdraw/complete:
+    post:
+      tags:
+        - Mercury
+      summary: Complete withdrawal and delete statechain server state
+      operationId: withdraw_complete
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WithdrawCompletePayload'
+      responses:
+        '200':
+          description: Statechain deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+        '500':
+          $ref: '#/components/responses/Error'
+
+  /token/token_gen:
+    get:
+      tags:
+        - token-server-v2
+      summary: Generate an onchain paid token
+      operationId: token_server_token_gen
+      responses:
+        '200':
+          description: Token payment details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenServerTokenResponse'
+        '500':
+          $ref: '#/components/responses/Error'
+
+  /token/token_verify/{token_id}:
+    get:
+      tags:
+        - token-server-v2
+      summary: Verify token payment status
+      operationId: token_server_token_verify
+      parameters:
+        - $ref: '#/components/parameters/TokenId'
+      responses:
+        '200':
+          description: Token status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenStatusResponse'
+        '404':
+          $ref: '#/components/responses/Error'
+        '500':
+          $ref: '#/components/responses/Error'
+
 components:
+  parameters:
+    StatechainId:
+      name: statechain_id
+      in: path
+      required: true
+      schema:
+        type: string
+    TokenId:
+      name: token_id
+      in: path
+      required: true
+      schema:
+        type: string
+
+  responses:
+    Error:
+      description: Error response
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
   schemas:
-    Address:
-      type: string
-    BSTMsg:
+    ErrorResponse:
       type: object
-      required:
-        - statechain_id
-        - swap_id
       properties:
-        statechain_id:
+        error:
           type: string
-        swap_id:
+        message:
           type: string
-    BSTSenderData:
-      description: >-
-        Blind Spend Token data for each Swap. (priv, pub) keypair, k and R'
-        value for signing and verification.
+
+    MessageResponse:
       type: object
       required:
-        - k
-        - q
-        - r_prime
-        - x
+        - message
       properties:
-        k:
-          $ref: '#/components/schemas/FE'
-        q:
-          $ref: '#/components/schemas/GE'
-        r_prime:
-          $ref: '#/components/schemas/GE'
-        x:
-          $ref: '#/components/schemas/FE'
-    BatchData:
-      description: Data present if transfer is part of an atomic batch transfer
-      type: object
-      required:
-        - commitment
-        - id
-      properties:
-        commitment:
+        message:
           type: string
-        id:
-          $ref: '#/components/schemas/Uuid'
-    BlindedSpendSignature:
-      description: blind spend signature
+
+    TokenResponse:
       type: object
       required:
-        - s_prime
-      properties:
-        s_prime:
-          $ref: '#/components/schemas/FE'
-    BlindedSpendToken:
-      description: (s,r) blind spend token
-      type: object
-      required:
-        - m
-        - r
-        - s
-      properties:
-        m:
-          type: string
-        r:
-          $ref: '#/components/schemas/GE'
-        s:
-          $ref: '#/components/schemas/FE'
-    CoinValueInfo:
-      description: List of current statecoin amounts and the number of each
-      type: object
-      required:
-        - values
-      properties:
-        values:
-          type: object
-          additionalProperties:
-            type: integer
-            format: uint64
-            minimum: 1
-    DepositMsg1POD:
-      description: Client -> SE
-      type: object
-      required:
-        - amount
-        - auth_key
         - token_id
+        - payment_method
+        - deposit_address
+        - fee
+        - confirmation_target
       properties:
-        amount:
+        token_id:
+          type: string
+        payment_method:
+          type: string
+          enum:
+            - free
+            - onchain
+        deposit_address:
+          type: string
+          nullable: true
+        fee:
           type: integer
           format: uint64
           minimum: 0
+        confirmation_target:
+          type: integer
+          format: uint64
+          minimum: 0
+
+    TokenServerTokenResponse:
+      type: object
+      required:
+        - token_id
+        - deposit_address
+        - fee
+        - confirmation_target
+      properties:
+        token_id:
+          type: string
+        deposit_address:
+          type: string
+        fee:
+          type: integer
+          format: uint64
+          minimum: 0
+        confirmation_target:
+          type: integer
+          format: uint32
+          minimum: 0
+
+    TokenStatusResponse:
+      type: object
+      required:
+        - confirmed
+        - spent
+      properties:
+        confirmed:
+          type: boolean
+        spent:
+          type: boolean
+
+    DepositMsg1:
+      type: object
+      required:
+        - auth_key
+        - token_id
+        - signed_token_id
+      properties:
         auth_key:
           type: string
         token_id:
-          $ref: '#/components/schemas/Uuid'
-    DepositMsg2:
-      description: Client -> SE
-      type: object
-      required:
-        - shared_key_id
-      properties:
-        shared_key_id:
-          $ref: '#/components/schemas/Uuid'
-    FE:
-      type: array
-      items:
-        type: integer
-        format: uint8
-        minimum: 0
-    FESer:
-      type: object
-      required:
-        - secret_bytes
-      properties:
-        secret_bytes:
-          type: array
-          items:
-            type: integer
-            format: uint8
-            minimum: 0
-    GE:
-      type: array
-      items:
-        type: integer
-        format: uint8
-        minimum: 0
-    GroupStatus:
-      description: Swap group status data
-      type: object
-      required:
-        - number
-        - time
-      properties:
-        number:
-          type: integer
-          format: uint64
-          minimum: 0
-        time:
           type: string
-          format: partial-date-time
-      example: '2:1691151686'
-    Invoice:
+        signed_token_id:
+          type: string
+
+    DepositMsg1Response:
       type: object
       required:
-        - bolt11
-        - expires_at
-        - payment_hash
-      properties:
-        bolt11:
-          type: string
-        expires_at:
-          type: integer
-          format: uint64
-          minimum: 0
-        payment_hash:
-          type: string
-    KUFinalize:
-      type: object
-      required:
-        - shared_key_id
+        - server_pubkey
         - statechain_id
-        - auth_sig
       properties:
-        shared_key_id:
-          $ref: '#/components/schemas/Uuid'
-        statechain_id:
-          $ref: '#/components/schemas/Uuid'
-        auth_sig:
-          $ref: '#/components/schemas/Uuid'
-    OwnerID:
-      description: State Entity -> Receiver
-      type: object
-      required:
-        - shared_key_id
-      properties:
-        shared_key_id:
-          $ref: '#/components/schemas/Uuid'
-    PK:
-      type: array
-      items:
-        type: integer
-        format: uint8
-        minimum: 0
-    PODInfo:
-      type: object
-      required:
-        - btc_payment_address
-        - lightning_invoice
-        - token_id
-        - value
-      properties:
-        btc_payment_address:
-          $ref: '#/components/schemas/Address'
-        lightning_invoice:
-          $ref: '#/components/schemas/Invoice'
-        token_id:
-          $ref: '#/components/schemas/Uuid'
-        value:
-          type: integer
-          format: uint64
-          minimum: 0
-    PODStatus:
-      type: object
-      required:
-        - amount
-        - confirmed
-      properties:
-        amount:
-          type: integer
-          format: uint64
-          minimum: 0
-        confirmed:
-          type: boolean
-    DepositInitResponse:
-      type: object
-      required:
-        - statechain_id
-        - se_pubkey
-      properties:
-        statechain_id:
-          $ref: '#/components/schemas/Uuid'
-        se_pubkey:
+        server_pubkey:
           description: Server public key share
           type: string
-          nullable: true
-    Protocol:
-      description: State Entity protocols
-      type: string
-      enum:
-        - Deposit
-        - Transfer
-        - Withdraw
-    PublicKey:
-      type: array
-      items:
-        type: integer
-        format: uint8
-        minimum: 0
-    RegisterUtxo:
-      description: Owner -> Conductor
+        statechain_id:
+          type: string
+
+    SignFirstRequestPayload:
       type: object
       required:
-        - signature
         - statechain_id
-        - swap_size
-        - wallet_version
+        - signed_statechain_id
       properties:
-        signature:
-          $ref: '#/components/schemas/AuthSig'
         statechain_id:
-          $ref: '#/components/schemas/Uuid'
-        swap_size:
+          type: string
+        signed_statechain_id:
+          type: string
+
+    SignFirstResponsePayload:
+      type: object
+      required:
+        - server_pubnonce
+      properties:
+        server_pubnonce:
+          type: string
+
+    PartialSignatureRequestPayload:
+      type: object
+      required:
+        - statechain_id
+        - negate_seckey
+        - session
+        - signed_statechain_id
+        - server_pub_nonce
+      properties:
+        statechain_id:
+          type: string
+        negate_seckey:
           type: integer
-          format: uint64
+          format: uint8
           minimum: 0
-        wallet_version:
+        session:
           type: string
-    KeyList:
-      type: object
-      properties:
-        pubkeys:
-          type: array
-          items:
-            type: string
-          nullable: true
-    S1PubKey:
-      description: SE public key share for encryption
+        signed_statechain_id:
+          type: string
+        server_pub_nonce:
+          type: string
+
+    PartialSignatureResponsePayload:
       type: object
       required:
-        - key
+        - partial_sig
       properties:
-        key:
+        partial_sig:
           type: string
-    SCEAddress:
-      description: Address generated for State Entity transfer protocol
+
+    InfoConfigResponse:
       type: object
       required:
-        - proof_key
-        - tx_backup_addr
-      properties:
-        proof_key:
-          $ref: '#/components/schemas/PublicKey'
-        tx_backup_addr:
-          $ref: '#/components/schemas/Address'
-    SignMessage:
-      type: string
-    SignMsg1:
-      description: User commitments for signing
-      type: object
-      required:
-        - statechain_id
-        - auth_sig
-      properties:
-        statechain_id:
-          $ref: '#/components/schemas/Uuid'
-        auth_sig:
-          type: string
-    SignMsg2:
-      type: object
-      required:
-        - statechain_id
-        - challenge
-        - auth_sig
-      properties:
-        statechain_id:
-          $ref: '#/components/schemas/Uuid'
-        challenge:
-          type: string
-        auth_sig:
-          type: string
-    SignReply1:
-      type: object
-      required:
-        - r1_public
-      properties:
-        r1_public:
-          type: string
-    Signature:
-      type: string
-    State:
-      description: State update object State to change statecoin ownership to new owner
-      type: object
-      required:
-        - data
-      properties:
-        data:
-          description: >-
-            The new owner proof public key (if transfer) or address (if
-            withdrawal)
-          type: string
-        next_state:
-          description: Current owner signature representing passing of ownership
-          allOf:
-            - $ref: '#/components/schemas/AuthSig'
-          nullable: true
-      example:
-        data: 037f8d5dfb3c8f99b1641d200e808dd0b6c52f53b04e972c2e61ab901133902ebd
-        next_state:
-          data: 037f8d5dfb3c8f99b1641d200e808dd0b6c52f53b04e972c2e61ab901133902ebd
-          purpose: TRANSFER
-          sig: >-
-            3045022100abe02f0d1918aca36b634eb1af8a4e0714f3f699fb425de65cc661e538da3f2002200a538a22df665a95adb739ff6bb592b152dba5613602c453c58adf70858f05f6
-    StateChainDataAPI:
-      description: >-
-        Statechain data This struct is returned containing the statechain of the
-        specified statechain ID
-      type: object
-      required:
-        - amount
-        - pubkey
-        - num_sigs
-        - s2_pub
-        - signature_count
-        - r1_values
-        - blind_challenges
-        - x1_pub
-      properties:
-        amount:
-          description: The value of the statecoin (in satoshis)
-          type: integer
-          format: uint64
-          minimum: 0
-        pubkey:
-          description: The current server public key share
-          type: string
-        num_sigs:
-          description: The number of signatures generated for this statechain
-          type: integer
-        s2_pub:
-          type: string
-        r1_values:
-          type: array
-          items:
-            type: string
-        blind_challenges:
-          type: array
-          items:
-            type: string
-        x1_pub:
-          type: array
-          items:
-            type: string
-    AuthSig:
-      description: Signature object Data necessary to create ownership transfer signatures
-      type: object
-      required:
-        - data
-        - purpose
-        - sig
-      properties:
-        data:
-          description: The new owner auth public key (if transfer)
-          type: string
-        purpose:
-          description: 'Purpose: "TRANSFER", "TRANSFER-BATCH" or "WITHDRAW"'
-          type: string
-        sig:
-          description: Current owner signature.
-          type: string
-      example:
-        data: 037f8d5dfb3c8f99b1641d200e808dd0b6c52f53b04e972c2e61ab901133902ebd
-        purpose: TRANSFER
-        sig: >-
-          3045022100abe02f0d1918aca36b634eb1af8a4e0714f3f699fb425de65cc661e538da3f2002200a538a22df665a95adb739ff6bb592b152dba5613602c453c58adf70858f05f6
-    StateEntityFeeInfoAPI:
-      description: >-
-        Statechain entity operating information This struct is returned
-        containing information on operating requirements of the statechain
-        entity which must be conformed with in the protocol.
-      type: object
-      required:
-        - backup_fee_rate
-        - deposit
         - initlock
         - interval
-        - wallet_message
-        - wallet_version
+        - batchtimeout
+        - version
       properties:
-        backup_fee_rate:
-          description: Current backup tx fee rate
-          type: integer
-          format: uint64
-          minimum: 0
-        deposit:
-          description: >-
-            The deposit fee, which is specified as a proportion of the deposit
-            amount in basis points
-          type: integer
-          format: int64
         initlock:
-          description: >-
-            The initial nLocktime from the current blockheight for the first
-            backup
           type: integer
           format: uint32
           minimum: 0
         interval:
-          description: >-
-            The decementing nLocktime (block height) interval enforced for
-            backup transactions
           type: integer
           format: uint32
           minimum: 0
-        wallet_message:
-          description: Message to display to all wallet users on startup
+        batchtimeout:
+          type: integer
+          format: uint32
+          minimum: 0
+        version:
           type: string
-        wallet_version:
-          description: The minumum wallet version required
+
+    PubKeyInfo:
+      type: object
+      required:
+        - server_pubkey
+        - tx_n
+        - created_at
+      properties:
+        server_pubkey:
           type: string
-      example:
-        address: bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq
-        backup_fee_rate: 1
-        deposit: 0
-        initlock: 14400
-        interval: 144
-        wallet_message: Warning
-        wallet_version: 0.4.65
-        withdraw: 300
-    StatechainID:
+        tx_n:
+          type: integer
+          format: uint32
+          minimum: 0
+        created_at:
+          type: string
+
+    KeyListResponsePayload:
       type: object
       required:
-        - id
+        - list_keyinfo
       properties:
-        id:
-          $ref: '#/components/schemas/Uuid'
-    TransferBatchDataAPI:
-      description: /info/transfer-batch return struct
-      type: object
-      required:
-        - finalized
-        - state_chains
-      properties:
-        finalized:
-          type: boolean
-        state_chains:
-          $ref: '#/components/schemas/Uuid'
-    TransferBatchInitMsg:
-      description: Conductor -> StateEntity
-      type: object
-      required:
-        - id
-        - signatures
-      properties:
-        id:
-          $ref: '#/components/schemas/Uuid'
-        signatures:
+        list_keyinfo:
           type: array
           items:
-            $ref: '#/components/schemas/AuthSig'
-    TransferMsg1:
-      description: Sender -> SE
+            $ref: '#/components/schemas/PubKeyInfo'
+
+    StatechainInfo:
       type: object
       required:
-        - batch_id
+        - statechain_id
+        - server_pubnonce
+        - challenge
+        - tx_n
+      properties:
+        statechain_id:
+          type: string
+        server_pubnonce:
+          type: string
+        challenge:
+          type: string
+        tx_n:
+          type: integer
+          format: uint32
+          minimum: 0
+
+    StatechainInfoResponsePayload:
+      type: object
+      required:
+        - enclave_public_key
+        - num_sigs
+        - statechain_info
+        - x1_pub
+      properties:
+        enclave_public_key:
+          type: string
+        num_sigs:
+          type: integer
+          format: uint32
+          minimum: 0
+        statechain_info:
+          type: array
+          items:
+            $ref: '#/components/schemas/StatechainInfo'
+        x1_pub:
+          type: string
+          nullable: true
+
+    GetMsgAddrResponsePayload:
+      type: object
+      required:
+        - list_enc_transfer_msg
+      properties:
+        list_enc_transfer_msg:
+          type: array
+          items:
+            type: string
+
+    TransferSenderRequestPayload:
+      type: object
+      required:
         - statechain_id
         - auth_sig
-        - new_auth_key
+        - new_user_auth_key
       properties:
-        batch_id:
-          $ref: '#/components/schemas/Uuid'
         statechain_id:
-          $ref: '#/components/schemas/Uuid'
+          type: string
         auth_sig:
           type: string
-        new_auth_key:
+        new_user_auth_key:
           type: string
-    TransferMsg2:
-      description: SE -> Sender
+        batch_id:
+          type: string
+          nullable: true
+
+    TransferSenderResponsePayload:
       type: object
       required:
         - x1
       properties:
         x1:
           type: string
-    TransferMsg3:
-      description: Sender -> Receiver
-      type: object
-      required:
-        - new_auth_key
-        - transfer_data
-      properties:
-        new_auth_key:
-          type: string
-        transfer_data:
-          type: string
-    TransferMsg4:
-      description: Receiver -> State Entity
+
+    TransferUpdateMsgRequestPayload:
       type: object
       required:
         - statechain_id
         - auth_sig
-        - t2
+        - new_user_auth_key
+        - enc_transfer_msg
       properties:
-        batch_data:
-          allOf:
-            - $ref: '#/components/schemas/BatchData'
-          nullable: true
         statechain_id:
-          $ref: '#/components/schemas/Uuid'
+          type: string
         auth_sig:
           type: string
+        new_user_auth_key:
+          type: string
+        enc_transfer_msg:
+          type: string
+
+    TransferUpdateMsgResponse:
+      type: object
+      required:
+        - updated
+      properties:
+        updated:
+          type: boolean
+
+    TransferUnlockRequestPayload:
+      type: object
+      required:
+        - statechain_id
+        - auth_sig
+      properties:
+        statechain_id:
+          type: string
+        auth_sig:
+          type: string
+        auth_pub_key:
+          type: string
+          nullable: true
+
+    TransferReceiverRequestPayload:
+      type: object
+      required:
+        - statechain_id
+        - t2
+        - auth_sig
+      properties:
+        statechain_id:
+          type: string
+        batch_data:
+          type: string
+          nullable: true
         t2:
           type: string
-    TransferMsg5:
-      description: State Entity -> Receiver
+        auth_sig:
+          type: string
+
+    TransferReceiverPostResponsePayload:
       type: object
       required:
-        - enclave_pubkey
-        - attestation
+        - server_pubkey
       properties:
-        enclave_pubkey:
+        server_pubkey:
           type: string
-        attestation:
-          type: string
-    PrevSigData:
-      description: State Entity -> Receiver
+
+    TransferReceiverErrorResponsePayload:
       type: object
       required:
-        - s2_pub
-        - signature_count
-        - r1_values
-        - blind_challenges
+        - code
+        - message
       properties:
-        s2_pub:
+        code:
           type: string
-        r1_values:
-          type: array
-          items:
-            type: string
-        blind_challenges:
-          type: array
-          items:
-            type: string
-    TransferRevealNonce:
-      description: User -> State Entity
-      type: object
-      required:
-        - batch_id
-        - hash
-        - nonce
-        - statechain_id
-      properties:
-        batch_id:
-          $ref: '#/components/schemas/Uuid'
-        hash:
+          enum:
+            - StatecoinBatchLockedError
+            - ExpiredBatchTimeError
+        message:
           type: string
-        nonce:
-          type: array
-          items:
-            type: integer
-            format: uint8
-            minimum: 0
-          maxItems: 32
-          minItems: 32
-        statechain_id:
-          $ref: '#/components/schemas/Uuid'
-    UserID:
-      type: object
-      required:
-        - id
-      properties:
-        challenge:
-          type: string
-          nullable: true
-        id:
-          $ref: '#/components/schemas/Uuid'
-    Uuid:
-      type: string
-    WithdrawMsg:
-      description: Owner -> State Entity
+
+    PaymentHashRequestPayload:
       type: object
       required:
         - statechain_id
         - auth_sig
+        - batch_id
       properties:
         statechain_id:
-          $ref: '#/components/schemas/Uuid'
+          type: string
         auth_sig:
-          type: array
-          items:
-            $ref: '#/components/schemas/AuthSig'
+          type: string
+        batch_id:
+          type: string
 
+    PaymentHashResponsePayload:
+      type: object
+      required:
+        - hash
+      properties:
+        hash:
+          type: string
+
+    TransferPreimageRequestPayload:
+      type: object
+      required:
+        - statechain_id
+        - auth_sig
+        - previous_user_auth_key
+        - batch_id
+      properties:
+        statechain_id:
+          type: string
+        auth_sig:
+          type: string
+        previous_user_auth_key:
+          type: string
+        batch_id:
+          type: string
+
+    TransferPreimageResponsePayload:
+      type: object
+      required:
+        - preimage
+      properties:
+        preimage:
+          type: string
+
+    WithdrawCompletePayload:
+      type: object
+      required:
+        - statechain_id
+        - signed_statechain_id
+      properties:
+        statechain_id:
+          type: string
+        signed_statechain_id:
+          type: string

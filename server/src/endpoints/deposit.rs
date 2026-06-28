@@ -149,7 +149,7 @@ struct TokenStatusResponse {
     err_message: Option<String>,
 }
 
-pub async fn check_token_status(token_id: &str) -> TokenStatusResponse {
+async fn check_token_status(token_id: &str) -> TokenStatusResponse {
     let config = crate::server_config::ServerConfig::load();
 
     let client: reqwest::Client = reqwest::Client::new();

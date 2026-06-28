@@ -22,7 +22,6 @@ pub struct Wallet {
     pub blockheight: u32,
     pub initlock: u32,
     pub interval: u32,
-    pub tokens: Vec<Token>,
     pub activities: Vec<Activity>,
     pub coins: Vec<Coin>,
     pub settings: Settings,
@@ -45,18 +44,6 @@ pub struct Settings {
     pub chainType: Option<String>,
     pub notifications: bool,
     pub tutorials: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Token {
-    pub btc_payment_address: String,
-    pub fee: String,
-    pub lightning_invoice: String,
-    pub processor_id: String,
-    pub token_id: String,
-    pub confirmed: bool,
-    pub spent: bool,
-    pub expiry: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -238,7 +225,6 @@ mod tests {
             blockheight: 42,
             initlock: 1000,
             interval: 10,
-            tokens: Vec::new(),
             activities: Vec::new(),
             coins: Vec::new(),
             settings: Settings {
@@ -258,8 +244,10 @@ mod tests {
             },
         };
 
-        let roundtrip: Wallet =
-            serde_json::from_value(serde_json::to_value(wallet).unwrap()).unwrap();
+        let mut wallet_json = serde_json::to_value(wallet).unwrap();
+        wallet_json["tokens"] = serde_json::json!([]);
+
+        let roundtrip: Wallet = serde_json::from_value(wallet_json).unwrap();
 
         assert_eq!(roundtrip.chain_backend, "core");
         assert_eq!(roundtrip.chain_endpoint, "http://127.0.0.1:18443");

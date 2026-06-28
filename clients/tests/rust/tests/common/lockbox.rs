@@ -390,7 +390,6 @@ pub fn sample_wallet() -> Wallet {
         blockheight: 0,
         initlock: 1_000,
         interval: 10,
-        tokens: Vec::new(),
         activities: Vec::new(),
         coins: Vec::new(),
         settings: Settings {
