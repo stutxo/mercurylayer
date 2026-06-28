@@ -45,14 +45,6 @@ jobs:
             push: true
             tags: mercurylayer/token-server-v2:${{ env.COMMIT_HASH }}
         -
-          name: Build and push for mercury-explorer
-          uses: docker/build-push-action@v5
-          with:
-            context: .
-            file: ./explorer/Dockerfile
-            push: true
-            tags: mercurylayer/mercury-explorer:${{ env.COMMIT_HASH }}
-        -
           name: Build and push for keylist-cronjob
           uses: docker/build-push-action@v5
           with:
