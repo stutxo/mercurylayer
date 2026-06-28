@@ -44,11 +44,3 @@ jobs:
             file: ./token-server-v2/Dockerfile
             push: true
             tags: mercurylayer/token-server-v2:${{ env.COMMIT_HASH }}
-        -
-          name: Build and push for keylist-cronjob
-          uses: docker/build-push-action@v5
-          with:
-            context: .
-            file: ./keylistCron/Dockerfile
-            push: true
-            tags: mercurylayer/keylist-cronjob:${{ env.COMMIT_HASH }}

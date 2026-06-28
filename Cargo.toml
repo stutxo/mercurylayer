@@ -1,6 +1,6 @@
 [workspace]
 members = ["clients/apps/rust", "clients/libs/rust", "server", "lib", "clients/tests/rust", "token-server-v2"]
-exclude = ["docs", "keylistCron"]
+exclude = ["docs"]
 resolver = "2"
 
 [patch.crates-io]

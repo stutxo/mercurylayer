@@ -58,6 +58,6 @@ When it comes to withdrawal, the server can no longer verify that any fee has be
 
 ### Keyshare publication
 
-The server does not have access to the TxIDs of individual coins along with the user proof keys that it can publish. Instead, it takes each of the current public key shares for each coin in the system and publishes this list. This is then updated with each new coin or coin ownership change. This public key list is then commited to bitcoin via Mainstay for a proof-of-uniqueness. 
+The server does not have access to the TxIDs of individual coins along with the user proof keys that it can publish. Instead, it takes each of the current public key shares for each coin in the system and publishes this list through the `/info/keylist` endpoint. Current deployments also publish server metadata through NIP-100/Nostr.
 
 To verify the uniqueness of the ownership of the shared public key, the current owner then derives the full shared public key from this commitment and their or key share (P = o1.(s1.G)) and verifies it against the coin. 
