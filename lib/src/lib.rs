@@ -1,3 +1,4 @@
+pub mod bip448;
 pub mod deposit;
 pub mod error;
 pub mod transaction;
