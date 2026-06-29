@@ -4,6 +4,8 @@ Mercury Layer is an implementation of a layer-2 statechain protocol that enables
 
 This documentation covers the description of the Mercury Layer architecture and protocol, the specification Mercury API and instructions for the deployment and operation of the separate components of the system. 
 
+The additive rebindable statechain work is documented separately in [`bip448_rebindable_statechains.md`](bip448_rebindable_statechains.md). That path targets the Bitcoin Inquisition BIP448 opcode bundle, not BIP118/APO.
+
 ## Overview
 
 An *unspent transaction output* (UTXO) is the fundamental object that defines value and ownership in Bitcoin. A UTXO is identified by a transaction ID (`TxID`) and output index number (`n`) and has two properties: 1. A value (in BTC) and 2. Spending conditions (defined in Script). The spending conditions can be arbitrarily complex (within the limits of the consensus rules), but is most commonly defined by a single public key and can only be spent by transaction signed with the corresponding public key. 
