@@ -1,4 +1,5 @@
 pub mod bip448;
+pub mod bip448_statechain;
 pub mod deposit;
 pub mod error;
 pub mod transaction;
