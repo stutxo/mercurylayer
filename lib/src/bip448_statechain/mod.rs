@@ -1,4 +1,5 @@
 pub mod script;
+pub mod transaction;
 
 #[cfg(test)]
 pub(crate) mod test_helpers {
