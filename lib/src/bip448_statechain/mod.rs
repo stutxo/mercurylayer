@@ -1,4 +1,5 @@
 pub mod script;
+pub mod signing;
 pub mod transaction;
 
 #[cfg(test)]

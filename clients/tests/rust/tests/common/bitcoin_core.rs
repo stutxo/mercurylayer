@@ -1,5 +1,10 @@
-use anyhow::{anyhow, Ok, Result};
-use std::{process::Command, thread};
+use anyhow::{anyhow, Result};
+use bitcoin::{
+    consensus::encode::{deserialize, serialize},
+    Address, Network, Transaction, Txid,
+};
+use serde_json::Value;
+use std::{process::Command, str::FromStr, thread};
 
 const BITCOIN_CONTAINER_NAME: &str = "mercurylayer-inquisition-1";
 const BITCOIN_WALLET_NAME: &str = "mercury_test";
@@ -63,6 +68,31 @@ pub fn sendtoaddress(amount_in_sats: u32, address: &str) -> Result<String> {
     execute_bitcoin_command(&bitcoin_command)
 }
 
+pub fn ensure_wallet_loaded() -> Result<()> {
+    execute_bitcoin_command(&format!(
+        "{BITCOIN_CLI} createwallet {BITCOIN_WALLET_NAME} >/dev/null 2>&1 || \
+         {BITCOIN_CLI} loadwallet {BITCOIN_WALLET_NAME} >/dev/null 2>&1 || true"
+    ))?;
+
+    Ok(())
+}
+
+pub fn ensure_wallet_ready() -> Result<()> {
+    ensure_wallet_loaded()?;
+    mine_blocks(101)
+}
+
+pub fn mine_block() -> Result<()> {
+    mine_blocks(1)
+}
+
+pub fn mine_blocks(num_blocks: u32) -> Result<()> {
+    let address = getnewaddress()?;
+    generatetoaddress(num_blocks, &address)?;
+
+    Ok(())
+}
+
 pub fn generatetoaddress(num_blocks: u32, address: &str) -> Result<String> {
     let bitcoin_command = format!(
         "{} generatetoaddress {} {}",
@@ -84,4 +114,44 @@ pub fn getnewaddress() -> Result<String> {
     );
 
     execute_bitcoin_command(&bitcoin_command)
+}
+
+pub fn regtest_address(address: &str) -> Result<Address> {
+    Ok(Address::from_str(address)?.require_network(Network::Regtest)?)
+}
+
+pub fn wallet_transaction(txid: &Txid) -> Result<Transaction> {
+    let tx_json = execute_bitcoin_command(&format!(
+        "{BITCOIN_CLI} -rpcwallet={BITCOIN_WALLET_NAME} gettransaction {txid}"
+    ))?;
+    let tx_json: Value = serde_json::from_str(&tx_json)?;
+    let tx_hex = tx_json
+        .get("hex")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("wallet transaction {txid} did not include raw hex"))?;
+    let tx_bytes = hex::decode(tx_hex)?;
+
+    Ok(deserialize(&tx_bytes)?)
+}
+
+pub fn broadcast_raw_transaction(tx: &Transaction) -> Result<Txid> {
+    let tx_hex = hex::encode(serialize(tx));
+    let txid = execute_bitcoin_command(&format!("{BITCOIN_CLI} sendrawtransaction {tx_hex}"))?;
+
+    Ok(Txid::from_str(&txid)?)
+}
+
+pub fn assert_confirmed(txid: &Txid) -> Result<()> {
+    let tx_json = execute_bitcoin_command(&format!("{BITCOIN_CLI} getrawtransaction {txid} true"))?;
+    let tx_json: Value = serde_json::from_str(&tx_json)?;
+    let confirmations = tx_json
+        .get("confirmations")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    if confirmations == 0 {
+        return Err(anyhow!("transaction {txid} was not mined"));
+    }
+
+    Ok(())
 }

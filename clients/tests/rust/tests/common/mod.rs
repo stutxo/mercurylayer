@@ -7,6 +7,7 @@ use anyhow::Result;
 use mercuryrustlib::client_config::ClientConfig;
 
 pub mod bip448_activation;
+pub mod bip448_regtest;
 pub mod bitcoin_core;
 pub mod chain;
 pub mod lockbox;
