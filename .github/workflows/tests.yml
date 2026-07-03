@@ -61,6 +61,21 @@ jobs:
           cd clients/tests/rust
           cargo test --test functional -- --ignored --test-threads=1
 
+      - name: Run BIP448 primitive integration suite
+        run: |
+          cd clients/tests/rust
+          cargo test --test bip448_primitive_spike -- --ignored --test-threads=1
+
+      - name: Run BIP448 CSFS signing integration suite
+        run: |
+          cd clients/tests/rust
+          cargo test --test bip448_csfs_signing -- --ignored --test-threads=1
+
+      - name: Run lockbox compatibility suite
+        run: |
+          cd clients/tests/rust
+          cargo test --test lockbox_compatibility -- --ignored --test-threads=1
+
       - name: Tear down
         if: always()
         run: |

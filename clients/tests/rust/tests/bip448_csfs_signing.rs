@@ -1,13 +1,16 @@
 mod common;
 
-use anyhow::{anyhow, Result};
+use std::str::FromStr;
+
+use anyhow::{anyhow, Context, Result};
 use bitcoin::{
     hashes::Hash,
     secp256k1::{
-        musig::{new_musig_nonce_pair, BlindingFactor, MusigSessionId},
+        musig::{new_musig_nonce_pair, BlindingFactor, MusigSessionId, PublicNonce},
         rand, schnorr, KeyPair, PublicKey, Secp256k1, SecretKey,
     },
-    Address, Network, ScriptBuf, Transaction,
+    sighash::TemplateHash,
+    Address, Network, PrivateKey, ScriptBuf, Transaction,
 };
 use common::bip448_regtest::{fund_bip448_output, unsigned_spend, SPEND_AMOUNT_SATS};
 use mercurylib::bip448::template_hash::template_hash;
@@ -18,6 +21,10 @@ use mercurylib::bip448_statechain::signing::{
     csfs_script_witness, csfs_witness_signature, CsfsSigningParticipant, CsfsSigningRole,
     CsfsSigningSession,
 };
+use mercurylib::bip448_statechain::signing_api::{
+    Bip448PartialSignatureRequestPayload, Bip448SignFirstRequestPayload,
+};
+use reqwest::StatusCode;
 
 /// Phase 4 end-to-end proof on Inquisition consensus: a blinded two-party
 /// MuSig CSFS signature over a BIP446 template hash, produced against the
@@ -156,6 +163,120 @@ fn bip448_blinded_musig_csfs_signature_spends_on_inquisition() -> Result<()> {
     common::bitcoin_core::assert_confirmed(&spend_b_txid)?;
 
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires docker regtest stack with Mercury server and lockbox"]
+async fn bip448_sign_second_recovers_after_post_claim_server_failure() -> Result<()> {
+    let _guard = common::test_guard();
+    let client = common::mercury::http_client();
+    common::mercury::wait_until_ready(&client).await?;
+
+    let (_wallet, coin) = common::mercury::create_deposited_coin(&client).await?;
+    let statechain_id = coin
+        .statechain_id
+        .as_ref()
+        .context("deposited coin missing statechain_id")?
+        .clone();
+    let signed_statechain_id = coin
+        .signed_statechain_id
+        .as_ref()
+        .context("deposited coin missing signed_statechain_id")?
+        .clone();
+    let signing_id = hex::encode([0x44u8; 32]);
+
+    let first = common::mercury::bip448_sign_first(
+        &client,
+        &Bip448SignFirstRequestPayload {
+            statechain_id: statechain_id.clone(),
+            signed_statechain_id: signed_statechain_id.clone(),
+            signing_id: signing_id.clone(),
+        },
+    )
+    .await?;
+    let second_payload =
+        bip448_partial_signature_payload(&coin, &signing_id, &first.server_pubnonce)?;
+
+    let lockbox_client = common::lockbox::http_client();
+    common::lockbox::stop_token_stack_lockbox_service().await?;
+    let failure_result = client
+        .post(format!(
+            "{}/bip448-statechain/sign/second",
+            common::mercury::MERCURY_URL
+        ))
+        .json(&second_payload)
+        .send()
+        .await;
+    common::lockbox::start_token_stack_lockbox_service(&lockbox_client).await?;
+
+    let failure = failure_result.context("failed to call mercury bip448 sign/second")?;
+    let failure_status = failure.status();
+    assert_eq!(failure_status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    let partial = common::mercury::bip448_sign_second(&client, &second_payload).await?;
+    assert_eq!(partial.partial_sig.len(), 64);
+
+    let replay = common::mercury::bip448_sign_second(&client, &second_payload).await?;
+    assert_eq!(replay.partial_sig, partial.partial_sig);
+
+    Ok(())
+}
+
+fn bip448_partial_signature_payload(
+    coin: &mercurylib::wallet::Coin,
+    signing_id: &str,
+    server_pubnonce: &str,
+) -> Result<Bip448PartialSignatureRequestPayload> {
+    let secp = Secp256k1::new();
+    let client_seckey = PrivateKey::from_wif(&coin.user_privkey)?.inner;
+    let client_pubkey = PublicKey::from_str(&coin.user_pubkey)?;
+    let server_pubkey = PublicKey::from_str(
+        coin.server_pubkey
+            .as_ref()
+            .context("deposited coin missing server_pubkey")?,
+    )?;
+    let aggregate_pubkey = client_pubkey.combine(&server_pubkey)?;
+
+    let mut rng = rand::rng();
+    let (_client_sec_nonce, client_pub_nonce) = new_musig_nonce_pair(
+        &secp,
+        MusigSessionId::new(&mut rng),
+        None,
+        Some(client_seckey),
+        client_pubkey,
+        None,
+        None,
+    )?;
+    let server_pub_nonce = PublicNonce::from_slice(&hex::decode(server_pubnonce)?)?;
+    let blinding_secret = SecretKey::new(&mut rng);
+    let blinding_factor = BlindingFactor::from_slice(&blinding_secret.to_secret_bytes())?;
+    let template_hash = TemplateHash::from_slice(&[0x51u8; 32])?;
+    let session = CsfsSigningSession::new(
+        &secp,
+        CsfsSigningRole::FundingUpdate,
+        aggregate_pubkey,
+        &client_pub_nonce,
+        &server_pub_nonce,
+        template_hash,
+        &blinding_factor,
+    )?;
+
+    Ok(Bip448PartialSignatureRequestPayload {
+        statechain_id: coin
+            .statechain_id
+            .as_ref()
+            .context("deposited coin missing statechain_id")?
+            .clone(),
+        signed_statechain_id: coin
+            .signed_statechain_id
+            .as_ref()
+            .context("deposited coin missing signed_statechain_id")?
+            .clone(),
+        signing_id: signing_id.to_string(),
+        negate_seckey: u8::from(session.negate_seckey()),
+        session: hex::encode(session.blinded_server_session().serialize()),
+        server_pub_nonce: server_pubnonce.to_string(),
+    })
 }
 
 fn push_csfs_witness(

@@ -175,6 +175,56 @@ pub async fn restart_lockbox_service(client: &Client) -> Result<()> {
     wait_until_ready(client).await
 }
 
+pub async fn stop_token_stack_lockbox_service() -> Result<()> {
+    let output = Command::new("docker")
+        .args([
+            "compose",
+            "-f",
+            "docker-compose-token-servers.yml",
+            "stop",
+            "lockbox",
+        ])
+        .current_dir(repo_root())
+        .output()
+        .context("failed to stop token-stack lockbox service")?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "failed to stop token-stack lockbox service: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    Ok(())
+}
+
+pub async fn start_token_stack_lockbox_service(client: &Client) -> Result<()> {
+    let output = Command::new("docker")
+        .args([
+            "compose",
+            "-f",
+            "docker-compose-token-servers.yml",
+            "up",
+            "-d",
+            "--no-deps",
+            "lockbox",
+        ])
+        .current_dir(repo_root())
+        .output()
+        .context("failed to start token-stack lockbox service")?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "failed to start token-stack lockbox service: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    wait_until_ready(client).await
+}
+
 pub async fn recreate_lockbox_service_with_rng_seed(
     client: &Client,
     rng_seed_hex: Option<&str>,

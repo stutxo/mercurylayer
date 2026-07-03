@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{error::Error, fmt, str::FromStr};
 
 use bitcoin::hashes::sha256;
 use rocket::{http::Status, response::status, serde::json::Json, State};
@@ -8,6 +8,35 @@ use serde_json::{json, Value};
 use sqlx::Row;
 
 use crate::server::StateChainEntity;
+
+#[derive(Debug)]
+pub enum SignatureValidationError {
+    StatechainNotFound,
+    MissingAuthKey,
+    InvalidAuthKey,
+    InvalidSignature,
+    Database(sqlx::Error),
+}
+
+impl fmt::Display for SignatureValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SignatureValidationError::StatechainNotFound => f.write_str("statechain not found"),
+            SignatureValidationError::MissingAuthKey => {
+                f.write_str("statechain auth key is missing")
+            }
+            SignatureValidationError::InvalidAuthKey => {
+                f.write_str("statechain auth key is invalid")
+            }
+            SignatureValidationError::InvalidSignature => {
+                f.write_str("signed_statechain_id is not a valid Schnorr signature")
+            }
+            SignatureValidationError::Database(err) => write!(f, "database error: {err}"),
+        }
+    }
+}
+
+impl Error for SignatureValidationError {}
 
 pub async fn get_auth_key_by_statechain_id(
     pool: &sqlx::PgPool,
@@ -64,6 +93,48 @@ pub async fn validate_signature(
     let secp = Secp256k1::new();
     secp.verify_schnorr(&signed_message, msg.as_ref(), &auth_key)
         .is_ok()
+}
+
+fn try_verify_statechain_signature(
+    signed_message_hex: &str,
+    statechain_id: &str,
+    auth_key: &XOnlyPublicKey,
+) -> Result<bool, SignatureValidationError> {
+    let signed_message = Signature::from_str(signed_message_hex)
+        .map_err(|_| SignatureValidationError::InvalidSignature)?;
+    let msg = Message::from_hashed_data::<sha256::Hash>(statechain_id.to_string().as_bytes());
+
+    let secp = Secp256k1::new();
+    Ok(secp
+        .verify_schnorr(&signed_message, msg.as_ref(), auth_key)
+        .is_ok())
+}
+
+pub async fn try_validate_signature(
+    pool: &sqlx::PgPool,
+    signed_message_hex: &str,
+    statechain_id: &str,
+) -> Result<bool, SignatureValidationError> {
+    let row = sqlx::query(
+        "SELECT auth_xonly_public_key \
+        FROM public.statechain_data \
+        WHERE statechain_id = $1",
+    )
+    .bind(statechain_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(SignatureValidationError::Database)?;
+
+    let Some(row) = row else {
+        return Err(SignatureValidationError::StatechainNotFound);
+    };
+    let public_key_bytes = row
+        .get::<Option<Vec<u8>>, _>("auth_xonly_public_key")
+        .ok_or(SignatureValidationError::MissingAuthKey)?;
+    let auth_key = XOnlyPublicKey::from_slice(&public_key_bytes)
+        .map_err(|_| SignatureValidationError::InvalidAuthKey)?;
+
+    try_verify_statechain_signature(signed_message_hex, statechain_id, &auth_key)
 }
 
 #[get("/info/config")]
@@ -192,5 +263,53 @@ mod tests {
         ));
 
         assert!(!is_valid);
+    }
+
+    #[test]
+    fn try_verify_statechain_signature_accepts_a_valid_signature() {
+        let secp = Secp256k1::new();
+        let secret_key = SecretKey::from_slice(&[44u8; 32]).unwrap();
+        let keypair = KeyPair::from_seckey_slice(&secp, secret_key.as_ref()).unwrap();
+        let auth_key = keypair.x_only_public_key().0;
+        let statechain_id = "statechain-1";
+        let message = Message::from_hashed_data::<sha256::Hash>(statechain_id.as_bytes());
+        let signature = secp.sign_schnorr(message.as_ref(), &keypair);
+
+        let is_valid =
+            try_verify_statechain_signature(&signature.to_string(), statechain_id, &auth_key)
+                .unwrap();
+
+        assert!(is_valid);
+    }
+
+    #[test]
+    fn try_verify_statechain_signature_rejects_wrong_message() {
+        let secp = Secp256k1::new();
+        let secret_key = SecretKey::from_slice(&[45u8; 32]).unwrap();
+        let keypair = KeyPair::from_seckey_slice(&secp, secret_key.as_ref()).unwrap();
+        let auth_key = keypair.x_only_public_key().0;
+        let signature = secp.sign_schnorr(
+            Message::from_hashed_data::<sha256::Hash>("statechain-a".as_bytes()).as_ref(),
+            &keypair,
+        );
+
+        let is_valid =
+            try_verify_statechain_signature(&signature.to_string(), "statechain-b", &auth_key)
+                .unwrap();
+
+        assert!(!is_valid);
+    }
+
+    #[test]
+    fn try_verify_statechain_signature_rejects_malformed_signature_without_panic() {
+        let secp = Secp256k1::new();
+        let secret_key = SecretKey::from_slice(&[46u8; 32]).unwrap();
+        let keypair = KeyPair::from_seckey_slice(&secp, secret_key.as_ref()).unwrap();
+        let auth_key = keypair.x_only_public_key().0;
+
+        let err = try_verify_statechain_signature("not-a-signature", "statechain-1", &auth_key)
+            .unwrap_err();
+
+        assert!(matches!(err, SignatureValidationError::InvalidSignature));
     }
 }

@@ -1,5 +1,6 @@
 use chrono::{DateTime, Duration, Utc};
 
+pub mod bip448_sign;
 pub mod deposit;
 pub mod lightning_latch;
 pub mod sign;

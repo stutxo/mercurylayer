@@ -5,6 +5,10 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use mercurylib::{
+    bip448_statechain::signing_api::{
+        Bip448PartialSignatureRequestPayload, Bip448PartialSignatureResponsePayload,
+        Bip448SignFirstRequestPayload, Bip448SignFirstResponsePayload,
+    },
     deposit::{self, DepositMsg1, DepositMsg1Response, TokenResponse},
     transaction::{
         PartialSignatureRequestPayload, PartialSignatureResponsePayload, SignFirstRequestPayload,
@@ -108,6 +112,42 @@ pub async fn sign_second(
 
     let mut result: PartialSignatureResponsePayload =
         ensure_success(response, "sign/second").await?;
+    result.partial_sig = lockbox::normalize_hex(&result.partial_sig);
+
+    Ok(result)
+}
+
+pub async fn bip448_sign_first(
+    client: &Client,
+    payload: &Bip448SignFirstRequestPayload,
+) -> Result<Bip448SignFirstResponsePayload> {
+    let response = client
+        .post(format!("{}/bip448-statechain/sign/first", MERCURY_URL))
+        .json(payload)
+        .send()
+        .await
+        .context("failed to call mercury bip448 sign/first")?;
+
+    let mut result: Bip448SignFirstResponsePayload =
+        ensure_success(response, "bip448 sign/first").await?;
+    result.server_pubnonce = lockbox::normalize_hex(&result.server_pubnonce);
+
+    Ok(result)
+}
+
+pub async fn bip448_sign_second(
+    client: &Client,
+    payload: &Bip448PartialSignatureRequestPayload,
+) -> Result<Bip448PartialSignatureResponsePayload> {
+    let response = client
+        .post(format!("{}/bip448-statechain/sign/second", MERCURY_URL))
+        .json(payload)
+        .send()
+        .await
+        .context("failed to call mercury bip448 sign/second")?;
+
+    let mut result: Bip448PartialSignatureResponsePayload =
+        ensure_success(response, "bip448 sign/second").await?;
     result.partial_sig = lockbox::normalize_hex(&result.partial_sig);
 
     Ok(result)

@@ -12,6 +12,24 @@ async fn delete_statechain_db(pool: &sqlx::PgPool, statechain_id: &String) {
         .await
         .unwrap();
 
+    let _ = sqlx::query("DELETE FROM signing_nonce_leases WHERE statechain_id = $1")
+        .bind(statechain_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+
+    let _ = sqlx::query("DELETE FROM statechain_signing_protocol WHERE statechain_id = $1")
+        .bind(statechain_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+
+    let _ = sqlx::query("DELETE FROM bip448_signature_data WHERE statechain_id = $1")
+        .bind(statechain_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+
     let _ = sqlx::query("DELETE FROM statechain_data WHERE statechain_id = $1")
         .bind(statechain_id)
         .execute(&mut *transaction)
