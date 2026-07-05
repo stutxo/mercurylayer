@@ -245,9 +245,11 @@ pub async fn recreate_lockbox_service_with_rng_seed(
 
     match rng_seed_hex {
         Some(seed) => {
+            command.env("LOCKBOX_ENABLE_TEST_RNG", "ON");
             command.env("LOCKBOX_TEST_RNG_SEED", seed);
         }
         None => {
+            command.env_remove("LOCKBOX_ENABLE_TEST_RNG");
             command.env_remove("LOCKBOX_TEST_RNG_SEED");
         }
     }

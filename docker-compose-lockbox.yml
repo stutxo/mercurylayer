@@ -32,6 +32,8 @@ services:
     build:
       context: lockbox
       dockerfile: ./Dockerfile
+      args:
+        LOCKBOX_ENABLE_TEST_RNG: ${LOCKBOX_ENABLE_TEST_RNG:-OFF}
     depends_on:
       - db_lockbox
       - vault-init

@@ -2,6 +2,7 @@
 #include <openssl/rand.h>
 #include <openssl/sha.h>
 #include <string.h>
+#include <cstdlib>
 #include <cstring> 
 #include <mutex>
 #include <stdexcept>
@@ -10,6 +11,7 @@
 namespace utils {
 
     namespace {
+#ifdef LOCKBOX_ENABLE_TEST_RNG
         std::mutex deterministic_rng_mutex;
         uint64_t deterministic_rng_counter = 0;
 
@@ -27,6 +29,12 @@ namespace utils {
 
             return seed;
         }
+#else
+        bool deterministicSeedConfigured() {
+            const char* seed_hex = std::getenv("LOCKBOX_TEST_RNG_SEED");
+            return seed_hex != nullptr && std::strlen(seed_hex) != 0;
+        }
+#endif
     } // namespace
 
     const signed char p_util_hexdigit[256] =
@@ -97,6 +105,7 @@ namespace utils {
     }
 
     void fill_random_bytes(unsigned char* buffer, size_t buffer_len, const std::string& purpose) {
+#ifdef LOCKBOX_ENABLE_TEST_RNG
         auto deterministic_seed = getDeterministicSeed();
 
         if (deterministic_seed.empty()) {
@@ -134,6 +143,15 @@ namespace utils {
             offset += bytes_to_copy;
             deterministic_rng_counter++;
         }
+#else
+        if (deterministicSeedConfigured()) {
+            throw std::runtime_error("LOCKBOX_TEST_RNG_SEED is only supported in test RNG builds");
+        }
+
+        if (RAND_bytes(buffer, buffer_len) != 1) {
+            throw std::runtime_error("Failed to generate random bytes");
+        }
+#endif
     }
 
     uint16_t convertStringToUint16(const char* value) {

@@ -6,6 +6,8 @@ project(MercuryLockbox VERSION 0.1
                     DESCRIPTION "Mercury Lockbox"
                     LANGUAGES C CXX)
 
+option(LOCKBOX_ENABLE_TEST_RNG "Enable deterministic lockbox RNG for tests" OFF)
+
 # Add C compiler settings
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -45,6 +47,10 @@ target_include_directories(LockboxLibrary PUBLIC include)
 target_compile_options(LockboxLibrary PRIVATE
     $<$<COMPILE_LANGUAGE:C>:-std=c11>
     $<$<COMPILE_LANGUAGE:CXX>:-std=c++17>)
+
+if(LOCKBOX_ENABLE_TEST_RNG)
+    target_compile_definitions(LockboxLibrary PRIVATE LOCKBOX_ENABLE_TEST_RNG=1)
+endif()
     
 target_link_libraries(LockboxLibrary 
     Crow::Crow 

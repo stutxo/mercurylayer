@@ -34,12 +34,14 @@ ENV PATH="/opt/vcpkg:${PATH}"
 # Set vcpkg root
 ENV VCPKG_ROOT=/opt/vcpkg
 
+ARG LOCKBOX_ENABLE_TEST_RNG=OFF
+
 # Copy your project files
 COPY . .
 
 # Create build directory and run cmake
 RUN mkdir -p build && cd build
-RUN cd build && cmake --preset=vcpkg ..
+RUN cd build && cmake --preset=vcpkg -DLOCKBOX_ENABLE_TEST_RNG=${LOCKBOX_ENABLE_TEST_RNG} ..
 RUN cd build && cmake --build .
 RUN test -s ./build/MercuryLockbox && test -s ./build/libLockboxLibrary.a
 
