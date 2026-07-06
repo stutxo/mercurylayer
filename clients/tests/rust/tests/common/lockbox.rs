@@ -132,6 +132,27 @@ pub async fn get_public_nonce(
     Ok(result)
 }
 
+pub async fn bip448_get_public_nonce(
+    client: &Client,
+    statechain_id: &str,
+    signing_id: &str,
+) -> Result<ServerPubnonceResponse> {
+    let response = post_json(
+        client,
+        "bip448/get_public_nonce",
+        json!({
+            "statechain_id": statechain_id,
+            "signing_id": signing_id,
+        }),
+    )
+    .await?;
+
+    let mut result: ServerPubnonceResponse =
+        ensure_success(response, "bip448/get_public_nonce").await?;
+    result.server_pubnonce = normalize_hex(&result.server_pubnonce);
+    Ok(result)
+}
+
 pub async fn delete_statechain(client: &Client, statechain_id: &str) -> Result<()> {
     let response = delete(client, &format!("delete_statechain/{}", statechain_id)).await?;
     let status = response.status();
@@ -152,45 +173,58 @@ pub async fn delete_statechain(client: &Client, statechain_id: &str) -> Result<(
 }
 
 pub async fn restart_lockbox_service(client: &Client) -> Result<()> {
-    let output = Command::new("docker")
-        .args([
-            "compose",
-            "-f",
-            "docker-compose-lockbox.yml",
-            "restart",
-            "lockbox",
-        ])
-        .current_dir(repo_root())
-        .output()
-        .context("failed to restart lockbox service")?;
-
-    if !output.status.success() {
-        return Err(anyhow!(
-            "failed to restart lockbox service: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
+    run_docker_compose(
+        "docker-compose-lockbox.yml",
+        &["restart", "lockbox"],
+        "restart lockbox service",
+    )?;
 
     wait_until_ready(client).await
 }
 
 pub async fn stop_token_stack_lockbox_service() -> Result<()> {
-    let output = Command::new("docker")
-        .args([
-            "compose",
-            "-f",
-            "docker-compose-token-servers.yml",
-            "stop",
-            "lockbox",
-        ])
-        .current_dir(repo_root())
+    run_docker_compose(
+        "docker-compose-token-servers.yml",
+        &["stop", "lockbox"],
+        "stop token-stack lockbox service",
+    )
+}
+
+pub async fn start_token_stack_lockbox_service(client: &Client) -> Result<()> {
+    run_docker_compose(
+        "docker-compose-token-servers.yml",
+        &["up", "-d", "--no-deps", "lockbox"],
+        "start token-stack lockbox service",
+    )?;
+
+    wait_until_ready(client).await
+}
+
+fn run_docker_compose(compose_file: &str, args: &[&str], context: &str) -> Result<()> {
+    let command = docker_compose_command(compose_file, args);
+    run_docker_command(command, context)
+}
+
+fn docker_compose_command(compose_file: &str, args: &[&str]) -> Command {
+    let mut command = Command::new("docker");
+    command
+        .arg("compose")
+        .arg("-f")
+        .arg(compose_file)
+        .args(args)
+        .current_dir(repo_root());
+    command
+}
+
+fn run_docker_command(mut command: Command, context: &str) -> Result<()> {
+    let output = command
         .output()
-        .context("failed to stop token-stack lockbox service")?;
+        .with_context(|| format!("failed to {context}"))?;
 
     if !output.status.success() {
         return Err(anyhow!(
-            "failed to stop token-stack lockbox service: stdout={} stderr={}",
+            "failed to {}: stdout={} stderr={}",
+            context,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         ));
@@ -199,49 +233,24 @@ pub async fn stop_token_stack_lockbox_service() -> Result<()> {
     Ok(())
 }
 
-pub async fn start_token_stack_lockbox_service(client: &Client) -> Result<()> {
-    let output = Command::new("docker")
-        .args([
-            "compose",
-            "-f",
-            "docker-compose-token-servers.yml",
-            "up",
-            "-d",
-            "--no-deps",
-            "lockbox",
-        ])
-        .current_dir(repo_root())
-        .output()
-        .context("failed to start token-stack lockbox service")?;
-
-    if !output.status.success() {
-        return Err(anyhow!(
-            "failed to start token-stack lockbox service: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-
-    wait_until_ready(client).await
-}
-
 pub async fn recreate_lockbox_service_with_rng_seed(
     client: &Client,
     rng_seed_hex: Option<&str>,
 ) -> Result<()> {
-    let mut command = Command::new("docker");
-    command
-        .args([
-            "compose",
-            "-f",
-            "docker-compose-lockbox.yml",
-            "up",
-            "-d",
-            "--build",
-            "--force-recreate",
-            "lockbox",
-        ])
-        .current_dir(repo_root());
+    run_recreate_lockbox_service_with_rng_seed(rng_seed_hex)?;
+
+    wait_until_ready(client).await
+}
+
+pub fn recreate_lockbox_service_with_production_rng() -> Result<()> {
+    run_recreate_lockbox_service_with_rng_seed(None)
+}
+
+fn run_recreate_lockbox_service_with_rng_seed(rng_seed_hex: Option<&str>) -> Result<()> {
+    let mut command = docker_compose_command(
+        "docker-compose-lockbox.yml",
+        &["up", "-d", "--build", "--force-recreate", "lockbox"],
+    );
 
     match rng_seed_hex {
         Some(seed) => {
@@ -254,19 +263,7 @@ pub async fn recreate_lockbox_service_with_rng_seed(
         }
     }
 
-    let output = command
-        .output()
-        .context("failed to recreate lockbox service")?;
-
-    if !output.status.success() {
-        return Err(anyhow!(
-            "failed to recreate lockbox service: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-
-    wait_until_ready(client).await
+    run_docker_command(command, "recreate lockbox service")
 }
 
 pub async fn keyupdate(
@@ -303,6 +300,30 @@ pub async fn request_partial_signature(
     .await?;
     let mut result: PartialSignatureResponse =
         ensure_success(response, "get_partial_signature").await?;
+    result.partial_sig = normalize_hex(&result.partial_sig);
+
+    Ok(result.partial_sig)
+}
+
+pub async fn bip448_request_partial_signature(
+    client: &Client,
+    signing_id: &str,
+    payload: &transaction::PartialSignatureRequestPayload,
+) -> Result<String> {
+    let response = post_json(
+        client,
+        "bip448/get_partial_signature",
+        json!({
+            "statechain_id": payload.statechain_id,
+            "signing_id": signing_id,
+            "negate_seckey": payload.negate_seckey,
+            "session": payload.session,
+            "server_pub_nonce": payload.server_pub_nonce,
+        }),
+    )
+    .await?;
+    let mut result: PartialSignatureResponse =
+        ensure_success(response, "bip448/get_partial_signature").await?;
     result.partial_sig = normalize_hex(&result.partial_sig);
 
     Ok(result.partial_sig)

@@ -101,22 +101,33 @@ pub async fn insert_bip448_signature_reservation(
     result.rows_affected() == 1
 }
 
-pub async fn update_bip448_signature_data_server_pubnonce(
+pub async fn update_bip448_signature_data_server_pubnonce_if_lease_matches(
     pool: &sqlx::PgPool,
     statechain_id: &str,
     signing_id: &str,
     server_pubnonce: &str,
+    lease_token: &str,
 ) -> bool {
     let query = "\
-        UPDATE bip448_signature_data \
+        UPDATE bip448_signature_data AS signature \
         SET server_pubnonce = $1, updated_at = NOW() \
-        WHERE statechain_id = $2 AND signing_id = $3 \
-          AND server_pubnonce IS NULL AND challenge IS NULL";
+        WHERE signature.statechain_id = $2 AND signature.signing_id = $3 \
+          AND signature.server_pubnonce IS NULL AND signature.challenge IS NULL \
+          AND EXISTS (\
+              SELECT 1 \
+              FROM signing_nonce_leases AS lease \
+              WHERE lease.statechain_id = signature.statechain_id \
+                AND lease.protocol = $4 \
+                AND lease.signing_id = signature.signing_id \
+                AND lease.lease_token = $5\
+          )";
 
     let result = sqlx::query(query)
         .bind(server_pubnonce)
         .bind(statechain_id)
         .bind(signing_id)
+        .bind(crate::database::sign::BIP448_SIGNING_PROTOCOL)
+        .bind(lease_token)
         .execute(pool)
         .await
         .unwrap();

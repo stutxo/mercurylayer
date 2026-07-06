@@ -267,6 +267,45 @@ pub async fn insert_statechain_transfer_row(
     Ok(())
 }
 
+pub async fn clear_bip448_server_partial_signature(
+    statechain_id: &str,
+    signing_id: &str,
+) -> Result<()> {
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(MERCURY_DATABASE_URL)
+        .await
+        .context("failed to connect to mercury postgres")?;
+
+    let result = sqlx::query(
+        "UPDATE bip448_signature_data \
+         SET server_partial_sig = NULL, updated_at = NOW() \
+         WHERE statechain_id = $1 AND signing_id = $2 \
+           AND challenge IS NOT NULL AND server_partial_sig IS NOT NULL",
+    )
+    .bind(statechain_id)
+    .bind(signing_id)
+    .execute(&pool)
+    .await
+    .with_context(|| {
+        format!(
+            "failed to clear BIP448 partial signature for {} / {}",
+            statechain_id, signing_id
+        )
+    })?;
+
+    if result.rows_affected() != 1 {
+        return Err(anyhow!(
+            "expected to clear one BIP448 partial signature for {} / {}, cleared {}",
+            statechain_id,
+            signing_id,
+            result.rows_affected()
+        ));
+    }
+
+    Ok(())
+}
+
 pub fn sign_t2_hex(auth_secret_key: &SecretKey, t2_hex: &str) -> Result<String> {
     let secp = Secp256k1::new();
     let keypair = KeyPair::from_seckey_slice(&secp, auth_secret_key.as_ref())?;

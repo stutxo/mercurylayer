@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use mercurylib::{deposit, transaction, transfer::receiver::TransferReceiverRequestPayload};
 use reqwest::StatusCode;
 use secp256k1::{Secp256k1, SecretKey};
-use serde_json::{json, Value};
+use serde_json::json;
 use tokio::{sync::Barrier, task::JoinSet};
 
 use crate::common::{lockbox, mercury};
@@ -23,8 +23,43 @@ struct DeterministicVector {
     updated_server_pubkey: String,
 }
 
+struct ProductionRngRestoreGuard {
+    active: bool,
+}
+
+impl ProductionRngRestoreGuard {
+    fn armed() -> Self {
+        Self { active: true }
+    }
+
+    async fn restore_now(&mut self, client: &reqwest::Client) -> Result<()> {
+        lockbox::recreate_lockbox_service_with_rng_seed(client, None).await?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for ProductionRngRestoreGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+
+        if let Err(err) = lockbox::recreate_lockbox_service_with_production_rng() {
+            eprintln!("failed to restore lockbox production RNG after deterministic test: {err:#}");
+        }
+    }
+}
+
 fn dummy_session_hex() -> String {
     "00".repeat(133)
+}
+
+fn mutate_bip448_session_challenge(session_hex: &str) -> Result<String> {
+    const CHALLENGE_OFFSET: usize = 4 + 1 + 32 + 32;
+    let mut session = hex::decode(session_hex)?;
+    session[CHALLENGE_OFFSET] ^= 0x01;
+    Ok(hex::encode(session))
 }
 
 fn deterministic_partial_signature_payload() -> transaction::PartialSignatureRequestPayload {
@@ -210,7 +245,7 @@ async fn keyupdate_requires_existing_statechain() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires lockbox docker stack"]
-async fn signature_count_for_missing_statechain_returns_json_number() -> Result<()> {
+async fn signature_count_for_missing_statechain_returns_not_found() -> Result<()> {
     let _guard = common::test_guard();
     let client = lockbox::http_client();
     lockbox::wait_until_ready(&client).await?;
@@ -229,11 +264,8 @@ async fn signature_count_for_missing_statechain_returns_json_number() -> Result<
         .await
         .context("failed to read missing signature_count body")?;
 
-    assert_eq!(status, StatusCode::OK);
-
-    let payload: Value = serde_json::from_str(&body)?;
-    assert!(payload.get("sig_count").is_some());
-    assert!(payload["sig_count"].is_number());
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.contains("Signature count not found."));
 
     Ok(())
 }
@@ -321,6 +353,80 @@ async fn nonce_generated_signing_state_survives_lockbox_restart() -> Result<()> 
     assert_eq!(signed_tx.input.len(), 1);
     assert_eq!(signed_tx.output.len(), 1);
     assert_eq!(signed_tx.input[0].witness.len(), 1);
+    assert_eq!(
+        lockbox::get_signature_count(&client, &statechain_id).await?,
+        1
+    );
+
+    lockbox::delete_statechain(&client, &statechain_id).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires lockbox docker stack"]
+async fn bip448_nonce_state_replays_after_restart_and_rejects_conflicting_challenge() -> Result<()>
+{
+    let _guard = common::test_guard();
+    let client = lockbox::http_client();
+    lockbox::wait_until_ready(&client).await?;
+
+    let statechain_id = lockbox::new_statechain_id("bip448-lockbox");
+    let signing_id = hex::encode([0x55u8; 32]);
+    let created = lockbox::create_statechain(&client, &statechain_id).await?;
+    let server_pubnonce =
+        lockbox::bip448_get_public_nonce(&client, &statechain_id, &signing_id).await?;
+    let repeated_server_pubnonce =
+        lockbox::bip448_get_public_nonce(&client, &statechain_id, &signing_id).await?;
+    assert_eq!(
+        repeated_server_pubnonce.server_pubnonce,
+        server_pubnonce.server_pubnonce
+    );
+
+    let payload = lockbox::build_partial_signature_fixture(
+        &statechain_id,
+        &created.server_pubkey,
+        &server_pubnonce.server_pubnonce,
+    )?
+    .partial_signature_request_payload;
+
+    let partial = lockbox::bip448_request_partial_signature(&client, &signing_id, &payload).await?;
+    assert_eq!(partial.len(), 64);
+    assert_eq!(
+        lockbox::get_signature_count(&client, &statechain_id).await?,
+        1
+    );
+
+    lockbox::restart_lockbox_service(&client).await?;
+
+    let replay = lockbox::bip448_request_partial_signature(&client, &signing_id, &payload).await?;
+    assert_eq!(replay, partial);
+    assert_eq!(
+        lockbox::get_signature_count(&client, &statechain_id).await?,
+        1
+    );
+
+    let mut conflicting_payload = payload.clone();
+    conflicting_payload.session = mutate_bip448_session_challenge(&payload.session)?;
+    let conflict = lockbox::post_json(
+        &client,
+        "bip448/get_partial_signature",
+        json!({
+            "statechain_id": conflicting_payload.statechain_id,
+            "signing_id": signing_id,
+            "negate_seckey": conflicting_payload.negate_seckey,
+            "session": conflicting_payload.session,
+            "server_pub_nonce": conflicting_payload.server_pub_nonce,
+        }),
+    )
+    .await?;
+    let conflict_status = conflict.status();
+    let conflict_body = conflict
+        .text()
+        .await
+        .context("failed to read BIP448 conflict body")?;
+    assert_eq!(conflict_status, StatusCode::CONFLICT);
+    assert!(conflict_body.contains("challenge does not match"));
     assert_eq!(
         lockbox::get_signature_count(&client, &statechain_id).await?,
         1
@@ -448,11 +554,8 @@ async fn delete_statechain_is_idempotent_and_deleted_statechain_cannot_be_used()
         .await
         .context("failed to read post-delete signature_count body")?;
 
-    assert_eq!(sig_count_status, StatusCode::OK);
-
-    let sig_count_payload: Value = serde_json::from_str(&sig_count_body)?;
-    assert!(sig_count_payload.get("sig_count").is_some());
-    assert!(sig_count_payload["sig_count"].is_number());
+    assert_eq!(sig_count_status, StatusCode::NOT_FOUND);
+    assert!(sig_count_body.contains("Signature count not found."));
 
     Ok(())
 }
@@ -464,6 +567,7 @@ async fn deterministic_lockbox_vectors_match_golden_outputs() -> Result<()> {
     let client = lockbox::http_client();
     let statechain_id = DETERMINISTIC_STATECHAIN_ID;
     let partial_signature_payload = deterministic_partial_signature_payload();
+    let mut production_rng_restore = ProductionRngRestoreGuard::armed();
 
     lockbox::recreate_lockbox_service_with_rng_seed(&client, Some(DETERMINISTIC_RNG_SEED)).await?;
 
@@ -529,7 +633,7 @@ async fn deterministic_lockbox_vectors_match_golden_outputs() -> Result<()> {
         "03b0e0d6db0474284547015b23f8e08a2fd9fe9e353688439624880af2b8444cea"
     );
 
-    lockbox::recreate_lockbox_service_with_rng_seed(&client, None).await?;
+    production_rng_restore.restore_now(&client).await?;
 
     Ok(())
 }

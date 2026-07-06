@@ -3,13 +3,13 @@ use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgConnectOptions;
 use std::env;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Enclave {
     pub url: String,
     pub allow_deposit: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NostrInfo {
     /// Nostr Relay server
     pub relay_server: String,
@@ -34,7 +34,7 @@ pub struct NostrInfo {
 }
 
 /// Config struct storing all StataChain Entity config
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServerConfig {
     /// Bitcoin network name (testnet, regtest, mainnet)
     pub network: String,

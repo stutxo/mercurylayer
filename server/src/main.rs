@@ -118,20 +118,19 @@ async fn main() {
 
     let config = server_config::ServerConfig::load();
 
-    let statechain_entity = StateChainEntity::new().await;
+    let statechain_entity = StateChainEntity::new(config).await;
 
     sqlx::migrate!("./migrations")
         .run(&statechain_entity.pool)
         .await
         .unwrap();
 
-    if config.nostr_info.is_some() {
-        let nostr_info = config.nostr_info.unwrap();
-
+    if let Some(nostr_info) = statechain_entity.config.nostr_info.clone() {
         /* println!("nostr_info: {:?}", nostr_info); */
         println!("Nostr info found. Starting NIP-100 broadcast");
 
         let interval_seconds = nostr_info.relay_interval as u64;
+        let timelock = statechain_entity.config.lockheight_init;
 
         tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(interval_seconds));
@@ -139,8 +138,6 @@ async fn main() {
             let start = SystemTime::now();
             let since_the_epoch = start.duration_since(UNIX_EPOCH).unwrap();
             let published_at = since_the_epoch.as_secs();
-
-            let timelock = config.lockheight_init;
 
             loop {
                 ticker.tick().await;

@@ -167,7 +167,7 @@ fn bip448_blinded_musig_csfs_signature_spends_on_inquisition() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires docker regtest stack with Mercury server and lockbox"]
-async fn bip448_sign_second_recovers_after_post_claim_server_failure() -> Result<()> {
+async fn bip448_sign_second_recovers_missing_mercury_partial_from_lockbox_replay() -> Result<()> {
     let _guard = common::test_guard();
     let client = common::mercury::http_client();
     common::mercury::wait_until_ready(&client).await?;
@@ -196,10 +196,121 @@ async fn bip448_sign_second_recovers_after_post_claim_server_failure() -> Result
     .await?;
     let second_payload =
         bip448_partial_signature_payload(&coin, &signing_id, &first.server_pubnonce)?;
+    let partial = common::mercury::bip448_sign_second(&client, &second_payload).await?;
+    assert_eq!(partial.partial_sig.len(), 64);
+
+    common::mercury::clear_bip448_server_partial_signature(&statechain_id, &signing_id).await?;
+
+    let replay = common::mercury::bip448_sign_second(&client, &second_payload).await?;
+    assert_eq!(replay.partial_sig, partial.partial_sig);
+
+    let conflicting_payload =
+        bip448_partial_signature_payload(&coin, &signing_id, &first.server_pubnonce)?;
+    let conflict = client
+        .post(format!(
+            "{}/bip448-statechain/sign/second",
+            common::mercury::MERCURY_URL
+        ))
+        .json(&conflicting_payload)
+        .send()
+        .await
+        .context("failed to send conflicting mercury bip448 sign/second")?;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+    let first_replay = common::mercury::bip448_sign_first(
+        &client,
+        &Bip448SignFirstRequestPayload {
+            statechain_id: statechain_id.clone(),
+            signed_statechain_id: signed_statechain_id.clone(),
+            signing_id,
+        },
+    )
+    .await?;
+    assert_eq!(first_replay.server_pubnonce, first.server_pubnonce);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires docker regtest stack with Mercury server and lockbox"]
+async fn bip448_sign_second_accepts_uppercase_0x_server_pubnonce() -> Result<()> {
+    let _guard = common::test_guard();
+    let client = common::mercury::http_client();
+    common::mercury::wait_until_ready(&client).await?;
+
+    let (_wallet, coin) = common::mercury::create_deposited_coin(&client).await?;
+    let statechain_id = coin
+        .statechain_id
+        .as_ref()
+        .context("deposited coin missing statechain_id")?
+        .clone();
+    let signed_statechain_id = coin
+        .signed_statechain_id
+        .as_ref()
+        .context("deposited coin missing signed_statechain_id")?
+        .clone();
+    let signing_id = hex::encode([0x46u8; 32]);
+
+    let first = common::mercury::bip448_sign_first(
+        &client,
+        &Bip448SignFirstRequestPayload {
+            statechain_id,
+            signed_statechain_id,
+            signing_id: signing_id.clone(),
+        },
+    )
+    .await?;
+    let mut second_payload =
+        bip448_partial_signature_payload(&coin, &signing_id, &first.server_pubnonce)?;
+    second_payload.server_pub_nonce =
+        format!("0x{}", second_payload.server_pub_nonce.to_uppercase());
+
+    let partial = common::mercury::bip448_sign_second(&client, &second_payload).await?;
+    assert_eq!(partial.partial_sig.len(), 64);
+
+    let replay = common::mercury::bip448_sign_second(&client, &second_payload).await?;
+    assert_eq!(replay.partial_sig, partial.partial_sig);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires docker regtest stack with Mercury server and lockbox"]
+async fn bip448_sign_second_fails_closed_while_lockbox_status_is_unavailable() -> Result<()> {
+    let _guard = common::test_guard();
+    let client = common::mercury::http_client();
+    common::mercury::wait_until_ready(&client).await?;
+
+    let (_wallet, coin) = common::mercury::create_deposited_coin(&client).await?;
+    let statechain_id = coin
+        .statechain_id
+        .as_ref()
+        .context("deposited coin missing statechain_id")?
+        .clone();
+    let signed_statechain_id = coin
+        .signed_statechain_id
+        .as_ref()
+        .context("deposited coin missing signed_statechain_id")?
+        .clone();
+    let signing_id = hex::encode([0x45u8; 32]);
+
+    let first = common::mercury::bip448_sign_first(
+        &client,
+        &Bip448SignFirstRequestPayload {
+            statechain_id: statechain_id.clone(),
+            signed_statechain_id: signed_statechain_id.clone(),
+            signing_id: signing_id.clone(),
+        },
+    )
+    .await?;
+    let second_payload =
+        bip448_partial_signature_payload(&coin, &signing_id, &first.server_pubnonce)?;
+    let conflicting_payload =
+        bip448_partial_signature_payload(&coin, &signing_id, &first.server_pubnonce)?;
 
     let lockbox_client = common::lockbox::http_client();
     common::lockbox::stop_token_stack_lockbox_service().await?;
-    let failure_result = client
+    let unavailable_result = client
         .post(format!(
             "{}/bip448-statechain/sign/second",
             common::mercury::MERCURY_URL
@@ -207,17 +318,34 @@ async fn bip448_sign_second_recovers_after_post_claim_server_failure() -> Result
         .json(&second_payload)
         .send()
         .await;
+    let exact_retry_while_unavailable = client
+        .post(format!(
+            "{}/bip448-statechain/sign/second",
+            common::mercury::MERCURY_URL
+        ))
+        .json(&second_payload)
+        .send()
+        .await;
+    let conflict_while_unavailable = client
+        .post(format!(
+            "{}/bip448-statechain/sign/second",
+            common::mercury::MERCURY_URL
+        ))
+        .json(&conflicting_payload)
+        .send()
+        .await;
     common::lockbox::start_token_stack_lockbox_service(&lockbox_client).await?;
 
-    let failure = failure_result.context("failed to call mercury bip448 sign/second")?;
-    let failure_status = failure.status();
-    assert_eq!(failure_status, StatusCode::INTERNAL_SERVER_ERROR);
+    let unavailable = unavailable_result.context("failed to call mercury sign/second")?;
+    assert_eq!(unavailable.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let exact_retry =
+        exact_retry_while_unavailable.context("failed exact retry while unavailable")?;
+    assert_eq!(exact_retry.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let conflict = conflict_while_unavailable.context("failed conflict retry while unavailable")?;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
 
-    let partial = common::mercury::bip448_sign_second(&client, &second_payload).await?;
-    assert_eq!(partial.partial_sig.len(), 64);
-
-    let replay = common::mercury::bip448_sign_second(&client, &second_payload).await?;
-    assert_eq!(replay.partial_sig, partial.partial_sig);
+    let recovered = common::mercury::bip448_sign_second(&client, &second_payload).await?;
+    assert_eq!(recovered.partial_sig.len(), 64);
 
     Ok(())
 }

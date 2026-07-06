@@ -6,17 +6,13 @@
 //! routes and must preserve the legacy blind-server property. The Mercury
 //! server sees only an opaque client-generated `signing_id`, never the state
 //! number, signing role, template hash, transaction contents, outputs, or
-//! settlement hash. The lockbox enclave contract is unchanged: the enclave
-//! signs a blinded challenge and cannot distinguish a BIP448 `TemplateHash`
-//! from a legacy `TapSighash`, so each BIP448 payload converts to the exact
-//! legacy enclave payload via [`Bip448SignFirstRequestPayload::to_enclave_payload`]
-//! and [`Bip448PartialSignatureRequestPayload::to_enclave_payload`].
+//! settlement hash. The BIP448 lockbox contract is also versioned so the
+//! lockbox can make nonce idempotency authoritative by opaque id without
+//! learning transaction metadata.
 
 use std::{error::Error, fmt};
 
 use serde::{Deserialize, Serialize};
-
-use crate::transaction::{PartialSignatureRequestPayload, SignFirstRequestPayload};
 
 /// Request payload for `/bip448-statechain/sign/first`.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -58,6 +54,26 @@ pub struct Bip448PartialSignatureResponsePayload {
     pub partial_sig: String,
 }
 
+/// Request payload forwarded from Mercury to the BIP448 lockbox nonce route.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Bip448LockboxSignFirstRequestPayload {
+    pub statechain_id: String,
+    /// Opaque 32-byte hex id. This is random retry/idempotency metadata, not a
+    /// transaction-derived value.
+    pub signing_id: String,
+}
+
+/// Request payload forwarded from Mercury to the BIP448 lockbox partial-signing
+/// route. It intentionally excludes auth signatures and transaction metadata.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Bip448LockboxPartialSignatureRequestPayload {
+    pub statechain_id: String,
+    pub signing_id: String,
+    pub negate_seckey: u8,
+    pub session: String,
+    pub server_pub_nonce: String,
+}
+
 /// Response payload for `/bip448-statechain/signature-count/<statechain_id>`,
 /// so a receiver can independently verify how many BIP448 update partial
 /// signatures the server has produced for a statechain.
@@ -67,23 +83,25 @@ pub struct Bip448SignatureCountResponsePayload {
 }
 
 impl Bip448SignFirstRequestPayload {
-    /// The exact legacy payload forwarded to the unchanged lockbox enclave.
-    pub fn to_enclave_payload(&self) -> SignFirstRequestPayload {
-        SignFirstRequestPayload {
+    /// The BIP448-specific payload forwarded to the lockbox. It contains only
+    /// the opaque idempotency id and statechain scope.
+    pub fn to_lockbox_payload(&self) -> Bip448LockboxSignFirstRequestPayload {
+        Bip448LockboxSignFirstRequestPayload {
             statechain_id: self.statechain_id.clone(),
-            signed_statechain_id: self.signed_statechain_id.clone(),
+            signing_id: self.signing_id.clone(),
         }
     }
 }
 
 impl Bip448PartialSignatureRequestPayload {
-    /// The exact legacy payload forwarded to the unchanged lockbox enclave.
-    pub fn to_enclave_payload(&self) -> PartialSignatureRequestPayload {
-        PartialSignatureRequestPayload {
+    /// The BIP448-specific payload forwarded to the lockbox. The lockbox sees
+    /// only blinded signing material and opaque retry metadata.
+    pub fn to_lockbox_payload(&self) -> Bip448LockboxPartialSignatureRequestPayload {
+        Bip448LockboxPartialSignatureRequestPayload {
             statechain_id: self.statechain_id.clone(),
+            signing_id: self.signing_id.clone(),
             negate_seckey: self.negate_seckey,
             session: self.session.clone(),
-            signed_statechain_id: self.signed_statechain_id.clone(),
             server_pub_nonce: self.server_pub_nonce.clone(),
         }
     }
@@ -178,14 +196,16 @@ mod tests {
     }
 
     #[test]
-    fn enclave_payloads_match_the_unchanged_legacy_contract() {
+    fn lockbox_payloads_exclude_auth_and_transaction_metadata() {
         let first = sample_first_payload();
-        let enclave_first = first.to_enclave_payload();
-        assert_eq!(enclave_first.statechain_id, first.statechain_id);
-        assert_eq!(
-            enclave_first.signed_statechain_id,
-            first.signed_statechain_id
-        );
+        let lockbox_first = first.to_lockbox_payload();
+        let first_json = serde_json::to_string(&lockbox_first).unwrap();
+        assert_eq!(lockbox_first.statechain_id, first.statechain_id);
+        assert_eq!(lockbox_first.signing_id, first.signing_id);
+        assert!(!first_json.contains("signed_statechain_id"));
+        assert!(!first_json.contains("state_number"));
+        assert!(!first_json.contains("signature_role"));
+        assert!(!first_json.contains("template_hash"));
 
         let second = Bip448PartialSignatureRequestPayload {
             statechain_id: "sc-1".to_string(),
@@ -195,15 +215,17 @@ mod tests {
             session: "aa".repeat(133),
             server_pub_nonce: "bb".repeat(66),
         };
-        let enclave_second = second.to_enclave_payload();
-        assert_eq!(enclave_second.statechain_id, second.statechain_id);
-        assert_eq!(enclave_second.negate_seckey, second.negate_seckey);
-        assert_eq!(enclave_second.session, second.session);
-        assert_eq!(
-            enclave_second.signed_statechain_id,
-            second.signed_statechain_id
-        );
-        assert_eq!(enclave_second.server_pub_nonce, second.server_pub_nonce);
+        let lockbox_second = second.to_lockbox_payload();
+        let second_json = serde_json::to_string(&lockbox_second).unwrap();
+        assert_eq!(lockbox_second.statechain_id, second.statechain_id);
+        assert_eq!(lockbox_second.signing_id, second.signing_id);
+        assert_eq!(lockbox_second.negate_seckey, second.negate_seckey);
+        assert_eq!(lockbox_second.session, second.session);
+        assert_eq!(lockbox_second.server_pub_nonce, second.server_pub_nonce);
+        assert!(!second_json.contains("signed_statechain_id"));
+        assert!(!second_json.contains("state_number"));
+        assert!(!second_json.contains("signature_role"));
+        assert!(!second_json.contains("template_hash"));
     }
 
     #[test]

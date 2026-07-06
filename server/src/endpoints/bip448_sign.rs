@@ -2,10 +2,9 @@
 //!
 //! `/bip448-statechain/sign/first` and `/bip448-statechain/sign/second` run
 //! in parallel with the legacy `/sign/first` and `/sign/second`, which stay
-//! unchanged. The lockbox enclave contract is also unchanged: the enclave
-//! signs a blinded challenge and cannot distinguish a BIP448 `TemplateHash`
-//! from a legacy `TapSighash`, so both routes forward the exact legacy
-//! payload shape (via `to_enclave_payload`) to the same enclave endpoints.
+//! unchanged. BIP448 uses versioned lockbox endpoints that include the opaque
+//! signing id, letting the lockbox make nonce idempotency authoritative without
+//! seeing transaction metadata.
 //!
 //! What is new is the opaque retry/idempotency identifier and the rules around
 //! it:
@@ -34,10 +33,21 @@ use rocket::{http::Status, response::status, serde::json::Json, State};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use super::{
+    challenge_from_session_hex, error_response, outbound_request_timeout, protocol_mixing_response,
+};
 use crate::database::bip448_sign::{Bip448IncompleteSignatureRecord, Bip448SignatureRecord};
 use crate::database::sign::{SigningProtocolClaim, BIP448_SIGNING_PROTOCOL};
 use crate::endpoints::utils::SignatureValidationError;
 use crate::server::StateChainEntity;
+
+fn normalize_hex_wire_value(value: &str) -> String {
+    value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value)
+        .to_ascii_lowercase()
+}
 
 /// Outcome of matching a `sign/first` request against the stored record.
 #[derive(Debug, PartialEq, Eq)]
@@ -93,8 +103,10 @@ pub fn classify_sign_second(
         Some(record) => record,
     };
 
+    let server_pub_nonce = normalize_hex_wire_value(server_pub_nonce);
+
     match &record.server_pubnonce {
-        Some(stored_nonce) if stored_nonce == server_pub_nonce => {}
+        Some(stored_nonce) if normalize_hex_wire_value(stored_nonce) == server_pub_nonce => {}
         _ => {
             return SignSecondDecision::Conflict {
                 reason: "server public nonce does not match the stored signature record",
@@ -125,26 +137,38 @@ pub fn classify_sign_second(
     }
 }
 
-const MUSIG_SESSION_MAGIC: [u8; 4] = [0x9d, 0xed, 0xe9, 0x17];
-// rust-secp256k1 fork serialization: magic || parity || fin_nonce || noncecoef || challenge || s_part.
-const MUSIG_SESSION_CHALLENGE_OFFSET: usize = 4 + 1 + 32 + 32;
-const MUSIG_SESSION_CHALLENGE_END: usize = MUSIG_SESSION_CHALLENGE_OFFSET + 32;
-
-/// Extracts the blinded challenge committed by the 133-byte hex session.
-pub fn challenge_from_session_hex(session_hex: &str) -> Option<String> {
-    let session_bytes: [u8; 133] = hex::decode(session_hex).ok()?.try_into().ok()?;
-
-    if session_bytes[..4] != MUSIG_SESSION_MAGIC {
-        return None;
+fn lockbox_status_to_rocket(status: reqwest::StatusCode) -> Status {
+    match status.as_u16() {
+        400 => Status::BadRequest,
+        404 => Status::NotFound,
+        409 => Status::Conflict,
+        _ => Status::InternalServerError,
     }
-
-    Some(hex::encode(
-        &session_bytes[MUSIG_SESSION_CHALLENGE_OFFSET..MUSIG_SESSION_CHALLENGE_END],
-    ))
 }
 
-fn error_response(status: Status, message: String) -> status::Custom<Json<Value>> {
-    status::Custom(status, Json(json!({ "message": message })))
+async fn lockbox_response_text(
+    response: reqwest::Response,
+) -> Result<String, status::Custom<Json<Value>>> {
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|err| error_response(Status::InternalServerError, err.to_string()))?;
+
+    if !status.is_success() {
+        return Err(error_response(lockbox_status_to_rocket(status), text));
+    }
+
+    Ok(text)
+}
+
+fn parse_lockbox_signature_count(value: &str) -> Result<u64, String> {
+    let response: Value = serde_json::from_str(value)
+        .map_err(|err| format!("failed to parse lockbox signature_count response: {err}"))?;
+
+    response["sig_count"]
+        .as_u64()
+        .ok_or_else(|| "lockbox signature_count response is missing sig_count".to_string())
 }
 
 fn incomplete_round_response(
@@ -179,7 +203,7 @@ fn cross_protocol_nonce_response(protocol: &str) -> status::Custom<Json<Value>> 
     )
 }
 
-async fn recover_bip448_sign_second_claim(
+async fn recover_bip448_sign_second_pre_lockbox_claim(
     pool: &sqlx::PgPool,
     statechain_id: &str,
     signing_id: &str,
@@ -195,16 +219,38 @@ async fn recover_bip448_sign_second_claim(
     crate::database::sign::delete_bip448_signing_nonce_lease(pool, statechain_id, signing_id).await;
 }
 
-fn protocol_mixing_response(
-    existing_protocol: &str,
-    requested_protocol: &str,
+async fn cleanup_bip448_sign_first_reservation(
+    pool: &sqlx::PgPool,
+    statechain_id: &str,
+    signing_id: &str,
+    lease_token: &str,
+) {
+    crate::database::bip448_sign::delete_bip448_signature_reservation(
+        pool,
+        statechain_id,
+        signing_id,
+    )
+    .await;
+    crate::database::sign::delete_bip448_signing_nonce_lease_by_token(
+        pool,
+        statechain_id,
+        signing_id,
+        lease_token,
+    )
+    .await;
+}
+
+async fn replay_bip448_partial_signature(
+    pool: &sqlx::PgPool,
+    statechain_id: &str,
+    signing_id: &str,
+    server_partial_sig: String,
 ) -> status::Custom<Json<Value>> {
-    error_response(
-        Status::Conflict,
-        format!(
-            "statechain already uses {} signing; {} signing is disabled for this coin",
-            existing_protocol, requested_protocol
-        ),
+    crate::database::sign::delete_bip448_signing_nonce_lease(pool, statechain_id, signing_id).await;
+
+    status::Custom(
+        Status::Ok,
+        Json(json!({ "partial_sig": server_partial_sig })),
     )
 }
 
@@ -446,7 +492,7 @@ pub async fn bip448_sign_first(
         );
     }
 
-    let config = crate::server_config::ServerConfig::load();
+    let config = &statechain_entity.config;
     let enclave_index = crate::database::utils::get_enclave_index_from_database(
         &statechain_entity.pool,
         &payload.statechain_id,
@@ -456,13 +502,7 @@ pub async fn bip448_sign_first(
     let enclave_index = match enclave_index {
         Some(index) => index as usize,
         None => {
-            crate::database::bip448_sign::delete_bip448_signature_reservation(
-                &statechain_entity.pool,
-                &payload.statechain_id,
-                &signing_id,
-            )
-            .await;
-            crate::database::sign::delete_bip448_signing_nonce_lease_by_token(
+            cleanup_bip448_sign_first_reservation(
                 &statechain_entity.pool,
                 &payload.statechain_id,
                 &signing_id,
@@ -480,13 +520,7 @@ pub async fn bip448_sign_first(
     };
 
     let Some(enclave) = config.enclaves.get(enclave_index) else {
-        crate::database::bip448_sign::delete_bip448_signature_reservation(
-            &statechain_entity.pool,
-            &payload.statechain_id,
-            &signing_id,
-        )
-        .await;
-        crate::database::sign::delete_bip448_signing_nonce_lease_by_token(
+        cleanup_bip448_sign_first_reservation(
             &statechain_entity.pool,
             &payload.statechain_id,
             &signing_id,
@@ -500,12 +534,14 @@ pub async fn bip448_sign_first(
     };
 
     let lockbox_endpoint = enclave.url.clone();
-    let path = "get_public_nonce";
+    let path = "bip448/get_public_nonce";
 
-    let client: reqwest::Client = reqwest::Client::new();
-    let request = client.post(&format!("{}/{}", lockbox_endpoint, path));
+    let client = statechain_entity.http_client.clone();
+    let request = client
+        .post(&format!("{}/{}", lockbox_endpoint, path))
+        .timeout(outbound_request_timeout());
 
-    let lease_lock = match crate::database::sign::lock_bip448_signing_nonce_lease_for_lockbox(
+    if !crate::database::sign::bip448_signing_nonce_lease_matches(
         &statechain_entity.pool,
         &payload.statechain_id,
         &signing_id,
@@ -513,42 +549,32 @@ pub async fn bip448_sign_first(
     )
     .await
     {
-        Some(lease_lock) => lease_lock,
-        None => return pending_nonce_response(),
-    };
+        cleanup_bip448_sign_first_reservation(
+            &statechain_entity.pool,
+            &payload.statechain_id,
+            &signing_id,
+            &lease_token,
+        )
+        .await;
+        return pending_nonce_response();
+    }
 
-    // The enclave contract is the unchanged legacy one; the enclave signs a
-    // blinded challenge and never sees BIP448 metadata.
-    let value = match request.json(&payload.to_enclave_payload()).send().await {
-        Ok(response) => match response.text().await {
+    let value = match request.json(&payload.to_lockbox_payload()).send().await {
+        Ok(response) => match lockbox_response_text(response).await {
             Ok(text) => text,
-            Err(err) => {
-                lease_lock.rollback().await.unwrap();
-                crate::database::bip448_sign::delete_bip448_signature_reservation(
-                    &statechain_entity.pool,
-                    &payload.statechain_id,
-                    &signing_id,
-                )
-                .await;
-                crate::database::sign::delete_bip448_signing_nonce_lease_by_token(
+            Err(response) => {
+                cleanup_bip448_sign_first_reservation(
                     &statechain_entity.pool,
                     &payload.statechain_id,
                     &signing_id,
                     &lease_token,
                 )
                 .await;
-                return error_response(Status::InternalServerError, err.to_string());
+                return response;
             }
         },
         Err(err) => {
-            lease_lock.rollback().await.unwrap();
-            crate::database::bip448_sign::delete_bip448_signature_reservation(
-                &statechain_entity.pool,
-                &payload.statechain_id,
-                &signing_id,
-            )
-            .await;
-            crate::database::sign::delete_bip448_signing_nonce_lease_by_token(
+            cleanup_bip448_sign_first_reservation(
                 &statechain_entity.pool,
                 &payload.statechain_id,
                 &signing_id,
@@ -563,14 +589,7 @@ pub async fn bip448_sign_first(
         match serde_json::from_str(value.as_str()) {
             Ok(response) => response,
             Err(err) => {
-                lease_lock.rollback().await.unwrap();
-                crate::database::bip448_sign::delete_bip448_signature_reservation(
-                    &statechain_entity.pool,
-                    &payload.statechain_id,
-                    &signing_id,
-                )
-                .await;
-                crate::database::sign::delete_bip448_signing_nonce_lease_by_token(
+                cleanup_bip448_sign_first_reservation(
                     &statechain_entity.pool,
                     &payload.statechain_id,
                     &signing_id,
@@ -581,28 +600,20 @@ pub async fn bip448_sign_first(
             }
         };
 
-    let mut server_pubnonce_hex = response.server_pubnonce.clone();
-    if server_pubnonce_hex.starts_with("0x") {
-        server_pubnonce_hex = server_pubnonce_hex[2..].to_string();
-    }
+    let server_pubnonce_hex = normalize_hex_wire_value(&response.server_pubnonce);
 
-    let updated = crate::database::bip448_sign::update_bip448_signature_data_server_pubnonce(
-        &statechain_entity.pool,
-        &payload.statechain_id,
-        &signing_id,
-        &server_pubnonce_hex,
-    )
-    .await;
-
-    if !updated {
-        lease_lock.rollback().await.unwrap();
-        crate::database::bip448_sign::delete_bip448_signature_reservation(
+    let updated =
+        crate::database::bip448_sign::update_bip448_signature_data_server_pubnonce_if_lease_matches(
             &statechain_entity.pool,
             &payload.statechain_id,
             &signing_id,
+            &server_pubnonce_hex,
+            &lease_token,
         )
         .await;
-        crate::database::sign::delete_bip448_signing_nonce_lease_by_token(
+
+    if !updated {
+        cleanup_bip448_sign_first_reservation(
             &statechain_entity.pool,
             &payload.statechain_id,
             &signing_id,
@@ -610,13 +621,10 @@ pub async fn bip448_sign_first(
         )
         .await;
         return error_response(
-            Status::InternalServerError,
-            "reserved BIP448 signature record could not be updated with the server nonce"
-                .to_string(),
+            Status::Conflict,
+            "BIP448 signing nonce lease expired; retry sign/first".to_string(),
         );
     }
-
-    lease_lock.commit().await.unwrap();
 
     let response = Bip448SignFirstResponsePayload {
         server_pubnonce: server_pubnonce_hex,
@@ -634,7 +642,7 @@ pub async fn bip448_sign_second(
     statechain_entity: &State<StateChainEntity>,
     partial_signature_request_payload: Json<Bip448PartialSignatureRequestPayload>,
 ) -> status::Custom<Json<Value>> {
-    let payload = partial_signature_request_payload.0;
+    let mut payload = partial_signature_request_payload.0;
     let statechain_entity = statechain_entity.inner();
 
     let signing_id = match validate_signing_id(&payload.signing_id) {
@@ -666,6 +674,7 @@ pub async fn bip448_sign_second(
             );
         }
     };
+    payload.server_pub_nonce = normalize_hex_wire_value(&payload.server_pub_nonce);
 
     let existing = crate::database::bip448_sign::get_bip448_signature_record(
         &statechain_entity.pool,
@@ -709,26 +718,20 @@ pub async fn bip448_sign_second(
         }
     }
 
+    let retry_claimed_challenge = matches!(&sign_second_decision, SignSecondDecision::RetryClaimed);
+
     match sign_second_decision {
         SignSecondDecision::Replay { server_partial_sig } => {
-            crate::database::sign::delete_bip448_signing_nonce_lease(
+            return replay_bip448_partial_signature(
                 &statechain_entity.pool,
                 &payload.statechain_id,
                 &signing_id,
+                server_partial_sig,
             )
             .await;
-            return status::Custom(
-                Status::Ok,
-                Json(json!({ "partial_sig": server_partial_sig })),
-            );
         }
         SignSecondDecision::Proceed => {}
-        SignSecondDecision::RetryClaimed => {
-            return error_response(
-                Status::Conflict,
-                "BIP448 signing challenge is already claimed; retry after the partial signature is available".to_string(),
-            );
-        }
+        SignSecondDecision::RetryClaimed => {}
         SignSecondDecision::NotFound | SignSecondDecision::Conflict { .. } => unreachable!(),
     };
 
@@ -775,53 +778,64 @@ pub async fn bip448_sign_second(
         }
     }
 
-    let claimed = crate::database::bip448_sign::try_claim_bip448_signature_data_challenge(
-        &statechain_entity.pool,
-        &payload.statechain_id,
-        &signing_id,
-        &payload.server_pub_nonce,
-        &challenge,
-        negate_seckey,
-    )
-    .await;
-
-    if !claimed {
-        let existing = crate::database::bip448_sign::get_bip448_signature_record(
+    if !retry_claimed_challenge {
+        let claimed = crate::database::bip448_sign::try_claim_bip448_signature_data_challenge(
             &statechain_entity.pool,
             &payload.statechain_id,
             &signing_id,
-        )
-        .await;
-
-        return match classify_sign_second(
-            existing.as_ref(),
             &payload.server_pub_nonce,
             &challenge,
             negate_seckey,
-        ) {
-            SignSecondDecision::Replay { server_partial_sig } => {
-                crate::database::sign::delete_bip448_signing_nonce_lease(
-                    &statechain_entity.pool,
-                    &payload.statechain_id,
-                    &signing_id,
-                )
-                .await;
-                status::Custom(Status::Ok, Json(json!({ "partial_sig": server_partial_sig })))
-            }
-            SignSecondDecision::NotFound => error_response(
-                Status::NotFound,
-                "no BIP448 signature record for signing_id; call sign/first first".to_string(),
-            ),
-            SignSecondDecision::Conflict { reason } => {
-                error_response(Status::Conflict, reason.to_string())
-            }
-            SignSecondDecision::Proceed | SignSecondDecision::RetryClaimed => error_response(
-                Status::Conflict,
-                "BIP448 signing challenge was concurrently claimed; retry after the partial signature is available".to_string(),
-            ),
-        };
+        )
+        .await;
+
+        if !claimed {
+            let existing = crate::database::bip448_sign::get_bip448_signature_record(
+                &statechain_entity.pool,
+                &payload.statechain_id,
+                &signing_id,
+            )
+            .await;
+
+            match classify_sign_second(
+                existing.as_ref(),
+                &payload.server_pub_nonce,
+                &challenge,
+                negate_seckey,
+            ) {
+                SignSecondDecision::Replay { server_partial_sig } => {
+                    return replay_bip448_partial_signature(
+                        &statechain_entity.pool,
+                        &payload.statechain_id,
+                        &signing_id,
+                        server_partial_sig,
+                    )
+                    .await;
+                }
+                SignSecondDecision::NotFound => {
+                    return error_response(
+                        Status::NotFound,
+                        "no BIP448 signature record for signing_id; call sign/first first"
+                            .to_string(),
+                    )
+                }
+                SignSecondDecision::Conflict { reason } => {
+                    return error_response(Status::Conflict, reason.to_string())
+                }
+                SignSecondDecision::Proceed => {
+                    return error_response(
+                        Status::Conflict,
+                        "BIP448 signing challenge was concurrently claimed; retry after the partial signature is available".to_string(),
+                    )
+                }
+                SignSecondDecision::RetryClaimed => {
+                    // The lockbox owns BIP448 nonce-use authority. Ask it for
+                    // exact replay instead of clearing or reopening the claim.
+                }
+            };
+        }
     }
-    let config = crate::server_config::ServerConfig::load();
+    let config = &statechain_entity.config;
     let enclave_index = crate::database::utils::get_enclave_index_from_database(
         &statechain_entity.pool,
         &payload.statechain_id,
@@ -831,7 +845,7 @@ pub async fn bip448_sign_second(
     let enclave_index = match enclave_index {
         Some(index) => index as usize,
         None => {
-            recover_bip448_sign_second_claim(
+            recover_bip448_sign_second_pre_lockbox_claim(
                 &statechain_entity.pool,
                 &payload.statechain_id,
                 &signing_id,
@@ -849,7 +863,7 @@ pub async fn bip448_sign_second(
     };
 
     let Some(enclave) = config.enclaves.get(enclave_index) else {
-        recover_bip448_sign_second_claim(
+        recover_bip448_sign_second_pre_lockbox_claim(
             &statechain_entity.pool,
             &payload.statechain_id,
             &signing_id,
@@ -863,34 +877,25 @@ pub async fn bip448_sign_second(
     };
 
     let lockbox_endpoint = enclave.url.clone();
-    let path = "get_partial_signature";
+    let path = "bip448/get_partial_signature";
 
-    let client: reqwest::Client = reqwest::Client::new();
-    let request = client.post(&format!("{}/{}", lockbox_endpoint, path));
+    let client = statechain_entity.http_client.clone();
+    let request = client
+        .post(&format!("{}/{}", lockbox_endpoint, path))
+        .timeout(outbound_request_timeout());
 
-    // Same unchanged enclave contract as the legacy route.
-    let value = match request.json(&payload.to_enclave_payload()).send().await {
-        Ok(response) => match response.text().await {
+    // Once this request is attempted, failures are indeterminate from
+    // Mercury's point of view. The lockbox is authoritative for BIP448 exact
+    // replay/conflict by opaque signing_id; Mercury must not clear/reopen the
+    // challenge after this point.
+    let value = match request.json(&payload.to_lockbox_payload()).send().await {
+        Ok(response) => match lockbox_response_text(response).await {
             Ok(text) => text,
-            Err(err) => {
-                recover_bip448_sign_second_claim(
-                    &statechain_entity.pool,
-                    &payload.statechain_id,
-                    &signing_id,
-                    &challenge,
-                )
-                .await;
-                return error_response(Status::InternalServerError, err.to_string());
+            Err(response) => {
+                return response;
             }
         },
         Err(err) => {
-            recover_bip448_sign_second_claim(
-                &statechain_entity.pool,
-                &payload.statechain_id,
-                &signing_id,
-                &challenge,
-            )
-            .await;
             return error_response(Status::InternalServerError, err.to_string());
         }
     };
@@ -903,13 +908,6 @@ pub async fn bip448_sign_second(
     let response: PartialSignatureResponsePayload = match serde_json::from_str(value.as_str()) {
         Ok(response) => response,
         Err(err) => {
-            recover_bip448_sign_second_claim(
-                &statechain_entity.pool,
-                &payload.statechain_id,
-                &signing_id,
-                &challenge,
-            )
-            .await;
             return error_response(Status::InternalServerError, err.to_string());
         }
     };
@@ -938,16 +936,13 @@ pub async fn bip448_sign_second(
             negate_seckey,
         ) {
             SignSecondDecision::Replay { server_partial_sig } => {
-                crate::database::sign::delete_bip448_signing_nonce_lease(
+                replay_bip448_partial_signature(
                     &statechain_entity.pool,
                     &payload.statechain_id,
                     &signing_id,
+                    server_partial_sig,
                 )
-                .await;
-                status::Custom(
-                    Status::Ok,
-                    Json(json!({ "partial_sig": server_partial_sig })),
-                )
+                .await
             }
             SignSecondDecision::NotFound => error_response(
                 Status::NotFound,
@@ -956,19 +951,10 @@ pub async fn bip448_sign_second(
             SignSecondDecision::Conflict { reason } => {
                 error_response(Status::Conflict, reason.to_string())
             }
-            SignSecondDecision::Proceed | SignSecondDecision::RetryClaimed => {
-                recover_bip448_sign_second_claim(
-                    &statechain_entity.pool,
-                    &payload.statechain_id,
-                    &signing_id,
-                    &challenge,
-                )
-                .await;
-                error_response(
-                    Status::Conflict,
-                    "BIP448 partial signature was not recorded; retry the request".to_string(),
-                )
-            }
+            SignSecondDecision::Proceed | SignSecondDecision::RetryClaimed => error_response(
+                Status::InternalServerError,
+                "BIP448 partial signature was returned by the lockbox but Mercury could not persist it; exact retry can recover from the lockbox".to_string(),
+            ),
         };
     }
 
@@ -988,6 +974,7 @@ pub async fn bip448_signature_count(
     statechain_id: &str,
 ) -> status::Custom<Json<Value>> {
     let statechain_entity = statechain_entity.inner();
+    let config = &statechain_entity.config;
 
     let enclave_index = crate::database::utils::get_enclave_index_from_database(
         &statechain_entity.pool,
@@ -1005,7 +992,6 @@ pub async fn bip448_signature_count(
         }
     };
 
-    let config = crate::server_config::ServerConfig::load();
     let Some(enclave) = config.enclaves.get(enclave_index) else {
         return error_response(
             Status::InternalServerError,
@@ -1016,29 +1002,24 @@ pub async fn bip448_signature_count(
     let lockbox_endpoint = enclave.url.clone();
     let path = "signature_count";
 
-    let client: reqwest::Client = reqwest::Client::new();
-    let request = client.get(&format!("{}/{}/{}", lockbox_endpoint, path, statechain_id));
+    let client = statechain_entity.http_client.clone();
+    let request = client
+        .get(&format!("{}/{}/{}", lockbox_endpoint, path, statechain_id))
+        .timeout(outbound_request_timeout());
 
     let value = match request.send().await {
-        Ok(response) => match response.text().await {
+        Ok(response) => match lockbox_response_text(response).await {
             Ok(text) => text,
-            Err(err) => return error_response(Status::InternalServerError, err.to_string()),
+            Err(response) => return response,
         },
         Err(err) => {
             return error_response(Status::InternalServerError, err.to_string());
         }
     };
 
-    let response: Value = match serde_json::from_str(value.as_str()) {
-        Ok(response) => response,
-        Err(err) => return error_response(Status::InternalServerError, err.to_string()),
-    };
-
-    let Some(sig_count) = response["sig_count"].as_u64() else {
-        return error_response(
-            Status::InternalServerError,
-            "lockbox signature_count response is missing sig_count".to_string(),
-        );
+    let sig_count = match parse_lockbox_signature_count(value.as_str()) {
+        Ok(sig_count) => sig_count,
+        Err(message) => return error_response(Status::InternalServerError, message),
     };
 
     let response = Bip448SignatureCountResponsePayload { sig_count };
@@ -1135,6 +1116,28 @@ mod tests {
     }
 
     #[test]
+    fn sign_second_normalizes_server_pubnonce_before_matching() {
+        let fresh = record(Some("abcdef"), None, None, None);
+        assert_eq!(
+            classify_sign_second(Some(&fresh), "0xABCDEF", "challenge-1", true),
+            SignSecondDecision::Proceed
+        );
+
+        let completed = record(
+            Some("abcdef"),
+            Some("challenge-1"),
+            Some(true),
+            Some("partial-1"),
+        );
+        assert_eq!(
+            classify_sign_second(Some(&completed), "0XABCDEF", "challenge-1", true),
+            SignSecondDecision::Replay {
+                server_partial_sig: "partial-1".to_string()
+            }
+        );
+    }
+
+    #[test]
     fn sign_second_retries_recorded_challenge_without_partial() {
         let interrupted = record(Some("nonce-1"), Some("challenge-1"), Some(true), None);
         assert_eq!(
@@ -1172,13 +1175,11 @@ mod tests {
 
     #[test]
     fn challenge_extraction_reads_serialized_session_challenge_field() {
-        let mut session = [0u8; 133];
-        session[..4].copy_from_slice(&MUSIG_SESSION_MAGIC);
-        session[MUSIG_SESSION_CHALLENGE_OFFSET..MUSIG_SESSION_CHALLENGE_END].fill(0x42);
+        let session = "9dede917000000000000000000000000000000000000000000000000000000000000000000b59faf7e0a44057b41d273e70cc0a59194347b286c8108fef3519bb52fe64b0729641b33afc4d71464ccde0ca4b0471ed2fda81a39056745ed7b1f4f90790dfd3ee2e8c6c5937a7f4dd30e9e78ec2096433ff32ea89ffca29a40b02b03b4e7eb";
 
         assert_eq!(
-            challenge_from_session_hex(&hex::encode(session)).unwrap(),
-            "42".repeat(32)
+            challenge_from_session_hex(session).unwrap(),
+            "29641b33afc4d71464ccde0ca4b0471ed2fda81a39056745ed7b1f4f90790dfd"
         );
     }
 
@@ -1187,6 +1188,38 @@ mod tests {
         let validated = validate_signing_id(&SIGNING_ID.to_uppercase()).unwrap();
 
         assert_eq!(validated, SIGNING_ID);
+    }
+
+    #[test]
+    fn parse_lockbox_signature_count_accepts_valid_json() {
+        let sig_count = parse_lockbox_signature_count(r#"{"sig_count":3}"#).unwrap();
+
+        assert_eq!(sig_count, 3);
+    }
+
+    #[test]
+    fn parse_lockbox_signature_count_rejects_plain_text() {
+        let err = parse_lockbox_signature_count("Signature count not found.").unwrap_err();
+
+        assert!(err.contains("failed to parse lockbox signature_count response"));
+    }
+
+    #[test]
+    fn parse_lockbox_signature_count_rejects_missing_sig_count() {
+        let err = parse_lockbox_signature_count(r#"{"status":"ok"}"#).unwrap_err();
+
+        assert_eq!(
+            err,
+            "lockbox signature_count response is missing sig_count".to_string()
+        );
+    }
+
+    #[test]
+    fn lockbox_status_maps_signature_count_not_found_to_not_found() {
+        assert_eq!(
+            lockbox_status_to_rocket(reqwest::StatusCode::NOT_FOUND),
+            Status::NotFound
+        );
     }
 
     #[test]

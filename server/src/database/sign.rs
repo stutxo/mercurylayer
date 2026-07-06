@@ -164,13 +164,12 @@ pub async fn lock_legacy_signing_nonce_lease_for_lockbox<'a>(
     }
 }
 
-pub async fn lock_bip448_signing_nonce_lease_for_lockbox<'a>(
-    pool: &'a sqlx::PgPool,
+pub async fn bip448_signing_nonce_lease_matches(
+    pool: &sqlx::PgPool,
     statechain_id: &str,
     signing_id: &str,
     lease_token: &str,
-) -> Option<Transaction<'a, Postgres>> {
-    let mut transaction = pool.begin().await.unwrap();
+) -> bool {
     let query = "\
         UPDATE signing_nonce_leases \
         SET updated_at = clock_timestamp() \
@@ -178,21 +177,15 @@ pub async fn lock_bip448_signing_nonce_lease_for_lockbox<'a>(
           AND signing_id = $3 AND lease_token = $4 \
         RETURNING 1";
 
-    let row = sqlx::query(query)
+    sqlx::query(query)
         .bind(statechain_id)
         .bind(BIP448_SIGNING_PROTOCOL)
         .bind(signing_id)
         .bind(lease_token)
-        .fetch_optional(&mut *transaction)
+        .fetch_optional(pool)
         .await
-        .unwrap();
-
-    if row.is_some() {
-        Some(transaction)
-    } else {
-        transaction.rollback().await.unwrap();
-        None
-    }
+        .unwrap()
+        .is_some()
 }
 
 pub async fn delete_signing_nonce_lease(
