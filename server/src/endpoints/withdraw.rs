@@ -1,6 +1,7 @@
 use rocket::{http::Status, response::status, serde::json::Json, State};
 use serde_json::{json, Value};
 
+use super::outbound_request_timeout;
 use crate::server::StateChainEntity;
 
 async fn delete_statechain_db(pool: &sqlx::PgPool, statechain_id: &String) {
@@ -95,8 +96,10 @@ pub async fn withdraw_complete(
     let lockbox_endpoint = config.enclaves.get(enclave_index).unwrap().url.clone();
     let path = "delete_statechain";
 
-    let client: reqwest::Client = reqwest::Client::new();
-    let request = client.delete(&format!("{}/{}/{}", lockbox_endpoint, path, statechain_id));
+    let client = statechain_entity.inner().http_client.clone();
+    let request = client
+        .delete(&format!("{}/{}/{}", lockbox_endpoint, path, statechain_id))
+        .timeout(outbound_request_timeout());
 
     let response = request.send().await;
 
