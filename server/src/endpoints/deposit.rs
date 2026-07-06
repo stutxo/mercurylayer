@@ -29,6 +29,20 @@ fn token_status_error(status: Status, message: String) -> TokenStatusResponse {
     }
 }
 
+fn token_verify_upstream_error(
+    response_status: reqwest::StatusCode,
+    text: String,
+) -> TokenStatusResponse {
+    token_status_error(
+        Status::InternalServerError,
+        format!(
+            "token server token_verify returned {}: {}",
+            response_status.as_u16(),
+            text
+        ),
+    )
+}
+
 pub async fn get_token_no_server(
     statechain_entity: &State<StateChainEntity>,
     config: &crate::server_config::ServerConfig,
@@ -214,16 +228,7 @@ async fn check_token_status(token_id: &str, client: &reqwest::Client) -> TokenSt
             };
 
             if !response_status.is_success() {
-                let status = Status::from_code(response_status.as_u16())
-                    .unwrap_or(Status::InternalServerError);
-                return token_status_error(
-                    status,
-                    format!(
-                        "token server token_verify returned {}: {}",
-                        response_status.as_u16(),
-                        text
-                    ),
-                );
+                return token_verify_upstream_error(response_status, text);
             }
 
             text
@@ -521,5 +526,20 @@ mod tests {
         let err = get_random_enclave_index("statechain-d", &enclaves).unwrap_err();
 
         assert_eq!(err, "No valid enclave found with allow_deposit set to true");
+    }
+
+    #[test]
+    fn token_verify_upstream_error_does_not_forward_4xx_status() {
+        let response = token_verify_upstream_error(
+            reqwest::StatusCode::NOT_FOUND,
+            r#"{"message":"Token not found in the database."}"#.to_string(),
+        );
+
+        assert!(response.err);
+        assert_eq!(response.status, Some(Status::InternalServerError));
+        assert!(response
+            .err_message
+            .unwrap()
+            .contains("token server token_verify returned 404"));
     }
 }
