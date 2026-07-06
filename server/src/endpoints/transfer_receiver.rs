@@ -12,7 +12,62 @@ use serde_json::{json, Value};
 
 use crate::server::StateChainEntity;
 
-use super::is_batch_expired;
+use super::{is_batch_expired, outbound_request_timeout};
+
+fn internal_server_error_response(message: String) -> status::Custom<Json<Value>> {
+    status::Custom(
+        Status::InternalServerError,
+        Json(json!({
+            "error": "Internal Server Error",
+            "message": message,
+        })),
+    )
+}
+
+fn lockbox_signature_count_error_response(
+    status_code: reqwest::StatusCode,
+    body: String,
+) -> status::Custom<Json<Value>> {
+    let response_status = if status_code == reqwest::StatusCode::NOT_FOUND {
+        Status::NotFound
+    } else {
+        Status::InternalServerError
+    };
+
+    let message = if body.is_empty() {
+        format!("lockbox signature_count returned {}", status_code.as_u16())
+    } else {
+        format!(
+            "lockbox signature_count returned {}: {}",
+            status_code.as_u16(),
+            body
+        )
+    };
+
+    status::Custom(
+        response_status,
+        Json(json!({
+            "error": "Lockbox Error",
+            "message": message,
+        })),
+    )
+}
+
+fn parse_lockbox_signature_count(value: &str) -> Result<u64, String> {
+    let response: Value = serde_json::from_str(value)
+        .map_err(|err| format!("failed to parse lockbox signature_count response: {err}"))?;
+
+    response["sig_count"]
+        .as_u64()
+        .ok_or_else(|| "lockbox signature_count response is missing sig_count".to_string())
+}
+
+fn parse_lockbox_keyupdate_response(
+    value: &str,
+) -> Result<TransferReceiverPostResponsePayload, String> {
+    serde_json::from_str(value)
+        .map_err(|err| format!("failed to parse lockbox keyupdate response: {err}"))
+}
 
 #[get("/info/statechain/<statechain_id>")]
 pub async fn statechain_info(
@@ -59,27 +114,34 @@ pub async fn statechain_info(
     let lockbox_endpoint = config.enclaves.get(enclave_index).unwrap().url.clone();
     let path = "signature_count";
 
-    let client: reqwest::Client = reqwest::Client::new();
-    let request = client.get(&format!("{}/{}/{}", lockbox_endpoint, path, statechain_id));
+    let client = statechain_entity.inner().http_client.clone();
+    let request = client
+        .get(&format!("{}/{}/{}", lockbox_endpoint, path, statechain_id))
+        .timeout(outbound_request_timeout());
 
     let value = match request.send().await {
         Ok(response) => {
-            let text = response.text().await.unwrap();
+            let response_status = response.status();
+            let text = match response.text().await {
+                Ok(text) => text,
+                Err(err) => return internal_server_error_response(err.to_string()),
+            };
+
+            if !response_status.is_success() {
+                return lockbox_signature_count_error_response(response_status, text);
+            }
+
             text
         }
         Err(err) => {
-            let response_body = json!({
-                "error": "Internal Server Error",
-                "message": err.to_string()
-            });
-
-            return status::Custom(Status::InternalServerError, Json(response_body));
+            return internal_server_error_response(err.to_string());
         }
     };
 
-    let response: Value = serde_json::from_str(value.as_str())
-        .expect(&format!("failed to parse: {}", value.as_str()));
-    let num_sigs = response["sig_count"].as_u64().unwrap();
+    let num_sigs = match parse_lockbox_signature_count(value.as_str()) {
+        Ok(num_sigs) => num_sigs,
+        Err(message) => return internal_server_error_response(message),
+    };
 
     let statechain_info = crate::database::transfer_receiver::get_statechain_info(
         &statechain_entity.pool,
@@ -190,6 +252,68 @@ pub async fn transfer_unlock(
     });
 
     status::Custom(Status::Ok, Json(response_body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_lockbox_signature_count_accepts_valid_json() {
+        let sig_count = parse_lockbox_signature_count(r#"{"sig_count":7}"#).unwrap();
+
+        assert_eq!(sig_count, 7);
+    }
+
+    #[test]
+    fn parse_lockbox_signature_count_rejects_plain_text() {
+        let err = parse_lockbox_signature_count("Signature count not found.").unwrap_err();
+
+        assert!(err.contains("failed to parse lockbox signature_count response"));
+    }
+
+    #[test]
+    fn parse_lockbox_signature_count_rejects_missing_sig_count() {
+        let err = parse_lockbox_signature_count(r#"{"status":"ok"}"#).unwrap_err();
+
+        assert_eq!(
+            err,
+            "lockbox signature_count response is missing sig_count".to_string()
+        );
+    }
+
+    #[test]
+    fn lockbox_signature_count_error_maps_missing_count_to_not_found() {
+        let response = lockbox_signature_count_error_response(
+            reqwest::StatusCode::NOT_FOUND,
+            "Signature count not found.".to_string(),
+        );
+
+        assert_eq!(response.0, Status::NotFound);
+        assert_eq!(response.1 .0["error"], "Lockbox Error");
+        assert!(response.1 .0["message"].as_str().unwrap().contains("404"));
+        assert!(response.1 .0["message"]
+            .as_str()
+            .unwrap()
+            .contains("Signature count not found."));
+    }
+
+    #[test]
+    fn parse_lockbox_keyupdate_response_accepts_valid_json() {
+        let response = parse_lockbox_keyupdate_response(r#"{"server_pubkey":"abc"}"#).unwrap();
+
+        assert_eq!(response.server_pubkey, "abc");
+    }
+
+    #[test]
+    fn parse_lockbox_keyupdate_response_rejects_plain_text() {
+        let err = match parse_lockbox_keyupdate_response("keyupdate failed") {
+            Ok(_) => panic!("plain text keyupdate response parsed as JSON"),
+            Err(err) => err,
+        };
+
+        assert!(err.contains("failed to parse lockbox keyupdate response"));
+    }
 }
 
 pub enum BatchTransferReceiveValidationResult {
@@ -341,6 +465,12 @@ pub async fn transfer_receiver(
 
         let server_public_key = server_public_key.unwrap();
 
+        // Idempotent replay: the coin was already transferred to this owner and
+        // the previous owner's signing guards were cleared transactionally
+        // during that first key update (see `update_statechain`). Do NOT clear
+        // guards here: a duplicate or re-synced transfer/receiver request must
+        // not destroy the current owner's live signing round (their stored
+        // BIP448 replay record and nonce lease).
         let response_body = json!({
             "server_pubkey": server_public_key.to_string(),
         });
@@ -380,26 +510,39 @@ pub async fn transfer_receiver(
     let lockbox_endpoint = config.enclaves.get(enclave_index).unwrap().url.clone();
     let path = "keyupdate";
 
-    let client: reqwest::Client = reqwest::Client::new();
-    let request = client.post(&format!("{}/{}", lockbox_endpoint, path));
+    let client = statechain_entity.inner().http_client.clone();
+    let request = client
+        .post(&format!("{}/{}", lockbox_endpoint, path))
+        .timeout(outbound_request_timeout());
 
     let value = match request.json(&key_update_response_payload).send().await {
         Ok(response) => {
-            let text = response.text().await.unwrap();
+            let response_status = response.status();
+            let text = match response.text().await {
+                Ok(text) => text,
+                Err(err) => return internal_server_error_response(err.to_string()),
+            };
+
+            if !response_status.is_success() {
+                return internal_server_error_response(format!(
+                    "lockbox keyupdate returned {}: {}",
+                    response_status.as_u16(),
+                    text
+                ));
+            }
+
             text
         }
         Err(err) => {
-            let response_body = json!({
-                "error": "Internal Server Error",
-                "message": err.to_string()
-            });
-
-            return status::Custom(Status::InternalServerError, Json(response_body));
+            return internal_server_error_response(err.to_string());
         }
     };
 
-    let response: TransferReceiverPostResponsePayload = serde_json::from_str(value.as_str())
-        .expect(&format!("failed to parse: {}", value.as_str()));
+    let response: TransferReceiverPostResponsePayload =
+        match parse_lockbox_keyupdate_response(value.as_str()) {
+            Ok(response) => response,
+            Err(err) => return internal_server_error_response(err),
+        };
 
     let mut server_pubkey_hex = response.server_pubkey.clone();
 

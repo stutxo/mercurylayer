@@ -3,6 +3,22 @@ use secp256k1::{PublicKey, Secp256k1, SecretKey, XOnlyPublicKey};
 
 use sqlx::Row;
 
+const DELETE_SIGNING_GUARDS_AFTER_TRANSFER_QUERY: &str = "\
+    WITH deleted_leases AS (\
+        DELETE FROM signing_nonce_leases WHERE statechain_id = $1 RETURNING 1\
+    ), \
+    deleted_legacy_incomplete AS (\
+        DELETE FROM statechain_signature_data \
+        WHERE statechain_id = $1 \
+          AND server_pubnonce IS NOT NULL \
+          AND challenge IS NULL \
+        RETURNING 1\
+    ), \
+    deleted_bip448 AS (\
+        DELETE FROM bip448_signature_data WHERE statechain_id = $1 RETURNING 1\
+    ) \
+    SELECT 1";
+
 pub async fn get_statechain_info(pool: &sqlx::PgPool, statechain_id: &str) -> Vec<StatechainInfo> {
     let mut result = Vec::<StatechainInfo>::new();
 
@@ -204,6 +220,17 @@ pub async fn update_statechain(
         WHERE statechain_id = $1";
 
     let _ = sqlx::query(query)
+        .bind(statechain_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+
+    // Ownership has moved to a new key share. Any incomplete signing guard
+    // state from the previous owner must not block the new owner. Preserve
+    // completed legacy signature rows for receiver fraud-proof validation, and
+    // preserve the protocol claim because transfer does not reset the shared
+    // signature count.
+    let _ = sqlx::query(DELETE_SIGNING_GUARDS_AFTER_TRANSFER_QUERY)
         .bind(statechain_id)
         .execute(&mut *transaction)
         .await

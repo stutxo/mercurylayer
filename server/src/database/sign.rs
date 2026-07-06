@@ -1,4 +1,4 @@
-use sqlx::{Postgres, Row, Transaction};
+use sqlx::Row;
 use uuid::Uuid;
 
 pub const LEGACY_SIGNING_PROTOCOL: &str = "legacy";
@@ -135,12 +135,11 @@ pub async fn insert_bip448_signing_nonce_lease(
     (result.rows_affected() == 1).then_some(lease_token)
 }
 
-pub async fn lock_legacy_signing_nonce_lease_for_lockbox<'a>(
-    pool: &'a sqlx::PgPool,
+pub async fn legacy_signing_nonce_lease_matches(
+    pool: &sqlx::PgPool,
     statechain_id: &str,
     lease_token: &str,
-) -> Option<Transaction<'a, Postgres>> {
-    let mut transaction = pool.begin().await.unwrap();
+) -> bool {
     let query = "\
         UPDATE signing_nonce_leases \
         SET updated_at = clock_timestamp() \
@@ -148,20 +147,14 @@ pub async fn lock_legacy_signing_nonce_lease_for_lockbox<'a>(
           AND signing_id IS NULL AND lease_token = $3 \
         RETURNING 1";
 
-    let row = sqlx::query(query)
+    sqlx::query(query)
         .bind(statechain_id)
         .bind(LEGACY_SIGNING_PROTOCOL)
         .bind(lease_token)
-        .fetch_optional(&mut *transaction)
+        .fetch_optional(pool)
         .await
-        .unwrap();
-
-    if row.is_some() {
-        Some(transaction)
-    } else {
-        transaction.rollback().await.unwrap();
-        None
-    }
+        .unwrap()
+        .is_some()
 }
 
 pub async fn bip448_signing_nonce_lease_matches(
@@ -273,11 +266,11 @@ pub async fn delete_bip448_signing_nonce_lease_by_token(
 }
 
 /// Reclaims expired leases only when no durable incomplete nonce round needs
-/// protection. Fresh sign/first handlers hold a row lock on their exact
-/// `lease_token` while asking the lockbox for a nonce, so this delete either
-/// waits for that handler to finish or rechecks a refreshed `updated_at` before
-/// reclaiming. Once a server nonce is stored without a partial signature, the
-/// client may still be able to finish sign/second.
+/// protection. Fresh sign/first handlers refresh their exact `lease_token`
+/// before asking the lockbox for a nonce and then persist nonce state only if
+/// the same token is still present. Legacy incomplete rounds are nonce rows
+/// with no challenge yet; BIP448 incomplete rounds are rows without a stored
+/// partial signature.
 pub async fn reclaim_stale_signing_nonce_lease(pool: &sqlx::PgPool, statechain_id: &str) -> bool {
     let query = "\
         WITH deleted_lease AS (\
@@ -292,6 +285,7 @@ pub async fn reclaim_stale_signing_nonce_lease(pool: &sqlx::PgPool, statechain_i
                           FROM statechain_signature_data AS signature \
                           WHERE signature.statechain_id = lease.statechain_id \
                             AND signature.server_pubnonce IS NOT NULL \
+                            AND signature.challenge IS NULL \
                             AND signature.created_at >= lease.created_at\
                       )\
                   )\
@@ -381,12 +375,32 @@ pub async fn get_server_pubnonce_from_null_challenge(
     Some(server_pubnonce)
 }
 
-pub async fn insert_new_signature_data(
+pub async fn insert_new_signature_data_if_lease_matches(
     pool: &sqlx::PgPool,
     server_pubnonce: &str,
     statechain_id: &str,
-) {
+    lease_token: &str,
+) -> bool {
     let mut transaction = pool.begin().await.unwrap();
+
+    let lease_query = "\
+        SELECT 1 \
+        FROM signing_nonce_leases \
+        WHERE statechain_id = $1 AND protocol = $2 \
+          AND signing_id IS NULL AND lease_token = $3";
+
+    let lease = sqlx::query(lease_query)
+        .bind(statechain_id)
+        .bind(LEGACY_SIGNING_PROTOCOL)
+        .bind(lease_token)
+        .fetch_optional(&mut *transaction)
+        .await
+        .unwrap();
+
+    if lease.is_none() {
+        transaction.rollback().await.unwrap();
+        return false;
+    }
 
     // FOR UPDATE is used to lock the row for the duration of the transaction
     // It is not allowed with aggregate functions (MAX in this case), so we need to wrap it in a subquery
@@ -420,6 +434,8 @@ pub async fn insert_new_signature_data(
         .unwrap();
 
     transaction.commit().await.unwrap();
+
+    true
 }
 
 pub async fn update_signature_data_challenge(
