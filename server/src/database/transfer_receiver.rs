@@ -5,13 +5,17 @@ use sqlx::Row;
 
 const DELETE_SIGNING_GUARDS_AFTER_TRANSFER_QUERY: &str = "\
     WITH deleted_leases AS (\
-        DELETE FROM signing_nonce_leases WHERE statechain_id = $1 RETURNING 1\
+        DELETE FROM signing_nonce_leases WHERE statechain_id = $1 RETURNING protocol, created_at\
     ), \
     deleted_legacy_incomplete AS (\
-        DELETE FROM statechain_signature_data \
-        WHERE statechain_id = $1 \
-          AND server_pubnonce IS NOT NULL \
-          AND challenge IS NULL \
+        DELETE FROM statechain_signature_data AS signature \
+        WHERE signature.statechain_id = $1 \
+          AND signature.server_pubnonce IS NOT NULL \
+          AND signature.server_partial_sig IS NULL \
+          AND (\
+              signature.challenge IS NULL \
+              OR signature.negate_seckey IS NOT NULL\
+          ) \
         RETURNING 1\
     ), \
     deleted_bip448 AS (\
@@ -26,6 +30,9 @@ pub async fn get_statechain_info(pool: &sqlx::PgPool, statechain_id: &str) -> Ve
         SELECT statechain_id, server_pubnonce, challenge, tx_n \
         FROM statechain_signature_data \
         WHERE statechain_id = $1 \
+          AND server_pubnonce IS NOT NULL \
+          AND challenge IS NOT NULL \
+          AND NOT (negate_seckey IS NOT NULL AND server_partial_sig IS NULL) \
         ORDER BY created_at ASC";
 
     let rows = sqlx::query(query)
@@ -36,9 +43,13 @@ pub async fn get_statechain_info(pool: &sqlx::PgPool, statechain_id: &str) -> Ve
 
     for row in rows {
         let statechain_id: String = row.get(0);
-        let server_pubnonce: String = row.get(1);
-        let challenge: String = row.get(2);
+        let server_pubnonce: Option<String> = row.get(1);
+        let challenge: Option<String> = row.get(2);
         let tx_n: i32 = row.get(3);
+
+        let (Some(server_pubnonce), Some(challenge)) = (server_pubnonce, challenge) else {
+            continue;
+        };
 
         let statechain_transfer = StatechainInfo {
             statechain_id,

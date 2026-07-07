@@ -51,11 +51,13 @@ pub fn new_statechain_id(prefix: &str) -> String {
 }
 
 pub fn normalize_hex(value: &str) -> String {
+    // Mirror the production `normalize_hex_wire_value`: strip an 0x/0X prefix
+    // and lowercase, so test-side comparisons match the server's stored form.
     value
         .strip_prefix("0x")
         .or_else(|| value.strip_prefix("0X"))
         .unwrap_or(value)
-        .to_string()
+        .to_ascii_lowercase()
 }
 
 pub async fn wait_until_ready(client: &Client) -> Result<()> {
