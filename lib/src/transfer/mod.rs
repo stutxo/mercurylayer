@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::wallet::BackupTx;
 
+pub mod bip448;
 pub mod receiver;
 pub mod sender;
 
