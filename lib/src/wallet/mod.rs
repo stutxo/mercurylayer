@@ -74,6 +74,9 @@ pub struct Coin {
     pub aggregated_pubkey: Option<String>,
     /// The aggregated address is the P2TR address from aggregated_pubkey
     pub aggregated_address: Option<String>,
+    /// Explicit protocol marker for non-legacy statechains. Missing means legacy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statechain_protocol: Option<String>,
     pub utxo_txid: Option<String>,
     pub utxo_vout: Option<u32>,
     pub amount: Option<u32>,
@@ -210,7 +213,7 @@ pub fn generate_mnemonic() -> core::result::Result<String, MercuryError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Settings, Wallet};
+    use super::{Coin, Settings, Wallet};
 
     #[test]
     fn wallet_deserializes_neutral_chain_metadata() {
@@ -254,5 +257,47 @@ mod tests {
         assert_eq!(roundtrip.settings.chainBackend, "core");
         assert_eq!(roundtrip.settings.chainUrl, "http://127.0.0.1:18443");
         assert_eq!(roundtrip.settings.chainType, None);
+    }
+
+    #[test]
+    fn legacy_coin_json_deserializes_without_protocol_marker() {
+        let wallet = Wallet {
+            name: "wallet".to_string(),
+            mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string(),
+            version: "0.1.0".to_string(),
+            state_entity_endpoint: "http://statechain".to_string(),
+            chain_backend: "core".to_string(),
+            chain_endpoint: "http://127.0.0.1:18443".to_string(),
+            network: "regtest".to_string(),
+            blockheight: 42,
+            initlock: 1000,
+            interval: 10,
+            activities: Vec::new(),
+            coins: Vec::new(),
+            settings: Settings {
+                network: "regtest".to_string(),
+                block_explorerURL: None,
+                torProxyHost: None,
+                torProxyPort: None,
+                torProxyControlPassword: None,
+                torProxyControlPort: None,
+                statechainEntityApi: "http://statechain".to_string(),
+                torStatechainEntityApi: None,
+                chainBackend: "core".to_string(),
+                chainUrl: "http://127.0.0.1:18443".to_string(),
+                chainType: None,
+                notifications: false,
+                tutorials: false,
+            },
+        };
+        let mut coin_json = serde_json::to_value(wallet.get_new_coin().unwrap()).unwrap();
+        coin_json
+            .as_object_mut()
+            .unwrap()
+            .remove("statechain_protocol");
+
+        let coin: Coin = serde_json::from_value(coin_json).unwrap();
+
+        assert_eq!(coin.statechain_protocol, None);
     }
 }

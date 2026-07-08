@@ -187,7 +187,10 @@ impl Bip448LatestState {
     ) -> Result<PublicKey, Bip448RecoveryVerifyError> {
         let recomputed = receiver_user_pubkey.combine(server_pubkey)?;
 
-        if !self.csfs_key_metadata.verifies_aggregate_pubkey(secp, &recomputed) {
+        if !self
+            .csfs_key_metadata
+            .verifies_aggregate_pubkey(secp, &recomputed)
+        {
             return Err(Bip448RecoveryVerifyError::KeyMetadataMismatch);
         }
 

@@ -127,6 +127,12 @@ impl CoreChainClient {
         Ok(txid)
     }
 
+    pub fn submit_package(&self, txs: &[Vec<u8>]) -> Result<Value> {
+        let tx_hexes = txs.iter().map(hex::encode).collect::<Vec<_>>();
+
+        self.call("submitpackage", &[json!(tx_hexes)])
+    }
+
     fn get_transaction(&self, txid: &Txid) -> Result<Transaction> {
         let raw_tx = self.get_raw_tx(txid)?;
         deserialize(&raw_tx).with_context(|| format!("failed to deserialize raw tx {}", txid))

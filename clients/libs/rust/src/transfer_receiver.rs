@@ -647,17 +647,30 @@ async fn verify_tx0_output_is_unspent_and_confirmed(
 
     for unspent in res {
         if unspent.txid == tx0_outpoint.txid && unspent.vout == tx0_outpoint.vout {
-            let confirmations = blockheight - unspent.height + 1;
-
-            if confirmations as u32 >= confirmation_target {
-                status = CoinStatus::CONFIRMED;
-            }
+            status = tx0_status_for_utxo_height(unspent.height, blockheight, confirmation_target);
 
             return Ok((true, status));
         }
     }
 
     Ok((false, status))
+}
+
+fn tx0_status_for_utxo_height(
+    utxo_height: u32,
+    blockheight: u32,
+    confirmation_target: u32,
+) -> CoinStatus {
+    if utxo_height == 0 {
+        return CoinStatus::UNCONFIRMED;
+    }
+
+    let confirmations = blockheight.saturating_sub(utxo_height).saturating_add(1);
+    if confirmations >= confirmation_target {
+        CoinStatus::CONFIRMED
+    } else {
+        CoinStatus::UNCONFIRMED
+    }
 }
 
 async fn unlock_statecoin(
@@ -776,6 +789,7 @@ mod tests {
             server_pubkey: None,
             aggregated_pubkey: None,
             aggregated_address: None,
+            statechain_protocol: None,
             utxo_txid: None,
             utxo_vout: None,
             amount: None,
@@ -888,5 +902,29 @@ mod tests {
         assert_eq!(first_group_outpoint.vout, 1);
         assert_eq!(second_group_outpoint.txid, hex::encode([0xbbu8; 32]));
         assert_eq!(second_group_outpoint.vout, 2);
+    }
+
+    #[test]
+    fn tx0_confirmation_status_never_treats_mempool_height_as_confirmed() {
+        assert_eq!(
+            tx0_status_for_utxo_height(0, 800_000, 2),
+            CoinStatus::UNCONFIRMED
+        );
+        assert_eq!(
+            tx0_status_for_utxo_height(0, 800_000, 0),
+            CoinStatus::UNCONFIRMED
+        );
+    }
+
+    #[test]
+    fn tx0_confirmation_status_uses_confirmed_heights_only() {
+        assert_eq!(
+            tx0_status_for_utxo_height(800_000, 800_000, 2),
+            CoinStatus::UNCONFIRMED
+        );
+        assert_eq!(
+            tx0_status_for_utxo_height(799_999, 800_000, 2),
+            CoinStatus::CONFIRMED
+        );
     }
 }

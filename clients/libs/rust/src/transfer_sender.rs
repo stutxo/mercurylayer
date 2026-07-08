@@ -26,6 +26,15 @@ pub async fn create_backup_transactions(
     statechain_id: &str,
     duplicated_indexes: Option<Vec<u32>>,
 ) -> Result<Vec<BackupTx>> {
+    if wallet.coins.iter().any(|coin| {
+        coin.statechain_id.as_deref() == Some(statechain_id)
+            && mercurylib::bip448_statechain::deposit::is_bip448_coin(coin)
+    }) {
+        return Err(anyhow!(
+            "statechain {statechain_id} is a BIP448 coin; use the BIP448 transfer flow, not the legacy transfer"
+        ));
+    }
+
     // throw error if duplicated_indexes contains an index that does not exist in wallet.coins
     // this can be moved to the caller function
     if duplicated_indexes.is_some() {
@@ -241,6 +250,15 @@ pub async fn execute(
 ) -> Result<()> {
     let mut wallet: mercurylib::wallet::Wallet =
         get_wallet(&client_config.pool, &wallet_name).await?;
+
+    if wallet.coins.iter().any(|coin| {
+        coin.statechain_id.as_deref() == Some(statechain_id)
+            && mercurylib::bip448_statechain::deposit::is_bip448_coin(coin)
+    }) {
+        return Err(anyhow!(
+            "statechain {statechain_id} is a BIP448 coin; use the BIP448 transfer flow, not the legacy transfer"
+        ));
+    }
 
     let is_address_valid = mercurylib::validate_address(recipient_address, &wallet.network)?;
 

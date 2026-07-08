@@ -19,6 +19,15 @@ pub async fn execute(
     let mut wallet: mercurylib::wallet::Wallet =
         get_wallet(&client_config.pool, &wallet_name).await?;
 
+    if wallet.coins.iter().any(|coin| {
+        coin.statechain_id.as_deref() == Some(statechain_id)
+            && mercurylib::bip448_statechain::deposit::is_bip448_coin(coin)
+    }) {
+        return Err(anyhow!(
+            "statechain {statechain_id} is a BIP448 coin; use the BIP448 recovery flow, not the legacy withdraw"
+        ));
+    }
+
     let is_address_valid = mercurylib::validate_address(to_address, &wallet.network)?;
 
     if !is_address_valid {

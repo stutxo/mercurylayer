@@ -138,6 +138,7 @@ impl Wallet {
             server_pubkey: None,
             aggregated_pubkey: None,
             aggregated_address: None,
+            statechain_protocol: None,
             utxo_txid: None,
             utxo_vout: None,
             amount: None,

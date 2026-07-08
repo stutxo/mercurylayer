@@ -2,6 +2,7 @@ mod core;
 
 use anyhow::Result;
 use bitcoin::{Script, Txid};
+use serde_json::Value;
 
 use self::core::CoreChainClient;
 pub(crate) use self::core::{CoreRpcAuth, CoreRpcConfig};
@@ -45,6 +46,10 @@ impl ChainClient {
 
     pub fn broadcast_tx(&self, tx_bytes: &[u8]) -> Result<Txid> {
         self.core.broadcast_tx(tx_bytes)
+    }
+
+    pub fn submit_package(&self, txs: &[Vec<u8>]) -> Result<Value> {
+        self.core.submit_package(txs)
     }
 }
 

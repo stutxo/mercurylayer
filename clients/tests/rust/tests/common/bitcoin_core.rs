@@ -141,6 +141,44 @@ pub fn broadcast_raw_transaction(tx: &Transaction) -> Result<Txid> {
     Ok(Txid::from_str(&txid)?)
 }
 
+pub fn submit_package(txs: &[Transaction]) -> Result<Value> {
+    let tx_hexes = txs
+        .iter()
+        .map(|tx| hex::encode(serialize(tx)))
+        .collect::<Vec<_>>();
+    let package_json = serde_json::to_string(&tx_hexes)?;
+    let response =
+        execute_bitcoin_command(&format!("{BITCOIN_CLI} submitpackage '{}'", package_json))?;
+
+    Ok(serde_json::from_str(&response)?)
+}
+
+pub fn raw_mempool() -> Result<Vec<Txid>> {
+    let response = execute_bitcoin_command(&format!("{BITCOIN_CLI} getrawmempool"))?;
+    let txids = serde_json::from_str::<Vec<String>>(&response)?
+        .into_iter()
+        .map(|txid| Txid::from_str(&txid))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(txids)
+}
+
+pub fn assert_in_mempool(txid: &Txid) -> Result<()> {
+    if !raw_mempool()?.contains(txid) {
+        return Err(anyhow!("transaction {txid} was not accepted into mempool"));
+    }
+
+    Ok(())
+}
+
+pub fn assert_not_in_mempool(txid: &Txid) -> Result<()> {
+    if raw_mempool()?.contains(txid) {
+        return Err(anyhow!("transaction {txid} unexpectedly entered mempool"));
+    }
+
+    Ok(())
+}
+
 pub fn assert_confirmed(txid: &Txid) -> Result<()> {
     let tx_json = execute_bitcoin_command(&format!("{BITCOIN_CLI} getrawtransaction {txid} true"))?;
     let tx_json: Value = serde_json::from_str(&tx_json)?;

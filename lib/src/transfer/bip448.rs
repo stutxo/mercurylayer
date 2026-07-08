@@ -57,13 +57,16 @@ impl Bip448TransferMsg {
             ));
         }
         if self.challenge_delay != self.latest_state.challenge_delay {
-            return Err(Bip448RecoveryVerifyError::InconsistentField("challenge_delay"));
+            return Err(Bip448RecoveryVerifyError::InconsistentField(
+                "challenge_delay",
+            ));
         }
         if self.value_schedule != self.latest_state.value_schedule {
-            return Err(Bip448RecoveryVerifyError::InconsistentField("value_schedule"));
+            return Err(Bip448RecoveryVerifyError::InconsistentField(
+                "value_schedule",
+            ));
         }
-        if self.server_signature_count
-            != self.latest_state.signing_metadata.server_signature_count
+        if self.server_signature_count != self.latest_state.signing_metadata.server_signature_count
         {
             return Err(Bip448RecoveryVerifyError::InconsistentField(
                 "server_signature_count",
@@ -468,7 +471,9 @@ mod tests {
     /// recompute-`P`-from-parties check. Returns
     /// `(aggregate_secret, aggregate_pub, user_pub, server_pub)` with
     /// `user_pub + server_pub == aggregate_pub`.
-    fn recovery_keys(secp: &Secp256k1<secp256k1::All>) -> (SecretKey, PublicKey, PublicKey, PublicKey) {
+    fn recovery_keys(
+        secp: &Secp256k1<secp256k1::All>,
+    ) -> (SecretKey, PublicKey, PublicKey, PublicKey) {
         let aggregate_secret = SecretKey::from_secret_bytes([7u8; 32]).unwrap();
         let aggregate_pub = aggregate_secret.public_key(secp);
         let server_secret = SecretKey::from_secret_bytes([4u8; 32]).unwrap();

@@ -27,12 +27,33 @@ enum Commands {
         token_id: String,
         amount: u32,
     },
+    /// Get a BIP448 deposit address. Used to fund a prototype BIP448 statecoin.
+    NewBip448DepositAddress {
+        wallet_name: String,
+        token_id: String,
+        amount: u32,
+    },
     /// Broadcast the backup transaction to the network
     BroadcastBackupTransaction {
         wallet_name: String,
         statechain_id: String,
         to_address: Option<String>,
         /// Transaction fee rate in sats per byte
+        fee_rate: Option<f64>,
+    },
+    /// Submit a BIP448 recovery parent and anchor CPFP child via Bitcoin Core submitpackage
+    BroadcastBip448RecoveryPackage {
+        wallet_name: String,
+        statechain_id: String,
+        /// Recovery role: funding_update or settlement
+        role: String,
+        /// Address that receives CPFP fee-input change
+        change_address: String,
+        /// Keyless P2A fee input descriptor: txid:vout:value_sats
+        #[arg(long = "fee-input", required = true)]
+        fee_inputs: Vec<String>,
+        /// Package fee rate in sats per vbyte
+        #[arg(long)]
         fee_rate: Option<f64>,
     },
     /// Broadcast the backup transaction to the network
@@ -123,6 +144,23 @@ async fn main() -> Result<()> {
 
             println!("{}", serde_json::to_string_pretty(&obj).unwrap());
         }
+        Commands::NewBip448DepositAddress {
+            wallet_name,
+            token_id,
+            amount,
+        } => {
+            let result = mercuryrustlib::deposit::get_bip448_deposit_bitcoin_address(
+                &client_config,
+                &wallet_name,
+                &token_id,
+                amount,
+            )
+            .await?;
+
+            let obj = json!(result);
+
+            println!("{}", serde_json::to_string_pretty(&obj).unwrap());
+        }
         Commands::BroadcastBackupTransaction {
             wallet_name,
             statechain_id,
@@ -138,6 +176,33 @@ async fn main() -> Result<()> {
                 fee_rate,
             )
             .await?;
+        }
+        Commands::BroadcastBip448RecoveryPackage {
+            wallet_name,
+            statechain_id,
+            role,
+            change_address,
+            fee_inputs,
+            fee_rate,
+        } => {
+            let role = mercuryrustlib::bip448_recovery::parse_recovery_template_role(&role)?;
+            let fee_inputs = fee_inputs
+                .iter()
+                .map(|input| mercuryrustlib::bip448_recovery::parse_keyless_p2a_fee_input(input))
+                .collect::<Result<Vec<_>>>()?;
+            let result = mercuryrustlib::bip448_recovery::submit_latest_state_recovery_package(
+                &client_config,
+                &wallet_name,
+                &statechain_id,
+                role,
+                &fee_inputs,
+                &change_address,
+                fee_rate,
+            )
+            .await?;
+
+            let obj = json!(result);
+            println!("{}", serde_json::to_string_pretty(&obj).unwrap());
         }
         Commands::ListStatecoins { wallet_name } => {
             mercuryrustlib::coin_status::update_coins(&client_config, &wallet_name).await?;
