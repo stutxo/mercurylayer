@@ -234,7 +234,8 @@ async fn sign_bip448_update(
         .as_ref()
         .ok_or_else(|| anyhow!("BIP448 deposit coin missing signed_statechain_id"))?
         .clone();
-    let update_template_hash = hex::encode(templates.update_template_hash.to_byte_array());
+    let update_template_hash =
+        hex::encode(templates.artifacts.update_template_hash.to_byte_array());
     let pending_signing = pending_or_new_bip448_deposit_signing(
         client_config,
         wallet_name,
@@ -266,7 +267,7 @@ async fn sign_bip448_update(
         aggregate_pubkey,
         &client_pub_nonce,
         &server_pub_nonce,
-        templates.update_template_hash,
+        templates.artifacts.update_template_hash,
         &blinding_factor,
     )?;
     let client_partial = session.partial_sign_verified(
@@ -335,7 +336,7 @@ async fn pending_or_new_bip448_deposit_signing(
 
     let secp = Secp256k1::new();
     let mut rng = rand::rng();
-    let signing_message: Message = templates.update_template_hash.into();
+    let signing_message: Message = templates.artifacts.update_template_hash.into();
     let (client_sec_nonce, client_pub_nonce) = new_musig_nonce_pair(
         &secp,
         MusigSessionId::new(&mut rng),

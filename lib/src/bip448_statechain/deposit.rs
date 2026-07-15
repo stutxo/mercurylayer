@@ -1,11 +1,9 @@
 use std::str::FromStr;
 
 use bitcoin::{
-    consensus::encode,
     hashes::Hash,
-    secp256k1::{schnorr, PublicKey, Secp256k1},
-    taproot::ControlBlock,
-    Address, OutPoint, ScriptBuf, Transaction, Txid, Witness,
+    secp256k1::{PublicKey, Secp256k1},
+    Address, OutPoint, ScriptBuf, Txid,
 };
 use serde::{Deserialize, Serialize};
 
@@ -13,12 +11,11 @@ use crate::{
     bip448_statechain::{
         script::{self, ScriptTemplateError},
         storage::{
-            Bip448AnchorOutput, Bip448CpfpChildTemplate, Bip448CsfsKeyMetadata,
-            Bip448FeeBumpPolicy, Bip448FundingOutpoint, Bip448LatestState,
-            Bip448RecoveryTemplateRole, Bip448SigningMetadata, Bip448StatechainRecord,
-            Bip448ValueSchedule,
+            build_funding_latest_state, build_funding_recovery_artifacts, control_block_hex,
+            script_hex, Bip448FeeBumpPolicy, Bip448FundingOutpoint, Bip448RecoveryArtifactError,
+            Bip448RecoveryArtifacts, Bip448RecoveryTemplateRole, Bip448SigningMetadata,
+            Bip448StatechainRecord,
         },
-        transaction::{self, FeePolicy, StateTemplates, TransactionTemplateError},
     },
     error::MercuryError,
     utils::get_network,
@@ -35,8 +32,6 @@ pub enum Bip448DepositError {
     MissingServerPubkey,
     #[error("BIP448 deposit coin is missing aggregate_pubkey")]
     MissingAggregatePubkey,
-    #[error("BIP448 deposit transaction template error: {0}")]
-    TransactionTemplate(#[from] TransactionTemplateError),
     #[error("BIP448 deposit script template error: {0}")]
     ScriptTemplate(#[from] ScriptTemplateError),
     #[error("BIP448 deposit wallet error: {0}")]
@@ -47,6 +42,8 @@ pub enum Bip448DepositError {
     Address(#[from] bitcoin::address::Error),
     #[error("BIP448 deposit txid hex error: {0}")]
     TxidHex(#[from] bitcoin::hashes::hex::Error),
+    #[error("BIP448 deposit recovery artifact error: {0}")]
+    RecoveryArtifacts(#[from] Bip448RecoveryArtifactError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,25 +57,10 @@ pub struct Bip448DepositAddress {
 
 #[derive(Debug, Clone)]
 pub struct Bip448DepositTemplates {
-    pub state_number: u32,
-    pub challenge_delay: u16,
     pub funding_outpoint: Bip448FundingOutpoint,
     pub aggregate_pubkey: String,
     pub funding_address: String,
-    pub update_tx: Transaction,
-    pub settlement_tx: Transaction,
-    pub update_template_hash: bitcoin::sighash::TemplateHash,
-    pub settlement_template_hash: bitcoin::sighash::TemplateHash,
-    pub state_output_script_pubkey: ScriptBuf,
-    pub funding_update_script: ScriptBuf,
-    pub funding_update_control_block: ControlBlock,
-    pub state_update_script: ScriptBuf,
-    pub state_update_control_block: ControlBlock,
-    pub state_settlement_script: ScriptBuf,
-    pub state_settlement_control_block: ControlBlock,
-    pub value_schedule: Bip448ValueSchedule,
-    pub anchors: Vec<Bip448AnchorOutput>,
-    pub cpfp_child_templates: Vec<Bip448CpfpChildTemplate>,
+    pub artifacts: Bip448RecoveryArtifacts,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,7 +91,7 @@ pub fn create_deposit_address(
         aggregate_pubkey: aggregate_pubkey.to_string(),
         script_pubkey: script_hex(&script_pubkey),
         funding_update_script: script_hex(&script::funding_update_leaf()),
-        funding_update_control_block: control_block_hex(control_block),
+        funding_update_control_block: control_block_hex(&control_block),
     })
 }
 
@@ -122,86 +104,29 @@ pub fn build_deposit_templates(
     let network = get_network(network)?;
     let secp = Secp256k1::new();
     let aggregate_pubkey = aggregate_pubkey_from_coin(coin)?;
-    let aggregate_xonly = aggregate_pubkey.x_only_public_key().0;
     let recovery_script = recovery_script_from_coin(coin, network)?;
     let funding_outpoint_for_tx = OutPoint {
         txid: Txid::from_str(&funding_outpoint.txid)?,
         vout: funding_outpoint.vout,
     };
 
-    let templates = transaction::build_state_templates(
+    let artifacts = build_funding_recovery_artifacts(
         &secp,
-        aggregate_xonly,
-        transaction::placeholder_outpoint(),
+        &aggregate_pubkey,
+        funding_outpoint_for_tx,
         funding_outpoint.value_sats,
         recovery_script.clone(),
         INITIAL_BIP448_STATE_NUMBER,
         challenge_delay,
-        FeePolicy::ZeroFeeEphemeralAnchor,
+        Bip448FeeBumpPolicy::ZeroFeeEphemeralAnchor,
     )?;
-    let update_tx = transaction::rebind_update_tx(
-        &templates.update_tx,
-        funding_outpoint_for_tx,
-        funding_outpoint.value_sats,
-        FeePolicy::ZeroFeeEphemeralAnchor,
-    )?;
-    let settlement_tx = transaction::rebind_settlement_tx(
-        &templates.settlement_tx,
-        OutPoint {
-            txid: update_tx.txid(),
-            vout: 0,
-        },
-        templates.settlement_input_amount,
-        FeePolicy::ZeroFeeEphemeralAnchor,
-    )?;
-    let settlement_template_hash = transaction::validate_state_template_set(
-        &secp,
-        aggregate_xonly,
-        INITIAL_BIP448_STATE_NUMBER,
-        funding_outpoint.value_sats,
-        &recovery_script,
-        challenge_delay,
-        FeePolicy::ZeroFeeEphemeralAnchor,
-        &update_tx,
-        &settlement_tx,
-    )?;
-    let update_template_hash = transaction::update_template_hash(&update_tx)?;
-    let funding_spend_info = script::funding_spend_info(&secp, aggregate_xonly)?;
-    let state_spend_info = script::state_spend_info(
-        &secp,
-        aggregate_xonly,
-        INITIAL_BIP448_STATE_NUMBER,
-        settlement_template_hash,
-    )?;
-    let funding_address =
-        Address::from_script(&script::output_script_pubkey(&funding_spend_info), network)?;
+    let funding_address = Address::from_script(&artifacts.funding_output_script_pubkey, network)?;
 
     Ok(Bip448DepositTemplates {
-        state_number: INITIAL_BIP448_STATE_NUMBER,
-        challenge_delay,
         funding_outpoint,
         aggregate_pubkey: aggregate_pubkey.to_string(),
         funding_address: funding_address.to_string(),
-        update_template_hash,
-        settlement_template_hash,
-        state_output_script_pubkey: templates.state_output_script_pubkey.clone(),
-        funding_update_script: script::funding_update_leaf(),
-        funding_update_control_block: script::funding_update_control_block(&funding_spend_info)?,
-        state_update_script: script::state_update_leaf(INITIAL_BIP448_STATE_NUMBER)?,
-        state_update_control_block: script::state_update_control_block(
-            &state_spend_info,
-            INITIAL_BIP448_STATE_NUMBER,
-        )?,
-        state_settlement_script: script::state_settlement_leaf(settlement_template_hash),
-        state_settlement_control_block: script::state_settlement_control_block(
-            &state_spend_info,
-            settlement_template_hash,
-        )?,
-        value_schedule: value_schedule(&templates, &settlement_tx),
-        anchors: committed_anchors(&update_tx, &settlement_tx),
-        cpfp_child_templates: Vec::new(),
-        update_tx,
-        settlement_tx,
+        artifacts,
     })
 }
 
@@ -212,43 +137,15 @@ pub fn build_deposit_record(
     templates: &Bip448DepositTemplates,
     signing_data: Bip448DepositSigningData,
 ) -> Result<Bip448StatechainRecord, Bip448DepositError> {
-    let signature = schnorr::Signature::from_str(&signing_data.update_signature)?;
-    let mut update_tx = templates.update_tx.clone();
-    update_tx.input[0].witness = crate::bip448_statechain::signing::csfs_script_witness(
-        &signature,
-        &templates.funding_update_script,
-        &templates.funding_update_control_block,
-    );
-    let mut settlement_tx = templates.settlement_tx.clone();
-    settlement_tx.input[0].witness = settlement_template_witness(
-        &templates.state_settlement_script,
-        &templates.state_settlement_control_block,
-    );
-    let update_template_hash = hex::encode(templates.update_template_hash.to_byte_array());
-
-    let latest_state = Bip448LatestState {
-        state_number: templates.state_number,
-        challenge_delay: templates.challenge_delay,
-        update_tx: tx_hex(&update_tx),
-        settlement_tx: tx_hex(&settlement_tx),
-        update_template_hash: update_template_hash.clone(),
-        settlement_template_hash: hex::encode(templates.settlement_template_hash.to_byte_array()),
-        state_output_script_pubkey: script_hex(&templates.state_output_script_pubkey),
-        funding_update_script: script_hex(&templates.funding_update_script),
-        funding_update_control_block: control_block_hex(
-            templates.funding_update_control_block.clone(),
-        ),
-        state_update_script: script_hex(&templates.state_update_script),
-        state_update_control_block: control_block_hex(templates.state_update_control_block.clone()),
-        state_settlement_script: script_hex(&templates.state_settlement_script),
-        state_settlement_control_block: control_block_hex(
-            templates.state_settlement_control_block.clone(),
-        ),
-        csfs_key_metadata: Bip448CsfsKeyMetadata::from_aggregate_pubkey(
-            &Secp256k1::new(),
-            &PublicKey::from_str(&templates.aggregate_pubkey)?,
-        ),
-        signing_metadata: Bip448SigningMetadata {
+    let secp = Secp256k1::new();
+    let aggregate_pubkey = PublicKey::from_str(&templates.aggregate_pubkey)?;
+    let update_template_hash =
+        hex::encode(templates.artifacts.update_template_hash.to_byte_array());
+    let latest_state = build_funding_latest_state(
+        &secp,
+        &aggregate_pubkey,
+        &templates.artifacts,
+        Bip448SigningMetadata {
             role: Bip448RecoveryTemplateRole::FundingUpdate,
             signing_id: signing_data.signing_id,
             client_public_nonce: signing_data.client_public_nonce,
@@ -258,11 +155,8 @@ pub fn build_deposit_record(
             update_signature: signing_data.update_signature,
             server_signature_count: signing_data.server_signature_count,
         },
-        fee_bump_policy: Bip448FeeBumpPolicy::ZeroFeeEphemeralAnchor,
-        value_schedule: templates.value_schedule.clone(),
-        anchors: templates.anchors.clone(),
-        cpfp_child_templates: templates.cpfp_child_templates.clone(),
-    };
+        Vec::new(),
+    )?;
 
     Ok(Bip448StatechainRecord {
         wallet_name: wallet_name.to_string(),
@@ -275,13 +169,6 @@ pub fn build_deposit_record(
         network: network.to_string(),
         latest_state,
     })
-}
-
-pub fn settlement_template_witness(script: &ScriptBuf, control_block: &ControlBlock) -> Witness {
-    let mut witness = Witness::new();
-    witness.push(script.as_bytes());
-    witness.push(control_block.serialize());
-    witness
 }
 
 pub fn is_bip448_coin(coin: &Coin) -> bool {
@@ -312,65 +199,14 @@ fn recovery_script_from_coin(
         .script_pubkey())
 }
 
-fn value_schedule(templates: &StateTemplates, settlement_tx: &Transaction) -> Bip448ValueSchedule {
-    Bip448ValueSchedule {
-        funding_value_sats: templates.update_input_amount,
-        update_input_value_sats: templates.update_input_amount,
-        update_state_output_value_sats: templates.settlement_input_amount,
-        settlement_input_value_sats: templates.settlement_input_amount,
-        settlement_recovery_output_value_sats: settlement_tx.output[0].value,
-    }
-}
-
-fn committed_anchors(
-    update_tx: &Transaction,
-    settlement_tx: &Transaction,
-) -> Vec<Bip448AnchorOutput> {
-    let mut anchors = Vec::new();
-
-    if let Some(anchor) = anchor_output(Bip448RecoveryTemplateRole::FundingUpdate, update_tx, 1) {
-        anchors.push(anchor);
-    }
-    if let Some(anchor) = anchor_output(Bip448RecoveryTemplateRole::Settlement, settlement_tx, 1) {
-        anchors.push(anchor);
-    }
-
-    anchors
-}
-
-fn anchor_output(
-    tx_role: Bip448RecoveryTemplateRole,
-    tx: &Transaction,
-    output_index: usize,
-) -> Option<Bip448AnchorOutput> {
-    tx.output
-        .get(output_index)
-        .map(|output| Bip448AnchorOutput {
-            tx_role,
-            output_index: output_index as u32,
-            value_sats: output.value,
-            script_pubkey: script_hex(&output.script_pubkey),
-        })
-}
-
-fn tx_hex(tx: &Transaction) -> String {
-    hex::encode(encode::serialize(tx))
-}
-
-fn script_hex(script: &ScriptBuf) -> String {
-    hex::encode(script.as_bytes())
-}
-
-fn control_block_hex(control_block: ControlBlock) -> String {
-    hex::encode(control_block.serialize())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bip448_statechain::storage::Bip448CpfpChildTemplate;
+    use crate::bip448_statechain::transaction::{self, FeePolicy};
     use crate::wallet::{Settings, Wallet};
-    use bitcoin::{consensus::encode, Network};
-    use secp256k1::{KeyPair, SecretKey};
+    use bitcoin::{consensus::encode, hashes::Hash, Network, PrivateKey, Transaction};
+    use secp256k1::{schnorr, KeyPair, Scalar, SecretKey};
 
     const FUNDING_VALUE: u64 = 100_000;
 
@@ -433,12 +269,26 @@ mod tests {
         encode::deserialize(&hex::decode(tx_hex).unwrap()).unwrap()
     }
 
-    fn test_signature(hash: bitcoin::sighash::TemplateHash) -> schnorr::Signature {
+    fn test_signature(coin: &Coin, hash: bitcoin::sighash::TemplateHash) -> schnorr::Signature {
         let secp = Secp256k1::new();
-        let keypair =
-            KeyPair::from_secret_key(&secp, &SecretKey::from_secret_bytes([42u8; 32]).unwrap());
+        let user_secret = PrivateKey::from_wif(&coin.user_privkey).unwrap().inner;
+        let server_secret = SecretKey::from_secret_bytes([7u8; 32]).unwrap();
+        let server_tweak = Scalar::from_be_bytes(server_secret.to_secret_bytes()).unwrap();
+        let aggregate_secret = user_secret.add_tweak(&server_tweak).unwrap();
+        let keypair = KeyPair::from_secret_key(&secp, &aggregate_secret);
 
         schnorr::sign(hash.as_byte_array(), &keypair)
+    }
+
+    fn test_signing_data(signature: schnorr::Signature) -> Bip448DepositSigningData {
+        Bip448DepositSigningData {
+            signing_id: "77".repeat(32),
+            client_public_nonce: "88".repeat(66),
+            server_public_nonce: "99".repeat(66),
+            blinding_factor: "aa".repeat(32),
+            update_signature: signature.to_string(),
+            server_signature_count: 1,
+        }
     }
 
     #[test]
@@ -478,16 +328,30 @@ mod tests {
         let aggregate_pubkey = PublicKey::from_str(&templates.aggregate_pubkey).unwrap();
         let recovery_script = recovery_script_from_coin(&coin, Network::Regtest).unwrap();
 
-        assert_eq!(templates.update_tx.version, transaction::TX_VERSION);
-        assert_eq!(templates.settlement_tx.version, transaction::TX_VERSION);
-        assert_eq!(templates.update_tx.input[0].previous_output.vout, 0);
         assert_eq!(
-            templates.settlement_tx.input[0].previous_output.txid,
-            templates.update_tx.txid()
+            templates.artifacts.update_tx.version,
+            transaction::TX_VERSION
         );
-        assert_eq!(templates.anchors.len(), 2);
-        assert_eq!(templates.anchors[0].script_pubkey, "51024e73");
-        assert_eq!(templates.value_schedule.funding_value_sats, FUNDING_VALUE);
+        assert_eq!(
+            templates.artifacts.settlement_tx.version,
+            transaction::TX_VERSION
+        );
+        assert_eq!(
+            templates.artifacts.update_tx.input[0].previous_output.vout,
+            0
+        );
+        assert_eq!(
+            templates.artifacts.settlement_tx.input[0]
+                .previous_output
+                .txid,
+            templates.artifacts.update_tx.txid()
+        );
+        assert_eq!(templates.artifacts.anchors.len(), 2);
+        assert_eq!(templates.artifacts.anchors[0].script_pubkey, "51024e73");
+        assert_eq!(
+            templates.artifacts.value_schedule.funding_value_sats,
+            FUNDING_VALUE
+        );
         assert!(transaction::validate_state_template_set(
             &secp,
             aggregate_pubkey.x_only_public_key().0,
@@ -496,12 +360,12 @@ mod tests {
             &recovery_script,
             DEFAULT_BIP448_CHALLENGE_DELAY,
             FeePolicy::ZeroFeeEphemeralAnchor,
-            &templates.update_tx,
-            &templates.settlement_tx,
+            &templates.artifacts.update_tx,
+            &templates.artifacts.settlement_tx,
         )
         .is_ok());
 
-        let mut mutated = templates.update_tx.clone();
+        let mut mutated = templates.artifacts.update_tx.clone();
         mutated.output[0].value -= 1;
         assert!(transaction::validate_state_template_set(
             &secp,
@@ -512,34 +376,28 @@ mod tests {
             DEFAULT_BIP448_CHALLENGE_DELAY,
             FeePolicy::ZeroFeeEphemeralAnchor,
             &mutated,
-            &templates.settlement_tx,
+            &templates.artifacts.settlement_tx,
         )
         .is_err());
     }
 
     #[test]
     fn signed_deposit_record_contains_recovery_witnesses_and_no_legacy_backups() {
+        let coin = sample_coin();
         let templates = build_deposit_templates(
-            &sample_coin(),
+            &coin,
             funding_outpoint(),
             DEFAULT_BIP448_CHALLENGE_DELAY,
             "regtest",
         )
         .unwrap();
-        let signature = test_signature(templates.update_template_hash);
+        let signature = test_signature(&coin, templates.artifacts.update_template_hash);
         let record = build_deposit_record(
             "wallet",
             "statechain",
             "regtest",
             &templates,
-            Bip448DepositSigningData {
-                signing_id: "77".repeat(32),
-                client_public_nonce: "88".repeat(66),
-                server_public_nonce: "99".repeat(66),
-                blinding_factor: "aa".repeat(32),
-                update_signature: signature.to_string(),
-                server_signature_count: 1,
-            },
+            test_signing_data(signature),
         )
         .unwrap();
         let update_tx = tx_from_hex(&record.latest_state.update_tx);
@@ -561,5 +419,101 @@ mod tests {
         assert!(record.latest_state.cpfp_child_templates.is_empty());
         assert!(!json.contains("backup_txs"));
         assert!(!json.contains("backup_transactions"));
+    }
+
+    #[test]
+    fn deposit_record_rejects_wrong_aggregate_key_or_signature() {
+        let secp = Secp256k1::new();
+        let coin = sample_coin();
+        let templates = build_deposit_templates(
+            &coin,
+            funding_outpoint(),
+            DEFAULT_BIP448_CHALLENGE_DELAY,
+            "regtest",
+        )
+        .unwrap();
+        let wrong_keypair =
+            KeyPair::from_secret_key(&secp, &SecretKey::from_secret_bytes([42u8; 32]).unwrap());
+        let wrong_signature = schnorr::sign(
+            templates.artifacts.update_template_hash.as_byte_array(),
+            &wrong_keypair,
+        );
+        let error = build_deposit_record(
+            "wallet",
+            "statechain",
+            "regtest",
+            &templates,
+            test_signing_data(wrong_signature),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Bip448DepositError::RecoveryArtifacts(
+                Bip448RecoveryArtifactError::UpdateSignatureVerification
+            )
+        ));
+
+        let mut mismatched_key = templates.clone();
+        mismatched_key.aggregate_pubkey = wrong_keypair.public_key().to_string();
+        let valid_signature = test_signature(&coin, templates.artifacts.update_template_hash);
+        let error = build_deposit_record(
+            "wallet",
+            "statechain",
+            "regtest",
+            &mismatched_key,
+            test_signing_data(valid_signature),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Bip448DepositError::RecoveryArtifacts(
+                Bip448RecoveryArtifactError::AggregateKeyMismatch
+            )
+        ));
+    }
+
+    #[test]
+    fn latest_state_builder_rejects_unverified_cpfp_children() {
+        let secp = Secp256k1::new();
+        let coin = sample_coin();
+        let templates = build_deposit_templates(
+            &coin,
+            funding_outpoint(),
+            DEFAULT_BIP448_CHALLENGE_DELAY,
+            "regtest",
+        )
+        .unwrap();
+        let aggregate_pubkey = PublicKey::from_str(&templates.aggregate_pubkey).unwrap();
+        let signature = test_signature(&coin, templates.artifacts.update_template_hash);
+        let error = build_funding_latest_state(
+            &secp,
+            &aggregate_pubkey,
+            &templates.artifacts,
+            Bip448SigningMetadata {
+                role: Bip448RecoveryTemplateRole::FundingUpdate,
+                signing_id: "77".repeat(32),
+                client_public_nonce: "88".repeat(66),
+                server_public_nonce: "99".repeat(66),
+                blinding_factor: "aa".repeat(32),
+                update_template_hash: hex::encode(
+                    templates.artifacts.update_template_hash.to_byte_array(),
+                ),
+                update_signature: signature.to_string(),
+                server_signature_count: 1,
+            },
+            vec![Bip448CpfpChildTemplate {
+                parent_role: Bip448RecoveryTemplateRole::FundingUpdate,
+                anchor_output_index: 1,
+                tx_hex: "03000000".to_string(),
+                fee_sats: 1_000,
+                target_feerate_sat_per_vbyte: Some(10),
+            }],
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Bip448RecoveryArtifactError::UnverifiedCpfpChildTemplates
+        ));
     }
 }

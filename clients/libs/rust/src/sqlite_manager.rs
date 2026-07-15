@@ -169,6 +169,12 @@ pub async fn insert_or_update_bip448_statechain(
     pool: &Pool<Sqlite>,
     record: &Bip448StatechainRecord,
 ) -> Result<()> {
+    if !record.latest_state.cpfp_child_templates.is_empty() {
+        return Err(anyhow!(
+            "BIP448 accepted state cannot contain unverified CPFP child templates"
+        ));
+    }
+
     let record_json = serde_json::to_string(record)?;
     let query = "\
         INSERT INTO bip448_statechains (\
@@ -518,13 +524,17 @@ mod tests {
                 value_sats: 0,
                 script_pubkey: "51024e73".to_string(),
             }],
-            cpfp_child_templates: vec![Bip448CpfpChildTemplate {
-                parent_role: Bip448RecoveryTemplateRole::StateUpdate,
-                anchor_output_index: 1,
-                tx_hex: "03000000".to_string(),
-                fee_sats: 1_000,
-                target_feerate_sat_per_vbyte: Some(10),
-            }],
+            cpfp_child_templates: Vec::new(),
+        }
+    }
+
+    fn sample_cpfp_child_template() -> Bip448CpfpChildTemplate {
+        Bip448CpfpChildTemplate {
+            parent_role: Bip448RecoveryTemplateRole::StateUpdate,
+            anchor_output_index: 1,
+            tx_hex: "03000000".to_string(),
+            fee_sats: 1_000,
+            target_feerate_sat_per_vbyte: Some(10),
         }
     }
 
@@ -560,7 +570,10 @@ mod tests {
     }
 
     fn sample_bip448_transfer_msg() -> Bip448TransferMsg {
-        let latest_state = sample_latest_state(2);
+        let mut latest_state = sample_latest_state(2);
+        latest_state
+            .cpfp_child_templates
+            .push(sample_cpfp_child_template());
         Bip448TransferMsg {
             statechain_id: "statechain".to_string(),
             transfer_signature: "ab".repeat(64),
@@ -667,6 +680,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bip448_accepted_state_rejects_unverified_cpfp_children() -> Result<()> {
+        let pool = migrated_pool().await?;
+        let mut rejected_insert = sample_bip448_record(1);
+        rejected_insert
+            .latest_state
+            .cpfp_child_templates
+            .push(sample_cpfp_child_template());
+
+        let error = insert_or_update_bip448_statechain(&pool, &rejected_insert)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cannot contain unverified CPFP child templates"));
+        assert!(get_bip448_statechain_optional(
+            &pool,
+            &rejected_insert.wallet_name,
+            &rejected_insert.statechain_id,
+        )
+        .await?
+        .is_none());
+
+        let accepted = sample_bip448_record(1);
+        insert_or_update_bip448_statechain(&pool, &accepted).await?;
+        let mut rejected_update = sample_bip448_record(2);
+        rejected_update
+            .latest_state
+            .cpfp_child_templates
+            .push(sample_cpfp_child_template());
+
+        insert_or_update_bip448_statechain(&pool, &rejected_update)
+            .await
+            .unwrap_err();
+        let persisted =
+            get_bip448_statechain(&pool, &accepted.wallet_name, &accepted.statechain_id).await?;
+        assert_eq!(persisted, accepted);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn bip448_transfer_messages_round_trip_through_sqlite() -> Result<()> {
         let pool = migrated_pool().await?;
         let transfer_msg = sample_bip448_transfer_msg();
@@ -689,6 +743,7 @@ mod tests {
 
         assert_eq!(roundtrip, transfer_msg);
         assert_eq!(roundtrip.latest_state.anchors[0].script_pubkey, "51024e73");
+        assert_eq!(roundtrip.latest_state.cpfp_child_templates.len(), 1);
 
         Ok(())
     }

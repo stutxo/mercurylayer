@@ -1,11 +1,124 @@
 use std::str::FromStr;
 
+use bitcoin::{Network, OutPoint, ScriptBuf, TxOut, Txid};
 use secp256k1::{PublicKey, Secp256k1, Signing, Verification};
 use serde::{Deserialize, Serialize};
 
 use crate::bip448_statechain::storage::{
-    Bip448FundingOutpoint, Bip448LatestState, Bip448RecoveryVerifyError, Bip448ValueSchedule,
+    Bip448FeeBumpPolicy, Bip448FundingOutpoint, Bip448LatestState, Bip448RecoveryVerifyError,
+    Bip448ValueSchedule, Bip448VerifiedRecoveryBinding,
 };
+use crate::bip448_statechain::transaction as bip448_transaction;
+
+/// Receiver-controlled facts required to validate a BIP448 recovery state.
+///
+/// The outpoint/output and BIP113 median-time-past must come from the receiver's
+/// trusted chain backend, the signature count from a direct lockbox query, and
+/// the remaining values from the local wallet or independently queried
+/// statechain state. Sender fields and local wall-clock time must never be used
+/// to construct this context.
+#[derive(Debug, Clone)]
+pub struct Bip448TrustedRecoveryContext {
+    expected_statechain_id: String,
+    expected_network: Network,
+    median_time_past: u32,
+    funding_outpoint: OutPoint,
+    funding_output: TxOut,
+    lockbox_signature_count: u64,
+    expected_challenge_delay: u16,
+    expected_fee_bump_policy: Bip448FeeBumpPolicy,
+    receiver_user_pubkey: PublicKey,
+    server_pubkey: PublicKey,
+    recovery_script: ScriptBuf,
+}
+
+impl Bip448TrustedRecoveryContext {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        expected_statechain_id: impl Into<String>,
+        expected_network: Network,
+        median_time_past: u32,
+        funding_outpoint: OutPoint,
+        funding_output: TxOut,
+        lockbox_signature_count: u64,
+        expected_challenge_delay: u16,
+        expected_fee_bump_policy: Bip448FeeBumpPolicy,
+        receiver_user_pubkey: PublicKey,
+        server_pubkey: PublicKey,
+        recovery_script: ScriptBuf,
+    ) -> Self {
+        Self {
+            expected_statechain_id: expected_statechain_id.into(),
+            expected_network,
+            median_time_past,
+            funding_outpoint,
+            funding_output,
+            lockbox_signature_count,
+            expected_challenge_delay,
+            expected_fee_bump_policy,
+            receiver_user_pubkey,
+            server_pubkey,
+            recovery_script,
+        }
+    }
+}
+
+/// Canonical recovery data produced only after the Phase 6 trust checks pass.
+///
+/// This is not complete transfer acceptance: sender authorization, `t1`, and
+/// key-share update still belong to Phase 8. Its security-relevant recovery
+/// fields use the receiver-reconstructed lowercase representation. Sender
+/// signing-retry metadata remains operational data that Phase 8 must strip or
+/// independently validate before accepted persistence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bip448VerifiedRecoveryState {
+    statechain_id: String,
+    network: Network,
+    funding_outpoint: OutPoint,
+    funding_output: TxOut,
+    receiver_user_pubkey: PublicKey,
+    server_pubkey: PublicKey,
+    aggregate_pubkey: PublicKey,
+    canonical_latest_state: Bip448LatestState,
+}
+
+impl Bip448VerifiedRecoveryState {
+    pub fn statechain_id(&self) -> &str {
+        &self.statechain_id
+    }
+
+    pub fn network(&self) -> Network {
+        self.network
+    }
+
+    pub fn funding_outpoint(&self) -> OutPoint {
+        self.funding_outpoint
+    }
+
+    pub fn funding_output(&self) -> &TxOut {
+        &self.funding_output
+    }
+
+    pub fn receiver_user_pubkey(&self) -> &PublicKey {
+        &self.receiver_user_pubkey
+    }
+
+    pub fn server_pubkey(&self) -> &PublicKey {
+        &self.server_pubkey
+    }
+
+    pub fn aggregate_pubkey(&self) -> &PublicKey {
+        &self.aggregate_pubkey
+    }
+
+    pub fn canonical_latest_state(&self) -> &Bip448LatestState {
+        &self.canonical_latest_state
+    }
+
+    pub fn into_canonical_latest_state(self) -> Bip448LatestState {
+        self.canonical_latest_state
+    }
+}
 
 /// BIP448 transfer message. This deliberately does not reuse the legacy
 /// `TransferMsg`/`BackupTx` shape, because BIP448 receivers validate signed
@@ -37,8 +150,10 @@ impl Bip448TransferMsg {
     /// Verifies the transfer message binds recovery authority to keys the
     /// receiver trusts. It reconciles the top-level convenience fields against
     /// the nested `latest_state`, recomputes `P = receiver_user_pubkey +
-    /// server_pubkey`, checks the message `aggregate_pubkey` equals it, and
-    /// verifies the CSFS key metadata + update signature against `P.x`.
+    /// server_pubkey`, requires the duplicated message key strings to use the
+    /// canonical encodings of those trusted keys, checks the message
+    /// `aggregate_pubkey` equals canonical `P`, and verifies the CSFS key
+    /// metadata + update signature against `P.x`.
     ///
     /// `receiver_user_pubkey` and `server_pubkey` MUST be the receiver's own
     /// key and the server key it confirms out of band (e.g. from
@@ -51,6 +166,17 @@ impl Bip448TransferMsg {
         receiver_user_pubkey: &PublicKey,
         server_pubkey: &PublicKey,
     ) -> Result<PublicKey, Bip448RecoveryVerifyError> {
+        Ok(self
+            .verify_recovery_binding_against_keys(secp, receiver_user_pubkey, server_pubkey)?
+            .into_aggregate_pubkey())
+    }
+
+    fn verify_recovery_binding_against_keys<C: Verification + Signing>(
+        &self,
+        secp: &Secp256k1<C>,
+        receiver_user_pubkey: &PublicKey,
+        server_pubkey: &PublicKey,
+    ) -> Result<Bip448VerifiedRecoveryBinding, Bip448RecoveryVerifyError> {
         if self.latest_state_number != self.latest_state.state_number {
             return Err(Bip448RecoveryVerifyError::InconsistentField(
                 "latest_state_number",
@@ -72,19 +198,157 @@ impl Bip448TransferMsg {
                 "server_signature_count",
             ));
         }
+        if self.receiver_user_public_key != receiver_user_pubkey.to_string() {
+            return Err(Bip448RecoveryVerifyError::TrustedFieldMismatch(
+                "receiver_user_public_key",
+            ));
+        }
+        if self.server_public_key != server_pubkey.to_string() {
+            return Err(Bip448RecoveryVerifyError::TrustedFieldMismatch(
+                "server_public_key",
+            ));
+        }
 
-        let recomputed = self.latest_state.verify_recovery_against_keys(
+        let binding = self.latest_state.verify_recovery_binding_against_keys(
             secp,
             receiver_user_pubkey,
             server_pubkey,
         )?;
 
-        let claimed = PublicKey::from_str(&self.aggregate_pubkey)?;
-        if claimed != recomputed {
+        if self.aggregate_pubkey != binding.aggregate_pubkey().to_string() {
             return Err(Bip448RecoveryVerifyError::AggregateKeyMismatch);
         }
 
-        Ok(recomputed)
+        Ok(binding)
+    }
+
+    /// Validates the BIP448 recovery state against receiver-controlled chain,
+    /// wallet, network, lockbox, and chain-MTP facts. Template reconstruction is
+    /// seeded by the chain-reported value, never by a sender-provided value
+    /// schedule, and both reconstructed transactions must already be final under
+    /// the chain's BIP113 median-time-past.
+    ///
+    /// This is deliberately NOT complete transfer acceptance: it does not verify
+    /// `transfer_signature`, validate `t1` against key-update state, or perform
+    /// the server key-share update. Phase 8 must complete those checks before a
+    /// receiver persists the message as an accepted transfer. Returns typed
+    /// trusted facts plus the receiver-reconstructed canonical latest state;
+    /// callers must not promote the original sender strings into persistence.
+    pub fn verify_recovery_state<C: Verification + Signing>(
+        &self,
+        secp: &Secp256k1<C>,
+        trusted: &Bip448TrustedRecoveryContext,
+    ) -> Result<Bip448VerifiedRecoveryState, Bip448RecoveryVerifyError> {
+        if self.statechain_id != trusted.expected_statechain_id {
+            return Err(Bip448RecoveryVerifyError::TrustedFieldMismatch(
+                "statechain_id",
+            ));
+        }
+        let network = Network::from_str(&self.network)
+            .map_err(|_| Bip448RecoveryVerifyError::TrustedFieldMismatch("network"))?;
+        if network != trusted.expected_network {
+            return Err(Bip448RecoveryVerifyError::TrustedFieldMismatch("network"));
+        }
+        let funding_txid = Txid::from_str(&self.funding_outpoint.txid)
+            .map_err(|_| Bip448RecoveryVerifyError::InvalidFundingTxid)?;
+        let claimed_funding_outpoint = OutPoint {
+            txid: funding_txid,
+            vout: self.funding_outpoint.vout,
+        };
+        if claimed_funding_outpoint != trusted.funding_outpoint {
+            return Err(Bip448RecoveryVerifyError::TrustedFieldMismatch(
+                "funding_outpoint",
+            ));
+        }
+        if self.funding_outpoint.value_sats != trusted.funding_output.value {
+            return Err(Bip448RecoveryVerifyError::TrustedFieldMismatch(
+                "funding_outpoint.value_sats",
+            ));
+        }
+        if self.amount_sats != trusted.funding_output.value {
+            return Err(Bip448RecoveryVerifyError::TrustedFieldMismatch(
+                "amount_sats",
+            ));
+        }
+        if self.server_signature_count != trusted.lockbox_signature_count
+            || self.latest_state.signing_metadata.server_signature_count
+                != trusted.lockbox_signature_count
+        {
+            return Err(Bip448RecoveryVerifyError::TrustedFieldMismatch(
+                "server_signature_count",
+            ));
+        }
+        // Each logical state consumes exactly one blind update signature. This
+        // binds the independently queried count to the state number committed by
+        // the signed update hash; comparing only sender-writable count fields
+        // would allow an older valid state to be relabeled with a newer count.
+        if u64::from(self.latest_state_number) != trusted.lockbox_signature_count
+            || u64::from(self.latest_state.state_number) != trusted.lockbox_signature_count
+        {
+            return Err(Bip448RecoveryVerifyError::TrustedFieldMismatch(
+                "latest_state_number",
+            ));
+        }
+        if self.challenge_delay != trusted.expected_challenge_delay
+            || self.latest_state.challenge_delay != trusted.expected_challenge_delay
+        {
+            return Err(Bip448RecoveryVerifyError::TrustedFieldMismatch(
+                "challenge_delay",
+            ));
+        }
+        if self.latest_state.fee_bump_policy != trusted.expected_fee_bump_policy {
+            return Err(Bip448RecoveryVerifyError::TrustedFieldMismatch(
+                "fee_bump_policy",
+            ));
+        }
+        let binding = self.verify_recovery_binding_against_keys(
+            secp,
+            &trusted.receiver_user_pubkey,
+            &trusted.server_pubkey,
+        )?;
+
+        let canonical_latest_state = self
+            .latest_state
+            .verify_reconstructed_templates_with_binding(
+                secp,
+                &binding,
+                trusted.funding_outpoint,
+                &trusted.funding_output,
+                &trusted.recovery_script,
+            )?;
+        // Canonical reconstruction proves both U(n) and S(n) use the exact
+        // state_locktime(n), so this one chain-time check covers both templates.
+        bip448_transaction::validate_immediately_final(
+            self.latest_state.state_number,
+            trusted.median_time_past,
+        )
+        .map_err(recovery_finality_error)?;
+
+        Ok(Bip448VerifiedRecoveryState {
+            statechain_id: trusted.expected_statechain_id.clone(),
+            network: trusted.expected_network,
+            funding_outpoint: trusted.funding_outpoint,
+            funding_output: trusted.funding_output.clone(),
+            receiver_user_pubkey: trusted.receiver_user_pubkey,
+            server_pubkey: trusted.server_pubkey,
+            aggregate_pubkey: binding.into_aggregate_pubkey(),
+            canonical_latest_state,
+        })
+    }
+}
+
+fn recovery_finality_error(
+    error: bip448_transaction::TransactionTemplateError,
+) -> Bip448RecoveryVerifyError {
+    match error {
+        bip448_transaction::TransactionTemplateError::StateLocktimeNotFinal {
+            state_number,
+            median_time_past,
+        } => Bip448RecoveryVerifyError::StateLocktimeNotFinal {
+            state_number,
+            median_time_past,
+        },
+        error => Bip448RecoveryVerifyError::Reconstruction(error.to_string()),
     }
 }
 
@@ -92,15 +356,17 @@ impl Bip448TransferMsg {
 mod tests {
     use super::*;
     use crate::bip448_statechain::storage::{
+        build_funding_latest_state, build_funding_recovery_artifacts, script_hex,
         Bip448AnchorOutput, Bip448CpfpChildTemplate, Bip448CsfsKeyMetadata, Bip448FeeBumpPolicy,
         Bip448RecoveryTemplateRole, Bip448SigningMetadata,
     };
     use crate::bip448_statechain::{script, transaction};
     use bitcoin::{
-        consensus::encode, hashes::Hash, script::Builder, taproot::ControlBlock, OutPoint,
-        ScriptBuf, Transaction, Txid,
+        consensus::encode, hashes::Hash, script::Builder, OutPoint, ScriptBuf, Transaction, Txid,
     };
     use secp256k1::{schnorr, KeyPair, PublicKey, Secp256k1, SecretKey};
+
+    const TEST_MEDIAN_TIME_PAST: u32 = 1_900_000_000;
 
     fn latest_state() -> Bip448LatestState {
         Bip448LatestState {
@@ -155,20 +421,8 @@ mod tests {
         }
     }
 
-    fn tx_hex(tx: &Transaction) -> String {
-        hex::encode(encode::serialize(tx))
-    }
-
     fn tx_from_hex(tx_hex: &str) -> Transaction {
         encode::deserialize(&hex::decode(tx_hex).unwrap()).unwrap()
-    }
-
-    fn script_hex(script: &ScriptBuf) -> String {
-        hex::encode(script.as_bytes())
-    }
-
-    fn control_block_hex(control_block: ControlBlock) -> String {
-        hex::encode(control_block.serialize())
     }
 
     fn aggregate_key() -> (SecretKey, PublicKey) {
@@ -190,99 +444,48 @@ mod tests {
         }
     }
 
-    fn latest_state_from_templates(
-        aggregate_pubkey: &PublicKey,
-        update_tx: &Transaction,
-        settlement_tx: &Transaction,
-        templates: &transaction::StateTemplates,
-    ) -> Bip448LatestState {
-        let secp = Secp256k1::new();
-        let aggregate_xonly = aggregate_pubkey.x_only_public_key().0;
-        let funding_spend_info = script::funding_spend_info(&secp, aggregate_xonly).unwrap();
-        let state_spend_info = script::state_spend_info(
-            &secp,
-            aggregate_xonly,
-            templates.state_number,
-            templates.settlement_template_hash,
-        )
-        .unwrap();
-        let update_template_hash = transaction::update_template_hash(update_tx).unwrap();
-
-        Bip448LatestState {
-            state_number: templates.state_number,
-            challenge_delay: templates.challenge_delay,
-            update_tx: tx_hex(update_tx),
-            settlement_tx: tx_hex(settlement_tx),
-            update_template_hash: hex::encode(update_template_hash.to_byte_array()),
-            settlement_template_hash: hex::encode(
-                templates.settlement_template_hash.to_byte_array(),
-            ),
-            state_output_script_pubkey: script_hex(&templates.state_output_script_pubkey),
-            funding_update_script: script_hex(&script::funding_update_leaf()),
-            funding_update_control_block: control_block_hex(
-                script::funding_update_control_block(&funding_spend_info).unwrap(),
-            ),
-            state_update_script: script_hex(
-                &script::state_update_leaf(templates.state_number).unwrap(),
-            ),
-            state_update_control_block: control_block_hex(
-                script::state_update_control_block(&state_spend_info, templates.state_number)
-                    .unwrap(),
-            ),
-            state_settlement_script: script_hex(&script::state_settlement_leaf(
-                templates.settlement_template_hash,
-            )),
-            state_settlement_control_block: control_block_hex(
-                script::state_settlement_control_block(
-                    &state_spend_info,
-                    templates.settlement_template_hash,
-                )
-                .unwrap(),
-            ),
-            csfs_key_metadata: Bip448CsfsKeyMetadata::from_aggregate_pubkey(
-                &secp,
-                aggregate_pubkey,
-            ),
-            signing_metadata: Bip448SigningMetadata {
-                role: Bip448RecoveryTemplateRole::FundingUpdate,
-                signing_id: "77".repeat(32),
-                client_public_nonce: "88".repeat(66),
-                server_public_nonce: "99".repeat(66),
-                blinding_factor: "aa".repeat(32),
-                update_template_hash: hex::encode(update_template_hash.to_byte_array()),
-                update_signature: "bb".repeat(64),
-                server_signature_count: 1,
-            },
-            fee_bump_policy: Bip448FeeBumpPolicy::ZeroFeeEphemeralAnchor,
-            value_schedule: Bip448ValueSchedule {
-                funding_value_sats: templates.update_input_amount,
-                update_input_value_sats: templates.update_input_amount,
-                update_state_output_value_sats: templates.settlement_input_amount,
-                settlement_input_value_sats: templates.settlement_input_amount,
-                settlement_recovery_output_value_sats: settlement_tx.output[0].value,
-            },
-            anchors: vec![
-                Bip448AnchorOutput {
-                    tx_role: Bip448RecoveryTemplateRole::FundingUpdate,
-                    output_index: 1,
-                    value_sats: update_tx.output[1].value,
-                    script_pubkey: script_hex(&update_tx.output[1].script_pubkey),
-                },
-                Bip448AnchorOutput {
-                    tx_role: Bip448RecoveryTemplateRole::Settlement,
-                    output_index: 1,
-                    value_sats: settlement_tx.output[1].value,
-                    script_pubkey: script_hex(&settlement_tx.output[1].script_pubkey),
-                },
-            ],
-            cpfp_child_templates: vec![Bip448CpfpChildTemplate {
-                parent_role: Bip448RecoveryTemplateRole::FundingUpdate,
-                anchor_output_index: 1,
-                tx_hex: "03000000".to_string(),
-                fee_sats: 1_000,
-                target_feerate_sat_per_vbyte: Some(10),
-            }],
+    fn trusted_outpoint(funding_outpoint: &Bip448FundingOutpoint) -> OutPoint {
+        OutPoint {
+            txid: Txid::from_str(&funding_outpoint.txid).unwrap(),
+            vout: funding_outpoint.vout,
         }
+    }
+
+    fn trusted_funding_output(
+        secp: &Secp256k1<secp256k1::All>,
+        aggregate_pubkey: &PublicKey,
+        value: u64,
+    ) -> TxOut {
+        let spend_info =
+            script::funding_spend_info(secp, aggregate_pubkey.x_only_public_key().0).unwrap();
+        TxOut {
+            value,
+            script_pubkey: script::output_script_pubkey(&spend_info),
+        }
+    }
+
+    fn trusted_recovery_context(
+        secp: &Secp256k1<secp256k1::All>,
+        funding_outpoint: &Bip448FundingOutpoint,
+        receiver_user_pubkey: &PublicKey,
+        server_pubkey: &PublicKey,
+        recovery_script: &ScriptBuf,
+        lockbox_signature_count: u64,
+    ) -> Bip448TrustedRecoveryContext {
+        let aggregate_pubkey = receiver_user_pubkey.combine(server_pubkey).unwrap();
+        Bip448TrustedRecoveryContext::new(
+            "statechain",
+            Network::Regtest,
+            TEST_MEDIAN_TIME_PAST,
+            trusted_outpoint(funding_outpoint),
+            trusted_funding_output(secp, &aggregate_pubkey, funding_outpoint.value_sats),
+            lockbox_signature_count,
+            144,
+            Bip448FeeBumpPolicy::ZeroFeeEphemeralAnchor,
+            receiver_user_pubkey.clone(),
+            server_pubkey.clone(),
+            recovery_script.clone(),
+        )
     }
 
     #[test]
@@ -325,40 +528,10 @@ mod tests {
         const CHALLENGE_DELAY: u16 = 144;
 
         let secp = Secp256k1::new();
-        let (_, aggregate_pubkey) = aggregate_key();
+        let (aggregate_secret, aggregate_pubkey) = aggregate_key();
         let aggregate_xonly = aggregate_pubkey.x_only_public_key().0;
-        let funding_outpoint = outpoint(0x11, 0);
-        let recovery_script = recovery_script();
-        let templates = transaction::build_state_templates(
-            &secp,
-            aggregate_xonly,
-            transaction::placeholder_outpoint(),
-            INPUT_AMOUNT,
-            recovery_script.clone(),
-            STATE_NUMBER,
-            CHALLENGE_DELAY,
-            transaction::FeePolicy::ZeroFeeEphemeralAnchor,
-        )
-        .unwrap();
-        let update_tx = transaction::rebind_update_tx(
-            &templates.update_tx,
-            funding_outpoint,
-            INPUT_AMOUNT,
-            transaction::FeePolicy::ZeroFeeEphemeralAnchor,
-        )
-        .unwrap();
-        let settlement_tx = transaction::rebind_settlement_tx(
-            &templates.settlement_tx,
-            OutPoint {
-                txid: update_tx.txid(),
-                vout: 0,
-            },
-            templates.settlement_input_amount,
-            transaction::FeePolicy::ZeroFeeEphemeralAnchor,
-        )
-        .unwrap();
-        let latest_state =
-            latest_state_from_templates(&aggregate_pubkey, &update_tx, &settlement_tx, &templates);
+        let (latest_state, funding_outpoint, recovery_script) =
+            reconstructible_latest_state(&secp, &aggregate_secret, &aggregate_pubkey);
         let msg = Bip448TransferMsg {
             statechain_id: "statechain".to_string(),
             transfer_signature: "ab".repeat(64),
@@ -366,11 +539,7 @@ mod tests {
             receiver_user_public_key: "03".to_string() + &"13".repeat(32),
             server_public_key: "02".to_string() + &"14".repeat(32),
             aggregate_pubkey: aggregate_pubkey.to_string(),
-            funding_outpoint: Bip448FundingOutpoint {
-                txid: funding_outpoint.txid.to_string(),
-                vout: funding_outpoint.vout,
-                value_sats: INPUT_AMOUNT,
-            },
+            funding_outpoint,
             latest_state_number: STATE_NUMBER,
             challenge_delay: CHALLENGE_DELAY,
             amount_sats: INPUT_AMOUNT,
@@ -385,40 +554,6 @@ mod tests {
         let decoded: Bip448TransferMsg = serde_json::from_str(&encoded).unwrap();
         let stored_update_tx = tx_from_hex(&decoded.latest_state.update_tx);
         let stored_settlement_tx = tx_from_hex(&decoded.latest_state.settlement_tx);
-        let reconstructed_templates = transaction::build_state_templates(
-            &secp,
-            aggregate_xonly,
-            transaction::placeholder_outpoint(),
-            decoded.value_schedule.update_input_value_sats,
-            recovery_script.clone(),
-            decoded.latest_state_number,
-            decoded.challenge_delay,
-            transaction::FeePolicy::ZeroFeeEphemeralAnchor,
-        )
-        .unwrap();
-        let reconstructed_update_tx = transaction::rebind_update_tx(
-            &reconstructed_templates.update_tx,
-            funding_outpoint,
-            decoded.value_schedule.update_input_value_sats,
-            transaction::FeePolicy::ZeroFeeEphemeralAnchor,
-        )
-        .unwrap();
-        let reconstructed_settlement_tx = transaction::rebind_settlement_tx(
-            &reconstructed_templates.settlement_tx,
-            OutPoint {
-                txid: stored_update_tx.txid(),
-                vout: 0,
-            },
-            decoded.value_schedule.settlement_input_value_sats,
-            transaction::FeePolicy::ZeroFeeEphemeralAnchor,
-        )
-        .unwrap();
-
-        assert_eq!(tx_hex(&stored_update_tx), tx_hex(&reconstructed_update_tx));
-        assert_eq!(
-            tx_hex(&stored_settlement_tx),
-            tx_hex(&reconstructed_settlement_tx)
-        );
         let settlement_hash = transaction::validate_state_template_set(
             &secp,
             aggregate_xonly,
@@ -531,6 +666,40 @@ mod tests {
             aggregate_pub
         );
 
+        let mut wrong_receiver_field = msg.clone();
+        wrong_receiver_field.receiver_user_public_key = server_pub.to_string();
+        assert_eq!(
+            wrong_receiver_field.verify_recovery_against_keys(&secp, &user_pub, &server_pub),
+            Err(Bip448RecoveryVerifyError::TrustedFieldMismatch(
+                "receiver_user_public_key"
+            ))
+        );
+
+        let mut wrong_server_field = msg.clone();
+        wrong_server_field.server_public_key = user_pub.to_string();
+        assert_eq!(
+            wrong_server_field.verify_recovery_against_keys(&secp, &user_pub, &server_pub),
+            Err(Bip448RecoveryVerifyError::TrustedFieldMismatch(
+                "server_public_key"
+            ))
+        );
+
+        // Even an alternate encoding of the same curve point is rejected so
+        // downstream code cannot observe non-canonical sender-controlled text.
+        let alternate_receiver_encoding = hex::encode(user_pub.serialize_uncompressed());
+        assert_eq!(
+            PublicKey::from_str(&alternate_receiver_encoding).unwrap(),
+            user_pub
+        );
+        let mut noncanonical_receiver = msg.clone();
+        noncanonical_receiver.receiver_user_public_key = alternate_receiver_encoding;
+        assert_eq!(
+            noncanonical_receiver.verify_recovery_against_keys(&secp, &user_pub, &server_pub),
+            Err(Bip448RecoveryVerifyError::TrustedFieldMismatch(
+                "receiver_user_public_key"
+            ))
+        );
+
         // A substituted aggregate_pubkey in the (sender-controlled) message is
         // rejected against the receiver's recomputed P.
         let mut wrong_aggregate = msg.clone();
@@ -540,11 +709,22 @@ mod tests {
             Err(Bip448RecoveryVerifyError::AggregateKeyMismatch)
         );
 
-        // A wrong server key changes the recomputed P; the metadata no longer
-        // matches, so recovery is rejected.
-        assert!(msg
-            .verify_recovery_against_keys(&secp, &user_pub, &user_pub)
-            .is_err());
+        let mut noncanonical_aggregate = msg.clone();
+        noncanonical_aggregate.aggregate_pubkey =
+            hex::encode(aggregate_pub.serialize_uncompressed());
+        assert_eq!(
+            noncanonical_aggregate.verify_recovery_against_keys(&secp, &user_pub, &server_pub),
+            Err(Bip448RecoveryVerifyError::AggregateKeyMismatch)
+        );
+
+        // A trusted server parameter that disagrees with the message is rejected
+        // before any downstream consumer can read the duplicated field.
+        assert_eq!(
+            msg.verify_recovery_against_keys(&secp, &user_pub, &user_pub),
+            Err(Bip448RecoveryVerifyError::TrustedFieldMismatch(
+                "server_public_key"
+            ))
+        );
 
         // A corrupted update signature does not verify against P.x.
         let mut bad_signature = msg.clone();
@@ -564,5 +744,633 @@ mod tests {
                 "server_signature_count"
             ))
         );
+    }
+
+    /// Builds a fully reconstructible latest state for `aggregate_pubkey`, plus
+    /// the funding outpoint and receiver recovery script it was built from — the
+    /// exact trusted inputs a receiver would supply to the reconstruction check.
+    fn reconstructible_latest_state(
+        secp: &Secp256k1<secp256k1::All>,
+        aggregate_secret: &SecretKey,
+        aggregate_pubkey: &PublicKey,
+    ) -> (Bip448LatestState, Bip448FundingOutpoint, ScriptBuf) {
+        reconstructible_latest_state_at(secp, aggregate_secret, aggregate_pubkey, 1)
+    }
+
+    fn reconstructible_latest_state_at(
+        secp: &Secp256k1<secp256k1::All>,
+        aggregate_secret: &SecretKey,
+        aggregate_pubkey: &PublicKey,
+        state_number: u32,
+    ) -> (Bip448LatestState, Bip448FundingOutpoint, ScriptBuf) {
+        const INPUT_AMOUNT: u64 = 100_000;
+        const CHALLENGE_DELAY: u16 = 144;
+
+        let funding_outpoint = outpoint(0x11, 0);
+        let recovery_script = recovery_script();
+        let artifacts = build_funding_recovery_artifacts(
+            secp,
+            aggregate_pubkey,
+            funding_outpoint,
+            INPUT_AMOUNT,
+            recovery_script.clone(),
+            state_number,
+            CHALLENGE_DELAY,
+            Bip448FeeBumpPolicy::ZeroFeeEphemeralAnchor,
+        )
+        .unwrap();
+        let keypair = KeyPair::from_secret_key(secp, aggregate_secret);
+        let signature = schnorr::sign(&artifacts.update_template_hash.to_byte_array(), &keypair);
+        let update_template_hash = hex::encode(artifacts.update_template_hash.to_byte_array());
+        let update_signature = signature.to_string();
+        let latest_state = build_funding_latest_state(
+            secp,
+            aggregate_pubkey,
+            &artifacts,
+            Bip448SigningMetadata {
+                role: Bip448RecoveryTemplateRole::FundingUpdate,
+                signing_id: "77".repeat(32),
+                client_public_nonce: "88".repeat(66),
+                server_public_nonce: "99".repeat(66),
+                blinding_factor: "aa".repeat(32),
+                update_template_hash: update_template_hash.to_uppercase(),
+                update_signature: update_signature.to_uppercase(),
+                server_signature_count: u64::from(state_number),
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            latest_state.signing_metadata.update_template_hash,
+            update_template_hash
+        );
+        assert_eq!(
+            latest_state.signing_metadata.update_signature,
+            update_signature
+        );
+
+        let funding_outpoint = Bip448FundingOutpoint {
+            txid: funding_outpoint.txid.to_string(),
+            vout: funding_outpoint.vout,
+            value_sats: INPUT_AMOUNT,
+        };
+
+        (latest_state, funding_outpoint, recovery_script)
+    }
+
+    fn uppercase_recovery_hex(state: &mut Bip448LatestState) {
+        state.update_tx.make_ascii_uppercase();
+        state.settlement_tx.make_ascii_uppercase();
+        state.update_template_hash.make_ascii_uppercase();
+        state.settlement_template_hash.make_ascii_uppercase();
+        state.state_output_script_pubkey.make_ascii_uppercase();
+        state.funding_update_script.make_ascii_uppercase();
+        state.funding_update_control_block.make_ascii_uppercase();
+        state.state_update_script.make_ascii_uppercase();
+        state.state_update_control_block.make_ascii_uppercase();
+        state.state_settlement_script.make_ascii_uppercase();
+        state.state_settlement_control_block.make_ascii_uppercase();
+        state
+            .signing_metadata
+            .update_template_hash
+            .make_ascii_uppercase();
+        state
+            .signing_metadata
+            .update_signature
+            .make_ascii_uppercase();
+        for anchor in &mut state.anchors {
+            anchor.script_pubkey.make_ascii_uppercase();
+        }
+    }
+
+    #[test]
+    fn verify_reconstructed_templates_rejects_every_tampered_field() {
+        let secp = Secp256k1::new();
+        let (aggregate_secret, aggregate_pub, _, _) = recovery_keys(&secp);
+        let (state, funding_outpoint, recovery_script) =
+            reconstructible_latest_state(&secp, &aggregate_secret, &aggregate_pub);
+        let chain_outpoint = trusted_outpoint(&funding_outpoint);
+        let chain_output =
+            trusted_funding_output(&secp, &aggregate_pub, funding_outpoint.value_sats);
+
+        // A faithful record recomputes to itself and is accepted.
+        state
+            .verify_reconstructed_templates(
+                &secp,
+                &aggregate_pub,
+                chain_outpoint,
+                &chain_output,
+                &recovery_script,
+            )
+            .unwrap();
+
+        // Every deterministic security-relevant field is projected into one
+        // canonical derived-state value, so tampering with any field makes the
+        // struct comparison fail.
+        let cases: [(&'static str, fn(&mut Bip448LatestState)); 13] = [
+            ("update_tx", |s| s.update_tx = "00".to_string()),
+            ("settlement_tx", |s| s.settlement_tx = "00".to_string()),
+            ("update_template_hash", |s| {
+                s.update_template_hash = "00".repeat(32)
+            }),
+            ("settlement_template_hash", |s| {
+                s.settlement_template_hash = "00".repeat(32)
+            }),
+            ("state_output_script_pubkey", |s| {
+                s.state_output_script_pubkey = "00".to_string()
+            }),
+            ("funding_update_script", |s| {
+                s.funding_update_script = "00".to_string()
+            }),
+            ("funding_update_control_block", |s| {
+                s.funding_update_control_block = "00".to_string()
+            }),
+            ("state_update_script", |s| {
+                s.state_update_script = "00".to_string()
+            }),
+            ("state_update_control_block", |s| {
+                s.state_update_control_block = "00".to_string()
+            }),
+            ("state_settlement_script", |s| {
+                s.state_settlement_script = "00".to_string()
+            }),
+            ("state_settlement_control_block", |s| {
+                s.state_settlement_control_block = "00".to_string()
+            }),
+            // Compared but not used as a reconstruction input, so the templates
+            // still recompute cleanly and the value-schedule check is what fires.
+            ("value_schedule", |s| {
+                s.value_schedule.funding_value_sats += 1
+            }),
+            ("anchors", |s| s.anchors[0].value_sats += 1),
+        ];
+
+        for (field, tamper) in cases {
+            let mut tampered = state.clone();
+            tamper(&mut tampered);
+            assert_eq!(
+                tampered.verify_reconstructed_templates(
+                    &secp,
+                    &aggregate_pub,
+                    chain_outpoint,
+                    &chain_output,
+                    &recovery_script,
+                ),
+                Err(Bip448RecoveryVerifyError::TemplateFieldMismatch(
+                    "derived_latest_state"
+                )),
+                "tampering `{field}` must be rejected"
+            );
+        }
+
+        let mut unverified_cpfp = state.clone();
+        unverified_cpfp
+            .cpfp_child_templates
+            .push(Bip448CpfpChildTemplate {
+                parent_role: Bip448RecoveryTemplateRole::FundingUpdate,
+                anchor_output_index: 1,
+                tx_hex: "03000000".to_string(),
+                fee_sats: 1_000,
+                target_feerate_sat_per_vbyte: Some(10),
+            });
+        assert_eq!(
+            unverified_cpfp.verify_reconstructed_templates(
+                &secp,
+                &aggregate_pub,
+                chain_outpoint,
+                &chain_output,
+                &recovery_script,
+            ),
+            Err(Bip448RecoveryVerifyError::UnverifiedSenderMetadata(
+                "cpfp_child_templates"
+            ))
+        );
+
+        let mut unsupported_state_update = state.clone();
+        unsupported_state_update.signing_metadata.role = Bip448RecoveryTemplateRole::StateUpdate;
+        assert_eq!(
+            unsupported_state_update.verify_reconstructed_templates(
+                &secp,
+                &aggregate_pub,
+                chain_outpoint,
+                &chain_output,
+                &recovery_script,
+            ),
+            Err(Bip448RecoveryVerifyError::UnsupportedRecoveryRole(
+                Bip448RecoveryTemplateRole::StateUpdate
+            ))
+        );
+
+        let mut inconsistent_settlement = state.clone();
+        inconsistent_settlement.signing_metadata.role = Bip448RecoveryTemplateRole::Settlement;
+        assert_eq!(
+            inconsistent_settlement.verify_reconstructed_templates(
+                &secp,
+                &aggregate_pub,
+                chain_outpoint,
+                &chain_output,
+                &recovery_script,
+            ),
+            Err(Bip448RecoveryVerifyError::InconsistentField(
+                "signing_metadata.role"
+            ))
+        );
+
+        // The receiver's own recovery script is a trust anchor: reconstructing
+        // against a different script yields different templates, so the record is
+        // rejected rather than silently accepted.
+        let wrong_recovery_script = Builder::new().push_slice([9u8; 32]).into_script();
+        assert!(matches!(
+            state.verify_reconstructed_templates(
+                &secp,
+                &aggregate_pub,
+                chain_outpoint,
+                &chain_output,
+                &wrong_recovery_script,
+            ),
+            Err(Bip448RecoveryVerifyError::TemplateFieldMismatch(_))
+        ));
+
+        let mut wrong_funding_output = chain_output.clone();
+        wrong_funding_output.value += 1;
+        assert_eq!(
+            state.verify_reconstructed_templates(
+                &secp,
+                &aggregate_pub,
+                chain_outpoint,
+                &wrong_funding_output,
+                &recovery_script,
+            ),
+            Err(Bip448RecoveryVerifyError::TemplateFieldMismatch(
+                "derived_latest_state"
+            ))
+        );
+
+        let mut wrong_funding_script = chain_output;
+        wrong_funding_script.script_pubkey = Builder::new().push_int(1).into_script();
+        assert_eq!(
+            state.verify_reconstructed_templates(
+                &secp,
+                &aggregate_pub,
+                chain_outpoint,
+                &wrong_funding_script,
+                &recovery_script,
+            ),
+            Err(Bip448RecoveryVerifyError::TrustedFieldMismatch(
+                "funding_output.script_pubkey"
+            ))
+        );
+    }
+
+    #[test]
+    fn verify_recovery_state_uses_trusted_context_and_rejects_tampering() {
+        let secp = Secp256k1::new();
+        let (aggregate_secret, aggregate_pub, user_pub, server_pub) = recovery_keys(&secp);
+        let (latest, funding_outpoint, recovery_script) =
+            reconstructible_latest_state(&secp, &aggregate_secret, &aggregate_pub);
+
+        let msg = Bip448TransferMsg {
+            statechain_id: "statechain".to_string(),
+            transfer_signature: "ab".repeat(64),
+            sender_user_public_key: "02".to_string() + &"12".repeat(32),
+            receiver_user_public_key: user_pub.to_string(),
+            server_public_key: server_pub.to_string(),
+            aggregate_pubkey: aggregate_pub.to_string(),
+            funding_outpoint: funding_outpoint.clone(),
+            latest_state_number: latest.state_number,
+            challenge_delay: latest.challenge_delay,
+            amount_sats: funding_outpoint.value_sats,
+            network: "regtest".to_string(),
+            value_schedule: latest.value_schedule.clone(),
+            server_signature_count: latest.signing_metadata.server_signature_count,
+            latest_state: latest,
+            t1: [9u8; 32],
+        };
+        let trusted = trusted_recovery_context(
+            &secp,
+            &funding_outpoint,
+            &user_pub,
+            &server_pub,
+            &recovery_script,
+            msg.server_signature_count,
+        );
+
+        // The recovery-state check binds keys + signature and every reconstructed
+        // field to independently supplied chain/network/lockbox facts.
+        let verified = msg.verify_recovery_state(&secp, &trusted).unwrap();
+        assert_eq!(verified.aggregate_pubkey(), &aggregate_pub);
+        assert_eq!(verified.canonical_latest_state(), &msg.latest_state);
+
+        // A tampered template field is rejected by the combined check even though
+        // the aggregate-key binding and update signature are still valid.
+        let mut tampered = msg.clone();
+        tampered.latest_state.state_output_script_pubkey = "00".to_string();
+        assert_eq!(
+            tampered.verify_recovery_state(&secp, &trusted),
+            Err(Bip448RecoveryVerifyError::TemplateFieldMismatch(
+                "derived_latest_state"
+            ))
+        );
+
+        // Passing the wrong receiver recovery script is rejected.
+        let mut wrong_recovery_context = trusted.clone();
+        wrong_recovery_context.recovery_script = Builder::new().push_slice([9u8; 32]).into_script();
+        assert!(matches!(
+            msg.verify_recovery_state(&secp, &wrong_recovery_context),
+            Err(Bip448RecoveryVerifyError::TemplateFieldMismatch(_))
+        ));
+
+        let mut wrong_amount = msg.clone();
+        wrong_amount.amount_sats += 1;
+        assert_eq!(
+            wrong_amount.verify_recovery_state(&secp, &trusted),
+            Err(Bip448RecoveryVerifyError::TrustedFieldMismatch(
+                "amount_sats"
+            ))
+        );
+
+        let mut wrong_funding_value = msg.clone();
+        wrong_funding_value.funding_outpoint.value_sats += 1;
+        wrong_funding_value.amount_sats = wrong_funding_value.funding_outpoint.value_sats;
+        assert_eq!(
+            wrong_funding_value.verify_recovery_state(&secp, &trusted),
+            Err(Bip448RecoveryVerifyError::TrustedFieldMismatch(
+                "funding_outpoint.value_sats"
+            ))
+        );
+
+        // Even a sender-self-consistent fabricated amount is rejected against
+        // the independently queried chain value before reconstruction.
+        let mut fabricated_amount = msg.clone();
+        let fabricated_value = funding_outpoint.value_sats * 100;
+        fabricated_amount.amount_sats = fabricated_value;
+        fabricated_amount.funding_outpoint.value_sats = fabricated_value;
+        fabricated_amount.value_schedule.funding_value_sats = fabricated_value;
+        fabricated_amount.value_schedule.update_input_value_sats = fabricated_value;
+        fabricated_amount.latest_state.value_schedule = fabricated_amount.value_schedule.clone();
+        assert_eq!(
+            fabricated_amount.verify_recovery_state(&secp, &trusted),
+            Err(Bip448RecoveryVerifyError::TrustedFieldMismatch(
+                "funding_outpoint.value_sats"
+            ))
+        );
+
+        let mut stale_context = trusted.clone();
+        stale_context.lockbox_signature_count += 1;
+        assert_eq!(
+            msg.verify_recovery_state(&secp, &stale_context),
+            Err(Bip448RecoveryVerifyError::TrustedFieldMismatch(
+                "server_signature_count"
+            ))
+        );
+
+        // Sender-reported counters are not receipts. Relabeling an older signed
+        // state with the current count is rejected because the signed state
+        // number must itself equal the lockbox count.
+        let mut relabeled_old_state = msg.clone();
+        relabeled_old_state.server_signature_count += 1;
+        relabeled_old_state
+            .latest_state
+            .signing_metadata
+            .server_signature_count += 1;
+        let mut current_count = trusted.clone();
+        current_count.lockbox_signature_count += 1;
+        assert_eq!(
+            relabeled_old_state.verify_recovery_state(&secp, &current_count),
+            Err(Bip448RecoveryVerifyError::TrustedFieldMismatch(
+                "latest_state_number"
+            ))
+        );
+
+        let mut wrong_delay = msg.clone();
+        wrong_delay.challenge_delay += 1;
+        wrong_delay.latest_state.challenge_delay = wrong_delay.challenge_delay;
+        assert_eq!(
+            wrong_delay.verify_recovery_state(&secp, &trusted),
+            Err(Bip448RecoveryVerifyError::TrustedFieldMismatch(
+                "challenge_delay"
+            ))
+        );
+
+        let mut wrong_network = msg.clone();
+        wrong_network.network = "testnet".to_string();
+        assert_eq!(
+            wrong_network.verify_recovery_state(&secp, &trusted),
+            Err(Bip448RecoveryVerifyError::TrustedFieldMismatch("network"))
+        );
+
+        let mut wrong_statechain = msg.clone();
+        wrong_statechain.statechain_id = "other-statechain".to_string();
+        assert_eq!(
+            wrong_statechain.verify_recovery_state(&secp, &trusted),
+            Err(Bip448RecoveryVerifyError::TrustedFieldMismatch(
+                "statechain_id"
+            ))
+        );
+
+        let mut wrong_outpoint = msg.clone();
+        wrong_outpoint.funding_outpoint.vout += 1;
+        assert_eq!(
+            wrong_outpoint.verify_recovery_state(&secp, &trusted),
+            Err(Bip448RecoveryVerifyError::TrustedFieldMismatch(
+                "funding_outpoint"
+            ))
+        );
+
+        let mut malformed_txid = msg.clone();
+        malformed_txid.funding_outpoint.txid = "not-a-txid".to_string();
+        assert_eq!(
+            malformed_txid.verify_recovery_state(&secp, &trusted),
+            Err(Bip448RecoveryVerifyError::InvalidFundingTxid)
+        );
+
+        let mut wrong_chain_script = trusted.clone();
+        wrong_chain_script.funding_output.script_pubkey = Builder::new().push_int(1).into_script();
+        assert_eq!(
+            msg.verify_recovery_state(&secp, &wrong_chain_script),
+            Err(Bip448RecoveryVerifyError::TrustedFieldMismatch(
+                "funding_output.script_pubkey"
+            ))
+        );
+
+        let mut wrong_receiver_key = msg.clone();
+        wrong_receiver_key.receiver_user_public_key = server_pub.to_string();
+        assert_eq!(
+            wrong_receiver_key.verify_recovery_state(&secp, &trusted),
+            Err(Bip448RecoveryVerifyError::TrustedFieldMismatch(
+                "receiver_user_public_key"
+            ))
+        );
+
+        let mut wrong_server_key = msg.clone();
+        wrong_server_key.server_public_key = user_pub.to_string();
+        assert_eq!(
+            wrong_server_key.verify_recovery_state(&secp, &trusted),
+            Err(Bip448RecoveryVerifyError::TrustedFieldMismatch(
+                "server_public_key"
+            ))
+        );
+
+        let mut wrong_signing_hash = msg;
+        wrong_signing_hash
+            .latest_state
+            .signing_metadata
+            .update_template_hash = "00".repeat(32);
+        assert_eq!(
+            wrong_signing_hash.verify_recovery_state(&secp, &trusted),
+            Err(Bip448RecoveryVerifyError::InconsistentField(
+                "signing_metadata.update_template_hash"
+            ))
+        );
+    }
+
+    #[test]
+    fn verify_recovery_state_rejects_self_consistent_future_locktime() {
+        const CURRENT_MTP: u32 = 1_800_000_000;
+
+        let secp = Secp256k1::new();
+        let (aggregate_secret, aggregate_pub, user_pub, server_pub) = recovery_keys(&secp);
+        let future_state_number = CURRENT_MTP - script::STATE_LOCKTIME_BASE + 1;
+        let (latest, funding_outpoint, recovery_script) = reconstructible_latest_state_at(
+            &secp,
+            &aggregate_secret,
+            &aggregate_pub,
+            future_state_number,
+        );
+        let msg = Bip448TransferMsg {
+            statechain_id: "statechain".to_string(),
+            transfer_signature: "ab".repeat(64),
+            sender_user_public_key: "02".to_string() + &"12".repeat(32),
+            receiver_user_public_key: user_pub.to_string(),
+            server_public_key: server_pub.to_string(),
+            aggregate_pubkey: aggregate_pub.to_string(),
+            funding_outpoint: funding_outpoint.clone(),
+            latest_state_number: latest.state_number,
+            challenge_delay: latest.challenge_delay,
+            amount_sats: funding_outpoint.value_sats,
+            network: "regtest".to_string(),
+            value_schedule: latest.value_schedule.clone(),
+            server_signature_count: latest.signing_metadata.server_signature_count,
+            latest_state: latest,
+            t1: [9u8; 32],
+        };
+        let mut trusted = trusted_recovery_context(
+            &secp,
+            &funding_outpoint,
+            &user_pub,
+            &server_pub,
+            &recovery_script,
+            msg.server_signature_count,
+        );
+        trusted.median_time_past = CURRENT_MTP;
+
+        assert_eq!(
+            msg.verify_recovery_state(&secp, &trusted),
+            Err(Bip448RecoveryVerifyError::StateLocktimeNotFinal {
+                state_number: future_state_number,
+                median_time_past: CURRENT_MTP,
+            })
+        );
+
+        let encoded_locktime = script::state_locktime(future_state_number)
+            .unwrap()
+            .to_consensus_u32();
+        assert_eq!(encoded_locktime, CURRENT_MTP + 1);
+
+        // Bitcoin finality is strict: equality with MTP is still non-final.
+        trusted.median_time_past = encoded_locktime;
+        assert_eq!(
+            msg.verify_recovery_state(&secp, &trusted),
+            Err(Bip448RecoveryVerifyError::StateLocktimeNotFinal {
+                state_number: future_state_number,
+                median_time_past: encoded_locktime,
+            })
+        );
+
+        trusted.median_time_past = encoded_locktime + 1;
+        assert_eq!(
+            msg.verify_recovery_state(&secp, &trusted)
+                .unwrap()
+                .aggregate_pubkey(),
+            &aggregate_pub
+        );
+    }
+
+    #[test]
+    fn verify_recovery_state_accepts_uppercase_hex_and_returns_canonical_state() {
+        let secp = Secp256k1::new();
+        let (aggregate_secret, aggregate_pub, user_pub, server_pub) = recovery_keys(&secp);
+        let (canonical_latest, canonical_funding_outpoint, recovery_script) =
+            reconstructible_latest_state(&secp, &aggregate_secret, &aggregate_pub);
+        let mut uppercase_latest = canonical_latest.clone();
+        uppercase_recovery_hex(&mut uppercase_latest);
+        let mut uppercase_funding_outpoint = canonical_funding_outpoint.clone();
+        uppercase_funding_outpoint.txid.make_ascii_uppercase();
+
+        let msg = Bip448TransferMsg {
+            statechain_id: "statechain".to_string(),
+            transfer_signature: "ab".repeat(64),
+            sender_user_public_key: "02".to_string() + &"12".repeat(32),
+            receiver_user_public_key: user_pub.to_string(),
+            server_public_key: server_pub.to_string(),
+            aggregate_pubkey: aggregate_pub.to_string(),
+            funding_outpoint: uppercase_funding_outpoint,
+            latest_state_number: uppercase_latest.state_number,
+            challenge_delay: uppercase_latest.challenge_delay,
+            amount_sats: canonical_funding_outpoint.value_sats,
+            network: "regtest".to_string(),
+            value_schedule: uppercase_latest.value_schedule.clone(),
+            server_signature_count: uppercase_latest.signing_metadata.server_signature_count,
+            latest_state: uppercase_latest,
+            t1: [9u8; 32],
+        };
+        let trusted = trusted_recovery_context(
+            &secp,
+            &canonical_funding_outpoint,
+            &user_pub,
+            &server_pub,
+            &recovery_script,
+            msg.server_signature_count,
+        );
+
+        let verified = msg.verify_recovery_state(&secp, &trusted).unwrap();
+        assert_eq!(verified.aggregate_pubkey(), &aggregate_pub);
+        assert_eq!(verified.canonical_latest_state(), &canonical_latest);
+        assert_eq!(
+            verified.funding_outpoint(),
+            trusted_outpoint(&canonical_funding_outpoint)
+        );
+
+        let mut odd_length = msg.clone();
+        odd_length.latest_state.update_tx.push('0');
+        assert_eq!(
+            odd_length.verify_recovery_state(&secp, &trusted),
+            Err(Bip448RecoveryVerifyError::TemplateFieldMismatch(
+                "derived_latest_state"
+            ))
+        );
+
+        let mut malformed = msg.clone();
+        malformed
+            .latest_state
+            .state_update_script
+            .replace_range(0..1, "z");
+        assert_eq!(
+            malformed.verify_recovery_state(&secp, &trusted),
+            Err(Bip448RecoveryVerifyError::TemplateFieldMismatch(
+                "derived_latest_state"
+            ))
+        );
+
+        let mut prefixed = msg.clone();
+        prefixed.latest_state.settlement_tx = format!("0x{}", prefixed.latest_state.settlement_tx);
+        assert!(prefixed.verify_recovery_state(&secp, &trusted).is_err());
+
+        let mut whitespace = msg;
+        whitespace
+            .latest_state
+            .state_settlement_control_block
+            .push(' ');
+        assert!(whitespace.verify_recovery_state(&secp, &trusted).is_err());
     }
 }
