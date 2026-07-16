@@ -80,10 +80,15 @@ pub async fn get_bip448_deposit_bitcoin_address(
 ) -> Result<Bip448DepositAddressResult> {
     let token_id = uuid::Uuid::parse_str(&token_id)?;
     let wallet = get_wallet(&client_config.pool, &wallet_name).await?;
-    let mut wallet = init(&client_config, &wallet, token_id).await?;
+    let mut wallet = init_with_protocol(
+        &client_config,
+        &wallet,
+        token_id,
+        Some(BIP448_COIN_PROTOCOL),
+    )
+    .await?;
 
     let coin = wallet.coins.last_mut().unwrap();
-    coin.statechain_protocol = Some(BIP448_COIN_PROTOCOL.to_string());
 
     let deposit_address = bip448_deposit::create_deposit_address(coin, &wallet.network)?;
 
@@ -501,9 +506,19 @@ pub async fn init(
     wallet: &Wallet,
     token_id: uuid::Uuid,
 ) -> Result<Wallet> {
+    init_with_protocol(client_config, wallet, token_id, None).await
+}
+
+async fn init_with_protocol(
+    client_config: &ClientConfig,
+    wallet: &Wallet,
+    token_id: uuid::Uuid,
+    statechain_protocol: Option<&str>,
+) -> Result<Wallet> {
     let mut wallet = wallet.clone();
 
-    let coin = wallet.get_new_coin()?;
+    let mut coin = wallet.get_new_coin()?;
+    coin.statechain_protocol = statechain_protocol.map(str::to_owned);
 
     wallet.coins.push(coin.clone());
 

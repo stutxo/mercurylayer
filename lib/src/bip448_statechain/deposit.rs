@@ -42,6 +42,10 @@ pub enum Bip448DepositError {
     Address(#[from] bitcoin::address::Error),
     #[error("BIP448 deposit txid hex error: {0}")]
     TxidHex(#[from] bitcoin::hashes::hex::Error),
+    #[error(
+        "BIP448 deposit server signature count for the initial state must be {expected}, got {actual}"
+    )]
+    InvalidServerSignatureCount { expected: u64, actual: u64 },
     #[error("BIP448 deposit recovery artifact error: {0}")]
     RecoveryArtifacts(#[from] Bip448RecoveryArtifactError),
 }
@@ -137,6 +141,14 @@ pub fn build_deposit_record(
     templates: &Bip448DepositTemplates,
     signing_data: Bip448DepositSigningData,
 ) -> Result<Bip448StatechainRecord, Bip448DepositError> {
+    let expected_signature_count = u64::from(INITIAL_BIP448_STATE_NUMBER);
+    if signing_data.server_signature_count != expected_signature_count {
+        return Err(Bip448DepositError::InvalidServerSignatureCount {
+            expected: expected_signature_count,
+            actual: signing_data.server_signature_count,
+        });
+    }
+
     let secp = Secp256k1::new();
     let aggregate_pubkey = PublicKey::from_str(&templates.aggregate_pubkey)?;
     let update_template_hash =
@@ -469,6 +481,33 @@ mod tests {
             Bip448DepositError::RecoveryArtifacts(
                 Bip448RecoveryArtifactError::AggregateKeyMismatch
             )
+        ));
+    }
+
+    #[test]
+    fn deposit_record_rejects_non_initial_server_signature_count() {
+        let coin = sample_coin();
+        let templates = build_deposit_templates(
+            &coin,
+            funding_outpoint(),
+            DEFAULT_BIP448_CHALLENGE_DELAY,
+            "regtest",
+        )
+        .unwrap();
+        let signature = test_signature(&coin, templates.artifacts.update_template_hash);
+        let mut signing_data = test_signing_data(signature);
+        signing_data.server_signature_count = 2;
+
+        let error =
+            build_deposit_record("wallet", "statechain", "regtest", &templates, signing_data)
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Bip448DepositError::InvalidServerSignatureCount {
+                expected: 1,
+                actual: 2
+            }
         ));
     }
 
