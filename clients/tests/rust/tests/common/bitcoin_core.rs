@@ -93,6 +93,19 @@ pub fn mine_blocks(num_blocks: u32) -> Result<()> {
     Ok(())
 }
 
+pub fn mine_block_with_transactions(txids: &[Txid]) -> Result<()> {
+    let address = getnewaddress()?;
+    let txids = txids.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let transactions = serde_json::to_string(&txids)?;
+    execute_bitcoin_command(&format!(
+        "{BITCOIN_CLI} generateblock {address} '{transactions}'"
+    ))?;
+
+    thread::sleep(std::time::Duration::from_secs(1));
+
+    Ok(())
+}
+
 pub fn generatetoaddress(num_blocks: u32, address: &str) -> Result<String> {
     let bitcoin_command = format!(
         "{} generatetoaddress {} {}",

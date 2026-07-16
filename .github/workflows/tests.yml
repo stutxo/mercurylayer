@@ -29,9 +29,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.92.0
 
-      - name: Build Rust tests
+      - name: Run Rust unit tests
         run: |
-          cargo test --workspace --locked --no-run
+          cargo test --workspace --locked
 
       - name: Start regtest stack
         run: |
@@ -70,6 +70,11 @@ jobs:
         run: |
           cd clients/tests/rust
           cargo test --test bip448_csfs_signing -- --ignored --test-threads=1
+
+      - name: Run BIP448 deposit and recovery integration suite
+        run: |
+          cd clients/tests/rust
+          cargo test --test bip448_deposit -- --ignored --test-threads=1
 
       - name: Run lockbox compatibility suite
         run: |

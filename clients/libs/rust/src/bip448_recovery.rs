@@ -68,7 +68,7 @@ pub async fn submit_latest_state_recovery_package(
         .collect::<Vec<_>>();
     let response = client_config.chain_client.submit_package(&txs)?;
 
-    if !package_response_is_success(&response) {
+    if !package_response_is_success(&response, txs.len()) {
         return Err(anyhow!(
             "Bitcoin Core submitpackage did not accept BIP448 {} package: {}",
             role.as_str(),
@@ -125,7 +125,7 @@ pub fn parse_keyless_p2a_fee_input(input: &str) -> Result<Bip448CpfpFeeInput> {
     ))
 }
 
-fn package_response_is_success(response: &Value) -> bool {
+fn package_response_is_success(response: &Value, expected_transaction_count: usize) -> bool {
     if response.get("package_msg").and_then(Value::as_str) == Some("success") {
         return true;
     }
@@ -138,7 +138,7 @@ fn package_response_is_success(response: &Value) -> bool {
         .get("tx-results")
         .and_then(Value::as_object)
         .map(|results| {
-            !results.is_empty()
+            results.len() == expected_transaction_count
                 && results.values().all(|result| {
                     result
                         .get("error")
@@ -165,36 +165,68 @@ mod tests {
     #[test]
     fn success_package_msg_is_accepted() {
         assert!(package_response_is_success(
-            &json!({ "package_msg": "success" })
+            &json!({ "package_msg": "success" }),
+            2,
         ));
     }
 
     #[test]
     fn already_known_resubmission_is_accepted() {
         // Idempotent resubmit: every tx is already in the mempool or chain.
-        assert!(package_response_is_success(&json!({
-            "package_msg": "transaction failed",
-            "tx-results": {
-                "wtxid-a": { "txid": "a", "error": "txn-already-in-mempool" },
-                "wtxid-b": { "txid": "b", "error": "Transaction already in block chain" }
-            }
-        })));
+        assert!(package_response_is_success(
+            &json!({
+                "package_msg": "transaction failed",
+                "tx-results": {
+                    "wtxid-a": { "txid": "a", "error": "txn-already-in-mempool" },
+                    "wtxid-b": { "txid": "b", "error": "Transaction already in block chain" }
+                }
+            }),
+            2,
+        ));
     }
 
     #[test]
     fn genuine_failure_is_rejected() {
-        assert!(!package_response_is_success(&json!({
-            "package_msg": "transaction failed",
-            "tx-results": {
-                "wtxid-a": { "txid": "a", "error": "insufficient fee" }
-            }
-        })));
+        assert!(!package_response_is_success(
+            &json!({
+                "package_msg": "transaction failed",
+                "tx-results": {
+                    "wtxid-a": { "txid": "a", "error": "txn-already-in-mempool" },
+                    "wtxid-b": { "txid": "b", "error": "insufficient fee" }
+                }
+            }),
+            2,
+        ));
     }
 
     #[test]
     fn non_success_without_tx_results_is_rejected() {
         assert!(!package_response_is_success(
-            &json!({ "package_msg": "transaction failed" })
+            &json!({ "package_msg": "transaction failed" }),
+            2,
+        ));
+    }
+
+    #[test]
+    fn non_success_requires_a_complete_result_for_every_expected_transaction() {
+        assert!(package_response_is_success(
+            &json!({
+                "package_msg": "transaction failed",
+                "tx-results": {
+                    "wtxid-a": { "txid": "a", "error": "txn-already-in-mempool" },
+                    "wtxid-b": { "txid": "b" }
+                }
+            }),
+            2,
+        ));
+        assert!(!package_response_is_success(
+            &json!({
+                "package_msg": "transaction failed",
+                "tx-results": {
+                    "wtxid-a": { "txid": "a", "error": "txn-already-in-mempool" }
+                }
+            }),
+            2,
         ));
     }
 

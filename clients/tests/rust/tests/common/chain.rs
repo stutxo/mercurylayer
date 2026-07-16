@@ -1,35 +1,62 @@
 use std::str::FromStr;
 
-use anyhow::{anyhow, Ok, Result};
-use bitcoin::{Address, Txid};
-use mercuryrustlib::client_config::ClientConfig;
+use anyhow::{anyhow, Result};
+use bitcoin::{Address, OutPoint, Txid};
+use mercuryrustlib::{chain::ChainUtxo, client_config::ClientConfig};
 use tokio::time::{sleep, Duration};
 
 const CHAIN_SYNC_TIMEOUT_SECONDS: u64 = 60;
-
-pub async fn check_address(
-    client_config: &ClientConfig,
-    address: &str,
-    amount: u32,
-) -> Result<bool> {
-    let address = Address::from_str(address)?.require_network(client_config.network)?;
-
-    let utxo_list = client_config
-        .chain_client
-        .list_unspent(address.script_pubkey().as_script())?;
-
-    Ok(utxo_list
-        .into_iter()
-        .any(|unspent| unspent.value == amount as u64))
-}
 
 pub async fn wait_for_address_utxo(
     client_config: &ClientConfig,
     address: &str,
     amount: u32,
 ) -> Result<()> {
+    let amount = u64::from(amount);
+    wait_for_address_utxo_matching(
+        client_config,
+        address,
+        format!("address {address} with amount {amount}"),
+        move |unspent| unspent.value == amount,
+    )
+    .await
+}
+
+pub async fn wait_for_address_outpoint(
+    client_config: &ClientConfig,
+    address: &str,
+    outpoint: OutPoint,
+    amount: u64,
+) -> Result<()> {
+    let expected_txid = outpoint.txid.to_string();
+    let expected_vout = outpoint.vout;
+    wait_for_address_utxo_matching(
+        client_config,
+        address,
+        format!("address {address} with outpoint {outpoint} and amount {amount}"),
+        move |unspent| {
+            unspent.txid == expected_txid
+                && unspent.vout == expected_vout
+                && unspent.value == amount
+        },
+    )
+    .await
+}
+
+async fn wait_for_address_utxo_matching(
+    client_config: &ClientConfig,
+    address: &str,
+    expected_utxo: String,
+    matches: impl Fn(&ChainUtxo) -> bool,
+) -> Result<()> {
+    let address = Address::from_str(address)?.require_network(client_config.network)?;
+    let script_pubkey = address.script_pubkey();
+
     for _ in 0..CHAIN_SYNC_TIMEOUT_SECONDS {
-        if check_address(client_config, address, amount).await? {
+        let utxo_list = client_config
+            .chain_client
+            .list_unspent(script_pubkey.as_script())?;
+        if utxo_list.iter().any(|unspent| matches(unspent)) {
             return Ok(());
         }
 
@@ -37,9 +64,8 @@ pub async fn wait_for_address_utxo(
     }
 
     Err(anyhow!(
-        "address {} with amount {} was not indexed by the configured chain backend within {} seconds",
-        address,
-        amount,
+        "{} was not indexed by the configured chain backend within {} seconds",
+        expected_utxo,
         CHAIN_SYNC_TIMEOUT_SECONDS
     ))
 }
