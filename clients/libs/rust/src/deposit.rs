@@ -41,6 +41,23 @@ use crate::{
     utils::info_config,
 };
 
+#[cfg(feature = "test-hooks")]
+fn bip448_process_checkpoint(checkpoint: &str) {
+    let is_restart_child =
+        std::env::var("ML_BIP448_RESTART_CHILD").as_deref() == std::result::Result::Ok("1");
+    if is_restart_child
+        && matches!(
+            std::env::var("ML_BIP448_TEST_CHECKPOINT").as_deref(),
+            std::result::Result::Ok(configured) if configured == checkpoint
+        )
+    {
+        std::process::exit(86);
+    }
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn bip448_process_checkpoint(_checkpoint: &str) {}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Bip448DepositAddressResult {
     pub address: String,
@@ -272,6 +289,7 @@ pub async fn create_bip448_deposit_state(
         wallet_network,
     )
     .await?;
+    bip448_process_checkpoint("pending_persisted");
     let signing_data = sign_bip448_update(
         client_config,
         wallet_name,
@@ -295,6 +313,7 @@ pub async fn create_bip448_deposit_state(
     coin.blinding_factor = Some(signing_data.blinding_factor);
 
     insert_or_update_bip448_statechain(&client_config.pool, &accepted).await?;
+    bip448_process_checkpoint("accepted_persisted");
     delete_bip448_pending_deposit_signing(
         &client_config.pool,
         wallet_name,
@@ -346,6 +365,7 @@ async fn sign_bip448_update(
         &pending_signing,
     )
     .await?;
+    bip448_process_checkpoint("server_nonce_persisted");
     let server_pub_nonce = PublicNonce::from_slice(&hex::decode(&server_pubnonce)?)?;
     let session = CsfsSigningSession::new(
         &secp,
@@ -383,6 +403,7 @@ async fn sign_bip448_update(
         &server_pubkey,
     )?;
     let signature = session.aggregate_and_verify(&[&client_partial, &server_partial])?;
+    bip448_process_checkpoint("final_signature_completed");
     // This is the owner's OWN deposit, so the lockbox-reported count is
     // authoritative to store here. A future transfer RECEIVER must not trust a
     // sender-supplied count and must re-query /signature-count independently

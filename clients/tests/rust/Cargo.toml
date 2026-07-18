@@ -7,7 +7,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0"
-mercuryrustlib = { path = "../../libs/rust" }
+mercuryrustlib = { path = "../../libs/rust", features = ["test-hooks"] }
 mercurylib = { path = "../../../lib" }
 tokio = { version = "1.27.0", features = ["full"] }
 serde = { version = "1.0.163", features = ["derive"] }
