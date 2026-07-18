@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use bitcoin::{Network, OutPoint, ScriptBuf, TxOut, Txid};
+use bitcoin::{absolute, Network, OutPoint, ScriptBuf, TxOut, Txid};
 use secp256k1::{PublicKey, Secp256k1, Signing, Verification};
 use serde::{Deserialize, Serialize};
 
@@ -278,10 +278,9 @@ impl Bip448TransferMsg {
                 "server_signature_count",
             ));
         }
-        // Each logical state consumes exactly one blind update signature. This
-        // binds the independently queried count to the state number committed by
-        // the signed update hash; comparing only sender-writable count fields
-        // would allow an older valid state to be relabeled with a newer count.
+        // The provisional count tracks logical state bookkeeping independently
+        // from consensus locktime. Initial funding recovery is restricted to
+        // state 1 below; complete future-state history binding belongs to Phase 8.
         if u64::from(self.latest_state_number) != trusted.lockbox_signature_count
             || u64::from(self.latest_state.state_number) != trusted.lockbox_signature_count
         {
@@ -316,10 +315,10 @@ impl Bip448TransferMsg {
                 &trusted.funding_output,
                 &trusted.recovery_script,
             )?;
-        // Canonical reconstruction proves both U(n) and S(n) use the exact
-        // state_locktime(n), so this one chain-time check covers both templates.
+        // Canonical reconstruction proves both U(n) and S(n) use the same
+        // explicit state locktime, so this one chain-time check covers both.
         bip448_transaction::validate_immediately_final(
-            self.latest_state.state_number,
+            absolute::LockTime::from_consensus(canonical_latest_state.state_locktime),
             trusted.median_time_past,
         )
         .map_err(recovery_finality_error)?;
@@ -342,10 +341,10 @@ fn recovery_finality_error(
 ) -> Bip448RecoveryVerifyError {
     match error {
         bip448_transaction::TransactionTemplateError::StateLocktimeNotFinal {
-            state_number,
+            locktime,
             median_time_past,
         } => Bip448RecoveryVerifyError::StateLocktimeNotFinal {
-            state_number,
+            locktime,
             median_time_past,
         },
         error => Bip448RecoveryVerifyError::Reconstruction(error.to_string()),
@@ -367,10 +366,12 @@ mod tests {
     use secp256k1::{schnorr, KeyPair, PublicKey, Secp256k1, SecretKey};
 
     const TEST_MEDIAN_TIME_PAST: u32 = 1_900_000_000;
+    const TEST_STATE_LOCKTIME: u32 = 700_000_042;
 
     fn latest_state() -> Bip448LatestState {
         Bip448LatestState {
             state_number: 2,
+            state_locktime: TEST_STATE_LOCKTIME,
             challenge_delay: 144,
             update_tx: "02000000".to_string(),
             settlement_tx: "03000000".to_string(),
@@ -558,6 +559,7 @@ mod tests {
             &secp,
             aggregate_xonly,
             decoded.latest_state_number,
+            absolute::LockTime::from_consensus(decoded.latest_state.state_locktime),
             decoded.value_schedule.update_input_value_sats,
             &recovery_script,
             decoded.challenge_delay,
@@ -754,7 +756,13 @@ mod tests {
         aggregate_secret: &SecretKey,
         aggregate_pubkey: &PublicKey,
     ) -> (Bip448LatestState, Bip448FundingOutpoint, ScriptBuf) {
-        reconstructible_latest_state_at(secp, aggregate_secret, aggregate_pubkey, 1)
+        reconstructible_latest_state_at(
+            secp,
+            aggregate_secret,
+            aggregate_pubkey,
+            1,
+            TEST_STATE_LOCKTIME,
+        )
     }
 
     fn reconstructible_latest_state_at(
@@ -762,6 +770,7 @@ mod tests {
         aggregate_secret: &SecretKey,
         aggregate_pubkey: &PublicKey,
         state_number: u32,
+        state_locktime: u32,
     ) -> (Bip448LatestState, Bip448FundingOutpoint, ScriptBuf) {
         const INPUT_AMOUNT: u64 = 100_000;
         const CHALLENGE_DELAY: u16 = 144;
@@ -775,6 +784,7 @@ mod tests {
             INPUT_AMOUNT,
             recovery_script.clone(),
             state_number,
+            absolute::LockTime::from_consensus(state_locktime),
             CHALLENGE_DELAY,
             Bip448FeeBumpPolicy::ZeroFeeEphemeralAnchor,
         )
@@ -864,9 +874,23 @@ mod tests {
             )
             .unwrap();
 
-        // Every deterministic security-relevant field is projected into one
-        // canonical derived-state value, so tampering with any field makes the
-        // struct comparison fail.
+        // Locktime seeds reconstruction, so changing it invalidates the
+        // signature over the reconstructed update template before comparison.
+        let mut tampered_locktime = state.clone();
+        tampered_locktime.state_locktime += 1;
+        assert_eq!(
+            tampered_locktime.verify_reconstructed_templates(
+                &secp,
+                &aggregate_pub,
+                chain_outpoint,
+                &chain_output,
+                &recovery_script,
+            ),
+            Err(Bip448RecoveryVerifyError::UpdateSignatureVerification)
+        );
+
+        // Every sender-copy field is projected into one canonical derived-state
+        // value, so tampering with any copy makes the struct comparison fail.
         let cases: [(&'static str, fn(&mut Bip448LatestState)); 13] = [
             ("update_tx", |s| s.update_tx = "00".to_string()),
             ("settlement_tx", |s| s.settlement_tx = "00".to_string()),
@@ -922,6 +946,35 @@ mod tests {
                 "tampering `{field}` must be rejected"
             );
         }
+
+        let mut out_of_range_locktime = state.clone();
+        out_of_range_locktime.state_locktime = script::INITIAL_STATE_LOCKTIME_MAX + 1;
+        assert!(matches!(
+            out_of_range_locktime.verify_reconstructed_templates(
+                &secp,
+                &aggregate_pub,
+                chain_outpoint,
+                &chain_output,
+                &recovery_script,
+            ),
+            Err(Bip448RecoveryVerifyError::Reconstruction(_))
+        ));
+
+        let mut later_state_without_history = state.clone();
+        later_state_without_history.state_number = 2;
+        later_state_without_history
+            .signing_metadata
+            .server_signature_count = 2;
+        assert_eq!(
+            later_state_without_history.verify_reconstructed_templates(
+                &secp,
+                &aggregate_pub,
+                chain_outpoint,
+                &chain_output,
+                &recovery_script,
+            ),
+            Err(Bip448RecoveryVerifyError::UnsupportedInitialStateNumber { state_number: 2 })
+        );
 
         let mut unverified_cpfp = state.clone();
         unverified_cpfp
@@ -980,7 +1033,7 @@ mod tests {
         // against a different script yields different templates, so the record is
         // rejected rather than silently accepted.
         let wrong_recovery_script = Builder::new().push_slice([9u8; 32]).into_script();
-        assert!(matches!(
+        assert_eq!(
             state.verify_reconstructed_templates(
                 &secp,
                 &aggregate_pub,
@@ -988,8 +1041,8 @@ mod tests {
                 &chain_output,
                 &wrong_recovery_script,
             ),
-            Err(Bip448RecoveryVerifyError::TemplateFieldMismatch(_))
-        ));
+            Err(Bip448RecoveryVerifyError::UpdateSignatureVerification)
+        );
 
         let mut wrong_funding_output = chain_output.clone();
         wrong_funding_output.value += 1;
@@ -1001,9 +1054,7 @@ mod tests {
                 &wrong_funding_output,
                 &recovery_script,
             ),
-            Err(Bip448RecoveryVerifyError::TemplateFieldMismatch(
-                "derived_latest_state"
-            ))
+            Err(Bip448RecoveryVerifyError::UpdateSignatureVerification)
         );
 
         let mut wrong_funding_script = chain_output;
@@ -1060,6 +1111,10 @@ mod tests {
         let verified = msg.verify_recovery_state(&secp, &trusted).unwrap();
         assert_eq!(verified.aggregate_pubkey(), &aggregate_pub);
         assert_eq!(verified.canonical_latest_state(), &msg.latest_state);
+        assert_eq!(
+            verified.canonical_latest_state().state_locktime,
+            TEST_STATE_LOCKTIME
+        );
 
         // A tampered template field is rejected by the combined check even though
         // the aggregate-key binding and update signature are still valid.
@@ -1075,10 +1130,10 @@ mod tests {
         // Passing the wrong receiver recovery script is rejected.
         let mut wrong_recovery_context = trusted.clone();
         wrong_recovery_context.recovery_script = Builder::new().push_slice([9u8; 32]).into_script();
-        assert!(matches!(
+        assert_eq!(
             msg.verify_recovery_state(&secp, &wrong_recovery_context),
-            Err(Bip448RecoveryVerifyError::TemplateFieldMismatch(_))
-        ));
+            Err(Bip448RecoveryVerifyError::UpdateSignatureVerification)
+        );
 
         let mut wrong_amount = msg.clone();
         wrong_amount.amount_sats += 1;
@@ -1140,6 +1195,25 @@ mod tests {
             Err(Bip448RecoveryVerifyError::TrustedFieldMismatch(
                 "latest_state_number"
             ))
+        );
+
+        // Once locktime is independent, changing every sender/count copy could
+        // otherwise relabel the same signed candidate as a later logical state.
+        // Phase 6 verifies only the initial funding state until Phase 8 supplies
+        // complete verified history.
+        let mut coordinated_relabel = msg.clone();
+        coordinated_relabel.latest_state_number = 2;
+        coordinated_relabel.latest_state.state_number = 2;
+        coordinated_relabel.server_signature_count = 2;
+        coordinated_relabel
+            .latest_state
+            .signing_metadata
+            .server_signature_count = 2;
+        let mut count_two = trusted.clone();
+        count_two.lockbox_signature_count = 2;
+        assert_eq!(
+            coordinated_relabel.verify_recovery_state(&secp, &count_two),
+            Err(Bip448RecoveryVerifyError::UnsupportedInitialStateNumber { state_number: 2 })
         );
 
         let mut wrong_delay = msg.clone();
@@ -1226,16 +1300,16 @@ mod tests {
 
     #[test]
     fn verify_recovery_state_rejects_self_consistent_future_locktime() {
-        const CURRENT_MTP: u32 = 1_800_000_000;
+        const FUTURE_LOCKTIME: u32 = 900_000_000;
 
         let secp = Secp256k1::new();
         let (aggregate_secret, aggregate_pub, user_pub, server_pub) = recovery_keys(&secp);
-        let future_state_number = CURRENT_MTP - script::STATE_LOCKTIME_BASE + 1;
         let (latest, funding_outpoint, recovery_script) = reconstructible_latest_state_at(
             &secp,
             &aggregate_secret,
             &aggregate_pub,
-            future_state_number,
+            1,
+            FUTURE_LOCKTIME,
         );
         let msg = Bip448TransferMsg {
             statechain_id: "statechain".to_string(),
@@ -1262,32 +1336,27 @@ mod tests {
             &recovery_script,
             msg.server_signature_count,
         );
-        trusted.median_time_past = CURRENT_MTP;
+        trusted.median_time_past = FUTURE_LOCKTIME - 1;
 
         assert_eq!(
             msg.verify_recovery_state(&secp, &trusted),
             Err(Bip448RecoveryVerifyError::StateLocktimeNotFinal {
-                state_number: future_state_number,
-                median_time_past: CURRENT_MTP,
+                locktime: FUTURE_LOCKTIME,
+                median_time_past: FUTURE_LOCKTIME - 1,
             })
         );
-
-        let encoded_locktime = script::state_locktime(future_state_number)
-            .unwrap()
-            .to_consensus_u32();
-        assert_eq!(encoded_locktime, CURRENT_MTP + 1);
 
         // Bitcoin finality is strict: equality with MTP is still non-final.
-        trusted.median_time_past = encoded_locktime;
+        trusted.median_time_past = FUTURE_LOCKTIME;
         assert_eq!(
             msg.verify_recovery_state(&secp, &trusted),
             Err(Bip448RecoveryVerifyError::StateLocktimeNotFinal {
-                state_number: future_state_number,
-                median_time_past: encoded_locktime,
+                locktime: FUTURE_LOCKTIME,
+                median_time_past: FUTURE_LOCKTIME,
             })
         );
 
-        trusted.median_time_past = encoded_locktime + 1;
+        trusted.median_time_past = FUTURE_LOCKTIME + 1;
         assert_eq!(
             msg.verify_recovery_state(&secp, &trusted)
                 .unwrap()

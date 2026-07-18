@@ -1,8 +1,8 @@
 use std::str::FromStr;
 
 use bitcoin::{
-    consensus::encode, hashes::Hash, taproot::ControlBlock, OutPoint, ScriptBuf, Transaction,
-    TxOut, Witness,
+    absolute, consensus::encode, hashes::Hash, taproot::ControlBlock, OutPoint, ScriptBuf,
+    Transaction, TxOut, Witness,
 };
 use secp256k1::{schnorr, Message, PublicKey, Secp256k1, Signing, Verification};
 use serde::{Deserialize, Serialize};
@@ -32,12 +32,14 @@ pub enum Bip448RecoveryVerifyError {
     #[error("record field `{0}` does not match the trusted receiver context")]
     TrustedFieldMismatch(&'static str),
     #[error(
-        "BIP448 state {state_number} is not immediately final at chain median time past {median_time_past}"
+        "BIP448 state locktime {locktime} is not immediately final at chain median time past {median_time_past}"
     )]
     StateLocktimeNotFinal {
-        state_number: u32,
+        locktime: u32,
         median_time_past: u32,
     },
+    #[error("initial funding recovery verification requires logical state 1, got {state_number}")]
+    UnsupportedInitialStateNumber { state_number: u32 },
     #[error("recovery record contains unverified sender metadata in `{0}`")]
     UnverifiedSenderMetadata(&'static str),
     #[error("failed to reconstruct BIP448 recovery templates: {0}")]
@@ -90,6 +92,8 @@ pub enum Bip448RecoveryArtifactError {
         role: Bip448RecoveryTemplateRole,
         output_index: usize,
     },
+    #[error("BIP448 recovery artifacts are not a canonical self-consistent template set")]
+    InconsistentArtifacts,
 }
 
 /// The durable outpoint and value of a BIP448 statechain funding output.
@@ -221,10 +225,11 @@ pub struct Bip448SigningMetadata {
 /// receiver verification. It deliberately excludes signing retry metadata,
 /// server counters, transfer signatures, and chain truth: those values are not
 /// deterministic template fields and must be verified separately.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bip448RecoveryArtifacts {
     pub aggregate_pubkey: PublicKey,
     pub state_number: u32,
+    pub state_locktime: u32,
     pub challenge_delay: u16,
     pub update_tx: Transaction,
     pub settlement_tx: Transaction,
@@ -249,6 +254,7 @@ pub struct Bip448RecoveryArtifacts {
 /// sender-originated operational metadata is intentionally absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bip448ExpectedLatestStateFields {
+    pub state_locktime: u32,
     pub update_tx: String,
     pub settlement_tx: String,
     pub update_template_hash: String,
@@ -266,7 +272,8 @@ pub struct Bip448ExpectedLatestStateFields {
 
 impl Bip448ExpectedLatestStateFields {
     fn matches_expected(&self, expected: &Self) -> bool {
-        encoded_hex_eq(&self.update_tx, &expected.update_tx)
+        self.state_locktime == expected.state_locktime
+            && encoded_hex_eq(&self.update_tx, &expected.update_tx)
             && encoded_hex_eq(&self.settlement_tx, &expected.settlement_tx)
             && template_hash_hex_eq(&self.update_template_hash, &expected.update_template_hash)
             && template_hash_hex_eq(
@@ -307,9 +314,15 @@ pub fn build_funding_recovery_artifacts<C: Verification>(
     funding_value_sats: u64,
     recovery_script: ScriptBuf,
     state_number: u32,
+    state_locktime: absolute::LockTime,
     challenge_delay: u16,
     fee_bump_policy: Bip448FeeBumpPolicy,
 ) -> Result<Bip448RecoveryArtifacts, Bip448RecoveryArtifactError> {
+    if state_number == crate::bip448_statechain::deposit::INITIAL_BIP448_STATE_NUMBER {
+        script::validate_initial_state_locktime(state_locktime)?;
+    } else {
+        script::validate_state_locktime(state_locktime)?;
+    }
     let aggregate_xonly = aggregate_pubkey.x_only_public_key().0;
     let fee_policy = transaction_fee_policy(fee_bump_policy);
     let templates = transaction::build_state_templates(
@@ -319,6 +332,7 @@ pub fn build_funding_recovery_artifacts<C: Verification>(
         funding_value_sats,
         recovery_script.clone(),
         state_number,
+        state_locktime,
         challenge_delay,
         fee_policy,
     )?;
@@ -341,6 +355,7 @@ pub fn build_funding_recovery_artifacts<C: Verification>(
         secp,
         aggregate_xonly,
         state_number,
+        state_locktime,
         funding_value_sats,
         &recovery_script,
         challenge_delay,
@@ -353,14 +368,14 @@ pub fn build_funding_recovery_artifacts<C: Verification>(
     let state_spend_info = script::state_spend_info(
         secp,
         aggregate_xonly,
-        state_number,
+        state_locktime,
         settlement_template_hash,
     )?;
     let funding_update_script = script::funding_update_leaf();
     let funding_update_control_block = script::funding_update_control_block(&funding_spend_info)?;
-    let state_update_script = script::state_update_leaf(state_number)?;
+    let state_update_script = script::state_update_leaf(state_locktime)?;
     let state_update_control_block =
-        script::state_update_control_block(&state_spend_info, state_number)?;
+        script::state_update_control_block(&state_spend_info, state_locktime)?;
     let state_settlement_script = script::state_settlement_leaf(settlement_template_hash);
     let state_settlement_control_block =
         script::state_settlement_control_block(&state_spend_info, settlement_template_hash)?;
@@ -368,6 +383,7 @@ pub fn build_funding_recovery_artifacts<C: Verification>(
     Ok(Bip448RecoveryArtifacts {
         aggregate_pubkey: aggregate_pubkey.clone(),
         state_number,
+        state_locktime: state_locktime.to_consensus_u32(),
         challenge_delay,
         update_template_hash,
         settlement_template_hash,
@@ -414,6 +430,7 @@ impl Bip448RecoveryArtifacts {
         );
 
         Bip448ExpectedLatestStateFields {
+            state_locktime: self.state_locktime,
             update_tx: tx_hex(&update_tx),
             settlement_tx: tx_hex(&settlement_tx),
             update_template_hash: hex::encode(self.update_template_hash.to_byte_array()),
@@ -431,13 +448,14 @@ impl Bip448RecoveryArtifacts {
     }
 }
 
-pub fn build_funding_latest_state<C: Signing>(
+pub fn build_funding_latest_state<C: Signing + Verification>(
     secp: &Secp256k1<C>,
     aggregate_pubkey: &PublicKey,
     artifacts: &Bip448RecoveryArtifacts,
     mut signing_metadata: Bip448SigningMetadata,
     cpfp_child_templates: Vec<Bip448CpfpChildTemplate>,
 ) -> Result<Bip448LatestState, Bip448RecoveryArtifactError> {
+    validate_funding_recovery_artifacts(secp, artifacts)?;
     if !cpfp_child_templates.is_empty() {
         return Err(Bip448RecoveryArtifactError::UnverifiedCpfpChildTemplates);
     }
@@ -483,6 +501,7 @@ pub fn build_funding_latest_state<C: Signing>(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bip448LatestState {
     pub state_number: u32,
+    pub state_locktime: u32,
     pub challenge_delay: u16,
     pub update_tx: String,
     pub settlement_tx: String,
@@ -514,6 +533,7 @@ impl Bip448LatestState {
     ) -> Self {
         Self {
             state_number,
+            state_locktime: expected.state_locktime,
             challenge_delay,
             update_tx: expected.update_tx,
             settlement_tx: expected.settlement_tx,
@@ -671,7 +691,15 @@ impl Bip448LatestState {
             ));
         }
         match self.signing_metadata.role {
-            Bip448RecoveryTemplateRole::FundingUpdate => {}
+            Bip448RecoveryTemplateRole::FundingUpdate => {
+                if self.state_number
+                    != crate::bip448_statechain::deposit::INITIAL_BIP448_STATE_NUMBER
+                {
+                    return Err(Bip448RecoveryVerifyError::UnsupportedInitialStateNumber {
+                        state_number: self.state_number,
+                    });
+                }
+            }
             Bip448RecoveryTemplateRole::StateUpdate => {
                 return Err(Bip448RecoveryVerifyError::UnsupportedRecoveryRole(
                     Bip448RecoveryTemplateRole::StateUpdate,
@@ -703,10 +731,18 @@ impl Bip448LatestState {
             funding_output.value,
             recovery_script.clone(),
             self.state_number,
+            absolute::LockTime::from_consensus(self.state_locktime),
             self.challenge_delay,
             self.fee_bump_policy,
         )
         .map_err(reconstruction_error)?;
+        let aggregate_xonly = aggregate_pubkey.x_only_public_key().0;
+        schnorr::verify(
+            signature,
+            artifacts.update_template_hash.as_byte_array(),
+            &aggregate_xonly,
+        )
+        .map_err(|_| Bip448RecoveryVerifyError::UpdateSignatureVerification)?;
         if artifacts.funding_output_script_pubkey != funding_output.script_pubkey {
             return Err(Bip448RecoveryVerifyError::TrustedFieldMismatch(
                 "funding_output.script_pubkey",
@@ -724,6 +760,7 @@ impl Bip448LatestState {
 
     fn deterministic_fields(&self) -> Bip448ExpectedLatestStateFields {
         Bip448ExpectedLatestStateFields {
+            state_locktime: self.state_locktime,
             update_tx: self.update_tx.clone(),
             settlement_tx: self.settlement_tx.clone(),
             update_template_hash: self.update_template_hash.clone(),
@@ -760,6 +797,41 @@ impl Bip448LatestState {
             self.fee_bump_policy,
         )
     }
+}
+
+fn validate_funding_recovery_artifacts<C: Verification>(
+    secp: &Secp256k1<C>,
+    artifacts: &Bip448RecoveryArtifacts,
+) -> Result<(), Bip448RecoveryArtifactError> {
+    let funding_outpoint = artifacts
+        .update_tx
+        .input
+        .first()
+        .ok_or(Bip448RecoveryArtifactError::InconsistentArtifacts)?
+        .previous_output;
+    let recovery_script = artifacts
+        .settlement_tx
+        .output
+        .first()
+        .ok_or(Bip448RecoveryArtifactError::InconsistentArtifacts)?
+        .script_pubkey
+        .clone();
+    let rebuilt = build_funding_recovery_artifacts(
+        secp,
+        &artifacts.aggregate_pubkey,
+        funding_outpoint,
+        artifacts.value_schedule.funding_value_sats,
+        recovery_script,
+        artifacts.state_number,
+        absolute::LockTime::from_consensus(artifacts.state_locktime),
+        artifacts.challenge_delay,
+        artifacts.fee_bump_policy,
+    )?;
+    if &rebuilt != artifacts {
+        return Err(Bip448RecoveryArtifactError::InconsistentArtifacts);
+    }
+
+    Ok(())
 }
 
 fn template_hash_hex_eq(actual: &str, expected: &str) -> bool {
@@ -863,6 +935,7 @@ mod tests {
     fn sample_latest_state() -> Bip448LatestState {
         Bip448LatestState {
             state_number: 7,
+            state_locktime: 700_000_042,
             challenge_delay: 144,
             update_tx: "02000000".to_string(),
             settlement_tx: "03000000".to_string(),

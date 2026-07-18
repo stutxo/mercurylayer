@@ -85,7 +85,7 @@ Meaning: "this coin can be pulled into any transaction whose fingerprint P has s
 
 `U(n)` **is** state n. It is a small transaction:
 
-- `nLockTime = 500_000_000 + n` — the state number, smuggled into the locktime field
+- `nLockTime = L(n)` — an explicit timestamp locktime independent of logical state number `n`
 - one protocol input, prevout initially a **placeholder** (this is the rebindable part), sequence non-final
 - output: the **state output** for state n (plus the fee-bump anchor selected in Phase 3)
 
@@ -94,8 +94,8 @@ Its input carries the CSFS signature by `P` over `U(n)`'s fingerprint. That sign
 The state output has **two** leaves:
 
 ```text
-state_update_leaf(n):                                     # "a STRICTLY newer state may replace me"
-<500_000_000 + n + 1> OP_CHECKLOCKTIMEVERIFY OP_DROP
+state_update_leaf(L(n)):                                  # "a STRICTLY newer locktime may replace me"
+<L(n) + 1> OP_CHECKLOCKTIMEVERIFY OP_DROP
 OP_TEMPLATEHASH OP_INTERNALKEY OP_CHECKSIGFROMSTACK
 
 state_settlement_leaf(settlement_template_hash(n)):        # "or exactly S(n) may cash me out"
@@ -104,7 +104,7 @@ state_settlement_leaf(settlement_template_hash(n)):        # "or exactly S(n) ma
 
 Leaf 1 is the same primitive as the funding leaf, plus a **CLTV gate**. Leaf 2 is the exact-template exit hatch, described next.
 
-Notice the update gate uses `n + 1` on purpose, so only a *strictly newer* update (`U(m)`, `m ≥ n+1`) can replace the state-n output — `U(n)` carries locktime `n` and so cannot spend its own output. Why the `+1` matters: once `U(n)` is broadcast its CSFS signature is public and the P2A fee anchor is keyless, so if the update leaf gated at `n` too, *anyone* could rebind `U(n)` back onto the output it just created — remaking an identical state-n output and restarting `S(n)`'s challenge-delay clock over and over, stalling the owner's exit forever. Gating at `n+1` makes that self-replay impossible while still letting any genuinely newer state override an older one. The settlement leaf has no separate CLTV gate: `OP_TEMPLATEHASH` commits to `S(n)`'s `nLockTime`, so any transaction that passes `OP_EQUAL` already has the committed `500_000_000 + n` locktime.
+Notice the update gate uses `L(n) + 1` on purpose. A later state is valid only when its explicit locktime is strictly greater than `L(n)`, so it can pass this gate, while `U(n)` itself carries only `L(n)` and cannot spend its own output. Why the `+1` matters: once `U(n)` is broadcast its CSFS signature is public and the P2A fee anchor is keyless, so if the update leaf gated at `L(n)` too, *anyone* could rebind `U(n)` back onto the output it just created, remaking the same output and restarting `S(n)`'s challenge-delay clock indefinitely. The settlement leaf has no separate CLTV gate: `OP_TEMPLATEHASH` commits to `S(n)`'s exact explicit locktime, and canonical construction requires `U(n).nLockTime == S(n).nLockTime == L(n)`.
 
 The settlement challenge delay is enforced by the settlement transaction's committed `nSequence` plus BIP68 sequence locks, not by a duplicate `OP_CHECKSEQUENCEVERIFY` in the script.
 
@@ -112,7 +112,7 @@ The settlement challenge delay is enforced by the settlement transaction's commi
 
 `S(n)` pays the coin to the current owner's normal wallet address. It has:
 
-- `nLockTime = 500_000_000 + n` (same state number)
+- `nLockTime = L(n)` (the same explicit locktime as `U(n)`)
 - `nSequence = challenge_delay` — a BIP68 **relative** timelock: "I can only confirm `challenge_delay` blocks after the output I spend was confirmed"
 - prevout: placeholder, rebindable just like `U(n)`
 
@@ -132,9 +132,9 @@ This kills a whole trust problem: the server can never withhold your exit. If yo
 
 ## The Lifecycle — Where Rebinding Actually Happens
 
-**Deposit:** fund `Tx0`. User and server co-sign `U(1)` (which commits to `S(1)`'s hash). The owner stores `U(1)`, `S(1)`, the signature, and the scripts. Nothing else goes on-chain. The coin now floats off-chain.
+**Deposit:** fund `Tx0`. The client samples `L(1)` uniformly from `500_000_000..=1_000_000_000`, journals it with all retry material before contacting the signer, and user and server co-sign `U(1)` (which commits to `S(1)`'s hash). The owner stores `U(1)`, `S(1)`, the signature, the explicit locktime, and the scripts. Nothing else goes on-chain. The coin now floats off-chain.
 
-**Transfer (state n → n+1):** the receiver builds their `S(n+1)` (paying *their* recovery address), computes its hash, builds the state-(n+1) output, and gets `U(n+1)` signed by `P`. The server updates key shares — `P` unchanged, the old owner's share dead. The receiver verifies everything by *reconstruction*: rebuild the templates byte-for-byte, recompute the hashes, check the signature. The old owner keeps their stale `U(n)`, `S(n)`... which are still consensus-valid. That is deliberate — the script handles it.
+**Transfer (state n → n+1):** the future transfer flow selects `L(n+1) = L(n) + delta`, where `delta` is a random integer in `1..=65_536`, after validating complete prior history, finality, and headroom. The receiver builds their `S(n+1)` (paying *their* recovery address), computes its hash, builds the state-(n+1) output, and gets `U(n+1)` signed by `P`. The server updates key shares — `P` unchanged, the old owner's share dead. The receiver verifies everything by *reconstruction*: rebuild the templates byte-for-byte from the explicit locktime, recompute the hashes, check the signature, and verify strict locktime ordering. The old owner keeps their stale `U(n)`, `S(n)`... which are still consensus-valid. That is deliberate — the script handles it.
 
 **Honest exit (current owner at state 9):**
 
@@ -152,13 +152,15 @@ This kills a whole trust problem: the server can never withhold your exit. If yo
 Old owner broadcasts stale U(5) spending Tx0.        (valid! consensus can't know it's stale)
 Coin is now in the state-5 output... but S(5) must wait challenge_delay blocks.
 
+Suppose L(5) = 700000000 and L(9) = 700010000.
+
 The current owner's watcher sees U(5). During the window:
   Take U(9). Rebind its input → U(5)'s output. Broadcast.
 
 Does consensus accept it?
   ✓ CSFS:  P signed U(9)'s fingerprint; the fingerprint ignores the prevout swap.
-  ✓ Update gate on U(5)'s output: requires locktime ≥ 500000006 (state 5's gate is 5+1).
-           U(9) carries 500000009. Pass.
+  ✓ Update gate on U(5)'s output: requires locktime ≥ 700000001 (L(5)+1).
+           U(9) carries 700010000. Pass.
 The coin fast-forwards from state 5 to state 9. S(5) is now spending a coin
 that no longer exists. Wait the delay, settle with S(9). Done.
 ```
@@ -167,29 +169,29 @@ And why can't the old owner do the same in reverse?
 
 ```text
 Old owner tries U(5) against the state-9 output:
-  ✗ Update gate requires locktime ≥ 500000010 (state 9's gate is 9+1). U(5) carries 500000005. Rejected.
+  ✗ Update gate requires locktime ≥ 700010001 (L(9)+1). U(5) carries 700000000. Rejected.
 Old owner tries S(5) against it:
-  ✗ Settlement gate requires locktime ≥ 500000009 (S(5) carries 500000005) — and the
-    settlement leaf's committed hash is S(9)'s, not S(5)'s. Two locked doors.
+  ✗ The settlement leaf commits to S(9)'s template hash, not S(5)'s. The explicit
+    locktime is one of the fields that makes those template hashes different.
 ```
 
 And why can't *anyone* — even the current owner's own broadcast, replayed by a griefer — stall the exit by re-applying `U(9)` to the output it just created?
 
 ```text
 Griefer tries U(9) against U(9)'s own state-9 output:
-  ✗ Update gate requires locktime ≥ 500000010 (state 9's gate is 9+1). U(9) carries 500000009. Rejected.
+  ✗ Update gate requires locktime ≥ 700010001 (L(9)+1). U(9) carries 700010000. Rejected.
 ```
 
-This last case is exactly why the update gate is `n+1` and not `n`: it forbids same-state
+This last case is exactly why the update gate is `L(n)+1` and not `L(n)`: it forbids same-state
 replay, so no one can keep recreating the state-9 output to reset S(9)'s challenge clock.
 
 That is the asymmetry, enforced purely by script: **newer spends older; older can never spend newer.** One transaction pair to store, no punishment machinery, no per-state secrets.
 
 Two supporting details worth understanding:
 
-- **Why `nLockTime` works as a state counter:** CLTV just does a numeric comparison between the script's number and the transaction's locktime. By using `500_000_000 + n`, the values fall in Bitcoin's *timestamp* range — and `500_000_001` is a date in 1985, permanently in the past. Consensus never actually makes anyone *wait* for these locktimes; the field degenerates into a pure monotonic counter. (This is the standard eltoo trick, used by the BIP442 LN-Symmetry sketch.)
+- **Why `nLockTime` is separate from state number:** CLTV only needs a strictly increasing numeric ratchet; it does not need the public value to encode the logical index. `L(1)` is an old randomized timestamp and later states use bounded positive random strides. Logical state number remains client bookkeeping and provisional signature-count comparison only. No protocol function converts between the two.
 - **Why the CLTV gate must exist at all:** the fingerprint does not commit to the scriptPubKey being spent. Without the gate, an old `U(5)` signature would be rebindable onto the *state-9* output too — rebinding would work backwards as well as forwards. The gate is the ratchet that gives rebinding a direction.
-- **Why the update gate is `n+1`, not `n`:** `S(n)` can settle its own state because its template hash commits to locktime `n`, but the update leaf gates one higher, at `n+1`. This makes forward progress *strict*: a state-`n` output can only be advanced by state `n+1` or later, never by `U(n)` itself. If it gated at `n`, the now-public `U(n)` signature plus the keyless anchor would let anyone replay `U(n)` onto its own output indefinitely, resetting the settlement delay each time — a liveness attack. The `+1` closes it without weakening override, since a genuinely newer state always has a number `> n`.
+- **Why the update gate is `L(n)+1`, not `L(n)`:** `S(n)` can settle its own state because its template hash commits to `L(n)`, but the update leaf gates one integer higher. This makes forward progress strict: only an update with a greater explicit locktime can advance the output, never `U(n)` itself. The `+1` closes the replay liveness attack without coupling consensus locktime back to logical state number.
 
 ## Why BIP448 Enables This, In One Paragraph
 

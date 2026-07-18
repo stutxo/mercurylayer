@@ -46,6 +46,7 @@
 use std::{error::Error, fmt};
 
 use bitcoin::{
+    absolute,
     blockdata::opcodes::all::OP_PUSHNUM_1,
     script::Builder,
     secp256k1::{Secp256k1, Verification, XOnlyPublicKey},
@@ -55,8 +56,7 @@ use bitcoin::{
 
 use crate::bip448::template_hash;
 use crate::bip448_statechain::script::{
-    self, output_script_pubkey, state_locktime, state_number_from_locktime, state_spend_info,
-    state_update_gate_locktime, ScriptTemplateError,
+    self, output_script_pubkey, state_spend_info, state_update_gate_locktime, ScriptTemplateError,
 };
 
 use bitcoin::hashes::Hash;
@@ -100,6 +100,9 @@ pub enum FeePolicy {
 pub enum TransactionTemplateError {
     Script(ScriptTemplateError),
     Sighash(SighashError),
+    InvalidStateNumber {
+        state_number: u32,
+    },
     InvalidChallengeDelay {
         challenge_delay: u16,
     },
@@ -112,7 +115,7 @@ pub enum TransactionTemplateError {
         minimum: u64,
     },
     StateLocktimeNotFinal {
-        state_number: u32,
+        locktime: u32,
         median_time_past: u32,
     },
     FinalProtocolInputSequence {
@@ -131,12 +134,10 @@ pub enum TransactionTemplateError {
         version: i32,
     },
     UnexpectedUpdateLocktime {
-        state_number: u32,
         expected: u32,
         actual: u32,
     },
     UnexpectedSettlementLocktime {
-        state_number: u32,
         expected: u32,
         actual: u32,
     },
@@ -165,6 +166,9 @@ impl fmt::Display for TransactionTemplateError {
             TransactionTemplateError::Sighash(err) => {
                 write!(f, "BIP448 template hash error: {err:?}")
             }
+            TransactionTemplateError::InvalidStateNumber { state_number } => {
+                write!(f, "invalid BIP448 logical state number {state_number}")
+            }
             TransactionTemplateError::InvalidChallengeDelay { challenge_delay } => {
                 write!(f, "invalid BIP448 challenge delay {challenge_delay}")
             }
@@ -177,11 +181,11 @@ impl fmt::Display for TransactionTemplateError {
                 "BIP448 template output value {value} is below the dust minimum {minimum}"
             ),
             TransactionTemplateError::StateLocktimeNotFinal {
-                state_number,
+                locktime,
                 median_time_past,
             } => write!(
                 f,
-                "BIP448 state {state_number} encodes a locktime that is not final for median time past {median_time_past}"
+                "BIP448 state locktime {locktime} is not final for median time past {median_time_past}"
             ),
             TransactionTemplateError::FinalProtocolInputSequence { sequence } => write!(
                 f,
@@ -204,20 +208,18 @@ impl fmt::Display for TransactionTemplateError {
                 "BIP448 recovery template version {version} does not match protocol version {TX_VERSION}"
             ),
             TransactionTemplateError::UnexpectedUpdateLocktime {
-                state_number,
                 expected,
                 actual,
             } => write!(
                 f,
-                "BIP448 update template for state {state_number} uses locktime {actual}, expected {expected}"
+                "BIP448 update template uses locktime {actual}, expected {expected}"
             ),
             TransactionTemplateError::UnexpectedSettlementLocktime {
-                state_number,
                 expected,
                 actual,
             } => write!(
                 f,
-                "BIP448 settlement template for state {state_number} uses locktime {actual}, expected {expected}"
+                "BIP448 settlement template uses locktime {actual}, expected {expected}"
             ),
             TransactionTemplateError::UnexpectedInputValue {
                 fee_policy,
@@ -287,16 +289,16 @@ pub fn build_update_tx(
     previous_output: OutPoint,
     input_amount: u64,
     state_output_script: ScriptBuf,
-    state_number: u32,
+    state_locktime: absolute::LockTime,
     fee_policy: FeePolicy,
 ) -> Result<Transaction, TransactionTemplateError> {
-    let lock_time = state_locktime(state_number)?;
+    script::validate_state_locktime(state_locktime)?;
     let main_output_value = main_output_value(input_amount, fee_policy)?;
     validate_non_dust(main_output_value, &state_output_script)?;
 
     Ok(Transaction {
         version: TX_VERSION,
-        lock_time,
+        lock_time: state_locktime,
         input: vec![TxIn {
             previous_output,
             script_sig: ScriptBuf::new(),
@@ -330,20 +332,20 @@ pub fn build_settlement_tx(
     previous_output: OutPoint,
     input_amount: u64,
     recovery_script: ScriptBuf,
-    state_number: u32,
+    state_locktime: absolute::LockTime,
     challenge_delay: u16,
     fee_policy: FeePolicy,
 ) -> Result<Transaction, TransactionTemplateError> {
     if challenge_delay == 0 {
         return Err(TransactionTemplateError::InvalidChallengeDelay { challenge_delay });
     }
-    let lock_time = state_locktime(state_number)?;
+    script::validate_state_locktime(state_locktime)?;
     let main_output_value = main_output_value(input_amount, fee_policy)?;
     validate_non_dust(main_output_value, &recovery_script)?;
 
     Ok(Transaction {
         version: TX_VERSION,
-        lock_time,
+        lock_time: state_locktime,
         input: vec![TxIn {
             previous_output,
             script_sig: ScriptBuf::new(),
@@ -394,6 +396,7 @@ pub fn settlement_template_hash(
 #[derive(Debug, Clone)]
 pub struct StateTemplates {
     pub state_number: u32,
+    pub state_locktime: absolute::LockTime,
     pub challenge_delay: u16,
     pub fee_policy: FeePolicy,
     /// Value of the funding or older-state output that `U(n)` spends.
@@ -424,33 +427,37 @@ pub fn build_state_templates<C: Verification>(
     input_amount: u64,
     recovery_script: ScriptBuf,
     state_number: u32,
+    state_locktime: absolute::LockTime,
     challenge_delay: u16,
     fee_policy: FeePolicy,
 ) -> Result<StateTemplates, TransactionTemplateError> {
+    validate_state_number(state_number)?;
+    script::validate_state_locktime(state_locktime)?;
     let state_output_value = main_output_value(input_amount, fee_policy)?;
     let settlement_tx = build_settlement_tx(
         placeholder_outpoint(),
         state_output_value,
         recovery_script,
-        state_number,
+        state_locktime,
         challenge_delay,
         fee_policy,
     )?;
     let settlement_hash = settlement_template_hash(&settlement_tx, 0, None)?;
 
-    let spend_info = state_spend_info(secp, aggregate_key, state_number, settlement_hash)?;
+    let spend_info = state_spend_info(secp, aggregate_key, state_locktime, settlement_hash)?;
     let state_output_script_pubkey = output_script_pubkey(&spend_info);
 
     let update_tx = build_update_tx(
         update_previous_output,
         input_amount,
         state_output_script_pubkey.clone(),
-        state_number,
+        state_locktime,
         fee_policy,
     )?;
 
     Ok(StateTemplates {
         state_number,
+        state_locktime,
         challenge_delay,
         fee_policy,
         update_input_amount: input_amount,
@@ -462,20 +469,20 @@ pub fn build_state_templates<C: Verification>(
     })
 }
 
-/// Validates that a state's encoded locktime is already final for the
+/// Validates that an explicit state locktime is already final for the
 /// receiver's chain view, so a recovery package is immediately usable.
 ///
 /// Bitcoin finality (BIP113) requires `nLockTime < median_time_past`. Normal
-/// state numbers encode 1985-era timestamps and pass trivially; a state
-/// number large enough to encode a future timestamp must be rejected.
+/// Protocol locktimes are timestamps and must be strictly below chain MTP.
 pub fn validate_immediately_final(
-    state_number: u32,
+    state_locktime: absolute::LockTime,
     median_time_past: u32,
 ) -> Result<(), TransactionTemplateError> {
-    let lock_time = state_locktime(state_number)?;
-    if lock_time.to_consensus_u32() >= median_time_past {
+    script::validate_state_locktime(state_locktime)?;
+    let locktime = state_locktime.to_consensus_u32();
+    if locktime >= median_time_past {
         return Err(TransactionTemplateError::StateLocktimeNotFinal {
-            state_number,
+            locktime,
             median_time_past,
         });
     }
@@ -488,9 +495,10 @@ pub fn validate_immediately_final(
 /// Receiver and watcher acceptance should use this entry point, not only the
 /// lower-level field validators. It derives `settlement_template_hash` from
 /// `settlement_tx`, reconstructs the expected state output script for
-/// `(aggregate_key, state_number, settlement_hash)`, and then verifies `U(n)`
-/// pays to that exact output. This binds the update's locktime state number to
-/// the CLTV state number encoded in the output script, preserving the ratchet.
+/// `(aggregate_key, state_locktime, settlement_hash)`, and then verifies `U(n)`
+/// pays to that exact output. This binds the update's explicit locktime to the
+/// CLTV gate encoded in the output script, preserving the ratchet without
+/// deriving locktime from logical state number.
 ///
 /// This validates template structure only. The caller must still confirm the
 /// state locktime is final for its own chain view with
@@ -501,6 +509,7 @@ pub fn validate_state_template_set<C: Verification>(
     secp: &Secp256k1<C>,
     aggregate_key: XOnlyPublicKey,
     state_number: u32,
+    state_locktime: absolute::LockTime,
     update_input_amount: u64,
     recovery_script: &ScriptBuf,
     challenge_delay: u16,
@@ -508,12 +517,13 @@ pub fn validate_state_template_set<C: Verification>(
     update_tx: &Transaction,
     settlement_tx: &Transaction,
 ) -> Result<TemplateHash, TransactionTemplateError> {
-    validate_update_protocol_input(update_tx, state_number)?;
-    validate_settlement_protocol_input(settlement_tx, state_number, challenge_delay)?;
+    validate_state_number(state_number)?;
+    validate_update_protocol_input(update_tx, state_locktime)?;
+    validate_settlement_protocol_input(settlement_tx, state_locktime, challenge_delay)?;
 
     let settlement_hash = settlement_template_hash(settlement_tx, 0, None)?;
     let expected_state_output =
-        expected_state_output_script_pubkey(secp, aggregate_key, state_number, settlement_hash)?;
+        expected_state_output_script_pubkey(secp, aggregate_key, state_locktime, settlement_hash)?;
     validate_fee_bump_outputs(
         update_tx,
         &expected_state_output,
@@ -532,15 +542,13 @@ pub fn validate_state_template_set<C: Verification>(
     Ok(settlement_hash)
 }
 
-/// Validates the update protocol fields: the exact state locktime for the
-/// claimed state number, and exactly one input whose sequence is the
+/// Validates the update protocol fields: the exact explicit state locktime and
+/// exactly one input whose sequence is the
 /// deterministic non-final update sequence, so transaction locktime and the
 /// CLTV state gate apply and BIP68 remains enabled.
 ///
-/// The locktime equality matters for stale-state defense: an update whose
-/// actual locktime is below `state_locktime(state_number)` cannot override
-/// stale states whose CLTV gates lie between the two values, and a higher
-/// locktime is not a reconstructible protocol template.
+/// The locktime equality matters for stale-state defense and deterministic
+/// reconstruction; ordering against prior states is validated separately.
 ///
 /// Also requires the deterministic v3 template version for TRUC consistency;
 /// the template hash commits the version, so any other value is not a
@@ -551,11 +559,11 @@ pub fn validate_state_template_set<C: Verification>(
 /// acceptance.
 pub fn validate_update_protocol_input(
     update_tx: &Transaction,
-    state_number: u32,
+    expected_state_locktime: absolute::LockTime,
 ) -> Result<(), TransactionTemplateError> {
     validate_protocol_transaction(
         update_tx,
-        state_number,
+        expected_state_locktime,
         UPDATE_INPUT_SEQUENCE,
         ProtocolTransactionRole::Update,
     )
@@ -572,7 +580,7 @@ pub fn validate_update_protocol_input(
 /// all.
 pub fn validate_settlement_protocol_input(
     settlement_tx: &Transaction,
-    state_number: u32,
+    expected_state_locktime: absolute::LockTime,
     challenge_delay: u16,
 ) -> Result<(), TransactionTemplateError> {
     if challenge_delay == 0 {
@@ -580,7 +588,7 @@ pub fn validate_settlement_protocol_input(
     }
     validate_protocol_transaction(
         settlement_tx,
-        state_number,
+        expected_state_locktime,
         Sequence::from_height(challenge_delay),
         ProtocolTransactionRole::Settlement,
     )
@@ -598,24 +606,16 @@ pub fn validate_settlement_protocol_input(
 /// non-final sequence and a sufficient same-type locktime.
 pub fn update_can_satisfy_state_gate(
     update_tx: &Transaction,
-    gate_state_number: u32,
+    spent_state_locktime: absolute::LockTime,
 ) -> Result<bool, TransactionTemplateError> {
-    let gate = state_update_gate_locktime(gate_state_number)?;
+    let gate = state_update_gate_locktime(spent_state_locktime)?;
     let update_locktime = update_tx.lock_time;
     // CLTV requires matching locktime types. Both sides use timestamp-range
     // encoding; anything else is not a protocol locktime.
     if update_locktime.is_block_height() {
         return Ok(false);
     }
-    // The update's own state number is defined by its locktime. Deriving it
-    // makes the validator's locktime-equality check tautological here, but
-    // keeps its range checks (state zero, overflow) and the version, input,
-    // and sequence rules in force.
-    let implied_state_number = match state_number_from_locktime(update_locktime) {
-        Ok(state_number) => state_number,
-        Err(_) => return Ok(false),
-    };
-    if validate_update_protocol_input(update_tx, implied_state_number).is_err() {
+    if validate_update_protocol_input(update_tx, update_locktime).is_err() {
         return Ok(false);
     }
 
@@ -630,12 +630,12 @@ pub fn is_expected_funding_update_leaf(leaf: &ScriptBuf) -> bool {
     *leaf == script::funding_update_leaf()
 }
 
-/// Exact-byte check for `state_update_leaf(n)`.
+/// Exact-byte check for `state_update_leaf(L)`.
 pub fn is_expected_state_update_leaf(
     leaf: &ScriptBuf,
-    state_number: u32,
+    state_locktime: absolute::LockTime,
 ) -> Result<bool, TransactionTemplateError> {
-    Ok(*leaf == script::state_update_leaf(state_number)?)
+    Ok(*leaf == script::state_update_leaf(state_locktime)?)
 }
 
 /// Exact-byte check for `state_settlement_leaf(settlement_template_hash)`.
@@ -647,7 +647,7 @@ pub fn is_expected_state_settlement_leaf(
 }
 
 /// Reconstructs the expected two-leaf state output scriptPubKey for
-/// `(P, n, hash)`.
+/// `(P, L, hash)`.
 ///
 /// This is the single source of truth for the state output, shared by
 /// [`verify_state_output_script_pubkey`] and [`validate_state_template_set`]
@@ -655,27 +655,32 @@ pub fn is_expected_state_settlement_leaf(
 pub fn expected_state_output_script_pubkey<C: Verification>(
     secp: &Secp256k1<C>,
     aggregate_key: XOnlyPublicKey,
-    state_number: u32,
+    state_locktime: absolute::LockTime,
     settlement_template_hash: TemplateHash,
 ) -> Result<ScriptBuf, TransactionTemplateError> {
-    let spend_info = state_spend_info(secp, aggregate_key, state_number, settlement_template_hash)?;
+    let spend_info = state_spend_info(
+        secp,
+        aggregate_key,
+        state_locktime,
+        settlement_template_hash,
+    )?;
 
     Ok(output_script_pubkey(&spend_info))
 }
 
-/// Reconstructs the expected two-leaf state output for `(P, n, hash)` and
+/// Reconstructs the expected two-leaf state output for `(P, L, hash)` and
 /// compares the claimed scriptPubKey byte-for-byte.
 pub fn verify_state_output_script_pubkey<C: Verification>(
     secp: &Secp256k1<C>,
     aggregate_key: XOnlyPublicKey,
-    state_number: u32,
+    state_locktime: absolute::LockTime,
     settlement_template_hash: TemplateHash,
     claimed_script_pubkey: &ScriptBuf,
 ) -> Result<bool, TransactionTemplateError> {
     let expected = expected_state_output_script_pubkey(
         secp,
         aggregate_key,
-        state_number,
+        state_locktime,
         settlement_template_hash,
     )?;
 
@@ -827,16 +832,15 @@ enum ProtocolTransactionRole {
 
 fn validate_protocol_transaction(
     tx: &Transaction,
-    state_number: u32,
+    expected_lock_time: absolute::LockTime,
     expected_sequence: Sequence,
     role: ProtocolTransactionRole,
 ) -> Result<(), TransactionTemplateError> {
     validate_transaction_version(tx.version)?;
-    let expected_lock_time = state_locktime(state_number)?;
+    script::validate_state_locktime(expected_lock_time)?;
     if tx.lock_time != expected_lock_time {
         return Err(unexpected_locktime_error(
             role,
-            state_number,
             expected_lock_time.to_consensus_u32(),
             tx.lock_time.to_consensus_u32(),
         ));
@@ -860,22 +864,15 @@ fn validate_protocol_transaction(
 
 fn unexpected_locktime_error(
     role: ProtocolTransactionRole,
-    state_number: u32,
     expected: u32,
     actual: u32,
 ) -> TransactionTemplateError {
     match role {
-        ProtocolTransactionRole::Update => TransactionTemplateError::UnexpectedUpdateLocktime {
-            state_number,
-            expected,
-            actual,
-        },
+        ProtocolTransactionRole::Update => {
+            TransactionTemplateError::UnexpectedUpdateLocktime { expected, actual }
+        }
         ProtocolTransactionRole::Settlement => {
-            TransactionTemplateError::UnexpectedSettlementLocktime {
-                state_number,
-                expected,
-                actual,
-            }
+            TransactionTemplateError::UnexpectedSettlementLocktime { expected, actual }
         }
     }
 }
@@ -927,6 +924,14 @@ fn validate_transaction_version(version: i32) -> Result<(), TransactionTemplateE
     Ok(())
 }
 
+fn validate_state_number(state_number: u32) -> Result<(), TransactionTemplateError> {
+    if state_number == 0 {
+        return Err(TransactionTemplateError::InvalidStateNumber { state_number });
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -939,9 +944,14 @@ mod tests {
 
     const INPUT_AMOUNT: u64 = 50_000;
     const STATE_NUMBER: u32 = 9;
+    const STATE_LOCKTIME: u32 = 700_000_042;
     const CHALLENGE_DELAY: u16 = 12;
     // 2025-06-15T15:06:40Z; far above any protocol state locktime in tests.
     const CURRENT_MTP: u32 = 1_750_000_000;
+
+    fn state_locktime() -> absolute::LockTime {
+        absolute::LockTime::from_consensus(STATE_LOCKTIME)
+    }
 
     #[test]
     fn anchor_script_matches_core_pay_to_anchor_bytes() {
@@ -986,10 +996,7 @@ mod tests {
             settlement.input[0].sequence,
             Sequence::from_height(CHALLENGE_DELAY)
         );
-        assert_eq!(
-            settlement.lock_time.to_consensus_u32(),
-            500_000_000 + STATE_NUMBER
-        );
+        assert_eq!(settlement.lock_time.to_consensus_u32(), STATE_LOCKTIME);
         assert_eq!(settlement.output.len(), 2);
         assert_eq!(settlement.output[0].value, INPUT_AMOUNT);
         assert_eq!(settlement.output[0].script_pubkey, recovery_script());
@@ -1000,15 +1007,55 @@ mod tests {
     fn update_and_settlement_use_timestamp_state_locktime() {
         let templates = sample_templates();
 
+        assert_eq!(templates.state_number, STATE_NUMBER);
+        assert_eq!(templates.state_locktime, state_locktime());
         assert_eq!(
             templates.update_tx.lock_time.to_consensus_u32(),
-            500_000_000 + STATE_NUMBER
+            STATE_LOCKTIME
         );
         assert_eq!(
             templates.settlement_tx.lock_time,
             templates.update_tx.lock_time
         );
         assert!(!templates.update_tx.lock_time.is_block_height());
+    }
+
+    #[test]
+    fn logical_state_number_does_not_select_consensus_locktime() {
+        let state_one = sample_templates_for_state_and_locktime(1, STATE_LOCKTIME);
+        let state_forty_two = sample_templates_for_state_and_locktime(42, STATE_LOCKTIME);
+
+        assert_eq!(
+            state_one.update_tx.lock_time,
+            state_forty_two.update_tx.lock_time
+        );
+        assert_eq!(
+            state_one.settlement_tx.lock_time,
+            state_forty_two.settlement_tx.lock_time
+        );
+        assert!(matches!(
+            script::checked_next_state_locktime(state_one.state_locktime, 0),
+            Err(script::ScriptTemplateError::InvalidStateLocktimeStride { stride: 0 })
+        ));
+    }
+
+    #[test]
+    fn changing_only_explicit_locktime_changes_both_template_hashes() {
+        let first = sample_templates_for_state_and_locktime(STATE_NUMBER, STATE_LOCKTIME);
+        let second = sample_templates_for_state_and_locktime(STATE_NUMBER, STATE_LOCKTIME + 123);
+
+        assert_ne!(
+            update_template_hash(&first.update_tx).unwrap(),
+            update_template_hash(&second.update_tx).unwrap()
+        );
+        assert_ne!(
+            first.settlement_template_hash,
+            second.settlement_template_hash
+        );
+        assert_ne!(
+            first.state_output_script_pubkey,
+            second.state_output_script_pubkey
+        );
     }
 
     #[test]
@@ -1083,7 +1130,7 @@ mod tests {
         let mut update = templates.update_tx.clone();
         update.input[0].script_sig = script_sig.clone();
         assert!(matches!(
-            validate_update_protocol_input(&update, STATE_NUMBER),
+            validate_update_protocol_input(&update, state_locktime()),
             Err(TransactionTemplateError::UnexpectedProtocolInputScriptSig { bytes })
                 if bytes == script_sig_len
         ));
@@ -1101,7 +1148,7 @@ mod tests {
         let mut settlement = templates.settlement_tx.clone();
         settlement.input[0].script_sig = script_sig;
         assert!(matches!(
-            validate_settlement_protocol_input(&settlement, STATE_NUMBER, CHALLENGE_DELAY),
+            validate_settlement_protocol_input(&settlement, state_locktime(), CHALLENGE_DELAY),
             Err(TransactionTemplateError::UnexpectedProtocolInputScriptSig { bytes })
                 if bytes == script_sig_len
         ));
@@ -1187,8 +1234,7 @@ mod tests {
         let mutations: Vec<Box<dyn Fn(&mut Transaction)>> = vec![
             Box::new(|tx| tx.input[0].sequence = Sequence::from_consensus(1)),
             Box::new(|tx| {
-                tx.lock_time =
-                    bitcoin::absolute::LockTime::from_consensus(500_000_000 + STATE_NUMBER + 1)
+                tx.lock_time = bitcoin::absolute::LockTime::from_consensus(STATE_LOCKTIME + 1)
             }),
             Box::new(|tx| tx.output[0].value -= 1),
             Box::new(|tx| tx.output[0].script_pubkey = recovery_script()),
@@ -1218,8 +1264,7 @@ mod tests {
         let mutations: Vec<Box<dyn Fn(&mut Transaction)>> = vec![
             Box::new(|tx| tx.input[0].sequence = Sequence::from_height(CHALLENGE_DELAY + 1)),
             Box::new(|tx| {
-                tx.lock_time =
-                    bitcoin::absolute::LockTime::from_consensus(500_000_000 + STATE_NUMBER - 1)
+                tx.lock_time = bitcoin::absolute::LockTime::from_consensus(STATE_LOCKTIME - 1)
             }),
             Box::new(|tx| tx.output[0].value -= 1),
             Box::new(|tx| tx.output[0].script_pubkey = pay_to_anchor_script()),
@@ -1245,20 +1290,26 @@ mod tests {
     }
 
     #[test]
-    fn strictly_newer_update_satisfies_older_gate_but_not_same_state() {
-        let older = sample_templates_for_state(STATE_NUMBER);
-        let newer = sample_templates_for_state(STATE_NUMBER + 1);
+    fn strictly_greater_locktime_satisfies_older_gate_but_same_locktime_does_not() {
+        let older = sample_templates();
+        let minimum_newer =
+            sample_templates_for_state_and_locktime(STATE_NUMBER + 1, STATE_LOCKTIME + 1);
+        let later = sample_templates_for_state_and_locktime(42, STATE_LOCKTIME + 65_536);
 
-        assert!(!update_can_satisfy_state_gate(&older.update_tx, STATE_NUMBER).unwrap());
-        assert!(update_can_satisfy_state_gate(&newer.update_tx, STATE_NUMBER).unwrap());
-        assert!(!update_can_satisfy_state_gate(&older.update_tx, STATE_NUMBER + 1).unwrap());
-        assert!(!update_can_satisfy_state_gate(&newer.update_tx, STATE_NUMBER + 1).unwrap());
+        assert!(!update_can_satisfy_state_gate(&older.update_tx, state_locktime()).unwrap());
+        assert!(update_can_satisfy_state_gate(&minimum_newer.update_tx, state_locktime()).unwrap());
+        assert!(update_can_satisfy_state_gate(&later.update_tx, state_locktime()).unwrap());
+        assert!(!update_can_satisfy_state_gate(
+            &minimum_newer.update_tx,
+            minimum_newer.state_locktime,
+        )
+        .unwrap());
     }
 
     #[test]
     fn older_settlement_cannot_satisfy_newer_gate() {
-        let older = sample_templates_for_state(STATE_NUMBER);
-        let newer_gate = state_locktime(STATE_NUMBER + 1).unwrap();
+        let older = sample_templates();
+        let newer_gate = state_update_gate_locktime(state_locktime()).unwrap();
 
         assert!(older.settlement_tx.lock_time.to_consensus_u32() < newer_gate.to_consensus_u32());
     }
@@ -1270,49 +1321,44 @@ mod tests {
         let mut wrong_version = templates.update_tx.clone();
         wrong_version.version = 2;
         assert!(matches!(
-            validate_update_protocol_input(&wrong_version, STATE_NUMBER),
+            validate_update_protocol_input(&wrong_version, state_locktime()),
             Err(TransactionTemplateError::UnexpectedTransactionVersion { version: 2 })
         ));
 
         let mut wrong_locktime = templates.update_tx.clone();
-        wrong_locktime.lock_time =
-            bitcoin::absolute::LockTime::from_consensus(500_000_000 + STATE_NUMBER - 1);
+        wrong_locktime.lock_time = bitcoin::absolute::LockTime::from_consensus(STATE_LOCKTIME - 1);
         assert!(matches!(
-            validate_update_protocol_input(&wrong_locktime, STATE_NUMBER),
-            Err(TransactionTemplateError::UnexpectedUpdateLocktime {
-                state_number: STATE_NUMBER,
-                ..
-            })
+            validate_update_protocol_input(&wrong_locktime, state_locktime()),
+            Err(TransactionTemplateError::UnexpectedUpdateLocktime { .. })
         ));
 
         let mut mutated = templates.update_tx.clone();
         mutated.input[0].sequence = Sequence::MAX;
         assert!(matches!(
-            validate_update_protocol_input(&mutated, STATE_NUMBER),
+            validate_update_protocol_input(&mutated, state_locktime()),
             Err(TransactionTemplateError::FinalProtocolInputSequence { .. })
         ));
-        assert!(!update_can_satisfy_state_gate(&mutated, STATE_NUMBER).unwrap());
+        assert!(!update_can_satisfy_state_gate(&mutated, state_locktime()).unwrap());
 
         let mut disabled_bip68 = templates.update_tx.clone();
         disabled_bip68.input[0].sequence = Sequence::from_consensus(0x8000_0000);
         assert!(matches!(
-            validate_update_protocol_input(&disabled_bip68, STATE_NUMBER),
+            validate_update_protocol_input(&disabled_bip68, state_locktime()),
             Err(TransactionTemplateError::ProtocolInputSequenceDisablesBip68 { .. })
         ));
-        assert!(!update_can_satisfy_state_gate(&disabled_bip68, STATE_NUMBER).unwrap());
+        assert!(!update_can_satisfy_state_gate(&disabled_bip68, state_locktime()).unwrap());
 
         let mut nonzero_relative_delay = templates.update_tx.clone();
         nonzero_relative_delay.input[0].sequence = Sequence::from_height(1);
         assert!(matches!(
-            validate_update_protocol_input(&nonzero_relative_delay, STATE_NUMBER),
+            validate_update_protocol_input(&nonzero_relative_delay, state_locktime()),
             Err(TransactionTemplateError::UnexpectedUpdateInputSequence { .. })
         ));
 
-        // A state-zero locktime (exactly the base) is rejected through the
-        // derived state number in the gate predicate.
-        let mut state_zero_locktime = templates.update_tx.clone();
-        state_zero_locktime.lock_time = bitcoin::absolute::LockTime::from_consensus(500_000_000);
-        assert!(!update_can_satisfy_state_gate(&state_zero_locktime, STATE_NUMBER).unwrap());
+        let mut height_locktime = templates.update_tx.clone();
+        height_locktime.lock_time =
+            bitcoin::absolute::LockTime::from_consensus(script::LOCKTIME_TIMESTAMP_THRESHOLD - 1);
+        assert!(!update_can_satisfy_state_gate(&height_locktime, state_locktime()).unwrap());
     }
 
     #[test]
@@ -1322,46 +1368,42 @@ mod tests {
         let mut version_1 = templates.settlement_tx.clone();
         version_1.version = 1;
         assert!(matches!(
-            validate_settlement_protocol_input(&version_1, STATE_NUMBER, CHALLENGE_DELAY),
+            validate_settlement_protocol_input(&version_1, state_locktime(), CHALLENGE_DELAY),
             Err(TransactionTemplateError::UnexpectedTransactionVersion { version: 1 })
         ));
 
         let mut wrong_locktime = templates.settlement_tx.clone();
-        wrong_locktime.lock_time =
-            bitcoin::absolute::LockTime::from_consensus(500_000_000 + STATE_NUMBER - 1);
+        wrong_locktime.lock_time = bitcoin::absolute::LockTime::from_consensus(STATE_LOCKTIME - 1);
         assert!(matches!(
-            validate_settlement_protocol_input(&wrong_locktime, STATE_NUMBER, CHALLENGE_DELAY),
-            Err(TransactionTemplateError::UnexpectedSettlementLocktime {
-                state_number: STATE_NUMBER,
-                ..
-            })
+            validate_settlement_protocol_input(&wrong_locktime, state_locktime(), CHALLENGE_DELAY),
+            Err(TransactionTemplateError::UnexpectedSettlementLocktime { .. })
         ));
 
         let mut final_sequence = templates.settlement_tx.clone();
         final_sequence.input[0].sequence = Sequence::MAX;
         assert!(matches!(
-            validate_settlement_protocol_input(&final_sequence, STATE_NUMBER, CHALLENGE_DELAY),
+            validate_settlement_protocol_input(&final_sequence, state_locktime(), CHALLENGE_DELAY),
             Err(TransactionTemplateError::FinalProtocolInputSequence { .. })
         ));
 
         let mut disabled_bip68 = templates.settlement_tx.clone();
         disabled_bip68.input[0].sequence = Sequence::from_consensus(0x8000_0000 | 12);
         assert!(matches!(
-            validate_settlement_protocol_input(&disabled_bip68, STATE_NUMBER, CHALLENGE_DELAY),
+            validate_settlement_protocol_input(&disabled_bip68, state_locktime(), CHALLENGE_DELAY),
             Err(TransactionTemplateError::ProtocolInputSequenceDisablesBip68 { .. })
         ));
 
         let mut wrong_delay = templates.settlement_tx.clone();
         wrong_delay.input[0].sequence = Sequence::from_height(CHALLENGE_DELAY + 1);
         assert!(matches!(
-            validate_settlement_protocol_input(&wrong_delay, STATE_NUMBER, CHALLENGE_DELAY),
+            validate_settlement_protocol_input(&wrong_delay, state_locktime(), CHALLENGE_DELAY),
             Err(TransactionTemplateError::UnexpectedSettlementInputSequence { sequence })
                 if sequence == Sequence::from_height(CHALLENGE_DELAY + 1)
         ));
 
         assert!(validate_settlement_protocol_input(
             &templates.settlement_tx,
-            STATE_NUMBER,
+            state_locktime(),
             CHALLENGE_DELAY
         )
         .is_ok());
@@ -1373,7 +1415,7 @@ mod tests {
             placeholder_outpoint(),
             INPUT_AMOUNT,
             recovery_script(),
-            STATE_NUMBER,
+            state_locktime(),
             0,
             FeePolicy::ZeroFeeEphemeralAnchor,
         );
@@ -1386,34 +1428,53 @@ mod tests {
 
     #[test]
     fn state_locktime_finality_validation() {
-        assert!(validate_immediately_final(STATE_NUMBER, CURRENT_MTP).is_ok());
+        assert!(validate_immediately_final(state_locktime(), CURRENT_MTP).is_ok());
 
-        let future_state = CURRENT_MTP - 500_000_000 + 1;
+        let future_locktime = absolute::LockTime::from_consensus(CURRENT_MTP);
         assert!(matches!(
-            validate_immediately_final(future_state, CURRENT_MTP),
+            validate_immediately_final(future_locktime, CURRENT_MTP),
             Err(TransactionTemplateError::StateLocktimeNotFinal { .. })
         ));
     }
 
     #[test]
-    fn builder_rejects_state_zero_and_locktime_overflow() {
-        let zero = build_update_tx(
+    fn builder_rejects_state_zero_and_invalid_locktimes() {
+        let zero = build_state_templates(
+            &Secp256k1::new(),
+            aggregate_key(),
             placeholder_outpoint(),
             INPUT_AMOUNT,
             recovery_script(),
             0,
+            state_locktime(),
+            CHALLENGE_DELAY,
             FeePolicy::ZeroFeeEphemeralAnchor,
         );
-        assert!(matches!(zero, Err(TransactionTemplateError::Script(_))));
+        assert!(matches!(
+            zero,
+            Err(TransactionTemplateError::InvalidStateNumber { state_number: 0 })
+        ));
 
-        let overflow = build_update_tx(
+        let height_type = build_update_tx(
             placeholder_outpoint(),
             INPUT_AMOUNT,
             recovery_script(),
-            u32::MAX - 500_000_000 + 1,
+            absolute::LockTime::from_consensus(script::LOCKTIME_TIMESTAMP_THRESHOLD - 1),
             FeePolicy::ZeroFeeEphemeralAnchor,
         );
-        assert!(matches!(overflow, Err(TransactionTemplateError::Script(_))));
+        assert!(matches!(
+            height_type,
+            Err(TransactionTemplateError::Script(_))
+        ));
+
+        let no_gate = build_update_tx(
+            placeholder_outpoint(),
+            INPUT_AMOUNT,
+            recovery_script(),
+            absolute::LockTime::from_consensus(u32::MAX),
+            FeePolicy::ZeroFeeEphemeralAnchor,
+        );
+        assert!(matches!(no_gate, Err(TransactionTemplateError::Script(_))));
     }
 
     #[test]
@@ -1422,7 +1483,7 @@ mod tests {
             placeholder_outpoint(),
             100,
             recovery_script(),
-            STATE_NUMBER,
+            state_locktime(),
             FeePolicy::ZeroFeeEphemeralAnchor,
         );
         assert!(matches!(
@@ -1434,7 +1495,7 @@ mod tests {
             placeholder_outpoint(),
             INPUT_AMOUNT,
             recovery_script(),
-            STATE_NUMBER,
+            state_locktime(),
             FeePolicy::PrototypeFixedFeeNoAnchor { fee: INPUT_AMOUNT },
         );
         assert!(matches!(
@@ -1450,7 +1511,7 @@ mod tests {
             placeholder_outpoint(),
             INPUT_AMOUNT,
             recovery_script(),
-            STATE_NUMBER,
+            state_locktime(),
             FeePolicy::PrototypeFixedFeeNoAnchor { fee },
         )
         .unwrap();
@@ -1472,6 +1533,7 @@ mod tests {
             INPUT_AMOUNT,
             recovery.clone(),
             STATE_NUMBER,
+            state_locktime(),
             CHALLENGE_DELAY,
             fee_policy,
         )
@@ -1511,6 +1573,7 @@ mod tests {
             &secp,
             aggregate_key(),
             STATE_NUMBER,
+            state_locktime(),
             templates.update_input_amount,
             &recovery,
             CHALLENGE_DELAY,
@@ -1534,6 +1597,7 @@ mod tests {
             INPUT_AMOUNT,
             other_recovery,
             STATE_NUMBER,
+            state_locktime(),
             CHALLENGE_DELAY,
             FeePolicy::ZeroFeeEphemeralAnchor,
         )
@@ -1551,7 +1615,7 @@ mod tests {
         assert!(verify_state_output_script_pubkey(
             &secp,
             aggregate_key(),
-            STATE_NUMBER,
+            state_locktime(),
             base.settlement_template_hash,
             &base.update_tx.output[0].script_pubkey,
         )
@@ -1559,7 +1623,7 @@ mod tests {
         assert!(!verify_state_output_script_pubkey(
             &secp,
             aggregate_key(),
-            STATE_NUMBER,
+            state_locktime(),
             other.settlement_template_hash,
             &base.update_tx.output[0].script_pubkey,
         )
@@ -1570,7 +1634,7 @@ mod tests {
             expected_state_output_script_pubkey(
                 &secp,
                 aggregate_key(),
-                STATE_NUMBER,
+                state_locktime(),
                 base.settlement_template_hash,
             )
             .unwrap(),
@@ -1589,6 +1653,7 @@ mod tests {
                 &secp,
                 aggregate_key(),
                 STATE_NUMBER,
+                state_locktime(),
                 INPUT_AMOUNT,
                 &recovery,
                 CHALLENGE_DELAY,
@@ -1600,11 +1665,11 @@ mod tests {
             templates.settlement_template_hash
         );
 
-        let stale_state_number = 1;
+        let stale_state_locktime = absolute::LockTime::from_consensus(STATE_LOCKTIME - 1);
         let stale_spend_info = state_spend_info(
             &secp,
             aggregate_key(),
-            stale_state_number,
+            stale_state_locktime,
             templates.settlement_template_hash,
         )
         .unwrap();
@@ -1613,7 +1678,7 @@ mod tests {
 
         // The low-level pieces can be composed unsafely if the expected script
         // is taken from the transaction itself.
-        assert!(validate_update_protocol_input(&wrong_state_output, STATE_NUMBER).is_ok());
+        assert!(validate_update_protocol_input(&wrong_state_output, state_locktime()).is_ok());
         assert!(validate_fee_bump_outputs(
             &wrong_state_output,
             &wrong_state_output.output[0].script_pubkey,
@@ -1621,17 +1686,17 @@ mod tests {
             FeePolicy::ZeroFeeEphemeralAnchor,
         )
         .is_ok());
-        assert!(update_can_satisfy_state_gate(
-            &sample_templates_for_state(5).update_tx,
-            stale_state_number,
-        )
-        .unwrap());
+        assert!(
+            update_can_satisfy_state_gate(&sample_templates().update_tx, stale_state_locktime,)
+                .unwrap()
+        );
 
         assert!(matches!(
             validate_state_template_set(
                 &secp,
                 aggregate_key(),
                 STATE_NUMBER,
+                state_locktime(),
                 INPUT_AMOUNT,
                 &recovery,
                 CHALLENGE_DELAY,
@@ -1648,13 +1713,13 @@ mod tests {
     #[test]
     fn lookalike_leaves_are_rejected_by_exact_byte_checks() {
         let templates = sample_templates();
-        let update_leaf = script::state_update_leaf(STATE_NUMBER).unwrap();
+        let update_leaf = script::state_update_leaf(state_locktime()).unwrap();
         let settlement_leaf = script::state_settlement_leaf(templates.settlement_template_hash);
 
         assert!(is_expected_funding_update_leaf(
             &script::funding_update_leaf()
         ));
-        assert!(is_expected_state_update_leaf(&update_leaf, STATE_NUMBER).unwrap());
+        assert!(is_expected_state_update_leaf(&update_leaf, state_locktime()).unwrap());
         assert!(is_expected_state_settlement_leaf(
             &settlement_leaf,
             templates.settlement_template_hash
@@ -1663,32 +1728,36 @@ mod tests {
         // Explicit 33-byte pubkey instead of OP_INTERNALKEY: BIP348 would
         // treat it as an auto-succeeding unknown key type.
         let explicit_key_leaf = Builder::new()
-            .push_lock_time(state_update_gate_locktime(STATE_NUMBER).unwrap())
+            .push_lock_time(state_update_gate_locktime(state_locktime()).unwrap())
             .push_opcode(OP_CLTV)
             .push_opcode(OP_DROP)
             .push_opcode(OP_TEMPLATEHASH)
             .push_slice([2u8; 33])
             .push_opcode(OP_CHECKSIGFROMSTACK)
             .into_script();
-        assert!(!is_expected_state_update_leaf(&explicit_key_leaf, STATE_NUMBER).unwrap());
+        assert!(!is_expected_state_update_leaf(&explicit_key_leaf, state_locktime()).unwrap());
 
         // Reordered opcodes.
         let reordered_leaf = Builder::new()
-            .push_lock_time(state_update_gate_locktime(STATE_NUMBER).unwrap())
+            .push_lock_time(state_update_gate_locktime(state_locktime()).unwrap())
             .push_opcode(OP_CLTV)
             .push_opcode(OP_DROP)
             .push_opcode(OP_TEMPLATEHASH)
             .push_opcode(OP_EQUAL)
             .into_script();
-        assert!(!is_expected_state_update_leaf(&reordered_leaf, STATE_NUMBER).unwrap());
+        assert!(!is_expected_state_update_leaf(&reordered_leaf, state_locktime()).unwrap());
 
-        // Wrong state gate.
-        assert!(!is_expected_state_update_leaf(&update_leaf, STATE_NUMBER + 1).unwrap());
+        // Wrong explicit locktime gate.
+        assert!(!is_expected_state_update_leaf(
+            &update_leaf,
+            absolute::LockTime::from_consensus(STATE_LOCKTIME + 1),
+        )
+        .unwrap());
 
         // The settlement leaf is exact hash equality only; a redundant CLTV prefix
         // is a different script and must not be accepted as the protocol leaf.
         let cltv_prefixed_settlement_leaf = Builder::new()
-            .push_lock_time(state_locktime(STATE_NUMBER).unwrap())
+            .push_lock_time(state_locktime())
             .push_opcode(OP_CLTV)
             .push_opcode(OP_DROP)
             .push_slice(templates.settlement_template_hash.to_byte_array())
@@ -1763,6 +1832,7 @@ mod tests {
                 &Secp256k1::new(),
                 aggregate_key(),
                 STATE_NUMBER,
+                state_locktime(),
                 1,
                 &recovery_script(),
                 CHALLENGE_DELAY,
@@ -1805,7 +1875,7 @@ mod tests {
             placeholder_outpoint(),
             INPUT_AMOUNT,
             recovery.clone(),
-            STATE_NUMBER,
+            state_locktime(),
             fee_policy,
         )
         .unwrap();
@@ -1821,6 +1891,13 @@ mod tests {
     }
 
     fn sample_templates_for_state(state_number: u32) -> StateTemplates {
+        sample_templates_for_state_and_locktime(state_number, STATE_LOCKTIME)
+    }
+
+    fn sample_templates_for_state_and_locktime(
+        state_number: u32,
+        state_locktime: u32,
+    ) -> StateTemplates {
         let secp = Secp256k1::new();
         build_state_templates(
             &secp,
@@ -1829,6 +1906,7 @@ mod tests {
             INPUT_AMOUNT,
             recovery_script(),
             state_number,
+            absolute::LockTime::from_consensus(state_locktime),
             CHALLENGE_DELAY,
             FeePolicy::ZeroFeeEphemeralAnchor,
         )

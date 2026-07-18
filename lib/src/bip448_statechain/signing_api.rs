@@ -162,6 +162,36 @@ mod tests {
         }
     }
 
+    fn assert_no_consensus_template_metadata(json: &str) {
+        for forbidden in [
+            "state_locktime",
+            "locktime",
+            "state_number",
+            "template_hash",
+            "random_offset",
+            "stride",
+            "500000000",
+            "1000000000",
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "serialized signing payload exposed forbidden value {forbidden}: {json}"
+            );
+        }
+        for forbidden_value in [
+            "700000042".to_string(),
+            "11".repeat(32),
+            "22".repeat(32),
+            "02000000deadbeef".to_string(),
+            "b175cecbcc".to_string(),
+        ] {
+            assert!(
+                !json.to_ascii_lowercase().contains(&forbidden_value),
+                "serialized signing payload exposed template value {forbidden_value}: {json}"
+            );
+        }
+    }
+
     #[test]
     fn signing_id_validation_canonicalizes_hex_case() {
         let validated = validate_signing_id(&SIGNING_ID.to_uppercase()).unwrap();
@@ -200,6 +230,7 @@ mod tests {
         let first = sample_first_payload();
         let lockbox_first = first.to_lockbox_payload();
         let first_json = serde_json::to_string(&lockbox_first).unwrap();
+        assert_no_consensus_template_metadata(&first_json);
         assert_eq!(lockbox_first.statechain_id, first.statechain_id);
         assert_eq!(lockbox_first.signing_id, first.signing_id);
         assert!(!first_json.contains("signed_statechain_id"));
@@ -217,6 +248,7 @@ mod tests {
         };
         let lockbox_second = second.to_lockbox_payload();
         let second_json = serde_json::to_string(&lockbox_second).unwrap();
+        assert_no_consensus_template_metadata(&second_json);
         assert_eq!(lockbox_second.statechain_id, second.statechain_id);
         assert_eq!(lockbox_second.signing_id, second.signing_id);
         assert_eq!(lockbox_second.negate_seckey, second.negate_seckey);
@@ -232,6 +264,7 @@ mod tests {
     fn payloads_round_trip_through_serde() {
         let first = sample_first_payload();
         let json = serde_json::to_string(&first).unwrap();
+        assert_no_consensus_template_metadata(&json);
         assert!(!json.contains("state_number"));
         assert!(!json.contains("signature_role"));
         assert!(!json.contains("template_hash"));
@@ -239,8 +272,38 @@ mod tests {
         let back: Bip448SignFirstRequestPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(back.signing_id, first.signing_id);
 
+        let first_response = Bip448SignFirstResponsePayload {
+            server_pubnonce: "aa".repeat(66),
+        };
+        let json = serde_json::to_string(&first_response).unwrap();
+        assert_no_consensus_template_metadata(&json);
+        let back: Bip448SignFirstResponsePayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.server_pubnonce, first_response.server_pubnonce);
+
+        let second = Bip448PartialSignatureRequestPayload {
+            statechain_id: "sc-1".to_string(),
+            signed_statechain_id: "sig-1".to_string(),
+            signing_id: SIGNING_ID.to_string(),
+            negate_seckey: 1,
+            session: "bb".repeat(133),
+            server_pub_nonce: "cc".repeat(66),
+        };
+        let json = serde_json::to_string(&second).unwrap();
+        assert_no_consensus_template_metadata(&json);
+        let back: Bip448PartialSignatureRequestPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.signing_id, second.signing_id);
+
+        let second_response = Bip448PartialSignatureResponsePayload {
+            partial_sig: "dd".repeat(32),
+        };
+        let json = serde_json::to_string(&second_response).unwrap();
+        assert_no_consensus_template_metadata(&json);
+        let back: Bip448PartialSignatureResponsePayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.partial_sig, second_response.partial_sig);
+
         let count = Bip448SignatureCountResponsePayload { sig_count: 3 };
         let json = serde_json::to_string(&count).unwrap();
+        assert_no_consensus_template_metadata(&json);
         let back: Bip448SignatureCountResponsePayload = serde_json::from_str(&json).unwrap();
         assert_eq!(back.sig_count, 3);
     }

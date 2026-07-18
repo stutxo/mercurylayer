@@ -1,10 +1,12 @@
 use std::str::FromStr;
 
 use bitcoin::{
+    absolute,
     hashes::Hash,
     secp256k1::{PublicKey, Secp256k1},
     Address, OutPoint, ScriptBuf, Txid,
 };
+use secp256k1::rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -25,6 +27,33 @@ use crate::{
 pub const INITIAL_BIP448_STATE_NUMBER: u32 = 1;
 pub const DEFAULT_BIP448_CHALLENGE_DELAY: u16 = 144;
 pub const BIP448_COIN_PROTOCOL: &str = "bip448";
+
+pub fn sample_initial_state_locktime() -> absolute::LockTime {
+    let mut rng = secp256k1::rand::rng();
+    sample_initial_state_locktime_with_rng(&mut rng)
+}
+
+fn sample_initial_state_locktime_with_rng<R: RngCore + ?Sized>(rng: &mut R) -> absolute::LockTime {
+    loop {
+        if let Some(locktime) = map_initial_state_locktime_sample(rng.next_u32()) {
+            return absolute::LockTime::from_consensus(locktime);
+        }
+    }
+}
+
+fn map_initial_state_locktime_sample(sample: u32) -> Option<u32> {
+    let range_size = u64::from(script::INITIAL_STATE_LOCKTIME_MAX)
+        - u64::from(script::INITIAL_STATE_LOCKTIME_MIN)
+        + 1;
+    let source_size = u64::from(u32::MAX) + 1;
+    let unbiased_zone = source_size - (source_size % range_size);
+    let sample = u64::from(sample);
+    if sample >= unbiased_zone {
+        return None;
+    }
+
+    Some(script::INITIAL_STATE_LOCKTIME_MIN + (sample % range_size) as u32)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Bip448DepositError {
@@ -102,9 +131,11 @@ pub fn create_deposit_address(
 pub fn build_deposit_templates(
     coin: &Coin,
     funding_outpoint: Bip448FundingOutpoint,
+    state_locktime: absolute::LockTime,
     challenge_delay: u16,
     network: &str,
 ) -> Result<Bip448DepositTemplates, Bip448DepositError> {
+    script::validate_initial_state_locktime(state_locktime)?;
     let network = get_network(network)?;
     let secp = Secp256k1::new();
     let aggregate_pubkey = aggregate_pubkey_from_coin(coin)?;
@@ -121,6 +152,7 @@ pub fn build_deposit_templates(
         funding_outpoint.value_sats,
         recovery_script.clone(),
         INITIAL_BIP448_STATE_NUMBER,
+        state_locktime,
         challenge_delay,
         Bip448FeeBumpPolicy::ZeroFeeEphemeralAnchor,
     )?;
@@ -221,6 +253,11 @@ mod tests {
     use secp256k1::{schnorr, KeyPair, Scalar, SecretKey};
 
     const FUNDING_VALUE: u64 = 100_000;
+    const STATE_LOCKTIME: u32 = 700_000_042;
+
+    fn state_locktime() -> absolute::LockTime {
+        absolute::LockTime::from_consensus(STATE_LOCKTIME)
+    }
 
     fn sample_wallet() -> Wallet {
         Wallet {
@@ -327,12 +364,61 @@ mod tests {
     }
 
     #[test]
+    fn initial_locktime_sampler_includes_both_range_boundaries() {
+        let range_size =
+            script::INITIAL_STATE_LOCKTIME_MAX - script::INITIAL_STATE_LOCKTIME_MIN + 1;
+
+        assert_eq!(
+            map_initial_state_locktime_sample(0),
+            Some(script::INITIAL_STATE_LOCKTIME_MIN)
+        );
+        assert_eq!(
+            map_initial_state_locktime_sample(range_size - 1),
+            Some(script::INITIAL_STATE_LOCKTIME_MAX)
+        );
+        assert_eq!(map_initial_state_locktime_sample(u32::MAX), None);
+    }
+
+    #[test]
+    fn randomized_state_locktime_does_not_change_funding_address() {
+        let coin = sample_coin();
+        let minimum = build_deposit_templates(
+            &coin,
+            funding_outpoint(),
+            absolute::LockTime::from_consensus(script::INITIAL_STATE_LOCKTIME_MIN),
+            DEFAULT_BIP448_CHALLENGE_DELAY,
+            "regtest",
+        )
+        .unwrap();
+        let maximum = build_deposit_templates(
+            &coin,
+            funding_outpoint(),
+            absolute::LockTime::from_consensus(script::INITIAL_STATE_LOCKTIME_MAX),
+            DEFAULT_BIP448_CHALLENGE_DELAY,
+            "regtest",
+        )
+        .unwrap();
+
+        assert_eq!(minimum.funding_address, maximum.funding_address);
+        assert_eq!(
+            minimum.artifacts.funding_output_script_pubkey,
+            maximum.artifacts.funding_output_script_pubkey
+        );
+        assert_ne!(minimum.artifacts.update_tx, maximum.artifacts.update_tx);
+        assert_ne!(
+            minimum.artifacts.settlement_tx,
+            maximum.artifacts.settlement_tx
+        );
+    }
+
+    #[test]
     fn deposit_templates_validate_state_one_and_reject_mutation() {
         let secp = Secp256k1::new();
         let coin = sample_coin();
         let templates = build_deposit_templates(
             &coin,
             funding_outpoint(),
+            state_locktime(),
             DEFAULT_BIP448_CHALLENGE_DELAY,
             "regtest",
         )
@@ -343,6 +429,16 @@ mod tests {
         assert_eq!(
             templates.artifacts.update_tx.version,
             transaction::TX_VERSION
+        );
+        assert_eq!(
+            templates.artifacts.state_number,
+            INITIAL_BIP448_STATE_NUMBER
+        );
+        assert_eq!(templates.artifacts.state_locktime, STATE_LOCKTIME);
+        assert_eq!(templates.artifacts.update_tx.lock_time, state_locktime());
+        assert_eq!(
+            templates.artifacts.settlement_tx.lock_time,
+            state_locktime()
         );
         assert_eq!(
             templates.artifacts.settlement_tx.version,
@@ -368,6 +464,7 @@ mod tests {
             &secp,
             aggregate_pubkey.x_only_public_key().0,
             INITIAL_BIP448_STATE_NUMBER,
+            state_locktime(),
             FUNDING_VALUE,
             &recovery_script,
             DEFAULT_BIP448_CHALLENGE_DELAY,
@@ -383,6 +480,7 @@ mod tests {
             &secp,
             aggregate_pubkey.x_only_public_key().0,
             INITIAL_BIP448_STATE_NUMBER,
+            state_locktime(),
             FUNDING_VALUE,
             &recovery_script,
             DEFAULT_BIP448_CHALLENGE_DELAY,
@@ -399,6 +497,7 @@ mod tests {
         let templates = build_deposit_templates(
             &coin,
             funding_outpoint(),
+            state_locktime(),
             DEFAULT_BIP448_CHALLENGE_DELAY,
             "regtest",
         )
@@ -417,6 +516,7 @@ mod tests {
         let json = serde_json::to_string(&record).unwrap();
 
         assert_eq!(record.latest_state_number, INITIAL_BIP448_STATE_NUMBER);
+        assert_eq!(record.latest_state.state_locktime, STATE_LOCKTIME);
         assert_eq!(
             record.latest_state.signing_metadata.role,
             Bip448RecoveryTemplateRole::FundingUpdate
@@ -440,6 +540,7 @@ mod tests {
         let templates = build_deposit_templates(
             &coin,
             funding_outpoint(),
+            state_locktime(),
             DEFAULT_BIP448_CHALLENGE_DELAY,
             "regtest",
         )
@@ -490,6 +591,7 @@ mod tests {
         let templates = build_deposit_templates(
             &coin,
             funding_outpoint(),
+            state_locktime(),
             DEFAULT_BIP448_CHALLENGE_DELAY,
             "regtest",
         )
@@ -518,6 +620,7 @@ mod tests {
         let templates = build_deposit_templates(
             &coin,
             funding_outpoint(),
+            state_locktime(),
             DEFAULT_BIP448_CHALLENGE_DELAY,
             "regtest",
         )

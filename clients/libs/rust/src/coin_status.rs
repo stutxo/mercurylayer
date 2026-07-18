@@ -17,8 +17,8 @@ use crate::{
     client_config::ClientConfig,
     deposit::{create_bip448_deposit_state, create_tx1},
     sqlite_manager::{
-        delete_bip448_pending_deposit_signing, get_bip448_statechain_optional, get_wallet,
-        insert_backup_txs, update_wallet,
+        delete_bip448_pending_deposit_signing, get_bip448_pending_deposit_signing,
+        get_bip448_statechain_optional, get_wallet, insert_backup_txs, update_wallet,
     },
 };
 
@@ -67,6 +67,88 @@ fn defer_bip448_signature_count_error(
             .unwrap_or_else(|| format!("coin-index-{}", coin.index)),
         error,
     });
+
+    Ok(())
+}
+
+fn select_bip448_funding_utxo(
+    utxo_list: Vec<ChainUtxo>,
+    coin: &Coin,
+    pending_signing: Option<&crate::sqlite_manager::Bip448PendingDepositSigning>,
+    accepted_state: Option<&Bip448StatechainRecord>,
+    expected_value: Option<u64>,
+) -> Option<ChainUtxo> {
+    if let Some(pending) = pending_signing {
+        return utxo_list.into_iter().find(|unspent| {
+            unspent.txid == pending.funding_txid
+                && unspent.vout == pending.funding_vout
+                && unspent.value == pending.funding_value_sats
+        });
+    }
+
+    if let (Some(txid), Some(vout)) = (coin.utxo_txid.as_ref(), coin.utxo_vout) {
+        return utxo_list
+            .into_iter()
+            .find(|unspent| &unspent.txid == txid && unspent.vout == vout);
+    }
+
+    if let Some(record) = accepted_state {
+        return utxo_list.into_iter().find(|unspent| {
+            unspent.txid == record.funding_outpoint.txid
+                && unspent.vout == record.funding_outpoint.vout
+                && unspent.value == record.funding_outpoint.value_sats
+        });
+    }
+
+    utxo_list
+        .into_iter()
+        .find(|unspent| Some(unspent.value) == expected_value)
+}
+
+fn validate_bip448_pending_matches_accepted(
+    pending: &crate::sqlite_manager::Bip448PendingDepositSigning,
+    accepted: &Bip448StatechainRecord,
+) -> Result<()> {
+    fn same_hex(left: &str, right: &str) -> bool {
+        let left = left
+            .strip_prefix("0x")
+            .or_else(|| left.strip_prefix("0X"))
+            .unwrap_or(left);
+        let right = right
+            .strip_prefix("0x")
+            .or_else(|| right.strip_prefix("0X"))
+            .unwrap_or(right);
+        left.eq_ignore_ascii_case(right)
+    }
+
+    let signing = &accepted.latest_state.signing_metadata;
+    let server_public_nonce = pending.server_public_nonce.as_deref().ok_or_else(|| {
+        anyhow!("accepted BIP448 deposit has an incomplete pending signing journal")
+    })?;
+    let matches = pending.wallet_name == accepted.wallet_name
+        && pending.statechain_id == accepted.statechain_id
+        && pending.funding_txid == accepted.funding_outpoint.txid
+        && pending.funding_vout == accepted.funding_outpoint.vout
+        && pending.funding_value_sats == accepted.funding_outpoint.value_sats
+        && pending.state_locktime == accepted.latest_state.state_locktime
+        && same_hex(
+            &pending.update_template_hash,
+            &accepted.latest_state.update_template_hash,
+        )
+        && same_hex(
+            &pending.settlement_template_hash,
+            &accepted.latest_state.settlement_template_hash,
+        )
+        && same_hex(&pending.update_template_hash, &signing.update_template_hash)
+        && same_hex(&pending.signing_id, &signing.signing_id)
+        && same_hex(&pending.client_public_nonce, &signing.client_public_nonce)
+        && same_hex(server_public_nonce, &signing.server_public_nonce)
+        && same_hex(&pending.blinding_factor, &signing.blinding_factor);
+    if !matches {
+        return Err(anyhow!(
+            "accepted BIP448 deposit does not match the pending signing journal"
+        ));
+    }
 
     Ok(())
 }
@@ -203,10 +285,30 @@ async fn check_bip448_deposit(
         return Ok(None);
     }
 
+    let pending_signing = if let Some(statechain_id) = coin.statechain_id.as_deref() {
+        get_bip448_pending_deposit_signing(&client_config.pool, wallet_name, statechain_id).await?
+    } else {
+        None
+    };
+    let accepted_state = if let Some(statechain_id) = coin.statechain_id.as_deref() {
+        get_bip448_statechain_optional(&client_config.pool, wallet_name, statechain_id).await?
+    } else {
+        None
+    };
+    if let (Some(pending), Some(accepted)) = (&pending_signing, &accepted_state) {
+        validate_bip448_pending_matches_accepted(pending, accepted)?;
+    }
     let expected_value = if coin.utxo_txid.is_none() {
-        Some(u64::from(coin.amount.ok_or_else(|| {
-            anyhow!("BIP448 coin missing amount after deposit setup")
-        })?))
+        Some(if let Some(pending) = &pending_signing {
+            pending.funding_value_sats
+        } else if let Some(record) = &accepted_state {
+            record.funding_outpoint.value_sats
+        } else {
+            u64::from(
+                coin.amount
+                    .ok_or_else(|| anyhow!("BIP448 coin missing amount after deposit setup"))?,
+            )
+        })
     } else {
         None
     };
@@ -218,18 +320,22 @@ async fn check_bip448_deposit(
     let utxo_list = client_config
         .chain_client
         .list_unspent(address.script_pubkey().as_script())?;
-    let utxo = match (coin.utxo_txid.as_ref(), coin.utxo_vout) {
-        // Once the funding outpoint is known, match on it deterministically
-        // rather than by value (list_unspent order is not stable, and equal
-        // value UTXOs at the same address would otherwise be ambiguous).
-        (Some(txid), Some(vout)) => utxo_list
-            .into_iter()
-            .find(|unspent| &unspent.txid == txid && unspent.vout == vout),
-        // Initial detection: match the expected funding amount at this address.
-        _ => utxo_list
-            .into_iter()
-            .find(|unspent| Some(unspent.value) == expected_value),
-    };
+    if let Some(pending) = &pending_signing {
+        if let (Some(txid), Some(vout)) = (coin.utxo_txid.as_ref(), coin.utxo_vout) {
+            if txid != &pending.funding_txid || vout != pending.funding_vout {
+                return Err(anyhow!(
+                    "BIP448 wallet funding outpoint does not match the pending signing journal"
+                ));
+            }
+        }
+    }
+    let utxo = select_bip448_funding_utxo(
+        utxo_list,
+        coin,
+        pending_signing.as_ref(),
+        accepted_state.as_ref(),
+        expected_value,
+    );
 
     if utxo.is_none() {
         return Ok(None);
@@ -266,14 +372,19 @@ async fn check_bip448_deposit(
             .ok_or_else(|| anyhow!("BIP448 coin missing statechain_id"))?
             .clone();
 
-        if let Some(record) =
-            get_bip448_statechain_optional(&client_config.pool, wallet_name, &statechain_id).await?
-        {
+        if let Some(record) = accepted_state.as_ref() {
             restore_bip448_deposit_state_from_record(
                 coin, &record, &utxo.txid, utxo.vout, utxo.value,
             )?;
-            delete_bip448_pending_deposit_signing(&client_config.pool, wallet_name, &statechain_id)
+            if let Some(pending) = &pending_signing {
+                delete_bip448_pending_deposit_signing(
+                    &client_config.pool,
+                    wallet_name,
+                    &statechain_id,
+                    &pending.signing_id,
+                )
                 .await?;
+            }
         } else {
             create_bip448_deposit_state(
                 client_config,
@@ -587,7 +698,7 @@ mod tests {
         chain::{ChainClient, CoreRpcAuth, CoreRpcConfig},
         sqlite_manager::{
             get_bip448_pending_deposit_signing, get_bip448_statechain_optional, get_wallet,
-            insert_or_update_bip448_pending_deposit_signing, insert_wallet,
+            insert_bip448_pending_deposit_signing_if_absent, insert_wallet,
             Bip448PendingDepositSigning,
         },
     };
@@ -712,6 +823,7 @@ mod tests {
     ) -> Bip448StatechainRecord {
         let latest_state = Bip448LatestState {
             state_number: 1,
+            state_locktime: 700_000_042,
             challenge_delay: 144,
             update_tx: "02000000".to_string(),
             settlement_tx: "03000000".to_string(),
@@ -972,14 +1084,19 @@ mod tests {
         let pending = Bip448PendingDepositSigning {
             wallet_name: wallet.name.clone(),
             statechain_id: "failed-statechain".to_string(),
+            funding_txid: "aa".repeat(32),
+            funding_vout: 1,
+            funding_value_sats: 50_000,
             update_template_hash: "11".repeat(32),
+            settlement_template_hash: "12".repeat(32),
+            state_locktime: 700_000_042,
             signing_id: "22".repeat(32),
             client_secret_nonce: "33".repeat(132),
             client_public_nonce: "44".repeat(66),
             blinding_factor: "55".repeat(32),
             server_public_nonce: Some("66".repeat(66)),
         };
-        insert_or_update_bip448_pending_deposit_signing(&client_config.pool, &pending).await?;
+        insert_bip448_pending_deposit_signing_if_absent(&client_config.pool, &pending).await?;
 
         let mut wallet = get_wallet(&client_config.pool, &wallet.name).await?;
         let mut deferred_errors = Vec::new();
@@ -1058,5 +1175,93 @@ mod tests {
         )
         .is_err());
         assert_eq!(coin.public_nonce, None);
+    }
+
+    #[test]
+    fn accepted_deposit_outpoint_wins_over_equal_value_utxo_order() {
+        let mut coin = sample_coin();
+        coin.utxo_txid = None;
+        coin.utxo_vout = None;
+        let accepted = sample_record(&"bb".repeat(32), 3, 50_000);
+        let wrong_equal_value = ChainUtxo {
+            txid: "aa".repeat(32),
+            vout: 1,
+            value: 50_000,
+            height: 1,
+        };
+        let accepted_utxo = ChainUtxo {
+            txid: accepted.funding_outpoint.txid.clone(),
+            vout: accepted.funding_outpoint.vout,
+            value: accepted.funding_outpoint.value_sats,
+            height: 1,
+        };
+
+        let selected = select_bip448_funding_utxo(
+            vec![wrong_equal_value, accepted_utxo.clone()],
+            &coin,
+            None,
+            Some(&accepted),
+            Some(50_000),
+        );
+
+        assert_eq!(selected, Some(accepted_utxo));
+    }
+
+    #[test]
+    fn accepted_and_pending_deposit_identities_must_match_before_cleanup() {
+        let accepted = sample_record(&"bb".repeat(32), 3, 50_000);
+        let signing = &accepted.latest_state.signing_metadata;
+        let pending = Bip448PendingDepositSigning {
+            wallet_name: accepted.wallet_name.clone(),
+            statechain_id: accepted.statechain_id.clone(),
+            funding_txid: accepted.funding_outpoint.txid.clone(),
+            funding_vout: accepted.funding_outpoint.vout,
+            funding_value_sats: accepted.funding_outpoint.value_sats,
+            update_template_hash: accepted.latest_state.update_template_hash.clone(),
+            settlement_template_hash: accepted.latest_state.settlement_template_hash.clone(),
+            state_locktime: accepted.latest_state.state_locktime,
+            signing_id: signing.signing_id.clone(),
+            client_secret_nonce: "77".repeat(132),
+            client_public_nonce: signing.client_public_nonce.clone(),
+            blinding_factor: signing.blinding_factor.clone(),
+            server_public_nonce: Some(format!(
+                "0X{}",
+                signing.server_public_nonce.to_ascii_uppercase()
+            )),
+        };
+        assert!(validate_bip448_pending_matches_accepted(&pending, &accepted).is_ok());
+
+        let mut conflicts = Vec::new();
+        let mut conflict = pending.clone();
+        conflict.funding_vout += 1;
+        conflicts.push(conflict);
+        let mut conflict = pending.clone();
+        conflict.state_locktime += 1;
+        conflicts.push(conflict);
+        let mut conflict = pending.clone();
+        conflict.update_template_hash = "01".repeat(32);
+        conflicts.push(conflict);
+        let mut conflict = pending.clone();
+        conflict.settlement_template_hash = "02".repeat(32);
+        conflicts.push(conflict);
+        let mut conflict = pending.clone();
+        conflict.signing_id = "03".repeat(32);
+        conflicts.push(conflict);
+        let mut conflict = pending.clone();
+        conflict.client_public_nonce = "04".repeat(66);
+        conflicts.push(conflict);
+        let mut conflict = pending.clone();
+        conflict.server_public_nonce = Some("05".repeat(66));
+        conflicts.push(conflict);
+        let mut conflict = pending.clone();
+        conflict.blinding_factor = "06".repeat(32);
+        conflicts.push(conflict);
+        let mut conflict = pending;
+        conflict.server_public_nonce = None;
+        conflicts.push(conflict);
+
+        for conflict in conflicts {
+            assert!(validate_bip448_pending_matches_accepted(&conflict, &accepted).is_err());
+        }
     }
 }

@@ -1,17 +1,24 @@
 use anyhow::{anyhow, Result};
 use mercurylib::{
-    bip448_statechain::storage::Bip448StatechainRecord,
+    bip448_statechain::{script, storage::Bip448StatechainRecord},
     transfer::bip448::Bip448TransferMsg,
     wallet::{BackupTx, Wallet},
 };
 use serde_json::json;
 use sqlx::{Pool, Row, Sqlite};
 
+use crate::deposit::Bip448AcceptedDepositState;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bip448PendingDepositSigning {
     pub wallet_name: String,
     pub statechain_id: String,
+    pub funding_txid: String,
+    pub funding_vout: u32,
+    pub funding_value_sats: u64,
     pub update_template_hash: String,
+    pub settlement_template_hash: String,
+    pub state_locktime: u32,
     pub signing_id: String,
     pub client_secret_nonce: String,
     pub client_public_nonce: String,
@@ -165,7 +172,14 @@ pub async fn insert_or_update_backup_txs(
 /// purely so the table can be queried/indexed without parsing JSON. Because
 /// they are always written from `record` in this one place, they cannot diverge
 /// from `record_json`.
-pub async fn insert_or_update_bip448_statechain(
+pub(crate) async fn insert_or_update_bip448_statechain(
+    pool: &Pool<Sqlite>,
+    accepted: &Bip448AcceptedDepositState,
+) -> Result<()> {
+    upsert_bip448_statechain_record(pool, accepted.record()).await
+}
+
+async fn upsert_bip448_statechain_record(
     pool: &Pool<Sqlite>,
     record: &Bip448StatechainRecord,
 ) -> Result<()> {
@@ -173,6 +187,20 @@ pub async fn insert_or_update_bip448_statechain(
         return Err(anyhow!(
             "BIP448 accepted state cannot contain unverified CPFP child templates"
         ));
+    }
+    if record.latest_state_number != record.latest_state.state_number {
+        return Err(anyhow!(
+            "BIP448 latest state number does not match the statechain record"
+        ));
+    }
+    let state_locktime =
+        bitcoin::absolute::LockTime::from_consensus(record.latest_state.state_locktime);
+    if record.latest_state_number
+        == mercurylib::bip448_statechain::deposit::INITIAL_BIP448_STATE_NUMBER
+    {
+        script::validate_initial_state_locktime(state_locktime)?;
+    } else {
+        script::validate_state_locktime(state_locktime)?;
     }
 
     let record_json = serde_json::to_string(record)?;
@@ -183,18 +211,10 @@ pub async fn insert_or_update_bip448_statechain(
             record_json\
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
         ON CONFLICT(wallet_name, statechain_id) DO UPDATE SET \
-            aggregate_pubkey = excluded.aggregate_pubkey, \
-            funding_txid = excluded.funding_txid, \
-            funding_vout = excluded.funding_vout, \
-            funding_value_sats = excluded.funding_value_sats, \
-            latest_state_number = excluded.latest_state_number, \
-            challenge_delay = excluded.challenge_delay, \
-            amount_sats = excluded.amount_sats, \
-            network = excluded.network, \
-            record_json = excluded.record_json, \
-            updated_at = CURRENT_TIMESTAMP";
+            updated_at = CURRENT_TIMESTAMP \
+        WHERE bip448_statechains.record_json = excluded.record_json";
 
-    let _ = sqlx::query(query)
+    let result = sqlx::query(query)
         .bind(&record.wallet_name)
         .bind(&record.statechain_id)
         .bind(&record.aggregate_pubkey)
@@ -208,6 +228,11 @@ pub async fn insert_or_update_bip448_statechain(
         .bind(record_json)
         .execute(pool)
         .await?;
+    if result.rows_affected() != 1 {
+        return Err(anyhow!(
+            "BIP448 accepted state already exists with different canonical identity"
+        ));
+    }
 
     Ok(())
 }
@@ -257,28 +282,34 @@ pub async fn get_bip448_statechain_optional(
     .transpose()
 }
 
-pub async fn insert_or_update_bip448_pending_deposit_signing(
+pub async fn insert_bip448_pending_deposit_signing_if_absent(
     pool: &Pool<Sqlite>,
     signing: &Bip448PendingDepositSigning,
-) -> Result<()> {
+) -> Result<Bip448PendingDepositSigning> {
+    script::validate_initial_state_locktime(bitcoin::absolute::LockTime::from_consensus(
+        signing.state_locktime,
+    ))?;
     let query = "\
         INSERT INTO bip448_pending_deposit_signings (\
-            wallet_name, statechain_id, update_template_hash, signing_id, client_secret_nonce, \
+            wallet_name, statechain_id, funding_txid, funding_vout, funding_value_sats, \
+            update_template_hash, settlement_template_hash, state_locktime, signing_id, client_secret_nonce, \
             client_public_nonce, blinding_factor, server_public_nonce\
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
-        ON CONFLICT(wallet_name, statechain_id) DO UPDATE SET \
-            update_template_hash = excluded.update_template_hash, \
-            signing_id = excluded.signing_id, \
-            client_secret_nonce = excluded.client_secret_nonce, \
-            client_public_nonce = excluded.client_public_nonce, \
-            blinding_factor = excluded.blinding_factor, \
-            server_public_nonce = excluded.server_public_nonce, \
-            updated_at = CURRENT_TIMESTAMP";
+        ) SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13 \
+        WHERE NOT EXISTS (\
+            SELECT 1 FROM bip448_statechains \
+            WHERE wallet_name = $1 AND statechain_id = $2\
+        ) \
+        ON CONFLICT(wallet_name, statechain_id) DO NOTHING";
 
     let _ = sqlx::query(query)
         .bind(&signing.wallet_name)
         .bind(&signing.statechain_id)
+        .bind(&signing.funding_txid)
+        .bind(i64::from(signing.funding_vout))
+        .bind(signing.funding_value_sats as i64)
         .bind(&signing.update_template_hash)
+        .bind(&signing.settlement_template_hash)
+        .bind(i64::from(signing.state_locktime))
         .bind(&signing.signing_id)
         .bind(&signing.client_secret_nonce)
         .bind(&signing.client_public_nonce)
@@ -287,7 +318,24 @@ pub async fn insert_or_update_bip448_pending_deposit_signing(
         .execute(pool)
         .await?;
 
-    Ok(())
+    if let Some(pending) =
+        get_bip448_pending_deposit_signing(pool, &signing.wallet_name, &signing.statechain_id)
+            .await?
+    {
+        return Ok(pending);
+    }
+    if get_bip448_statechain_optional(pool, &signing.wallet_name, &signing.statechain_id)
+        .await?
+        .is_some()
+    {
+        return Err(anyhow!(
+            "BIP448 deposit state is already accepted; a new signing identity cannot be created"
+        ));
+    }
+
+    Err(anyhow!(
+        "BIP448 pending deposit signing row disappeared after insertion"
+    ))
 }
 
 pub async fn get_bip448_pending_deposit_signing(
@@ -296,8 +344,9 @@ pub async fn get_bip448_pending_deposit_signing(
     statechain_id: &str,
 ) -> Result<Option<Bip448PendingDepositSigning>> {
     let query = "\
-        SELECT wallet_name, statechain_id, update_template_hash, signing_id, client_secret_nonce, \
-               client_public_nonce, blinding_factor, server_public_nonce \
+        SELECT wallet_name, statechain_id, funding_txid, funding_vout, funding_value_sats, \
+               update_template_hash, settlement_template_hash, signing_id, client_secret_nonce, \
+               client_public_nonce, blinding_factor, server_public_nonce, state_locktime \
         FROM bip448_pending_deposit_signings \
         WHERE wallet_name = $1 AND statechain_id = $2";
 
@@ -307,16 +356,61 @@ pub async fn get_bip448_pending_deposit_signing(
         .fetch_optional(pool)
         .await?;
 
-    Ok(row.map(|row| Bip448PendingDepositSigning {
-        wallet_name: row.get(0),
-        statechain_id: row.get(1),
-        update_template_hash: row.get(2),
-        signing_id: row.get(3),
-        client_secret_nonce: row.get(4),
-        client_public_nonce: row.get(5),
-        blinding_factor: row.get(6),
-        server_public_nonce: row.get(7),
-    }))
+    row.map(|row| {
+        let state_locktime = row
+            .try_get::<Option<i64>, _>(12)?
+            .ok_or_else(|| {
+                anyhow!(
+                    "BIP448 pending deposit signing row predates randomized locktime support and cannot be resumed"
+                )
+            })?;
+        let state_locktime = u32::try_from(state_locktime)
+            .map_err(|_| anyhow!("BIP448 pending state locktime is outside the u32 range"))?;
+        script::validate_initial_state_locktime(bitcoin::absolute::LockTime::from_consensus(
+            state_locktime,
+        ))?;
+        let funding_txid = row.try_get::<Option<String>, _>(2)?.ok_or_else(|| {
+            anyhow!(
+                "BIP448 pending deposit signing row predates funding-outpoint journaling and cannot be resumed"
+            )
+        })?;
+        let funding_vout = row.try_get::<Option<i64>, _>(3)?.ok_or_else(|| {
+            anyhow!(
+                "BIP448 pending deposit signing row predates funding-outpoint journaling and cannot be resumed"
+            )
+        })?;
+        let funding_vout = u32::try_from(funding_vout)
+            .map_err(|_| anyhow!("BIP448 pending funding vout is outside the u32 range"))?;
+        let funding_value_sats = row.try_get::<Option<i64>, _>(4)?.ok_or_else(|| {
+            anyhow!(
+                "BIP448 pending deposit signing row predates funding-outpoint journaling and cannot be resumed"
+            )
+        })?;
+        let funding_value_sats = u64::try_from(funding_value_sats)
+            .map_err(|_| anyhow!("BIP448 pending funding value is negative"))?;
+        let settlement_template_hash = row.try_get::<Option<String>, _>(6)?.ok_or_else(|| {
+            anyhow!(
+                "BIP448 pending deposit signing row predates settlement-template journaling and cannot be resumed"
+            )
+        })?;
+
+        Ok(Bip448PendingDepositSigning {
+            wallet_name: row.get(0),
+            statechain_id: row.get(1),
+            funding_txid,
+            funding_vout,
+            funding_value_sats,
+            update_template_hash: row.get(5),
+            settlement_template_hash,
+            signing_id: row.get(7),
+            client_secret_nonce: row.get(8),
+            client_public_nonce: row.get(9),
+            blinding_factor: row.get(10),
+            server_public_nonce: row.get(11),
+            state_locktime,
+        })
+    })
+    .transpose()
 }
 
 pub async fn update_bip448_pending_deposit_server_public_nonce(
@@ -353,13 +447,16 @@ pub async fn delete_bip448_pending_deposit_signing(
     pool: &Pool<Sqlite>,
     wallet_name: &str,
     statechain_id: &str,
+    signing_id: &str,
 ) -> Result<()> {
-    let query =
-        "DELETE FROM bip448_pending_deposit_signings WHERE wallet_name = $1 AND statechain_id = $2";
+    let query = "\
+        DELETE FROM bip448_pending_deposit_signings \
+        WHERE wallet_name = $1 AND statechain_id = $2 AND signing_id = $3";
 
     let _ = sqlx::query(query)
         .bind(wallet_name)
         .bind(statechain_id)
+        .bind(signing_id)
         .execute(pool)
         .await?;
 
@@ -484,6 +581,7 @@ mod tests {
     fn sample_latest_state(state_number: u32) -> Bip448LatestState {
         Bip448LatestState {
             state_number,
+            state_locktime: 700_000_042,
             challenge_delay: 144,
             update_tx: "02000000".to_string(),
             settlement_tx: "03000000".to_string(),
@@ -651,30 +749,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bip448_latest_state_records_round_trip_through_sqlite() -> Result<()> {
+    async fn bip448_latest_state_round_trips_and_conflicting_identity_cannot_overwrite(
+    ) -> Result<()> {
         let pool = migrated_pool().await?;
         let record = sample_bip448_record(1);
 
-        insert_or_update_bip448_statechain(&pool, &record).await?;
+        upsert_bip448_statechain_record(&pool, &record).await?;
         let roundtrip =
             get_bip448_statechain(&pool, &record.wallet_name, &record.statechain_id).await?;
 
         assert_eq!(roundtrip, record);
 
-        let updated = sample_bip448_record(2);
-        insert_or_update_bip448_statechain(&pool, &updated).await?;
+        upsert_bip448_statechain_record(&pool, &record).await?;
+        let conflicting = sample_bip448_record(2);
+        let error = upsert_bip448_statechain_record(&pool, &conflicting)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("different canonical identity"));
         let roundtrip =
-            get_bip448_statechain(&pool, &updated.wallet_name, &updated.statechain_id).await?;
-
-        assert_eq!(roundtrip.latest_state_number, 2);
-        assert_eq!(roundtrip.latest_state.state_number, 2);
-        assert_eq!(
-            roundtrip
-                .latest_state
-                .signing_metadata
-                .server_signature_count,
-            2
-        );
+            get_bip448_statechain(&pool, &record.wallet_name, &record.statechain_id).await?;
+        assert_eq!(roundtrip, record);
 
         Ok(())
     }
@@ -688,7 +782,7 @@ mod tests {
             .cpfp_child_templates
             .push(sample_cpfp_child_template());
 
-        let error = insert_or_update_bip448_statechain(&pool, &rejected_insert)
+        let error = upsert_bip448_statechain_record(&pool, &rejected_insert)
             .await
             .unwrap_err();
         assert!(error
@@ -703,14 +797,14 @@ mod tests {
         .is_none());
 
         let accepted = sample_bip448_record(1);
-        insert_or_update_bip448_statechain(&pool, &accepted).await?;
+        upsert_bip448_statechain_record(&pool, &accepted).await?;
         let mut rejected_update = sample_bip448_record(2);
         rejected_update
             .latest_state
             .cpfp_child_templates
             .push(sample_cpfp_child_template());
 
-        insert_or_update_bip448_statechain(&pool, &rejected_update)
+        upsert_bip448_statechain_record(&pool, &rejected_update)
             .await
             .unwrap_err();
         let persisted =
@@ -754,7 +848,12 @@ mod tests {
         let mut pending = Bip448PendingDepositSigning {
             wallet_name: "wallet".to_string(),
             statechain_id: "statechain".to_string(),
+            funding_txid: "aa".repeat(32),
+            funding_vout: 1,
+            funding_value_sats: 100_000,
             update_template_hash: "11".repeat(32),
+            settlement_template_hash: "12".repeat(32),
+            state_locktime: 700_000_042,
             signing_id: "22".repeat(32),
             client_secret_nonce: "33".repeat(132),
             client_public_nonce: "44".repeat(66),
@@ -762,7 +861,8 @@ mod tests {
             server_public_nonce: None,
         };
 
-        insert_or_update_bip448_pending_deposit_signing(&pool, &pending).await?;
+        let inserted = insert_bip448_pending_deposit_signing_if_absent(&pool, &pending).await?;
+        assert_eq!(inserted, pending);
         let roundtrip =
             get_bip448_pending_deposit_signing(&pool, &pending.wallet_name, &pending.statechain_id)
                 .await?
@@ -784,8 +884,13 @@ mod tests {
                 .expect("pending signing exists");
         assert_eq!(with_server_nonce, pending);
 
-        delete_bip448_pending_deposit_signing(&pool, &pending.wallet_name, &pending.statechain_id)
-            .await?;
+        delete_bip448_pending_deposit_signing(
+            &pool,
+            &pending.wallet_name,
+            &pending.statechain_id,
+            &pending.signing_id,
+        )
+        .await?;
         assert!(get_bip448_pending_deposit_signing(
             &pool,
             &pending.wallet_name,
@@ -793,6 +898,108 @@ mod tests {
         )
         .await?
         .is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_insert_if_absent_keeps_one_locktime_and_template_identity() -> Result<()> {
+        let pool = migrated_pool().await?;
+        let first = Bip448PendingDepositSigning {
+            wallet_name: "wallet".to_string(),
+            statechain_id: "statechain".to_string(),
+            funding_txid: "aa".repeat(32),
+            funding_vout: 1,
+            funding_value_sats: 100_000,
+            update_template_hash: "11".repeat(32),
+            settlement_template_hash: "12".repeat(32),
+            state_locktime: 600_000_001,
+            signing_id: "22".repeat(32),
+            client_secret_nonce: "33".repeat(132),
+            client_public_nonce: "44".repeat(66),
+            blinding_factor: "55".repeat(32),
+            server_public_nonce: None,
+        };
+        let mut competing = first.clone();
+        competing.update_template_hash = "aa".repeat(32);
+        competing.settlement_template_hash = "ab".repeat(32);
+        competing.state_locktime = 900_000_001;
+        competing.signing_id = "bb".repeat(32);
+        competing.client_secret_nonce = "cc".repeat(132);
+
+        let (first_result, competing_result) = tokio::join!(
+            insert_bip448_pending_deposit_signing_if_absent(&pool, &first),
+            insert_bip448_pending_deposit_signing_if_absent(&pool, &competing),
+        );
+        let first_result = first_result?;
+        let competing_result = competing_result?;
+
+        assert_eq!(first_result, competing_result);
+        assert!(first_result == first || first_result == competing);
+        assert_eq!(
+            get_bip448_pending_deposit_signing(&pool, "wallet", "statechain")
+                .await?
+                .unwrap(),
+            first_result
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_row_without_randomized_locktime_fails_closed() -> Result<()> {
+        let pool = migrated_pool().await?;
+        sqlx::query(
+            "INSERT INTO bip448_pending_deposit_signings (\
+                wallet_name, statechain_id, update_template_hash, signing_id, \
+                client_secret_nonce, client_public_nonce, blinding_factor\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind("wallet")
+        .bind("pre-phase-7-1")
+        .bind("11".repeat(32))
+        .bind("22".repeat(32))
+        .bind("33".repeat(132))
+        .bind("44".repeat(66))
+        .bind("55".repeat(32))
+        .execute(&pool)
+        .await?;
+
+        let error = get_bip448_pending_deposit_signing(&pool, "wallet", "pre-phase-7-1")
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("predates randomized locktime support"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accepted_record_without_explicit_locktime_is_not_silently_upgraded() -> Result<()> {
+        let pool = migrated_pool().await?;
+        let record = sample_bip448_record(1);
+        upsert_bip448_statechain_record(&pool, &record).await?;
+
+        let mut old_json = serde_json::to_value(&record)?;
+        old_json["latest_state"]
+            .as_object_mut()
+            .unwrap()
+            .remove("state_locktime");
+        sqlx::query(
+            "UPDATE bip448_statechains SET record_json = $1 \
+             WHERE wallet_name = $2 AND statechain_id = $3",
+        )
+        .bind(serde_json::to_string(&old_json)?)
+        .bind(&record.wallet_name)
+        .bind(&record.statechain_id)
+        .execute(&pool)
+        .await?;
+
+        let error = get_bip448_statechain(&pool, &record.wallet_name, &record.statechain_id)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("state_locktime"));
 
         Ok(())
     }

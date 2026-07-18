@@ -44,6 +44,11 @@ impl CoreChainClient {
         self.call("getblockcount", &[])
     }
 
+    pub fn median_time_past(&self) -> Result<u32> {
+        let response: BlockchainInfoResponse = self.call("getblockchaininfo", &[])?;
+        Ok(response.median_time)
+    }
+
     pub fn estimate_fee_btc_per_kb(&self, number_blocks: usize) -> Result<f64> {
         let response: EstimateSmartFeeResponse =
             self.call("estimatesmartfee", &[json!(number_blocks)])?;
@@ -253,6 +258,12 @@ struct EstimateSmartFeeResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct BlockchainInfoResponse {
+    #[serde(rename = "mediantime")]
+    median_time: u32,
+}
+
+#[derive(Debug, Deserialize)]
 struct ScanTxOutSetResponse {
     success: bool,
     #[serde(default)]
@@ -292,5 +303,18 @@ where
             "unexpected BTC amount value {}",
             other
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blockchain_info_uses_core_median_time_past_field() {
+        let response: BlockchainInfoResponse =
+            serde_json::from_str(r#"{"mediantime":1700000000}"#).unwrap();
+
+        assert_eq!(response.median_time, 1_700_000_000);
     }
 }

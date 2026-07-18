@@ -13,19 +13,26 @@ use bitcoin::{
     taproot::{ControlBlock, LeafVersion, TaprootBuilder, TaprootBuilderError, TaprootSpendInfo},
     ScriptBuf,
 };
+use secp256k1::rand::RngCore;
 
 use crate::bip448;
 
-pub const STATE_LOCKTIME_BASE: u32 = 500_000_000;
+pub const LOCKTIME_TIMESTAMP_THRESHOLD: u32 = 500_000_000;
+pub const INITIAL_STATE_LOCKTIME_MIN: u32 = LOCKTIME_TIMESTAMP_THRESHOLD;
+pub const INITIAL_STATE_LOCKTIME_MAX: u32 = 1_000_000_000;
+pub const FUTURE_STATE_STRIDE_MIN: u32 = 1;
+pub const FUTURE_STATE_STRIDE_MAX: u32 = 65_536;
 
 #[derive(Debug)]
 pub enum ScriptTemplateError {
     TaprootBuilder(TaprootBuilderError),
     UnfinalizedTaprootBuilder,
     MissingControlBlock,
-    InvalidStateNumber { state_number: u32 },
     InvalidStateLocktime { locktime: u32 },
-    StateLocktimeOverflow { state_number: u32 },
+    InitialStateLocktimeOutOfRange { locktime: u32 },
+    InvalidStateLocktimeStride { stride: u32 },
+    InsufficientStateLocktimeHeadroom { locktime: u32 },
+    StateLocktimeOverflow { locktime: u32 },
 }
 
 impl fmt::Display for ScriptTemplateError {
@@ -40,16 +47,30 @@ impl fmt::Display for ScriptTemplateError {
             ScriptTemplateError::MissingControlBlock => {
                 f.write_str("missing BIP448 taproot control block")
             }
-            ScriptTemplateError::InvalidStateNumber { state_number } => {
-                write!(f, "invalid BIP448 state number {state_number}")
-            }
             ScriptTemplateError::InvalidStateLocktime { locktime } => {
-                write!(f, "invalid BIP448 state locktime {locktime}")
+                write!(
+                    f,
+                    "BIP448 state locktime {locktime} is not a timestamp locktime"
+                )
             }
-            ScriptTemplateError::StateLocktimeOverflow { state_number } => write!(
+            ScriptTemplateError::InitialStateLocktimeOutOfRange { locktime } => write!(
                 f,
-                "BIP448 state number {state_number} overflows consensus locktime"
+                "BIP448 initial state locktime {locktime} is outside the allowed range"
             ),
+            ScriptTemplateError::InvalidStateLocktimeStride { stride } => write!(
+                f,
+                "BIP448 state locktime stride {stride} is outside the allowed range"
+            ),
+            ScriptTemplateError::InsufficientStateLocktimeHeadroom { locktime } => write!(
+                f,
+                "BIP448 state locktime {locktime} leaves no valid superseding cancellation state"
+            ),
+            ScriptTemplateError::StateLocktimeOverflow { locktime } => {
+                write!(
+                    f,
+                    "BIP448 state locktime {locktime} has no representable update gate"
+                )
+            }
         }
     }
 }
@@ -66,51 +87,106 @@ pub fn funding_update_leaf() -> ScriptBuf {
     bip448::primitive_script()
 }
 
-pub fn state_locktime(state_number: u32) -> Result<absolute::LockTime, ScriptTemplateError> {
-    validate_state_number(state_number)?;
+pub fn validate_state_locktime(locktime: absolute::LockTime) -> Result<(), ScriptTemplateError> {
+    let consensus_locktime = locktime.to_consensus_u32();
+    if locktime.is_block_height() || consensus_locktime < LOCKTIME_TIMESTAMP_THRESHOLD {
+        return Err(ScriptTemplateError::InvalidStateLocktime {
+            locktime: consensus_locktime,
+        });
+    }
+    if consensus_locktime == u32::MAX {
+        return Err(ScriptTemplateError::StateLocktimeOverflow {
+            locktime: consensus_locktime,
+        });
+    }
 
-    let locktime = STATE_LOCKTIME_BASE
-        .checked_add(state_number)
-        .ok_or(ScriptTemplateError::StateLocktimeOverflow { state_number })?;
-
-    Ok(absolute::LockTime::from_consensus(locktime))
+    Ok(())
 }
 
-pub fn state_number_from_locktime(
+pub fn validate_initial_state_locktime(
     locktime: absolute::LockTime,
-) -> Result<u32, ScriptTemplateError> {
-    let locktime = locktime.to_consensus_u32();
-    let state_number = locktime
-        .checked_sub(STATE_LOCKTIME_BASE)
-        .ok_or(ScriptTemplateError::InvalidStateLocktime { locktime })?;
-    validate_state_number(state_number)?;
+) -> Result<(), ScriptTemplateError> {
+    validate_state_locktime(locktime)?;
+    let consensus_locktime = locktime.to_consensus_u32();
+    if !(INITIAL_STATE_LOCKTIME_MIN..=INITIAL_STATE_LOCKTIME_MAX).contains(&consensus_locktime) {
+        return Err(ScriptTemplateError::InitialStateLocktimeOutOfRange {
+            locktime: consensus_locktime,
+        });
+    }
 
-    Ok(state_number)
+    Ok(())
 }
 
-/// The CLTV gate for the update leaf of state `n`.
+/// The CLTV gate for the update leaf at explicit locktime `L`.
 ///
-/// This uses `state_locktime(n + 1)` so `U(n)` cannot replay onto its own
-/// state output and reset the settlement challenge delay.
+/// The gate is `L + 1`, so an update cannot replay onto its own state output
+/// and reset the settlement challenge delay.
 pub fn state_update_gate_locktime(
-    state_number: u32,
+    state_locktime: absolute::LockTime,
 ) -> Result<absolute::LockTime, ScriptTemplateError> {
-    validate_state_number(state_number)?;
-
-    let gate_state_number = state_number
+    validate_state_locktime(state_locktime)?;
+    let current = state_locktime.to_consensus_u32();
+    let gate = current
         .checked_add(1)
-        .ok_or(ScriptTemplateError::StateLocktimeOverflow { state_number })?;
-    state_locktime(gate_state_number).map_err(|err| match err {
-        ScriptTemplateError::StateLocktimeOverflow { .. } => {
-            ScriptTemplateError::StateLocktimeOverflow { state_number }
-        }
-        err => err,
-    })
+        .ok_or(ScriptTemplateError::StateLocktimeOverflow { locktime: current })?;
+
+    Ok(absolute::LockTime::from_consensus(gate))
 }
 
-pub fn state_update_leaf(state_number: u32) -> Result<ScriptBuf, ScriptTemplateError> {
+pub fn checked_next_state_locktime(
+    current_locktime: absolute::LockTime,
+    stride: u32,
+) -> Result<absolute::LockTime, ScriptTemplateError> {
+    validate_state_locktime(current_locktime)?;
+    if !(FUTURE_STATE_STRIDE_MIN..=FUTURE_STATE_STRIDE_MAX).contains(&stride) {
+        return Err(ScriptTemplateError::InvalidStateLocktimeStride { stride });
+    }
+
+    let current = current_locktime.to_consensus_u32();
+    let next = current
+        .checked_add(stride)
+        .ok_or(ScriptTemplateError::StateLocktimeOverflow { locktime: current })?;
+    let next_locktime = absolute::LockTime::from_consensus(next);
+    validate_state_locktime(next_locktime)?;
+    let cancellation_locktime = next
+        .checked_add(FUTURE_STATE_STRIDE_MIN)
+        .ok_or(ScriptTemplateError::InsufficientStateLocktimeHeadroom { locktime: next })?;
+    validate_state_locktime(absolute::LockTime::from_consensus(cancellation_locktime))
+        .map_err(|_| ScriptTemplateError::InsufficientStateLocktimeHeadroom { locktime: next })?;
+
+    Ok(next_locktime)
+}
+
+pub fn sample_future_state_stride() -> u32 {
+    let mut rng = secp256k1::rand::rng();
+    sample_future_state_stride_with_rng(&mut rng)
+}
+
+fn sample_future_state_stride_with_rng<R: RngCore + ?Sized>(rng: &mut R) -> u32 {
+    loop {
+        if let Some(stride) = map_future_state_stride_sample(rng.next_u32()) {
+            return stride;
+        }
+    }
+}
+
+fn map_future_state_stride_sample(sample: u32) -> Option<u32> {
+    let range_size = u64::from(FUTURE_STATE_STRIDE_MAX) - u64::from(FUTURE_STATE_STRIDE_MIN) + 1;
+    let source_size = u64::from(u32::MAX) + 1;
+    let unbiased_zone = source_size - (source_size % range_size);
+    let sample = u64::from(sample);
+    if sample >= unbiased_zone {
+        return None;
+    }
+
+    Some(FUTURE_STATE_STRIDE_MIN + (sample % range_size) as u32)
+}
+
+pub fn state_update_leaf(
+    state_locktime: absolute::LockTime,
+) -> Result<ScriptBuf, ScriptTemplateError> {
     Ok(Builder::new()
-        .push_lock_time(state_update_gate_locktime(state_number)?)
+        .push_lock_time(state_update_gate_locktime(state_locktime)?)
         .push_opcode(OP_CLTV)
         .push_opcode(OP_DROP)
         .push_opcode(OP_TEMPLATEHASH)
@@ -137,13 +213,13 @@ pub fn funding_spend_info<C: Verification>(
 pub fn state_spend_info<C: Verification>(
     secp: &Secp256k1<C>,
     aggregate_key: XOnlyPublicKey,
-    state_number: u32,
+    state_locktime: absolute::LockTime,
     settlement_template_hash: TemplateHash,
 ) -> Result<TaprootSpendInfo, ScriptTemplateError> {
     // Mercury uses the aggregate key P as the Taproot internal key. OP_INTERNALKEY
     // in the update leaf pushes this same P, so CSFS signatures verify against P.
     TaprootBuilder::new()
-        .add_leaf(1, state_update_leaf(state_number)?)?
+        .add_leaf(1, state_update_leaf(state_locktime)?)?
         .add_leaf(1, state_settlement_leaf(settlement_template_hash))?
         .finalize(secp, aggregate_key)
         .map_err(|_| ScriptTemplateError::UnfinalizedTaprootBuilder)
@@ -157,9 +233,9 @@ pub fn funding_update_control_block(
 
 pub fn state_update_control_block(
     spend_info: &TaprootSpendInfo,
-    state_number: u32,
+    state_locktime: absolute::LockTime,
 ) -> Result<ControlBlock, ScriptTemplateError> {
-    control_block(spend_info, state_update_leaf(state_number)?)
+    control_block(spend_info, state_update_leaf(state_locktime)?)
 }
 
 pub fn state_settlement_control_block(
@@ -186,14 +262,6 @@ fn single_leaf_spend_info<C: Verification>(
         .map_err(|_| ScriptTemplateError::UnfinalizedTaprootBuilder)
 }
 
-fn validate_state_number(state_number: u32) -> Result<(), ScriptTemplateError> {
-    if state_number == 0 {
-        return Err(ScriptTemplateError::InvalidStateNumber { state_number });
-    }
-
-    Ok(())
-}
-
 fn control_block(
     spend_info: &TaprootSpendInfo,
     leaf: ScriptBuf,
@@ -217,71 +285,100 @@ mod tests {
     const OP_INTERNALKEY_BYTE: u8 = 0xcb;
     const OP_CHECKSIGFROMSTACK_BYTE: u8 = 0xcc;
     const OP_TEMPLATEHASH_BYTE: u8 = 0xce;
+    const STATE_LOCKTIME: u32 = 700_000_042;
+
+    fn locktime(value: u32) -> absolute::LockTime {
+        absolute::LockTime::from_consensus(value)
+    }
 
     #[test]
-    fn state_locktime_uses_ln_symmetry_timestamp_range() {
-        assert_eq!(STATE_LOCKTIME_BASE, 500_000_000);
-        assert_eq!(state_locktime(42).unwrap().to_consensus_u32(), 500_000_042);
+    fn initial_state_locktime_range_and_gate_are_explicit() {
+        assert_eq!(LOCKTIME_TIMESTAMP_THRESHOLD, 500_000_000);
+        assert!(validate_initial_state_locktime(locktime(INITIAL_STATE_LOCKTIME_MIN)).is_ok());
+        assert!(validate_initial_state_locktime(locktime(INITIAL_STATE_LOCKTIME_MAX)).is_ok());
         assert_eq!(
-            state_number_from_locktime(state_locktime(42).unwrap()).unwrap(),
-            42
-        );
-        assert_eq!(
-            state_update_gate_locktime(42).unwrap().to_consensus_u32(),
-            500_000_043
+            state_update_gate_locktime(locktime(STATE_LOCKTIME))
+                .unwrap()
+                .to_consensus_u32(),
+            STATE_LOCKTIME + 1
         );
     }
 
     #[test]
-    fn state_zero_is_rejected() {
-        let secp = Secp256k1::new();
-        let aggregate_key = aggregate_key();
-
+    fn invalid_and_out_of_range_locktimes_are_rejected() {
         assert!(matches!(
-            state_locktime(0),
-            Err(ScriptTemplateError::InvalidStateNumber { state_number: 0 })
+            validate_initial_state_locktime(locktime(LOCKTIME_TIMESTAMP_THRESHOLD - 1)),
+            Err(ScriptTemplateError::InvalidStateLocktime { .. })
         ));
         assert!(matches!(
-            state_number_from_locktime(absolute::LockTime::from_consensus(STATE_LOCKTIME_BASE)),
-            Err(ScriptTemplateError::InvalidStateNumber { state_number: 0 })
+            validate_initial_state_locktime(locktime(INITIAL_STATE_LOCKTIME_MAX + 1)),
+            Err(ScriptTemplateError::InitialStateLocktimeOutOfRange { .. })
         ));
         assert!(matches!(
-            state_update_leaf(0),
-            Err(ScriptTemplateError::InvalidStateNumber { state_number: 0 })
+            validate_state_locktime(locktime(u32::MAX)),
+            Err(ScriptTemplateError::StateLocktimeOverflow { locktime: u32::MAX })
         ));
         assert!(matches!(
-            state_spend_info(&secp, aggregate_key, 0, template_hash(0)),
-            Err(ScriptTemplateError::InvalidStateNumber { state_number: 0 })
+            state_update_gate_locktime(locktime(u32::MAX)),
+            Err(ScriptTemplateError::StateLocktimeOverflow { locktime: u32::MAX })
         ));
     }
 
     #[test]
-    fn state_locktime_overflow_is_rejected() {
-        let overflowing_state_number = u32::MAX - STATE_LOCKTIME_BASE + 1;
+    fn future_stride_is_bounded_and_checked() {
+        let current = locktime(STATE_LOCKTIME);
+        assert_eq!(
+            checked_next_state_locktime(current, FUTURE_STATE_STRIDE_MIN)
+                .unwrap()
+                .to_consensus_u32(),
+            STATE_LOCKTIME + FUTURE_STATE_STRIDE_MIN
+        );
+        assert_eq!(
+            checked_next_state_locktime(current, FUTURE_STATE_STRIDE_MAX)
+                .unwrap()
+                .to_consensus_u32(),
+            STATE_LOCKTIME + FUTURE_STATE_STRIDE_MAX
+        );
+        assert!(matches!(
+            checked_next_state_locktime(current, 0),
+            Err(ScriptTemplateError::InvalidStateLocktimeStride { stride: 0 })
+        ));
+        assert!(matches!(
+            checked_next_state_locktime(current, FUTURE_STATE_STRIDE_MAX + 1),
+            Err(ScriptTemplateError::InvalidStateLocktimeStride { .. })
+        ));
+        assert!(matches!(
+            checked_next_state_locktime(locktime(u32::MAX - 1), 1),
+            Err(ScriptTemplateError::StateLocktimeOverflow { locktime: u32::MAX })
+        ));
+        assert!(matches!(
+            checked_next_state_locktime(locktime(u32::MAX - 2), 1),
+            Err(ScriptTemplateError::InsufficientStateLocktimeHeadroom {
+                locktime
+            }) if locktime == u32::MAX - 1
+        ));
+    }
 
-        assert!(matches!(
-            state_locktime(overflowing_state_number),
-            Err(ScriptTemplateError::StateLocktimeOverflow { state_number })
-                if state_number == overflowing_state_number
-        ));
-        assert!(matches!(
-            state_update_leaf(overflowing_state_number),
-            Err(ScriptTemplateError::StateLocktimeOverflow { state_number })
-                if state_number == overflowing_state_number
-        ));
+    #[test]
+    fn future_stride_sampler_is_uniform_and_includes_both_boundaries() {
+        let range_size = FUTURE_STATE_STRIDE_MAX - FUTURE_STATE_STRIDE_MIN + 1;
 
-        let final_settlement_state = u32::MAX - STATE_LOCKTIME_BASE;
-        assert!(state_locktime(final_settlement_state).is_ok());
-        assert!(matches!(
-            state_update_gate_locktime(final_settlement_state),
-            Err(ScriptTemplateError::StateLocktimeOverflow { state_number })
-                if state_number == final_settlement_state
-        ));
-        assert!(matches!(
-            state_number_from_locktime(absolute::LockTime::from_consensus(STATE_LOCKTIME_BASE - 1)),
-            Err(ScriptTemplateError::InvalidStateLocktime { locktime })
-                if locktime == STATE_LOCKTIME_BASE - 1
-        ));
+        assert_eq!(
+            map_future_state_stride_sample(0),
+            Some(FUTURE_STATE_STRIDE_MIN)
+        );
+        assert_eq!(
+            map_future_state_stride_sample(range_size - 1),
+            Some(FUTURE_STATE_STRIDE_MAX)
+        );
+        assert_eq!(
+            map_future_state_stride_sample(range_size),
+            Some(FUTURE_STATE_STRIDE_MIN)
+        );
+        assert_eq!(
+            map_future_state_stride_sample(u32::MAX),
+            Some(FUTURE_STATE_STRIDE_MAX)
+        );
     }
 
     #[test]
@@ -299,7 +396,7 @@ mod tests {
     #[test]
     fn state_update_leaf_uses_next_state_cltv_drop_templatehash_internalkey_csfs() {
         assert_eq!(
-            state_update_leaf(42).unwrap().as_bytes(),
+            state_update_leaf(locktime(500_000_042)).unwrap().as_bytes(),
             [
                 0x04,
                 0x2b,
@@ -328,7 +425,7 @@ mod tests {
     #[test]
     fn state_leaves_do_not_include_csv() {
         assert_eq!(OP_CSV.to_u8(), OP_CHECKSEQUENCEVERIFY_BYTE);
-        assert!(!state_update_leaf(42)
+        assert!(!state_update_leaf(locktime(STATE_LOCKTIME))
             .unwrap()
             .as_bytes()
             .contains(&OP_CSV.to_u8()));
@@ -342,7 +439,13 @@ mod tests {
         let secp = Secp256k1::new();
         let aggregate_key = aggregate_key();
 
-        let spend_info = state_spend_info(&secp, aggregate_key, 1, template_hash(5)).unwrap();
+        let spend_info = state_spend_info(
+            &secp,
+            aggregate_key,
+            locktime(STATE_LOCKTIME),
+            template_hash(5),
+        )
+        .unwrap();
 
         assert_eq!(spend_info.internal_key(), aggregate_key);
     }
@@ -353,22 +456,35 @@ mod tests {
         let aggregate_key = aggregate_key();
         let funding_info = funding_spend_info(&secp, aggregate_key).unwrap();
         let settlement_hash = template_hash(6);
-        let state_info = state_spend_info(&secp, aggregate_key, 7, settlement_hash).unwrap();
+        let state_info = state_spend_info(
+            &secp,
+            aggregate_key,
+            locktime(STATE_LOCKTIME),
+            settlement_hash,
+        )
+        .unwrap();
 
         assert!(funding_update_control_block(&funding_info).is_ok());
-        assert!(state_update_control_block(&state_info, 7).is_ok());
+        assert!(state_update_control_block(&state_info, locktime(STATE_LOCKTIME)).is_ok());
         assert!(state_settlement_control_block(&state_info, settlement_hash).is_ok());
     }
 
     #[test]
-    fn state_number_changes_state_leaf_and_output_script_pubkey() {
+    fn explicit_locktime_changes_state_leaf_and_output_script_pubkey() {
         let secp = Secp256k1::new();
         let aggregate_key = aggregate_key();
         let settlement_hash = template_hash(7);
-        let state_1_info = state_spend_info(&secp, aggregate_key, 1, settlement_hash).unwrap();
-        let state_2_info = state_spend_info(&secp, aggregate_key, 2, settlement_hash).unwrap();
+        let first_locktime = locktime(STATE_LOCKTIME);
+        let second_locktime = locktime(STATE_LOCKTIME + 42);
+        let state_1_info =
+            state_spend_info(&secp, aggregate_key, first_locktime, settlement_hash).unwrap();
+        let state_2_info =
+            state_spend_info(&secp, aggregate_key, second_locktime, settlement_hash).unwrap();
 
-        assert_ne!(state_update_leaf(1).unwrap(), state_update_leaf(2).unwrap());
+        assert_ne!(
+            state_update_leaf(first_locktime).unwrap(),
+            state_update_leaf(second_locktime).unwrap()
+        );
         assert_ne!(
             output_script_pubkey(&state_1_info),
             output_script_pubkey(&state_2_info)
@@ -379,10 +495,20 @@ mod tests {
     fn settlement_template_hash_changes_state_leaf_and_output_script_pubkey() {
         let secp = Secp256k1::new();
         let aggregate_key = aggregate_key();
-        let state_with_hash_1 =
-            state_spend_info(&secp, aggregate_key, 8, template_hash(8)).unwrap();
-        let state_with_hash_2 =
-            state_spend_info(&secp, aggregate_key, 8, template_hash(9)).unwrap();
+        let state_with_hash_1 = state_spend_info(
+            &secp,
+            aggregate_key,
+            locktime(STATE_LOCKTIME),
+            template_hash(8),
+        )
+        .unwrap();
+        let state_with_hash_2 = state_spend_info(
+            &secp,
+            aggregate_key,
+            locktime(STATE_LOCKTIME),
+            template_hash(9),
+        )
+        .unwrap();
 
         assert_ne!(
             state_settlement_leaf(template_hash(8)),

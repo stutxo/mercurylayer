@@ -30,6 +30,10 @@ impl ChainClient {
         self.core.tip_height()
     }
 
+    pub fn median_time_past(&self) -> Result<u32> {
+        self.core.median_time_past()
+    }
+
     pub fn estimate_fee_sat_per_vbyte(&self, number_blocks: usize) -> Result<f64> {
         let fee_rate_btc_per_kb = self.core.estimate_fee_btc_per_kb(number_blocks)?;
 
