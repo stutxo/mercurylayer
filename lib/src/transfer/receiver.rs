@@ -12,7 +12,7 @@ use secp256k1::{
         PublicNonce as MusigPubNonce, Session as MusigSession,
     },
     schnorr::Signature,
-    KeyPair, Message, PublicKey, Scalar, Secp256k1, SecretKey, XOnlyPublicKey,
+    KeyPair, Message, PublicKey, Scalar, Secp256k1, SecretKey, Verification, XOnlyPublicKey,
 };
 use serde::{Deserialize, Serialize};
 
@@ -178,27 +178,42 @@ pub fn verify_transfer_signature(
     transfer_msg: &TransferMsg,
 ) -> Result<bool, MercuryError> {
     let new_user_pubkey = PublicKey::from_str(new_user_pubkey)?;
-    let sender_public_key = PublicKey::from_str(&transfer_msg.user_public_key)?
-        .x_only_public_key()
-        .0;
-
+    let sender_public_key = PublicKey::from_str(&transfer_msg.user_public_key)?;
     let input_vout = tx0_outpoint.vout;
     let input_txid = Txid::from_str(&tx0_outpoint.txid)?;
-
     let signature = Signature::from_str(&transfer_msg.transfer_signature)?;
+    let secp = Secp256k1::verification_only();
 
-    let secp = Secp256k1::new();
+    Ok(verify_transfer_signature_with_keys(
+        &secp,
+        &new_user_pubkey,
+        &input_txid,
+        input_vout,
+        &sender_public_key,
+        &signature,
+    ))
+}
 
+pub(crate) fn verify_transfer_signature_with_keys<C: Verification>(
+    secp: &Secp256k1<C>,
+    new_user_pubkey: &PublicKey,
+    input_txid: &Txid,
+    input_vout: u32,
+    sender_public_key: &PublicKey,
+    signature: &Signature,
+) -> bool {
     let mut data_to_verify = Vec::<u8>::new();
     data_to_verify.extend_from_slice(&input_txid[..]);
     data_to_verify.extend_from_slice(&input_vout.to_le_bytes());
     data_to_verify.extend_from_slice(&new_user_pubkey.serialize()[..]);
-
     let msg = Message::from_hashed_data::<sha256::Hash>(&data_to_verify);
 
-    Ok(secp
-        .verify_schnorr(&signature, msg.as_ref(), &sender_public_key)
-        .is_ok())
+    secp.verify_schnorr(
+        signature,
+        msg.as_ref(),
+        &sender_public_key.x_only_public_key().0,
+    )
+    .is_ok()
 }
 
 pub fn validate_tx0_output_pubkey(
@@ -623,7 +638,7 @@ pub fn verify_blinded_musig_scheme(
     Ok(())
 }
 
-fn validate_t1pub(
+pub(crate) fn validate_t1pub(
     t1: &[u8; 32],
     x1_pub: &PublicKey,
     sender_public_key: &PublicKey,

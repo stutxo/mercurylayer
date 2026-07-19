@@ -673,6 +673,7 @@ mod tests {
             .cpfp_child_templates
             .push(sample_cpfp_child_template());
         Bip448TransferMsg {
+            msg_version: 1,
             statechain_id: "statechain".to_string(),
             transfer_signature: "ab".repeat(64),
             sender_user_public_key: "02".to_string() + &"12".repeat(32),
@@ -692,6 +693,7 @@ mod tests {
             latest_state,
             server_signature_count: 2,
             t1: [9u8; 32],
+            state_history: Vec::new(),
         }
     }
 

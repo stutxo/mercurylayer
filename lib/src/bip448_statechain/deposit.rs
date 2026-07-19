@@ -61,6 +61,8 @@ pub enum Bip448DepositError {
     MissingServerPubkey,
     #[error("BIP448 deposit coin is missing aggregate_pubkey")]
     MissingAggregatePubkey,
+    #[error("BIP448 deposit backup address does not match user_pubkey")]
+    RecoveryAddressMismatch,
     #[error("BIP448 deposit script template error: {0}")]
     ScriptTemplate(#[from] ScriptTemplateError),
     #[error("BIP448 deposit wallet error: {0}")]
@@ -112,6 +114,7 @@ pub fn create_deposit_address(
 ) -> Result<Bip448DepositAddress, Bip448DepositError> {
     let network = get_network(network)?;
     let secp = Secp256k1::new();
+    recovery_script_from_coin(coin, network)?;
     let aggregate_pubkey = aggregate_pubkey_from_coin(coin)?;
     let aggregate_xonly = aggregate_pubkey.x_only_public_key().0;
     let spend_info = script::funding_spend_info(&secp, aggregate_xonly)?;
@@ -238,9 +241,19 @@ fn recovery_script_from_coin(
     coin: &Coin,
     network: bitcoin::Network,
 ) -> Result<ScriptBuf, Bip448DepositError> {
-    Ok(Address::from_str(&coin.backup_address)?
-        .require_network(network)?
-        .script_pubkey())
+    let recovery_address = Address::from_str(&coin.backup_address)?.require_network(network)?;
+    let user_pubkey = PublicKey::from_str(&coin.user_pubkey)?;
+    let expected = Address::p2tr(
+        &Secp256k1::new(),
+        user_pubkey.x_only_public_key().0,
+        None,
+        network,
+    );
+    if recovery_address != expected {
+        return Err(Bip448DepositError::RecoveryAddressMismatch);
+    }
+
+    Ok(recovery_address.script_pubkey())
 }
 
 #[cfg(test)]
@@ -361,6 +374,35 @@ mod tests {
             address.funding_update_script,
             script_hex(&script::funding_update_leaf())
         );
+    }
+
+    #[test]
+    fn deposit_rejects_backup_address_not_derived_from_user_pubkey() {
+        let secp = Secp256k1::new();
+        let mut coin = sample_coin();
+        let unrelated = SecretKey::from_secret_bytes([42u8; 32]).unwrap();
+        coin.backup_address = Address::p2tr(
+            &secp,
+            unrelated.public_key(&secp).x_only_public_key().0,
+            None,
+            Network::Regtest,
+        )
+        .to_string();
+
+        assert!(matches!(
+            create_deposit_address(&coin, "regtest"),
+            Err(Bip448DepositError::RecoveryAddressMismatch)
+        ));
+        assert!(matches!(
+            build_deposit_templates(
+                &coin,
+                funding_outpoint(),
+                state_locktime(),
+                DEFAULT_BIP448_CHALLENGE_DELAY,
+                "regtest",
+            ),
+            Err(Bip448DepositError::RecoveryAddressMismatch)
+        ));
     }
 
     #[test]

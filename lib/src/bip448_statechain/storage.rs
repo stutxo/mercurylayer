@@ -651,7 +651,7 @@ impl Bip448LatestState {
         funding_output: &TxOut,
         recovery_script: &ScriptBuf,
     ) -> Result<Bip448LatestState, Bip448RecoveryVerifyError> {
-        self.verify_reconstruction_metadata()?;
+        self.verify_reconstruction_metadata(false)?;
         let signature = schnorr::Signature::from_str(&self.signing_metadata.update_signature)
             .map_err(|_| Bip448RecoveryVerifyError::InvalidUpdateSignature)?;
 
@@ -672,8 +672,9 @@ impl Bip448LatestState {
         funding_outpoint: OutPoint,
         funding_output: &TxOut,
         recovery_script: &ScriptBuf,
+        allow_transferred_funding_state: bool,
     ) -> Result<Bip448LatestState, Bip448RecoveryVerifyError> {
-        self.verify_reconstruction_metadata()?;
+        self.verify_reconstruction_metadata(allow_transferred_funding_state)?;
         self.verify_reconstructed_templates_with_signature(
             secp,
             &binding.aggregate_pubkey,
@@ -684,7 +685,10 @@ impl Bip448LatestState {
         )
     }
 
-    fn verify_reconstruction_metadata(&self) -> Result<(), Bip448RecoveryVerifyError> {
+    fn verify_reconstruction_metadata(
+        &self,
+        allow_transferred_funding_state: bool,
+    ) -> Result<(), Bip448RecoveryVerifyError> {
         if !self.cpfp_child_templates.is_empty() {
             return Err(Bip448RecoveryVerifyError::UnverifiedSenderMetadata(
                 "cpfp_child_templates",
@@ -692,8 +696,9 @@ impl Bip448LatestState {
         }
         match self.signing_metadata.role {
             Bip448RecoveryTemplateRole::FundingUpdate => {
-                if self.state_number
-                    != crate::bip448_statechain::deposit::INITIAL_BIP448_STATE_NUMBER
+                let initial_state = crate::bip448_statechain::deposit::INITIAL_BIP448_STATE_NUMBER;
+                if self.state_number != initial_state
+                    && !(allow_transferred_funding_state && self.state_number == initial_state + 1)
                 {
                     return Err(Bip448RecoveryVerifyError::UnsupportedInitialStateNumber {
                         state_number: self.state_number,
