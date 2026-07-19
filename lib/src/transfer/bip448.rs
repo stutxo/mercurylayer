@@ -1,8 +1,8 @@
 use std::str::FromStr;
 
 use bitcoin::{
-    absolute, hashes::Hash, sighash::TemplateHash, Address, Network, OutPoint, ScriptBuf, TxOut,
-    Txid,
+    absolute, hashes::Hash, sighash::TemplateHash, Address, Network, OutPoint, PrivateKey,
+    ScriptBuf, TxOut, Txid,
 };
 use secp256k1::{
     musig::{BlindingFactor, PublicNonce},
@@ -18,6 +18,7 @@ use crate::bip448_statechain::storage::{
     Bip448ValueSchedule, Bip448VerifiedRecoveryBinding,
 };
 use crate::bip448_statechain::transaction as bip448_transaction;
+use crate::error::MercuryError;
 
 use super::receiver::{
     validate_t1pub, verify_transfer_signature_with_keys, StatechainInfoResponsePayload,
@@ -217,6 +218,18 @@ pub struct Bip448StateHistoryEntry {
 }
 
 impl Bip448TransferMsg {
+    pub fn encrypt(&self, recipient_auth_pubkey: &PublicKey) -> Result<String, MercuryError> {
+        let transfer_msg_json = serde_json::json!(self);
+        let transfer_msg_json = serde_json::to_string_pretty(&transfer_msg_json)?;
+        let encrypted = ecies::encrypt(
+            &recipient_auth_pubkey.serialize(),
+            transfer_msg_json.as_bytes(),
+        )
+        .map_err(|_| MercuryError::SecpError)?;
+
+        Ok(hex::encode(encrypted))
+    }
+
     /// Verifies the transfer message binds recovery authority to keys the
     /// receiver trusts. It reconciles the top-level convenience fields against
     /// the nested `latest_state`, recomputes `P = receiver_user_pubkey +
@@ -439,6 +452,19 @@ impl Bip448TransferMsg {
             canonical_latest_state,
         })
     }
+}
+
+pub fn decrypt_bip448_transfer_msg(
+    encrypted_message: &str,
+    private_key_wif: &str,
+) -> Result<Bip448TransferMsg, MercuryError> {
+    let client_auth_key = PrivateKey::from_wif(private_key_wif)?.inner;
+    let encrypted = hex::decode(encrypted_message)?;
+    let decrypted = ecies::decrypt(&client_auth_key.to_secret_bytes(), &encrypted)
+        .map_err(|_| MercuryError::SecpError)?;
+    let transfer_msg = serde_json::from_slice(&decrypted)?;
+
+    Ok(transfer_msg)
 }
 
 /// Verifies BIP448 receiver checks 1-9 without performing network or storage I/O.
@@ -819,7 +845,25 @@ mod tests {
         musig::{new_musig_nonce_pair, MusigSessionId},
         schnorr, KeyPair, Message, PublicKey, Secp256k1, SecretKey,
     };
+    use std::sync::atomic::{AtomicBool, Ordering};
     use Bip448TransferVerifyError::*;
+
+    static ECIES_TEST_LOCK: AtomicBool = AtomicBool::new(false);
+
+    #[no_mangle]
+    unsafe fn _critical_section_1_0_acquire() {
+        while ECIES_TEST_LOCK
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            std::thread::yield_now();
+        }
+    }
+
+    #[no_mangle]
+    unsafe fn _critical_section_1_0_release(_: ()) {
+        ECIES_TEST_LOCK.store(false, Ordering::Release);
+    }
 
     const TEST_MEDIAN_TIME_PAST: u32 = 1_900_000_000;
     const TEST_STATE_LOCKTIME: u32 = 999_999_995;
@@ -1209,6 +1253,20 @@ mod tests {
         assert!(json.contains("state_history"));
         assert!(json.contains("latest_state"));
         assert!(!json.contains("backup_transactions"));
+    }
+
+    #[test]
+    fn transfer_message_ecies_round_trips() {
+        let secp = Secp256k1::new();
+        let auth_secret = SecretKey::from_secret_bytes([42u8; 32]).unwrap();
+        let auth_public = auth_secret.public_key(&secp);
+        let auth_wif = PrivateKey::new(auth_secret, Network::Regtest).to_wif();
+        let msg = transfer_fixture().msg;
+
+        let encrypted = msg.encrypt(&auth_public).unwrap();
+        let decrypted = decrypt_bip448_transfer_msg(&encrypted, &auth_wif).unwrap();
+
+        assert_eq!(decrypted, msg);
     }
 
     #[test]
