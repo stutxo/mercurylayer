@@ -1,4 +1,5 @@
 pub mod bip448_recovery;
+pub mod bip448_transfer_sender;
 pub mod broadcast_backup_tx;
 pub mod chain;
 pub mod client_config;

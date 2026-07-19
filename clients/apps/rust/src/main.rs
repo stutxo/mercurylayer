@@ -85,6 +85,12 @@ enum Commands {
         batch_id: Option<String>,
         duplicated_indexes: Option<Vec<u32>>,
     },
+    /// Send a BIP448 statechain coin to a transfer address
+    Bip448TransferSend {
+        wallet_name: String,
+        statechain_id: String,
+        to_address: String,
+    },
     /// Send a statechain coin to a transfer address
     TransferReceive { wallet_name: String },
     /// Create a payment hash for a lightning latch
@@ -294,6 +300,17 @@ async fn main() -> Result<()> {
             let obj = json!({"Transfer": "sent"});
 
             println!("{}", serde_json::to_string_pretty(&obj).unwrap());
+        }
+        Commands::Bip448TransferSend {
+            wallet_name,
+            statechain_id,
+            to_address,
+        } => {
+            mercuryrustlib::coin_status::update_coins(&client_config, &wallet_name).await?;
+            mercuryrustlib::bip448_transfer_sender::transfer_bip448_sender(
+                &client_config, &to_address, &wallet_name, &statechain_id,
+            ).await?;
+            println!("{}", serde_json::to_string_pretty(&json!({"Transfer": "sent"})).unwrap());
         }
         Commands::TransferReceive { wallet_name } => {
             mercuryrustlib::coin_status::update_coins(&client_config, &wallet_name).await?;

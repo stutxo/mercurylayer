@@ -424,7 +424,7 @@ async fn create_backup_tx_to_receiver(
     Ok(signed_tx)
 }
 
-async fn get_new_x1(
+pub(crate) async fn get_new_x1(
     client_config: &ClientConfig,
     statechain_id: &str,
     signed_statechain_id: &str,
