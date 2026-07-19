@@ -289,6 +289,11 @@ impl CsfsSigningSession {
         self.session.remove_fin_nonce_from_session()
     }
 
+    /// The blinded MuSig challenge committed by the server signing row.
+    pub fn blinded_challenge(&self) -> [u8; 32] {
+        self.session.get_challenge_from_session()
+    }
+
     /// Produces and verifies one participant's partial signature with the
     /// session's parity flag applied. The secret nonce is consumed to prevent
     /// reuse.
