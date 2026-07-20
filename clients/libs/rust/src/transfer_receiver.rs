@@ -854,6 +854,57 @@ mod tests {
     };
     use mercurylib::wallet::Coin;
 
+    #[test]
+    fn bip448_message_error_does_not_discard_prior_success() {
+        let mut received_statechain_ids = Vec::new();
+
+        let success = handle_bip448_message_result(
+            Ok(Bip448ReceiveOutcome::Processed(MessageResult {
+                is_batch_locked: false,
+                statechain_id: Some("accepted-statechain".to_string()),
+                duplicated_coins: Vec::new(),
+            })),
+            &mut received_statechain_ids,
+        );
+        let failure = handle_bip448_message_result(
+            Err(anyhow!("invalid later message")),
+            &mut received_statechain_ids,
+        );
+
+        assert!(matches!(success, Bip448MessageDisposition::Processed));
+        assert!(matches!(failure, Bip448MessageDisposition::Rejected));
+        assert_eq!(received_statechain_ids, vec!["accepted-statechain"]);
+    }
+
+    #[test]
+    fn completed_bip448_replay_does_not_report_or_mutate_a_new_result() {
+        let mut received_statechain_ids = vec!["previously-accepted".to_string()];
+
+        let disposition = handle_bip448_message_result(
+            Ok(Bip448ReceiveOutcome::AlreadyProcessed),
+            &mut received_statechain_ids,
+        );
+
+        assert!(matches!(
+            disposition,
+            Bip448MessageDisposition::AlreadyProcessed
+        ));
+        assert_eq!(received_statechain_ids, vec!["previously-accepted"]);
+    }
+
+    #[test]
+    fn non_bip448_message_still_falls_through_to_legacy_processing() {
+        let mut received_statechain_ids = Vec::new();
+
+        let disposition = handle_bip448_message_result(
+            Ok(Bip448ReceiveOutcome::Legacy),
+            &mut received_statechain_ids,
+        );
+
+        assert!(matches!(disposition, Bip448MessageDisposition::Legacy));
+        assert!(received_statechain_ids.is_empty());
+    }
+
     fn sample_coin(statechain_id: Option<&str>, duplicate_index: u32) -> Coin {
         Coin {
             index: 0,

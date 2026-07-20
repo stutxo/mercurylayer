@@ -548,133 +548,326 @@ mod tests {
     use std::{cell::RefCell, rc::Rc};
 
     use super::*;
+    use crate::chain::{ChainClient, CoreRpcAuth, CoreRpcConfig};
+    use bitcoin::TxOut;
+    use mercurylib::{
+        bip448_statechain::script,
+        encode_sc_address,
+        transfer::sender::create_transfer_update_msg,
+        wallet::{Settings, Wallet},
+    };
+    use secp256k1::SecretKey;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    // Cryptographically valid two-state transfer vector with deterministic keys and nonces.
+    const MSG: &str = r#"{"msg_version":1,"statechain_id":"statechain","transfer_signature":"bf5840f84f3ac32690da6c53ebec7f99fab14ddf5a6318476ff072971e82ab558dd4e81145cec932de46230fea378bdf431efbfec70335337f457c17c075a8fe","sender_user_public_key":"02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337","receiver_user_public_key":"0362c0a046dacce86ddd0343c6d3c7c79c2208ba0d9c9cf24a6d046d21d21f90f7","server_public_key":"03462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b","aggregate_pubkey":"02989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f","funding_outpoint":{"txid":"4242424242424242424242424242424242424242424242424242424242424242","vout":0,"value_sats":100000},"latest_state_number":2,"challenge_delay":144,"amount_sats":100000,"network":"regtest","value_schedule":{"funding_value_sats":100000,"update_input_value_sats":100000,"update_state_output_value_sats":100000,"settlement_input_value_sats":100000,"settlement_recovery_output_value_sats":100000},"latest_state":{"state_number":2,"state_locktime":1000000005,"challenge_delay":144,"update_tx":"03000000000101424242424242424242424242424242424242424242424242424242424242424200000000000000000002a086010000000000225120f99f4d961c7c21602831c6d649a4ea38201af79c05d0991d16d90829fdadb45400000000000000000451024e73034065baa3ef9d33105e31878e408fa9ffd32f2545ca635720a86abecc6edffae0310f6d946e034e65b1b58c1a51e98f49aa553920437775a1aab26422538579297f03cecbcc21c1989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f05ca9a3b","settlement_tx":"0300000000010123c27b49882b8977be9f7bf669f513351fdd151d241c9f7749db49bc2a9ae40300000000009000000002a0860100000000002251209a09f771892f1be2e77ac302ff88d53afdc94e3ad79f66a6065bcf343378a14d00000000000000000451024e730223201345b09228120c17a2e1e0690f9dfb9b15b59b1f7debd52a0acac6b4dcb66c72ce8741c0989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f017f96e5b2074130b4d846e4bbf1c794346f38b6c90f6b2d7bcf85ac4b2d13e005ca9a3b","update_template_hash":"70e2849f02b3e921cda139949d9f68771e007317387e7ef60515231440fd1e52","settlement_template_hash":"1345b09228120c17a2e1e0690f9dfb9b15b59b1f7debd52a0acac6b4dcb66c72","state_output_script_pubkey":"5120f99f4d961c7c21602831c6d649a4ea38201af79c05d0991d16d90829fdadb454","funding_update_script":"cecbcc","funding_update_control_block":"c1989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f","state_update_script":"0406ca9a3bb175cecbcc","state_update_control_block":"c0989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6fd8d16b3760c57c7267b789d8a1cd2ffe9c5978025537629273b460aba53ab90c","state_settlement_script":"201345b09228120c17a2e1e0690f9dfb9b15b59b1f7debd52a0acac6b4dcb66c72ce87","state_settlement_control_block":"c0989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f017f96e5b2074130b4d846e4bbf1c794346f38b6c90f6b2d7bcf85ac4b2d13e0","csfs_key_metadata":{"aggregate_pubkey_parity_odd":false,"negate_seckey":false},"signing_metadata":{"role":"funding_update","signing_id":"0202020202020202020202020202020202020202020202020202020202020202","client_public_nonce":"03bc02445e1111ebf1f103c6ff2cf62c214fec48d0084a65c482e99ce73ba198de03d28c76d8f858a659d37f4abd1505f8931c45077ba71a5274adde79bc8aae06f3","server_public_nonce":"035f10ef76a0174cdb766a68b3439e22bcf24dc277497b37205bab3766e32a6899038f6a8fc25318cc9887a6e8cadbe7cac425174b884599058ce8b2f78c6e8fbd70","blinding_factor":"1616161616161616161616161616161616161616161616161616161616161616","update_template_hash":"70e2849f02b3e921cda139949d9f68771e007317387e7ef60515231440fd1e52","update_signature":"65baa3ef9d33105e31878e408fa9ffd32f2545ca635720a86abecc6edffae0310f6d946e034e65b1b58c1a51e98f49aa553920437775a1aab26422538579297f","server_signature_count":2},"fee_bump_policy":"zero_fee_ephemeral_anchor","value_schedule":{"funding_value_sats":100000,"update_input_value_sats":100000,"update_state_output_value_sats":100000,"settlement_input_value_sats":100000,"settlement_recovery_output_value_sats":100000},"anchors":[{"tx_role":"funding_update","output_index":1,"value_sats":0,"script_pubkey":"51024e73"},{"tx_role":"settlement","output_index":1,"value_sats":0,"script_pubkey":"51024e73"}],"cpfp_child_templates":[]},"server_signature_count":2,"t1":[9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9],"state_history":[{"state_number":1,"state_locktime":999999995,"update_template_hash":"381f652c451fde1f0eef1f979592ba5a418376e2316b738614b28c69e9400490","settlement_template_hash":"0e81168589cdd3d3e91d4e9e8f6d0fccd95bb0825393626e74164e23f5220126","update_signature":"f5fe9372be09b258db29877d816469c1a921b8dcb778ef23af00e969459d8416ce63f43466445e8958cc66b1ed431d934675738cf66da4a33ef8d48a6b58fcae","client_public_nonce":"0303d4415fc74e49a480db2ee554566f625b2d4b1af82b6e262c433374859e9efb033eee3c4e3493e97110f0a4c0a4d4d4d5f272f980782234a46dc5a7f01b019ee0","server_public_nonce":"039f31d027e17b6be6aace5fd20d1119f131f226777884bc423fb262dc037b38e302b2890303451ceffd050fcb0ee9db960c4b05755f5b533ef9535cbe25b6a4b533","blinding_factor":"1515151515151515151515151515151515151515151515151515151515151515"},{"state_number":2,"state_locktime":1000000005,"update_template_hash":"70e2849f02b3e921cda139949d9f68771e007317387e7ef60515231440fd1e52","settlement_template_hash":"1345b09228120c17a2e1e0690f9dfb9b15b59b1f7debd52a0acac6b4dcb66c72","update_signature":"65baa3ef9d33105e31878e408fa9ffd32f2545ca635720a86abecc6edffae0310f6d946e034e65b1b58c1a51e98f49aa553920437775a1aab26422538579297f","client_public_nonce":"03bc02445e1111ebf1f103c6ff2cf62c214fec48d0084a65c482e99ce73ba198de03d28c76d8f858a659d37f4abd1505f8931c45077ba71a5274adde79bc8aae06f3","server_public_nonce":"035f10ef76a0174cdb766a68b3439e22bcf24dc277497b37205bab3766e32a6899038f6a8fc25318cc9887a6e8cadbe7cac425174b884599058ce8b2f78c6e8fbd70","blinding_factor":"1616161616161616161616161616161616161616161616161616161616161616"}]}"#;
+    const INFO: &str = r#"{"enclave_public_key":"03462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b","num_sigs":2,"statechain_info":[{"statechain_id":"statechain","server_pubnonce":"039f31d027e17b6be6aace5fd20d1119f131f226777884bc423fb262dc037b38e302b2890303451ceffd050fcb0ee9db960c4b05755f5b533ef9535cbe25b6a4b533","challenge":"c92315f66e51c7fe79055243762996a9e250782ddd53adf6c6c958dc928a6d7b","tx_n":1},{"statechain_id":"statechain","server_pubnonce":"035f10ef76a0174cdb766a68b3439e22bcf24dc277497b37205bab3766e32a6899038f6a8fc25318cc9887a6e8cadbe7cac425174b884599058ce8b2f78c6e8fbd70","challenge":"ac31ec275e2e9d4e9fc62ed0f9d9f558800def734bd267fb2e260a283d606b93","tx_n":2}],"x1_pub":"03f006a18d5653c4edf5391ff23a61f03ff83d237e880ee61187fa9f379a028e0a"}"#;
+    // ECIES plaintext is {"msg_version":1,"statechain_id":"statechain"} under auth key [8; 32].
+    const MISSING_SIGNATURE: &str = "0450bfa93d1d7eccf21e821b47555b35717c7581539a802dbce4e2681e947f9ed1265b32fb0f3168723723f59ac9acda6a5e3aa93ae3da95b2f6c466abac1f9c02d4a0b843668195f2fc903b94f884316ecbe86fd73a02a26c8202c2f98e3189b6a065c5444ba47420e7c54e8f68986f32ca7a456ba17f5ba14ce0ded13d738e391ba33a2afe2ad28f8f61c0e9c96f";
+    const EMPTY_COIN: &str = r#"{"index":0,"user_privkey":"","user_pubkey":"","auth_privkey":"","auth_pubkey":"","derivation_path":"","fingerprint":"","address":"","backup_address":"","server_pubkey":null,"aggregated_pubkey":null,"aggregated_address":null,"statechain_protocol":null,"utxo_txid":null,"utxo_vout":null,"amount":null,"statechain_id":null,"signed_statechain_id":null,"locktime":null,"secret_nonce":null,"public_nonce":null,"blinding_factor":null,"server_public_nonce":null,"tx_cpfp":null,"tx_withdraw":null,"withdrawal_address":null,"status":"INITIALISED","duplicate_index":0}"#;
+
+    #[rustfmt::skip]
+    struct Fixture { msg: Bip448TransferMsg, mailbox: String, facts: Bip448TransferChainFacts, coin: Coin }
+    #[rustfmt::skip]
+    fn test_coin(user_seed: u8, auth_seed: u8) -> Coin {
+        let secp = Secp256k1::new();
+        let user = SecretKey::from_secret_bytes([user_seed; 32]).unwrap();
+        let auth = SecretKey::from_secret_bytes([auth_seed; 32]).unwrap();
+        let mut coin: Coin = serde_json::from_str(EMPTY_COIN).unwrap();
+        coin.user_privkey = PrivateKey::new(user, Network::Regtest).to_wif();
+        coin.user_pubkey = user.public_key(&secp).to_string();
+        coin.auth_privkey = PrivateKey::new(auth, Network::Regtest).to_wif();
+        coin.auth_pubkey = auth.public_key(&secp).to_string();
+        coin.address = encode_sc_address(&user.public_key(&secp), &auth.public_key(&secp), Network::Regtest).unwrap();
+        coin.backup_address = Address::p2tr(&secp, user.public_key(&secp).x_only_public_key().0, None, Network::Regtest).to_string();
+        coin
+    }
+
+    #[rustfmt::skip]
+    fn test_wallet(coin: Coin) -> Wallet {
+        Wallet {
+            name: "wallet".to_string(), mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string(),
+            version: "0.1.0".to_string(), state_entity_endpoint: "http://127.0.0.1:1".to_string(), chain_backend: "core".to_string(),
+            chain_endpoint: "http://127.0.0.1:1".to_string(), network: "regtest".to_string(), blockheight: 0, initlock: 1000, interval: 10,
+            activities: Vec::new(), coins: vec![coin],
+            settings: Settings { network: "regtest".to_string(), block_explorerURL: None, torProxyHost: None, torProxyPort: None, torProxyControlPassword: None, torProxyControlPort: None, statechainEntityApi: "http://127.0.0.1:1".to_string(), torStatechainEntityApi: None, chainBackend: "core".to_string(), chainUrl: "http://127.0.0.1:1".to_string(), chainType: None, notifications: false, tutorials: false },
+        }
+    }
+
+    #[rustfmt::skip]
+    fn fixture() -> Fixture {
+        let msg: Bip448TransferMsg = serde_json::from_str(MSG).unwrap();
+        let coin = test_coin(5, 8);
+        let aggregate = PublicKey::from_str(&msg.aggregate_pubkey).unwrap();
+        let secp = Secp256k1::new();
+        let funding_outpoint = OutPoint { txid: Txid::from_str(&msg.funding_outpoint.txid).unwrap(), vout: msg.funding_outpoint.vout };
+        let funding_output = TxOut { value: msg.amount_sats, script_pubkey: script::output_script_pubkey(&script::funding_spend_info(&secp, aggregate.x_only_public_key().0).unwrap()) };
+        let facts = Bip448TransferChainFacts { expected_network: Network::Regtest, median_time_past: 1_900_000_000, funding_outpoint, funding_output, tx0_confirmed: true, tx0_unspent: true, receiver_user_pubkey: PublicKey::from_str(&coin.user_pubkey).unwrap() };
+        let mailbox = msg.encrypt(&PublicKey::from_str(&coin.auth_pubkey).unwrap()).unwrap();
+        Fixture { msg, mailbox, facts, coin }
+    }
+
+    #[test]
+    fn mirrored_t2_satisfies_continuity_equation() {
+        let secp = Secp256k1::new();
+        let msg: Bip448TransferMsg = serde_json::from_str(MSG).unwrap();
+        let coin = test_coin(5, 8);
+        let request = create_receiver_request(&msg, &coin).unwrap();
+        let t2_bytes: [u8; 32] = hex::decode(request.t2).unwrap().try_into().unwrap();
+        let t2_g = SecretKey::from_secret_bytes(t2_bytes)
+            .unwrap()
+            .public_key(&secp);
+        let t1_g = SecretKey::from_secret_bytes(msg.t1)
+            .unwrap()
+            .public_key(&secp);
+        let receiver = PublicKey::from_str(&coin.user_pubkey).unwrap();
+
+        assert_eq!(t2_g, t1_g.combine(&receiver.negate()).unwrap());
+    }
+
+    #[rustfmt::skip]
+    async fn pool() -> sqlx::Pool<sqlx::Sqlite> {
+        let pool = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    #[rustfmt::skip]
+    fn test_client_config(endpoint: String, pool: sqlx::Pool<sqlx::Sqlite>) -> ClientConfig {
+        ClientConfig { statechain_entity: endpoint.clone(), chain_backend: "core".to_string(), chain_client: ChainClient::new(CoreRpcConfig { url: endpoint.clone(), auth: CoreRpcAuth::None }).unwrap(), core_rpc_url: Some(endpoint), core_rpc_auth: Some("none".to_string()), core_rpc_user: None, core_rpc_password: None, core_rpc_cookie_file: None, network: Network::Regtest, fee_rate_tolerance: 0.05, confirmation_target: 1, pool, tor_proxy: None, max_fee_rate: 100.0 }
+    }
 
     #[derive(Default)]
-    struct MockTransport {
-        updated: bool,
-        persisted: bool,
-        crash_before_post: bool,
-        lose_response: bool,
-        crash_after_update: bool,
-        verify_calls: u32,
-        post_calls: u32,
-        events: Vec<&'static str>,
+    #[rustfmt::skip]
+    struct Transport { server: String, crash_before: bool, lose_response: bool, crash_after: bool, verifies: u32, unlocks: u32, posts: u32 }
+    #[rustfmt::skip]
+    fn transport() -> Rc<RefCell<Transport>> {
+        let info: StatechainInfoResponsePayload = serde_json::from_str(INFO).unwrap();
+        Rc::new(RefCell::new(Transport { server: info.enclave_public_key, ..Default::default() }))
     }
 
-    async fn mock_attempt(mock: Rc<RefCell<MockTransport>>) -> Result<()> {
-        {
-            let mut mock = mock.borrow_mut();
-            mock.verify_calls += 1;
-            mock.events.push("verify");
-            if mock.updated {
-                return Err(anyhow!(ALREADY_UPDATED_ERROR));
-            }
-        }
-        let checkpoint_mock = Rc::clone(&mock);
-        let unlock_mock = Rc::clone(&mock);
-        let update_mock = Rc::clone(&mock);
-        let persist_mock = Rc::clone(&mock);
-
+    #[rustfmt::skip]
+    async fn attempt(
+        fixture: &Fixture, pool: &sqlx::Pool<sqlx::Sqlite>, coin: &mut Coin,
+        activities: &mut Vec<Activity>, transport: Rc<RefCell<Transport>>,
+    ) -> Result<MessageResult> {
+        let msg = decrypt_transfer_message(&fixture.mailbox, &coin.auth_privkey)?.ok_or_else(|| anyhow!("unexpected legacy message"))?;
+        let mut info: StatechainInfoResponsePayload = serde_json::from_str(INFO)?;
+        info.enclave_public_key = transport.borrow().server.clone();
+        if info.enclave_public_key != serde_json::from_str::<StatechainInfoResponsePayload>(INFO)?.enclave_public_key { info.statechain_info.clear(); }
+        let current_server = PublicKey::from_str(&info.enclave_public_key)?;
+        let expected = expected_server_pubkey(&msg, &fixture.facts.receiver_user_pubkey)?;
+        transport.borrow_mut().verifies += 1;
+        let verified = match Bip448VerifiedTransfer::new(msg, &info, fixture.facts.clone()) {
+            Ok(verified) => verified,
+            Err(_) if current_server == expected => return Err(anyhow!(ALREADY_UPDATED_ERROR)),
+            Err(error) => return Err(error),
+        };
+        let request = create_receiver_request(&verified.msg, coin)?;
+        assert_eq!(request.t2, hex::encode([4u8; 32]));
+        let digest = sha256::Hash::hash(request.t2.as_bytes()).to_byte_array();
+        schnorr::verify(&schnorr::Signature::from_str(&request.auth_sig)?, &digest, &PublicKey::from_str(&coin.auth_pubkey)?.x_only_public_key().0)?;
+        assert!(!mercurylib::transfer::receiver::sign_message(&verified.msg.statechain_id, coin)?.is_empty());
+        let checkpoint_transport = Rc::clone(&transport);
+        let unlock_transport = Rc::clone(&transport);
+        let update_transport = Rc::clone(&transport);
+        let persist_transport = Rc::clone(&transport);
+        let expected_text = expected.to_string();
         execute_receiver_attempt(
-            || std::future::ready(Ok(())),
+            || std::future::ready(Ok(verified)),
+            move || if std::mem::take(&mut checkpoint_transport.borrow_mut().crash_before) { Err(anyhow!("crash before transfer/receiver")) } else { Ok(()) },
+            move || { unlock_transport.borrow_mut().unlocks += 1; std::future::ready(Ok(())) },
             move || {
-                let mut mock = checkpoint_mock.borrow_mut();
-                mock.events.push("before_post");
-                if std::mem::take(&mut mock.crash_before_post) {
-                    return Err(anyhow!("crash before transfer/receiver"));
-                }
-                Ok(())
-            },
-            move || {
-                unlock_mock.borrow_mut().events.push("unlock");
-                std::future::ready(Ok(()))
-            },
-            move || {
-                let mut mock = update_mock.borrow_mut();
-                mock.events.push("post");
-                mock.post_calls += 1;
-                mock.updated = true;
-                if std::mem::take(&mut mock.lose_response) {
-                    std::future::ready(Err(anyhow!("lost response")))
-                } else {
-                    std::future::ready(Ok("server-share-2"))
-                }
-            },
-            move |(), response| {
-                let mut mock = persist_mock.borrow_mut();
-                mock.events.push("persist");
-                let result = if std::mem::take(&mut mock.crash_after_update) {
-                    Err(anyhow!("crash after key update"))
-                } else {
-                    assert_eq!(response, "server-share-2");
-                    mock.persisted = true;
-                    Ok(())
-                };
+                let mut transport = update_transport.borrow_mut();
+                transport.posts += 1;
+                transport.server = expected_text.clone();
+                let result = if std::mem::take(&mut transport.lose_response) { Err(ReceiverPostError::LostResponse(anyhow!("lost response"))) } else { Ok(super::super::TransferReceiveRequestResult { is_batch_locked: false, server_pubkey: Some(expected_text.clone()) }) };
                 std::future::ready(result)
             },
-        )
-        .await
+            move |verified, response| {
+                let crash = std::mem::take(&mut persist_transport.borrow_mut().crash_after);
+                async move { if crash { Err(anyhow!("crash after key update")) } else { persist_accepted_transfer(pool, "wallet", coin, activities, verified, response).await } }
+            },
+        ).await
     }
 
     #[tokio::test]
-    async fn full_happy_path_uses_the_mock_transport_once() {
-        let mock = Rc::new(RefCell::new(MockTransport::default()));
-        mock_attempt(Rc::clone(&mock)).await.unwrap();
-
-        let mock = mock.borrow();
-        assert!(mock.updated && mock.persisted);
-        assert_eq!(mock.verify_calls, 1);
-        assert_eq!(mock.post_calls, 1);
-        assert_eq!(
-            mock.events,
-            ["verify", "unlock", "before_post", "post", "persist"]
-        );
+    #[rustfmt::skip]
+    async fn full_happy_path_verifies_requests_persists_and_updates_coin() {
+        let fixture = fixture(); let mut coin = fixture.coin.clone(); let mut activities = Vec::new();
+        let pool = pool().await; let transport = transport();
+        let result = attempt(&fixture, &pool, &mut coin, &mut activities, Rc::clone(&transport)).await.unwrap();
+        let record = crate::sqlite_manager::get_bip448_statechain(&pool, "wallet", "statechain").await.unwrap();
+        assert_eq!(result.statechain_id.as_deref(), Some("statechain"));
+        assert_eq!(record.latest_state_number, 2);
+        assert_eq!(coin.statechain_protocol.as_deref(), Some("bip448"));
+        assert_eq!(coin.utxo_txid.as_deref(), Some("4242424242424242424242424242424242424242424242424242424242424242"));
+        assert_eq!(coin.amount, Some(100_000));
+        assert_eq!(coin.status, CoinStatus::CONFIRMED);
+        assert_eq!(activities.len(), 1);
+        assert_eq!((transport.borrow().verifies, transport.borrow().unlocks, transport.borrow().posts), (1, 1, 1));
     }
 
     #[tokio::test]
-    async fn crash_before_receiver_post_reruns_verification_and_completes() {
-        let mock = Rc::new(RefCell::new(MockTransport {
-            crash_before_post: true,
-            ..Default::default()
-        }));
-        assert!(mock_attempt(Rc::clone(&mock)).await.is_err());
-        assert!(!mock.borrow().updated);
-
-        mock_attempt(Rc::clone(&mock)).await.unwrap();
-        let mock = mock.borrow();
-        assert_eq!(mock.verify_calls, 2);
-        assert_eq!(mock.post_calls, 1);
-        assert!(mock.persisted);
+    #[rustfmt::skip]
+    async fn completed_receipt_is_recognized_as_an_idempotent_replay() {
+        let fixture = fixture(); let mut coin = fixture.coin.clone(); let mut activities = Vec::new();
+        let pool = pool().await; let transport = transport();
+        attempt(&fixture, &pool, &mut coin, &mut activities, Rc::clone(&transport)).await.unwrap();
+        crate::sqlite_manager::insert_wallet(&pool, &test_wallet(coin.clone())).await.unwrap();
+        let current_server = PublicKey::from_str(coin.server_pubkey.as_deref().unwrap()).unwrap();
+        let outcome = resolve_already_updated(&pool, "wallet", &coin, &fixture.msg, &current_server).await.unwrap();
+        assert!(matches!(outcome, Bip448ReceiveOutcome::AlreadyProcessed));
+        assert_eq!(activities.len(), 1);
     }
 
     #[tokio::test]
-    async fn lost_response_reposts_without_reverification() {
-        let mock = Rc::new(RefCell::new(MockTransport {
-            lose_response: true,
-            ..Default::default()
-        }));
-        mock_attempt(Rc::clone(&mock)).await.unwrap();
-
-        let mock = mock.borrow();
-        assert_eq!(mock.verify_calls, 1);
-        assert_eq!(mock.post_calls, 2);
-        assert!(mock.updated && mock.persisted);
-    }
-
-    #[tokio::test]
-    async fn crash_after_key_update_requires_manual_completion_on_rerun() {
-        let mock = Rc::new(RefCell::new(MockTransport {
-            crash_after_update: true,
-            ..Default::default()
-        }));
-        assert!(mock_attempt(Rc::clone(&mock)).await.is_err());
-        assert!(mock.borrow().updated);
-        assert!(!mock.borrow().persisted);
-
-        let error = mock_attempt(Rc::clone(&mock)).await.unwrap_err();
+    #[rustfmt::skip]
+    async fn record_without_persisted_accepted_coin_still_requires_manual_completion() {
+        let fixture = fixture(); let original_coin = fixture.coin.clone(); let mut accepted_coin = original_coin.clone(); let mut activities = Vec::new();
+        let pool = pool().await; let transport = transport();
+        attempt(&fixture, &pool, &mut accepted_coin, &mut activities, Rc::clone(&transport)).await.unwrap();
+        crate::sqlite_manager::insert_wallet(&pool, &test_wallet(original_coin.clone())).await.unwrap();
+        let current_server = PublicKey::from_str(accepted_coin.server_pubkey.as_deref().unwrap()).unwrap();
+        let result = resolve_already_updated(&pool, "wallet", &original_coin, &fixture.msg, &current_server).await;
+        let error = match result { Err(error) => error, Ok(_) => panic!("incomplete receipt was accepted as a replay") };
         assert_eq!(error.to_string(), ALREADY_UPDATED_ERROR);
-        assert_eq!(mock.borrow().verify_calls, 2);
-        assert!(!mock.borrow().persisted);
+        assert!(crate::sqlite_manager::get_bip448_statechain_optional(&pool, "wallet", "statechain").await.unwrap().is_some());
+        assert_eq!(crate::sqlite_manager::get_wallet(&pool, "wallet").await.unwrap().coins[0].status, CoinStatus::INITIALISED);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    #[rustfmt::skip]
+    async fn completed_receipt_replays_through_execute_without_duplicate_wallet_state() {
+        let fixture = fixture(); let mut coin = fixture.coin.clone(); let mut activities = Vec::new();
+        let pool = pool().await; let transport = transport();
+        attempt(&fixture, &pool, &mut coin, &mut activities, Rc::clone(&transport)).await.unwrap();
+        let mut wallet = test_wallet(coin.clone()); wallet.activities = activities;
+        crate::sqlite_manager::insert_wallet(&pool, &wallet).await.unwrap();
+        let mut statechain_info: StatechainInfoResponsePayload = serde_json::from_str(INFO).unwrap();
+        statechain_info.enclave_public_key = coin.server_pubkey.clone().unwrap();
+        let (endpoint, server) = mock_execute_endpoints(vec![fixture.mailbox], Some(serde_json::to_string(&statechain_info).unwrap())).await;
+        let config = test_client_config(endpoint, pool.clone());
+        let result = super::super::execute(&config, "wallet").await;
+        server.abort();
+        let result = result.unwrap();
+        assert!(result.received_statechain_ids.is_empty());
+        assert!(!result.is_there_batch_locked);
+        let wallet = crate::sqlite_manager::get_wallet(&pool, "wallet").await.unwrap();
+        assert_eq!(wallet.coins.len(), 1);
+        assert_eq!(wallet.activities.len(), 1);
+        assert_eq!(wallet.coins[0].statechain_id.as_deref(), Some("statechain"));
+        assert_eq!(wallet.coins[0].status, CoinStatus::CONFIRMED);
+    }
+
+    #[tokio::test]
+    #[rustfmt::skip]
+    async fn crash_before_receiver_post_rereads_mailbox_and_reverifies() {
+        let fixture = fixture(); let mut coin = fixture.coin.clone(); let mut activities = Vec::new();
+        let pool = pool().await; let transport = transport();
+        transport.borrow_mut().crash_before = true;
+        assert!(attempt(&fixture, &pool, &mut coin, &mut activities, Rc::clone(&transport)).await.is_err());
+        attempt(&fixture, &pool, &mut coin, &mut activities, Rc::clone(&transport)).await.unwrap();
+        assert_eq!((transport.borrow().verifies, transport.borrow().posts), (2, 1));
+        assert!(crate::sqlite_manager::get_bip448_statechain_optional(&pool, "wallet", "statechain").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    #[rustfmt::skip]
+    async fn lost_response_reposts_without_reverification() {
+        let fixture = fixture(); let mut coin = fixture.coin.clone(); let mut activities = Vec::new();
+        let pool = pool().await; let transport = transport();
+        transport.borrow_mut().lose_response = true;
+        attempt(&fixture, &pool, &mut coin, &mut activities, Rc::clone(&transport)).await.unwrap();
+        assert_eq!((transport.borrow().verifies, transport.borrow().posts), (1, 2));
+        assert!(crate::sqlite_manager::get_bip448_statechain_optional(&pool, "wallet", "statechain").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    #[rustfmt::skip]
+    async fn crash_after_key_update_detects_p_minus_o2_and_persists_nothing() {
+        let fixture = fixture(); let mut coin = fixture.coin.clone(); let mut activities = Vec::new();
+        let pool = pool().await; let transport = transport();
+        transport.borrow_mut().crash_after = true;
+        assert!(attempt(&fixture, &pool, &mut coin, &mut activities, Rc::clone(&transport)).await.is_err());
+        let error = match attempt(&fixture, &pool, &mut coin, &mut activities, Rc::clone(&transport)).await { Err(error) => error, Ok(_) => panic!("rerun unexpectedly succeeded") };
+        assert_eq!(error.to_string(), ALREADY_UPDATED_ERROR);
+        assert_eq!(transport.borrow().verifies, 2);
+        assert!(crate::sqlite_manager::get_bip448_statechain_optional(&pool, "wallet", "statechain").await.unwrap().is_none());
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn version_one_plaintext_missing_transfer_signature_falls_through_without_panic() {
+        let coin = test_coin(5, 8);
+        let result = std::panic::catch_unwind(|| decrypt_transfer_message(MISSING_SIGNATURE, &coin.auth_privkey));
+        assert!(result.is_ok());
+        assert!(result.unwrap().unwrap().is_none());
+    }
+
+    #[rustfmt::skip]
+    async fn mock_execute_endpoints(mailbox: Vec<String>, statechain_info: Option<String>) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let mailbox = serde_json::json!({"list_enc_transfer_msg": mailbox}).to_string();
+            let mut rpc_calls = 0;
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = [0u8; 8192];
+                let size = socket.read(&mut bytes).await.unwrap();
+                let request = String::from_utf8_lossy(&bytes[..size]);
+                let body = if request.starts_with("GET /info/config ") { r#"{"initlock":1000,"interval":10,"batchtimeout":60,"version":"test"}"#.to_string() }
+                else if request.starts_with("GET /transfer/get_msg_addr/") { mailbox.clone() } else {
+                    if request.starts_with("GET /info/statechain/") && statechain_info.is_some() { statechain_info.clone().unwrap() } else {
+                    rpc_calls += 1;
+                    if rpc_calls % 2 == 1 { r#"{"result":{"feerate":0.00001},"error":null,"id":"mercury-client"}"#.to_string() }
+                    else { r#"{"result":42,"error":null,"id":"mercury-client"}"#.to_string() }
+                    }
+                };
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (endpoint, task)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[rustfmt::skip]
+    async fn legacy_message_and_later_bip448_error_complete_receive_loop() {
+        use crate::sqlite_manager::insert_wallet;
+        let mut sender = test_coin(7, 8); sender.statechain_id = Some("legacy-statechain".to_string()); sender.signed_statechain_id = Some("legacy-auth-signature".to_string()); sender.status = CoinStatus::CONFIRMED;
+        let receiver = test_coin(9, 10);
+        let payload = create_transfer_update_msg(&hex::encode([11u8; 32]), &receiver.address, &sender, "legacy-transfer-signature", &Vec::new()).unwrap();
+        let (endpoint, server) = mock_execute_endpoints(vec![payload.enc_transfer_msg, "invalid later message".to_string()], None).await;
+        let pool = pool().await;
+        let config = test_client_config(endpoint, pool.clone());
+        let mut wallet = crate::wallet::create_wallet("wallet", &config).await.unwrap();
+        wallet.coins.push(receiver);
+        insert_wallet(&pool, &wallet).await.unwrap();
+        let result = super::super::execute(&config, "wallet").await;
+        server.abort();
+        assert!(result.is_ok());
+        assert_eq!(crate::sqlite_manager::get_wallet(&pool, "wallet").await.unwrap().coins[0].status, CoinStatus::INITIALISED);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[rustfmt::skip]
+    async fn bip448_error_does_not_append_reused_address_coin_or_abort_receive_loop() {
+        use crate::sqlite_manager::insert_wallet;
+        let mut receiver = test_coin(9, 10); receiver.status = CoinStatus::CONFIRMED;
+        let (endpoint, server) = mock_execute_endpoints(vec!["invalid transfer message".to_string()], None).await;
+        let pool = pool().await;
+        let config = test_client_config(endpoint, pool.clone());
+        let mut wallet = crate::wallet::create_wallet("wallet", &config).await.unwrap();
+        wallet.coins.push(receiver);
+        insert_wallet(&pool, &wallet).await.unwrap();
+        let result = super::super::execute(&config, "wallet").await;
+        server.abort();
+        assert!(result.is_ok());
+        let wallet = crate::sqlite_manager::get_wallet(&pool, "wallet").await.unwrap();
+        assert_eq!(wallet.coins.len(), 1);
+        assert_eq!(wallet.coins[0].status, CoinStatus::CONFIRMED);
+    }
 }
