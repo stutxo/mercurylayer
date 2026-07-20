@@ -1,12 +1,24 @@
 mod common;
 
-use std::sync::Arc;
+use std::{str::FromStr, sync::Arc};
 
 use anyhow::{Context, Result};
-use mercurylib::{deposit, transaction, transfer::receiver::TransferReceiverRequestPayload};
+use bitcoin::{hashes::Hash, sighash::TemplateHash, PrivateKey};
+use mercurylib::{
+    bip448_statechain::{
+        signing::{CsfsSigningRole, CsfsSigningSession},
+        signing_api::{Bip448PartialSignatureRequestPayload, Bip448SignFirstRequestPayload},
+    },
+    deposit, transaction,
+    transfer::receiver::TransferReceiverRequestPayload,
+};
 use reqwest::StatusCode;
-use secp256k1::{Secp256k1, SecretKey};
+use secp256k1::{
+    musig::{new_musig_nonce_pair, BlindingFactor, MusigSessionId, PublicNonce},
+    rand, PublicKey, Secp256k1, SecretKey,
+};
 use serde_json::json;
+use sqlx::postgres::PgPoolOptions;
 use tokio::{sync::Barrier, task::JoinSet};
 
 use crate::common::{lockbox, mercury};
@@ -14,6 +26,7 @@ use crate::common::{lockbox, mercury};
 const DETERMINISTIC_RNG_SEED: &str =
     "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 const DETERMINISTIC_STATECHAIN_ID: &str = "deterministic-vector";
+const MERCURY_DATABASE_URL: &str = "postgres://postgres:postgres@127.0.0.1:5432/mercury";
 
 #[derive(Debug, PartialEq, Eq)]
 struct DeterministicVector {
@@ -109,6 +122,162 @@ async fn legacy_partial_signature_payload(
         statechain_id,
         partial_signature_request.partial_signature_request_payload,
     ))
+}
+
+fn bip448_partial_signature_payload(
+    coin: &mercurylib::wallet::Coin,
+    signing_id: &str,
+    server_pubnonce: &str,
+) -> Result<(Bip448PartialSignatureRequestPayload, String)> {
+    let secp = Secp256k1::new();
+    let client_seckey = PrivateKey::from_wif(&coin.user_privkey)?.inner;
+    let client_pubkey = PublicKey::from_str(&coin.user_pubkey)?;
+    let server_pubkey = PublicKey::from_str(
+        coin.server_pubkey
+            .as_ref()
+            .context("deposited coin missing server_pubkey")?,
+    )?;
+    let aggregate_pubkey = client_pubkey.combine(&server_pubkey)?;
+
+    let mut rng = rand::rng();
+    let (_client_sec_nonce, client_pub_nonce) = new_musig_nonce_pair(
+        &secp,
+        MusigSessionId::new(&mut rng),
+        None,
+        Some(client_seckey),
+        client_pubkey,
+        None,
+        None,
+    )?;
+    let server_pub_nonce = PublicNonce::from_slice(&hex::decode(server_pubnonce)?)?;
+    let blinding_secret = SecretKey::new(&mut rng);
+    let blinding_factor = BlindingFactor::from_slice(&blinding_secret.to_secret_bytes())?;
+    let template_hash = TemplateHash::from_slice(&[0x51u8; 32])?;
+    let session = CsfsSigningSession::new(
+        &secp,
+        CsfsSigningRole::FundingUpdate,
+        aggregate_pubkey,
+        &client_pub_nonce,
+        &server_pub_nonce,
+        template_hash,
+        &blinding_factor,
+    )?;
+    let challenge = hex::encode(session.blinded_challenge());
+
+    Ok((
+        Bip448PartialSignatureRequestPayload {
+            statechain_id: coin
+                .statechain_id
+                .as_ref()
+                .context("deposited coin missing statechain_id")?
+                .clone(),
+            signed_statechain_id: coin
+                .signed_statechain_id
+                .as_ref()
+                .context("deposited coin missing signed_statechain_id")?
+                .clone(),
+            signing_id: signing_id.to_string(),
+            negate_seckey: u8::from(session.negate_seckey()),
+            session: hex::encode(session.blinded_server_session().serialize()),
+            server_pub_nonce: server_pubnonce.to_string(),
+        },
+        challenge,
+    ))
+}
+
+async fn complete_bip448_signing_round(
+    mercury_client: &reqwest::Client,
+    coin: &mercurylib::wallet::Coin,
+    signing_id: String,
+) -> Result<(String, String)> {
+    let first = mercury::bip448_sign_first(
+        mercury_client,
+        &Bip448SignFirstRequestPayload {
+            statechain_id: coin
+                .statechain_id
+                .as_ref()
+                .context("deposited coin missing statechain_id")?
+                .clone(),
+            signed_statechain_id: coin
+                .signed_statechain_id
+                .as_ref()
+                .context("deposited coin missing signed_statechain_id")?
+                .clone(),
+            signing_id: signing_id.clone(),
+        },
+    )
+    .await?;
+    let (second_payload, challenge) =
+        bip448_partial_signature_payload(coin, &signing_id, &first.server_pubnonce)?;
+    let second = mercury::bip448_sign_second(mercury_client, &second_payload).await?;
+    assert_eq!(second.partial_sig.len(), 64);
+
+    Ok((first.server_pubnonce, challenge))
+}
+
+async fn insert_completed_legacy_signature_row(statechain_id: &str) -> Result<()> {
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(MERCURY_DATABASE_URL)
+        .await
+        .context("failed to connect to mercury postgres")?;
+    sqlx::query(
+        "INSERT INTO statechain_signature_data \
+         (statechain_id, server_pubnonce, challenge, tx_n, negate_seckey, server_partial_sig) \
+         VALUES ($1, $2, $3, 1, 0, $4)",
+    )
+    .bind(statechain_id)
+    .bind("mixed-legacy-server-pubnonce")
+    .bind("mixed-legacy-challenge")
+    .bind("mixed-legacy-partial-signature")
+    .execute(&pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn insert_completed_bip448_signature_row(statechain_id: &str) -> Result<()> {
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(MERCURY_DATABASE_URL)
+        .await
+        .context("failed to connect to mercury postgres")?;
+    sqlx::query(
+        "INSERT INTO bip448_signature_data \
+         (statechain_id, signing_id, server_pubnonce, challenge, negate_seckey, server_partial_sig) \
+         VALUES ($1, $2, $3, $4, false, $5)",
+    )
+    .bind(statechain_id)
+    .bind(hex::encode([0xb2u8; 32]))
+    .bind("mixed-bip448-server-pubnonce")
+    .bind("mixed-bip448-challenge")
+    .bind("mixed-bip448-partial-signature")
+    .execute(&pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn statechain_info_response_bytes(
+    mercury_client: &reqwest::Client,
+    statechain_id: &str,
+) -> Result<Vec<u8>> {
+    let response = mercury_client
+        .get(format!(
+            "{}/info/statechain/{}",
+            mercury::MERCURY_URL,
+            statechain_id
+        ))
+        .send()
+        .await
+        .context("failed to call mercury info/statechain")?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    Ok(response
+        .bytes()
+        .await
+        .context("failed to read mercury info/statechain body")?
+        .to_vec())
 }
 
 async fn assert_response_status_contains(
@@ -932,6 +1101,112 @@ async fn mercury_signing_routes_nonce_and_partial_signature_through_lockbox() ->
         first_response.server_pubnonce
     );
     assert!(!statechain_info.statechain_info[0].challenge.is_empty());
+
+    lockbox::delete_statechain(&lockbox_client, &statechain_id).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires lockbox docker stack"]
+async fn mercury_statechain_info_returns_ordered_bip448_rows_and_transfer_clears_them() -> Result<()>
+{
+    let _guard = common::test_guard();
+    let mercury_client = mercury::http_client();
+    let lockbox_client = lockbox::http_client();
+    mercury::wait_until_ready(&mercury_client).await?;
+    lockbox::wait_until_ready(&lockbox_client).await?;
+    common::bitcoin_core::ensure_wallet_ready()?;
+
+    let (_wallet, coin) = mercury::create_deposited_coin(&mercury_client).await?;
+    let statechain_id = coin
+        .statechain_id
+        .as_ref()
+        .context("deposited coin missing statechain_id")?
+        .clone();
+    let first_signing_id = hex::encode([0xa5u8; 32]);
+    let first_row =
+        complete_bip448_signing_round(&mercury_client, &coin, first_signing_id.clone()).await?;
+    let second_signing_id = hex::encode([0x5au8; 32]);
+    let second_row =
+        complete_bip448_signing_round(&mercury_client, &coin, second_signing_id.clone()).await?;
+    let second_challenge = second_row.1.clone();
+    insert_completed_legacy_signature_row(&statechain_id).await?;
+    insert_completed_bip448_signature_row(&format!("foreign-{statechain_id}")).await?;
+
+    let secp = Secp256k1::new();
+    let new_user_auth_secret = SecretKey::from_secret_bytes([13u8; 32])?;
+    let new_user_auth_public_key = new_user_auth_secret.public_key(&secp);
+    let x1_secret_key = [14u8; 32];
+    mercury::insert_statechain_transfer_row(
+        &statechain_id,
+        &new_user_auth_public_key,
+        x1_secret_key,
+    )
+    .await?;
+
+    let statechain_info = mercury::statechain_info(&mercury_client, &statechain_id).await?;
+    assert_eq!(statechain_info.num_sigs, 2);
+    assert_eq!(statechain_info.statechain_info.len(), 2);
+    for (row, (expected_nonce, expected_challenge, expected_tx_n)) in
+        statechain_info.statechain_info.iter().zip([
+            (first_row.0, first_row.1, 1u32),
+            (second_row.0, second_row.1, 2u32),
+        ])
+    {
+        assert_eq!(row.statechain_id, statechain_id);
+        assert_eq!(lockbox::normalize_hex(&row.server_pubnonce), expected_nonce);
+        assert_eq!(row.challenge, expected_challenge);
+        assert_eq!(row.tx_n, expected_tx_n);
+    }
+
+    mercury::clear_bip448_server_partial_signature(&statechain_id, &first_signing_id).await?;
+    let incomplete_info = mercury::statechain_info(&mercury_client, &statechain_id).await?;
+    assert_eq!(incomplete_info.num_sigs, 2);
+    assert_eq!(incomplete_info.statechain_info.len(), 1);
+    assert_eq!(incomplete_info.statechain_info[0].tx_n, 2);
+    assert_eq!(
+        incomplete_info.statechain_info[0].challenge,
+        second_challenge
+    );
+
+    let t2_hex = hex::encode([15u8; 32]);
+    mercury::transfer_receiver(
+        &mercury_client,
+        &TransferReceiverRequestPayload {
+            statechain_id: statechain_id.clone(),
+            batch_data: None,
+            t2: t2_hex.clone(),
+            auth_sig: mercury::sign_t2_hex(&new_user_auth_secret, &t2_hex)?,
+        },
+    )
+    .await?;
+
+    let post_transfer_info = mercury::statechain_info(&mercury_client, &statechain_id).await?;
+    assert_eq!(post_transfer_info.num_sigs, 2);
+    assert!(post_transfer_info.statechain_info.is_empty());
+
+    lockbox::delete_statechain(&lockbox_client, &statechain_id).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires lockbox docker stack"]
+async fn mercury_statechain_info_preserves_legacy_response_bytes() -> Result<()> {
+    let _guard = common::test_guard();
+    let mercury_client = mercury::http_client();
+    let lockbox_client = lockbox::http_client();
+    mercury::wait_until_ready(&mercury_client).await?;
+    lockbox::wait_until_ready(&lockbox_client).await?;
+    common::bitcoin_core::ensure_wallet_ready()?;
+
+    let (statechain_id, payload) = legacy_partial_signature_payload(&mercury_client).await?;
+    mercury::sign_second(&mercury_client, &payload).await?;
+    let before_body = statechain_info_response_bytes(&mercury_client, &statechain_id).await?;
+    insert_completed_bip448_signature_row(&statechain_id).await?;
+    let after_body = statechain_info_response_bytes(&mercury_client, &statechain_id).await?;
+    assert_eq!(after_body, before_body);
 
     lockbox::delete_statechain(&lockbox_client, &statechain_id).await?;
 
