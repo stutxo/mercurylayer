@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{future::Future, str::FromStr};
 use anyhow::{anyhow, Result};
 use bitcoin::{absolute, hashes::Hash, Address, Network, OutPoint, PrivateKey, Txid};
 use mercurylib::{
@@ -27,7 +27,9 @@ use crate::{
     client_config::ClientConfig,
     deposit::{bip448_sign_first, bip448_sign_second, bip448_signature_count},
     sqlite_manager::*,
+    transfer_receiver::bip448_transfer_receiver::expected_server_pubkey,
     transfer_sender::get_new_x1,
+    utils,
 };
 const ELIGIBILITY_ERROR: &str = "only one-hop transfer of a fresh deposit is supported in the prototype";
 #[cfg(feature = "test-hooks")]
@@ -58,9 +60,16 @@ pub async fn transfer_bip448_sender(
     let (_, receiver_user_pubkey, recipient_auth_pubkey) = decode_transfer_address(recipient_address)?;
     let recipient_auth = recipient_auth_pubkey.to_string();
     if let Some(transfer_msg) = get_bip448_transfer_msg(&client_config.pool, wallet_name, statechain_id, &recipient_auth).await.map(Some).or_else(|error| if matches!(error.downcast_ref::<sqlx::Error>(), Some(sqlx::Error::RowNotFound)) { Ok(None) } else { Err(error) })? {
-        if transfer_msg.receiver_user_public_key != receiver_user_pubkey.to_string() { return Err(anyhow!("BIP448 persisted transfer message does not match the recipient address")); }
-        upload_transfer_msg(client_config, &wallet.coins[coin_index], &recipient_auth_pubkey, &transfer_msg).await?;
-        bip448_process_checkpoint("transfer_msg_uploaded");
+        if transfer_msg.statechain_id != statechain_id || transfer_msg.receiver_user_public_key != receiver_user_pubkey.to_string() { return Err(anyhow!("BIP448 persisted transfer message does not match the recipient address")); }
+        let coin = wallet.coins[coin_index].clone();
+        ensure_persisted_transfer_delivered(
+            || verify_persisted_transfer_completed(client_config, &transfer_msg, &receiver_user_pubkey),
+            || async {
+                upload_transfer_msg(client_config, &coin, &recipient_auth_pubkey, &transfer_msg).await?;
+                bip448_process_checkpoint("transfer_msg_uploaded");
+                Ok(())
+            },
+        ).await?;
         finish_transfer(client_config, &mut wallet, coin_index).await?;
         return Ok(());
     }
@@ -82,6 +91,44 @@ pub async fn transfer_bip448_sender(
     upload_transfer_msg(client_config, &coin, &recipient_auth_pubkey, &transfer_msg).await?;
     bip448_process_checkpoint("transfer_msg_uploaded");
     finish_transfer(client_config, &mut wallet, coin_index).await
+}
+async fn ensure_persisted_transfer_delivered<C, CF, U, UF>(
+    mut verify_completed: C,
+    upload: U,
+) -> Result<()>
+where
+    C: FnMut() -> CF,
+    CF: Future<Output = Result<bool>>,
+    U: FnOnce() -> UF,
+    UF: Future<Output = Result<()>>,
+{
+    if matches!(verify_completed().await, Ok(true)) {
+        return Ok(());
+    }
+
+    let upload_error = match upload().await {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    if matches!(verify_completed().await, Ok(true)) {
+        Ok(())
+    } else {
+        Err(upload_error)
+    }
+}
+async fn verify_persisted_transfer_completed(
+    client_config: &ClientConfig,
+    transfer_msg: &Bip448TransferMsg,
+    receiver_user_pubkey: &PublicKey,
+) -> Result<bool> {
+    let Some(statechain_info) =
+        utils::get_statechain_info(&transfer_msg.statechain_id, client_config).await?
+    else {
+        return Ok(false);
+    };
+    let current_server = PublicKey::from_str(&statechain_info.enclave_public_key)?;
+    Ok(expected_server_pubkey(transfer_msg, receiver_user_pubkey)
+        .is_ok_and(|expected| current_server == expected))
 }
 fn ensure_local_eligibility(latest_state_number: u32, status: &CoinStatus) -> Result<()> {
     if latest_state_number != 1 || status != &CoinStatus::CONFIRMED { return Err(eligibility_error()); }
@@ -358,6 +405,8 @@ fn normalize_hex(value: &str) -> &str {
 }
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
     #[test]
     fn signature_count_rejects_mismatch_and_allows_resume() {
@@ -366,6 +415,60 @@ mod tests {
             ELIGIBILITY_ERROR
         );
         assert!(ensure_signature_count(2, true).is_ok());
+    }
+
+    #[tokio::test]
+    async fn verified_completion_skips_reupload() {
+        let checks = Cell::new(0);
+        let uploads = Cell::new(0);
+
+        ensure_persisted_transfer_delivered(
+            || {
+                checks.set(checks.get() + 1);
+                std::future::ready(Ok(true))
+            },
+            || {
+                uploads.set(uploads.get() + 1);
+                std::future::ready(Err(anyhow!("upload must be skipped")))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(checks.get(), 1);
+        assert_eq!(uploads.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn upload_failure_finishes_only_after_verified_completion() {
+        let checks = Cell::new(0);
+        ensure_persisted_transfer_delivered(
+            || {
+                let completed = checks.get() == 1;
+                checks.set(checks.get() + 1);
+                std::future::ready(Ok(completed))
+            },
+            || std::future::ready(Err(anyhow!("rotated authentication key"))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(checks.get(), 2);
+
+        let error = ensure_persisted_transfer_delivered(
+            || std::future::ready(Ok(false)),
+            || std::future::ready(Err(anyhow!("original upload error"))),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "original upload error");
+
+        let error = ensure_persisted_transfer_delivered(
+            || std::future::ready(Err(anyhow!("completion evidence unavailable"))),
+            || std::future::ready(Err(anyhow!("original upload error"))),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "original upload error");
     }
 
 }

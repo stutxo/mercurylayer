@@ -184,7 +184,13 @@ async fn transfer_bip448_receiver(
         return Ok(Bip448ReceiveOutcome::AlreadyProcessed);
     }
 
-    let chain_facts = transfer_chain_facts(client_config, &msg, coin, wallet_network).await?;
+    let chain_facts = transfer_chain_facts(
+        client_config,
+        &msg,
+        PublicKey::from_str(&coin.user_pubkey)?,
+        wallet_network,
+    )
+    .await?;
     let verified =
         match Bip448VerifiedTransfer::new(msg.clone(), &statechain_info, chain_facts.clone()) {
             Ok(verified) => verified,
@@ -331,10 +337,10 @@ async fn persist_accepted_transfer(
     })
 }
 
-async fn transfer_chain_facts(
+pub(crate) async fn transfer_chain_facts(
     client_config: &ClientConfig,
     msg: &Bip448TransferMsg,
-    coin: &Coin,
+    receiver_user_pubkey: PublicKey,
     wallet_network: &str,
 ) -> Result<Bip448TransferChainFacts> {
     let funding_outpoint = OutPoint {
@@ -367,11 +373,11 @@ async fn transfer_chain_facts(
         funding_output,
         tx0_confirmed: status == CoinStatus::CONFIRMED,
         tx0_unspent,
-        receiver_user_pubkey: PublicKey::from_str(&coin.user_pubkey)?,
+        receiver_user_pubkey,
     })
 }
 
-fn expected_server_pubkey(msg: &Bip448TransferMsg, receiver: &PublicKey) -> Result<PublicKey> {
+pub(crate) fn expected_server_pubkey(msg: &Bip448TransferMsg, receiver: &PublicKey) -> Result<PublicKey> {
     Ok(PublicKey::from_str(&msg.aggregate_pubkey)?.combine(&receiver.negate())?)
 }
 
