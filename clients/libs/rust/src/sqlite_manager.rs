@@ -8,6 +8,7 @@ use serde_json::json;
 use sqlx::{Pool, Row, Sqlite};
 
 use crate::deposit::Bip448AcceptedDepositState;
+use crate::transfer_receiver::bip448_transfer_receiver::Bip448AcceptedTransferState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bip448PendingDepositSigning {
@@ -179,10 +180,14 @@ pub(crate) async fn insert_or_update_bip448_statechain(
     upsert_bip448_statechain_record(pool, accepted.record()).await
 }
 
-async fn upsert_bip448_statechain_record(
+pub(crate) async fn insert_or_update_bip448_statechain_from_transfer(
     pool: &Pool<Sqlite>,
-    record: &Bip448StatechainRecord,
+    accepted: &Bip448AcceptedTransferState,
 ) -> Result<()> {
+    upsert_bip448_statechain_record(pool, accepted.record()).await
+}
+
+fn validated_bip448_record_json(record: &Bip448StatechainRecord) -> Result<String> {
     if !record.latest_state.cpfp_child_templates.is_empty() {
         return Err(anyhow!(
             "BIP448 accepted state cannot contain unverified CPFP child templates"
@@ -203,7 +208,14 @@ async fn upsert_bip448_statechain_record(
         script::validate_state_locktime(state_locktime)?;
     }
 
-    let record_json = serde_json::to_string(record)?;
+    Ok(serde_json::to_string(record)?)
+}
+
+async fn upsert_bip448_statechain_record(
+    pool: &Pool<Sqlite>,
+    record: &Bip448StatechainRecord,
+) -> Result<()> {
+    let record_json = validated_bip448_record_json(record)?;
     let query = "\
         INSERT INTO bip448_statechains (\
             wallet_name, statechain_id, aggregate_pubkey, funding_txid, funding_vout, \

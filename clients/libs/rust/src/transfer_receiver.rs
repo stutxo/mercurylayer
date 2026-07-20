@@ -18,6 +18,9 @@ use mercurylib::{
 };
 use reqwest::StatusCode;
 
+#[path = "bip448_transfer_receiver.rs"]
+pub(crate) mod bip448_transfer_receiver;
+
 pub async fn new_transfer_address(
     client_config: &ClientConfig,
     wallet_name: &str,
@@ -51,6 +54,41 @@ pub struct MessageResult {
     pub is_batch_locked: bool,
     pub statechain_id: Option<String>,
     pub duplicated_coins: Vec<DuplicatedCoinData>,
+}
+
+enum Bip448ReceiveOutcome {
+    Legacy,
+    Processed(MessageResult),
+    AlreadyProcessed,
+}
+
+enum Bip448MessageDisposition {
+    Legacy,
+    Processed,
+    AlreadyProcessed,
+    Rejected,
+}
+
+fn handle_bip448_message_result(
+    result: Result<Bip448ReceiveOutcome>,
+    received_statechain_ids: &mut Vec<String>,
+) -> Bip448MessageDisposition {
+    match result {
+        std::result::Result::Ok(Bip448ReceiveOutcome::Legacy) => Bip448MessageDisposition::Legacy,
+        std::result::Result::Ok(Bip448ReceiveOutcome::Processed(message_result)) => {
+            if let Some(statechain_id) = message_result.statechain_id {
+                received_statechain_ids.push(statechain_id);
+            }
+            Bip448MessageDisposition::Processed
+        }
+        std::result::Result::Ok(Bip448ReceiveOutcome::AlreadyProcessed) => {
+            Bip448MessageDisposition::AlreadyProcessed
+        }
+        std::result::Result::Err(error) => {
+            println!("BIP448 processing error: {error}");
+            Bip448MessageDisposition::Rejected
+        }
+    }
 }
 
 pub fn sort_coins_by_statechain(coins: &mut Vec<Coin>) {
@@ -130,6 +168,27 @@ pub async fn execute(
             if coin.is_some() {
                 let mut coin = coin.unwrap();
 
+                let bip448_result = bip448_transfer_receiver::try_transfer_bip448_receiver(
+                    client_config,
+                    coin,
+                    enc_message,
+                    &wallet.network,
+                    &wallet.name,
+                    &mut temp_activities,
+                )
+                .await;
+                match handle_bip448_message_result(
+                    bip448_result,
+                    &mut received_statechain_ids,
+                ) {
+                    Bip448MessageDisposition::Legacy => {}
+                    Bip448MessageDisposition::Processed
+                    | Bip448MessageDisposition::AlreadyProcessed
+                    | Bip448MessageDisposition::Rejected => {
+                        continue;
+                    }
+                }
+
                 let is_msg_valid = validate_encrypted_message(
                     client_config,
                     &coin,
@@ -201,6 +260,28 @@ pub async fn execute(
                 }
 
                 let mut new_coin = new_coin.unwrap();
+
+                let bip448_result = bip448_transfer_receiver::try_transfer_bip448_receiver(
+                    client_config,
+                    &mut new_coin,
+                    enc_message,
+                    &wallet.network,
+                    &wallet.name,
+                    &mut temp_activities,
+                )
+                .await;
+                match handle_bip448_message_result(
+                    bip448_result,
+                    &mut received_statechain_ids,
+                ) {
+                    Bip448MessageDisposition::Legacy => {}
+                    Bip448MessageDisposition::Processed => {
+                        temp_coins.push(new_coin.clone());
+                        continue;
+                    }
+                    Bip448MessageDisposition::AlreadyProcessed
+                    | Bip448MessageDisposition::Rejected => continue,
+                }
 
                 let is_msg_valid = validate_encrypted_message(
                     client_config,
