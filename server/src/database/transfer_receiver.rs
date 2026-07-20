@@ -190,13 +190,11 @@ pub async fn get_auth_pubkey_and_x1(
 
     let row = sqlx::query(query)
         .bind(statechain_id)
-        .fetch_one(pool)
+        .fetch_optional(pool)
         .await
         .unwrap();
 
-    if row.is_empty() {
-        return None;
-    }
+    let row = row?;
 
     let new_user_auth_public_key_bytes = row.get::<Vec<u8>, _>(0);
     let new_user_auth_public_key = PublicKey::from_slice(&new_user_auth_public_key_bytes).unwrap();

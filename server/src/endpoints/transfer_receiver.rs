@@ -224,14 +224,25 @@ pub async fn transfer_unlock(
     )
     .await;
 
-    if !is_current_owner_signature
-        && auth_pub_key.is_some()
-        && !crate::endpoints::utils::validate_signature_given_public_key(
-            &signed_statechain_id,
+    let durable_recipient_auth_key = if is_current_owner_signature {
+        None
+    } else {
+        crate::database::transfer_receiver::get_auth_pubkey_and_x1(
+            &statechain_entity.pool,
             &statechain_id,
-            &auth_pub_key.unwrap(),
         )
         .await
+        .map(|(auth_key, _)| auth_key)
+    };
+
+    if !is_transfer_unlock_authorized(
+        is_current_owner_signature,
+        auth_pub_key.as_deref(),
+        durable_recipient_auth_key.as_ref(),
+        &signed_statechain_id,
+        &statechain_id,
+    )
+    .await
     {
         let response_body = json!({
             "message": "Signature does not match authentication key."
@@ -254,9 +265,110 @@ pub async fn transfer_unlock(
     status::Custom(Status::Ok, Json(response_body))
 }
 
+async fn is_transfer_unlock_authorized(
+    is_current_owner_signature: bool,
+    _caller_auth_pub_key: Option<&str>,
+    durable_recipient_auth_key: Option<&PublicKey>,
+    auth_sig: &str,
+    statechain_id: &str,
+) -> bool {
+    if is_current_owner_signature {
+        return true;
+    }
+
+    let Some(durable_recipient_auth_key) = durable_recipient_auth_key else {
+        return false;
+    };
+
+    crate::endpoints::utils::validate_signature_given_public_key(
+        auth_sig,
+        statechain_id,
+        &durable_recipient_auth_key.to_string(),
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rocket::tokio::runtime::Builder;
+    use secp256k1::{KeyPair, SecretKey};
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    fn auth_material(secret_byte: u8, statechain_id: &str) -> (PublicKey, String) {
+        let secp = Secp256k1::new();
+        let secret_key = SecretKey::from_slice(&[secret_byte; 32]).unwrap();
+        let keypair = KeyPair::from_seckey_slice(&secp, secret_key.as_ref()).unwrap();
+        let public_key = secret_key.public_key(&secp);
+        let message = Message::from_hashed_data::<sha256::Hash>(statechain_id.as_bytes());
+        let signature = secp.sign_schnorr(message.as_ref(), &keypair);
+
+        (public_key, signature.to_string())
+    }
+
+    #[test]
+    fn transfer_unlock_rejects_no_key_and_invalid_signature() {
+        let statechain_id = "statechain-1";
+        let (durable_key, _) = auth_material(1, statechain_id);
+        let (_, invalid_signature) = auth_material(2, statechain_id);
+
+        assert!(!block_on(is_transfer_unlock_authorized(
+            false,
+            None,
+            Some(&durable_key),
+            &invalid_signature,
+            statechain_id,
+        )));
+    }
+
+    #[test]
+    fn transfer_unlock_rejects_attacker_supplied_key() {
+        let statechain_id = "statechain-1";
+        let (durable_key, _) = auth_material(3, statechain_id);
+        let (attacker_key, attacker_signature) = auth_material(4, statechain_id);
+        let attacker_key = attacker_key.to_string();
+
+        assert!(!block_on(is_transfer_unlock_authorized(
+            false,
+            Some(&attacker_key),
+            Some(&durable_key),
+            &attacker_signature,
+            statechain_id,
+        )));
+    }
+
+    #[test]
+    fn transfer_unlock_authorizes_stored_recipient_key() {
+        let statechain_id = "statechain-1";
+        let (durable_key, recipient_signature) = auth_material(5, statechain_id);
+        let supplied_key = durable_key.to_string();
+
+        assert!(block_on(is_transfer_unlock_authorized(
+            false,
+            Some(&supplied_key),
+            Some(&durable_key),
+            &recipient_signature,
+            statechain_id,
+        )));
+    }
+
+    #[test]
+    fn transfer_unlock_authorizes_current_owner() {
+        assert!(block_on(is_transfer_unlock_authorized(
+            true,
+            None,
+            None,
+            "unused",
+            "statechain-1",
+        )));
+    }
 
     #[test]
     fn parse_lockbox_signature_count_accepts_valid_json() {
