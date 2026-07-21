@@ -78,18 +78,24 @@ pub async fn sign_first(
 
     let signed_statechain_id = sign_first_request_payload.0.signed_statechain_id.clone();
 
-    if !crate::endpoints::utils::validate_signature(
+    let signature_failure_status = match crate::endpoints::utils::try_validate_signature(
         &statechain_entity.pool,
         &signed_statechain_id,
         &statechain_id,
     )
     .await
     {
+        Ok(true) => None,
+        Ok(false) => Some(Status::Unauthorized),
+        Err(_) => Some(Status::InternalServerError),
+    };
+
+    if let Some(signature_failure_status) = signature_failure_status {
         let response_body = json!({
             "message": "Signature does not match authentication key."
         });
 
-        return status::Custom(Status::Unauthorized, Json(response_body));
+        return status::Custom(signature_failure_status, Json(response_body));
     }
 
     crate::database::sign::reclaim_stale_signing_nonce_lease(
@@ -313,18 +319,24 @@ pub async fn sign_second(
         .signed_statechain_id
         .clone();
 
-    if !crate::endpoints::utils::validate_signature(
+    let signature_failure_status = match crate::endpoints::utils::try_validate_signature(
         &statechain_entity.pool,
         &signed_statechain_id,
         &statechain_id,
     )
     .await
     {
+        Ok(true) => None,
+        Ok(false) => Some(Status::Unauthorized),
+        Err(_) => Some(Status::InternalServerError),
+    };
+
+    if let Some(signature_failure_status) = signature_failure_status {
         let response_body = json!({
             "message": "Signature does not match authentication key."
         });
 
-        return status::Custom(Status::Unauthorized, Json(response_body));
+        return status::Custom(signature_failure_status, Json(response_body));
     }
 
     let mut partial_signature_request_payload = partial_signature_request_payload.0.clone();

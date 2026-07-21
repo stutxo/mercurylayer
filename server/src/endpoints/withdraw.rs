@@ -58,18 +58,24 @@ pub async fn withdraw_complete(
     let statechain_id = delete_statechain_payload.0.statechain_id.clone();
     let signed_statechain_id = delete_statechain_payload.0.signed_statechain_id.clone();
 
-    if !crate::endpoints::utils::validate_signature(
+    let signature_failure_status = match crate::endpoints::utils::try_validate_signature(
         &statechain_entity.pool,
         &signed_statechain_id,
         &statechain_id,
     )
     .await
     {
+        Ok(true) => None,
+        Ok(false) => Some(Status::InternalServerError),
+        Err(_) => Some(Status::InternalServerError),
+    };
+
+    if let Some(signature_failure_status) = signature_failure_status {
         let response_body = json!({
             "message": "Signature does not match authentication key."
         });
 
-        return status::Custom(Status::InternalServerError, Json(response_body));
+        return status::Custom(signature_failure_status, Json(response_body));
     }
 
     let config = crate::server_config::ServerConfig::load();

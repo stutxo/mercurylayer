@@ -62,18 +62,24 @@ pub async fn post_paymenthash(
     let signed_statechain_id = payment_hash_payload.0.auth_sig.clone();
     let batch_id = payment_hash_payload.0.batch_id.clone();
 
-    if !crate::endpoints::utils::validate_signature(
+    let signature_failure_status = match crate::endpoints::utils::try_validate_signature(
         &statechain_entity.pool,
         &signed_statechain_id,
         &statechain_id,
     )
     .await
     {
+        Ok(true) => None,
+        Ok(false) => Some(Status::InternalServerError),
+        Err(_) => Some(Status::InternalServerError),
+    };
+
+    if let Some(signature_failure_status) = signature_failure_status {
         let response_body = json!({
             "message": "Signature does not match authentication key."
         });
 
-        return status::Custom(Status::InternalServerError, Json(response_body));
+        return status::Custom(signature_failure_status, Json(response_body));
     }
 
     let sender_auth_key =
@@ -128,18 +134,25 @@ pub async fn transfer_preimage(
         .clone();
     let batch_id = transfer_preimage_request_payload.0.batch_id.clone();
 
-    if !crate::endpoints::utils::validate_signature_given_public_key(
-        &signed_statechain_id,
-        &statechain_id,
-        &previous_user_auth_key,
-    )
-    .await
-    {
+    let signature_failure_status =
+        match crate::endpoints::utils::try_validate_signature_given_public_key(
+            &signed_statechain_id,
+            &statechain_id,
+            &previous_user_auth_key,
+        )
+        .await
+        {
+            Ok(true) => None,
+            Ok(false) => Some(Status::Forbidden),
+            Err(_) => Some(Status::InternalServerError),
+        };
+
+    if let Some(signature_failure_status) = signature_failure_status {
         let response_body = json!({
             "message": "Signature does not match authentication key."
         });
 
-        return status::Custom(Status::Forbidden, Json(response_body));
+        return status::Custom(signature_failure_status, Json(response_body));
     }
 
     let previous_user_auth_key = PublicKey::from_str(&previous_user_auth_key).unwrap();

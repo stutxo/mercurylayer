@@ -217,12 +217,22 @@ pub async fn transfer_unlock(
     let signed_statechain_id = transfer_unlock_request_payload.0.auth_sig.clone();
     let auth_pub_key = transfer_unlock_request_payload.0.auth_pub_key.clone();
 
-    let is_current_owner_signature = crate::endpoints::utils::validate_signature(
+    let is_current_owner_signature = match crate::endpoints::utils::try_validate_signature(
         &statechain_entity.pool,
         &signed_statechain_id,
         &statechain_id,
     )
-    .await;
+    .await
+    {
+        Ok(is_valid) => is_valid,
+        Err(_) => {
+            let response_body = json!({
+                "message": "Signature does not match authentication key."
+            });
+
+            return status::Custom(Status::InternalServerError, Json(response_body));
+        }
+    };
 
     let durable_recipient_auth_key = if is_current_owner_signature {
         None
@@ -235,7 +245,7 @@ pub async fn transfer_unlock(
         .map(|(auth_key, _)| auth_key)
     };
 
-    if !is_transfer_unlock_authorized(
+    let is_authorized = match is_transfer_unlock_authorized(
         is_current_owner_signature,
         auth_pub_key.as_deref(),
         durable_recipient_auth_key.as_ref(),
@@ -244,6 +254,17 @@ pub async fn transfer_unlock(
     )
     .await
     {
+        Ok(is_authorized) => is_authorized,
+        Err(_) => {
+            let response_body = json!({
+                "message": "Signature does not match authentication key."
+            });
+
+            return status::Custom(Status::InternalServerError, Json(response_body));
+        }
+    };
+
+    if !is_authorized {
         let response_body = json!({
             "message": "Signature does not match authentication key."
         });
@@ -271,16 +292,16 @@ async fn is_transfer_unlock_authorized(
     durable_recipient_auth_key: Option<&PublicKey>,
     auth_sig: &str,
     statechain_id: &str,
-) -> bool {
+) -> Result<bool, crate::endpoints::utils::SignatureValidationError> {
     if is_current_owner_signature {
-        return true;
+        return Ok(true);
     }
 
     let Some(durable_recipient_auth_key) = durable_recipient_auth_key else {
-        return false;
+        return Ok(false);
     };
 
-    crate::endpoints::utils::validate_signature_given_public_key(
+    crate::endpoints::utils::try_validate_signature_given_public_key(
         auth_sig,
         statechain_id,
         &durable_recipient_auth_key.to_string(),
@@ -325,7 +346,8 @@ mod tests {
             Some(&durable_key),
             &invalid_signature,
             statechain_id,
-        )));
+        ))
+        .unwrap());
     }
 
     #[test]
@@ -341,7 +363,8 @@ mod tests {
             Some(&durable_key),
             &attacker_signature,
             statechain_id,
-        )));
+        ))
+        .unwrap());
     }
 
     #[test]
@@ -356,7 +379,8 @@ mod tests {
             Some(&durable_key),
             &recipient_signature,
             statechain_id,
-        )));
+        ))
+        .unwrap());
     }
 
     #[test]
@@ -367,7 +391,8 @@ mod tests {
             None,
             "unused",
             "statechain-1",
-        )));
+        ))
+        .unwrap());
     }
 
     #[test]

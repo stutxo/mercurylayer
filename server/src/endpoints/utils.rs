@@ -63,38 +63,6 @@ pub async fn get_auth_key_by_statechain_id(
     };
 }
 
-pub async fn validate_signature_given_public_key(
-    signed_message_hex: &str,
-    statechain_id: &str,
-    auth_key: &str,
-) -> bool {
-    let auth_key = PublicKey::from_str(auth_key).unwrap().x_only_public_key().0;
-
-    let signed_message = Signature::from_str(signed_message_hex).unwrap();
-    let msg = Message::from_hashed_data::<sha256::Hash>(statechain_id.to_string().as_bytes());
-
-    let secp = Secp256k1::new();
-    secp.verify_schnorr(&signed_message, msg.as_ref(), &auth_key)
-        .is_ok()
-}
-
-pub async fn validate_signature(
-    pool: &sqlx::PgPool,
-    signed_message_hex: &str,
-    statechain_id: &str,
-) -> bool {
-    let auth_key = get_auth_key_by_statechain_id(pool, statechain_id)
-        .await
-        .unwrap();
-
-    let signed_message = Signature::from_str(signed_message_hex).unwrap();
-    let msg = Message::from_hashed_data::<sha256::Hash>(statechain_id.to_string().as_bytes());
-
-    let secp = Secp256k1::new();
-    secp.verify_schnorr(&signed_message, msg.as_ref(), &auth_key)
-        .is_ok()
-}
-
 fn try_verify_statechain_signature(
     signed_message_hex: &str,
     statechain_id: &str,
@@ -108,6 +76,19 @@ fn try_verify_statechain_signature(
     Ok(secp
         .verify_schnorr(&signed_message, msg.as_ref(), auth_key)
         .is_ok())
+}
+
+pub async fn try_validate_signature_given_public_key(
+    signed_message_hex: &str,
+    statechain_id: &str,
+    auth_key: &str,
+) -> Result<bool, SignatureValidationError> {
+    let auth_key = PublicKey::from_str(auth_key)
+        .map_err(|_| SignatureValidationError::InvalidAuthKey)?
+        .x_only_public_key()
+        .0;
+
+    try_verify_statechain_signature(signed_message_hex, statechain_id, &auth_key)
 }
 
 pub async fn try_validate_signature(
@@ -227,7 +208,35 @@ mod tests {
     }
 
     #[test]
-    fn validate_signature_given_public_key_accepts_a_valid_signature() {
+    fn try_validate_signature_given_public_key_rejects_malformed_public_key_without_panic() {
+        let err = block_on(try_validate_signature_given_public_key(
+            "not-a-signature",
+            "statechain-1",
+            "not-a-public-key",
+        ))
+        .unwrap_err();
+
+        assert!(matches!(err, SignatureValidationError::InvalidAuthKey));
+    }
+
+    #[test]
+    fn try_validate_signature_given_public_key_rejects_malformed_signature_without_panic() {
+        let secp = Secp256k1::new();
+        let secret_key = SecretKey::from_slice(&[41u8; 32]).unwrap();
+        let public_key = secret_key.public_key(&secp);
+
+        let err = block_on(try_validate_signature_given_public_key(
+            "not-a-signature",
+            "statechain-1",
+            &public_key.to_string(),
+        ))
+        .unwrap_err();
+
+        assert!(matches!(err, SignatureValidationError::InvalidSignature));
+    }
+
+    #[test]
+    fn try_validate_signature_given_public_key_accepts_a_valid_signature() {
         let secp = Secp256k1::new();
         let secret_key = SecretKey::from_slice(&[42u8; 32]).unwrap();
         let keypair = KeyPair::from_seckey_slice(&secp, secret_key.as_ref()).unwrap();
@@ -236,17 +245,18 @@ mod tests {
         let message = Message::from_hashed_data::<sha256::Hash>(statechain_id.as_bytes());
         let signature = secp.sign_schnorr(message.as_ref(), &keypair);
 
-        let is_valid = block_on(validate_signature_given_public_key(
+        let is_valid = block_on(try_validate_signature_given_public_key(
             &signature.to_string(),
             statechain_id,
             &public_key.to_string(),
-        ));
+        ))
+        .unwrap();
 
         assert!(is_valid);
     }
 
     #[test]
-    fn validate_signature_given_public_key_rejects_a_signature_for_the_wrong_message() {
+    fn try_validate_signature_given_public_key_rejects_a_signature_for_the_wrong_message() {
         let secp = Secp256k1::new();
         let secret_key = SecretKey::from_slice(&[43u8; 32]).unwrap();
         let keypair = KeyPair::from_seckey_slice(&secp, secret_key.as_ref()).unwrap();
@@ -256,11 +266,12 @@ mod tests {
             &keypair,
         );
 
-        let is_valid = block_on(validate_signature_given_public_key(
+        let is_valid = block_on(try_validate_signature_given_public_key(
             &signature.to_string(),
             "statechain-b",
             &public_key.to_string(),
-        ));
+        ))
+        .unwrap();
 
         assert!(!is_valid);
     }
