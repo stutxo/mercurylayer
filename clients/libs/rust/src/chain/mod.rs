@@ -1,7 +1,7 @@
 mod core;
 
 use anyhow::Result;
-use bitcoin::{BlockHash, Script, Txid};
+use bitcoin::{BlockHash, Txid};
 use serde_json::Value;
 
 use self::core::CoreChainClient;
@@ -39,10 +39,6 @@ impl ChainClient {
         let fee_rate_btc_per_kb = self.core.estimate_fee_btc_per_kb(number_blocks)?;
 
         Ok(normalize_fee_rate_sats_per_byte(fee_rate_btc_per_kb))
-    }
-
-    pub fn list_unspent(&self, script: &Script) -> Result<Vec<ChainUtxo>> {
-        self.core.list_unspent(script)
     }
 
     pub fn get_tx_out(

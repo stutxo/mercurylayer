@@ -55,6 +55,7 @@ max_fee_rate = 1
 ```
 
 The Core/Inquisition RPC endpoint must be your own signet node or another trusted node you operate; the values above assume a local signet RPC service.
+The node must run with `-blockfilterindex=1` and retain full block data back to the earliest Tx0 height among its coins because received coins can predate the wallet and client UTXO discovery reads compact filters and then the matching blocks.
 
 The test mercury key server URL is: `http://test.mercurylayer.com:8500`
 

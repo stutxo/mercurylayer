@@ -1,4 +1,5 @@
 use crate::utils::create_activity;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use anyhow::{anyhow, Ok, Result};
@@ -13,7 +14,7 @@ use mercurylib::{
 };
 
 use crate::{
-    chain::ChainUtxo,
+    chain::{ChainUtxo, DescriptorActivity},
     client_config::ClientConfig,
     deposit::{create_bip448_deposit_state, create_tx1},
     sqlite_manager::{
@@ -34,6 +35,112 @@ struct Bip448DepositResult {
 struct DeferredBip448DepositError {
     statechain_id: String,
     error: anyhow::Error,
+}
+
+pub fn unspent_from_descriptor_activity(activity: Vec<DescriptorActivity>) -> Vec<ChainUtxo> {
+    let mut receives = HashMap::new();
+    let mut spends = HashSet::new();
+    for event in activity {
+        match event {
+            DescriptorActivity::Receive {
+                amount,
+                height,
+                txid,
+                vout,
+            } => {
+                receives.insert(
+                    (txid, vout),
+                    ChainUtxo {
+                        txid: txid.to_string(),
+                        vout,
+                        value: amount,
+                        height: height.unwrap_or(0),
+                    },
+                );
+            }
+            DescriptorActivity::Spend {
+                prevout_txid,
+                prevout_vout,
+                ..
+            } => {
+                spends.insert((prevout_txid, prevout_vout));
+            }
+        }
+    }
+    receives.retain(|outpoint, _| !spends.contains(outpoint));
+
+    receives.into_values().collect()
+}
+
+fn discover_unspent(
+    client_config: &ClientConfig,
+    address: &Address,
+    start_height: u32,
+) -> Result<Vec<ChainUtxo>> {
+    let descriptor = format!("addr({address})");
+    retry_discovery_once(|| {
+        let stop_height = client_config.chain_client.tip_height()?;
+        let scan = client_config.chain_client.scan_blocks(
+            &descriptor,
+            start_height.min(stop_height),
+            stop_height,
+        )?;
+        if !scan.completed {
+            return Err(anyhow!("Bitcoin Core scanblocks did not complete"));
+        }
+        let activity = client_config.chain_client.descriptor_activity(
+            &scan.relevant_blocks,
+            &descriptor,
+            true,
+        )?;
+        Ok(unspent_from_descriptor_activity(activity))
+    })
+}
+
+fn retry_discovery_once<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
+    operation().or_else(|_| operation())
+}
+
+fn get_known_utxo(
+    client_config: &ClientConfig,
+    address: &Address,
+    txid: &str,
+    vout: u32,
+    expected_value: Option<u64>,
+) -> Result<Option<(ChainUtxo, u32)>> {
+    let txid = match Txid::from_str(txid) {
+        std::result::Result::Ok(parsed) if parsed.to_string() == txid => parsed,
+        _ => {
+            return Err(anyhow!(
+                "invalid or non-canonical stored funding txid: {txid}"
+            ))
+        }
+    };
+    let Some(tx_out) = client_config.chain_client.get_tx_out(&txid, vout, true)? else {
+        return Ok(None);
+    };
+    if tx_out.script_pubkey != address.script_pubkey()
+        || expected_value.map_or(false, |value| value != tx_out.value)
+    {
+        return Ok(None);
+    }
+
+    let confirmations = tx_out.confirmations;
+    let blockheight = client_config.chain_client.tip_height()?;
+    let height = if confirmations == 0 {
+        0
+    } else {
+        blockheight.saturating_sub(confirmations).saturating_add(1)
+    };
+    Ok(Some((
+        ChainUtxo {
+            txid: txid.to_string(),
+            vout,
+            value: tx_out.value,
+            height,
+        },
+        confirmations,
+    )))
 }
 
 fn deposit_setup_is_incomplete(coin: &Coin) -> bool {
@@ -157,6 +264,7 @@ async fn check_deposit(
     client_config: &ClientConfig,
     coin: &mut Coin,
     wallet_netwotk: &str,
+    wallet_blockheight: u32,
 ) -> Result<Option<DepositResult>> {
     if funding_outpoint_is_partial(coin) {
         return Err(anyhow!("Coin has a partial funding outpoint"));
@@ -188,9 +296,7 @@ async fn check_deposit(
     )?
     .require_network(client_config.network)?;
 
-    let utxo_list = client_config
-        .chain_client
-        .list_unspent(address.script_pubkey().as_script())?;
+    let utxo_list = discover_unspent(client_config, &address, wallet_blockheight)?;
 
     for unspent in utxo_list {
         if unspent.value == u64::from(expected_amount) {
@@ -266,6 +372,7 @@ async fn check_bip448_deposit(
     wallet_name: &str,
     coin: &mut Coin,
     wallet_network: &str,
+    wallet_blockheight: u32,
 ) -> Result<Option<Bip448DepositResult>> {
     if funding_outpoint_is_partial(coin) {
         return Err(anyhow!("BIP448 coin has a partial funding outpoint"));
@@ -298,17 +405,27 @@ async fn check_bip448_deposit(
     if let (Some(pending), Some(accepted)) = (&pending_signing, &accepted_state) {
         validate_bip448_pending_matches_accepted(pending, accepted)?;
     }
-    let expected_value = if coin.utxo_txid.is_none() {
-        Some(if let Some(pending) = &pending_signing {
-            pending.funding_value_sats
-        } else if let Some(record) = &accepted_state {
-            record.funding_outpoint.value_sats
-        } else {
-            u64::from(
-                coin.amount
-                    .ok_or_else(|| anyhow!("BIP448 coin missing amount after deposit setup"))?,
-            )
-        })
+    let known_outpoint = if let Some(pending) = &pending_signing {
+        Some((
+            pending.funding_txid.as_str(),
+            pending.funding_vout,
+            Some(pending.funding_value_sats),
+        ))
+    } else if let (Some(txid), Some(vout)) = (coin.utxo_txid.as_deref(), coin.utxo_vout) {
+        Some((txid, vout, None))
+    } else if let Some(record) = &accepted_state {
+        Some((
+            record.funding_outpoint.txid.as_str(),
+            record.funding_outpoint.vout,
+            Some(record.funding_outpoint.value_sats),
+        ))
+    } else {
+        None
+    };
+    let expected_value = if known_outpoint.is_none() {
+        Some(u64::from(coin.amount.ok_or_else(|| {
+            anyhow!("BIP448 coin missing amount after deposit setup")
+        })?))
     } else {
         None
     };
@@ -317,9 +434,6 @@ async fn check_bip448_deposit(
             anyhow!("BIP448 coin missing aggregated_address after deposit setup")
         })?)?
         .require_network(client_config.network)?;
-    let utxo_list = client_config
-        .chain_client
-        .list_unspent(address.script_pubkey().as_script())?;
     if let Some(pending) = &pending_signing {
         if let (Some(txid), Some(vout)) = (coin.utxo_txid.as_ref(), coin.utxo_vout) {
             if txid != &pending.funding_txid || vout != pending.funding_vout {
@@ -329,20 +443,30 @@ async fn check_bip448_deposit(
             }
         }
     }
-    let utxo = select_bip448_funding_utxo(
-        utxo_list,
-        coin,
-        pending_signing.as_ref(),
-        accepted_state.as_ref(),
-        expected_value,
-    );
-
-    if utxo.is_none() {
-        return Ok(None);
-    }
-
-    let utxo = utxo.unwrap();
-    let blockheight = client_config.chain_client.tip_height()?;
+    let (utxo, confirmations) = if let Some((txid, vout, value)) = known_outpoint {
+        let Some(utxo) = get_known_utxo(client_config, &address, txid, vout, value)? else {
+            return Ok(None);
+        };
+        utxo
+    } else {
+        let utxo_list = discover_unspent(client_config, &address, wallet_blockheight)?;
+        let Some(utxo) = select_bip448_funding_utxo(
+            utxo_list,
+            coin,
+            pending_signing.as_ref(),
+            accepted_state.as_ref(),
+            expected_value,
+        ) else {
+            return Ok(None);
+        };
+        let blockheight = client_config.chain_client.tip_height()?;
+        let confirmations = if utxo.height == 0 {
+            0
+        } else {
+            blockheight.saturating_sub(utxo.height).saturating_add(1)
+        };
+        (utxo, confirmations)
+    };
     let mut deposit_result = None;
 
     if coin.utxo_txid.is_none() || coin.utxo_vout.is_none() {
@@ -358,11 +482,10 @@ async fn check_bip448_deposit(
         coin.status = CoinStatus::IN_MEMPOOL;
     }
 
-    if utxo.height == 0 {
+    if confirmations == 0 {
         return Ok(None);
     }
 
-    let confirmations = blockheight.saturating_sub(utxo.height).saturating_add(1);
     coin.status = CoinStatus::UNCONFIRMED;
 
     if coin.public_nonce.is_none() {
@@ -521,6 +644,7 @@ async fn check_withdrawal(client_config: &ClientConfig, coin: &mut Coin) -> Resu
 async fn check_for_duplicated(
     client_config: &ClientConfig,
     existing_coins: &Vec<Coin>,
+    wallet_blockheight: u32,
 ) -> Result<Vec<Coin>> {
     let mut duplicated_coin_list: Vec<Coin> = Vec::new();
 
@@ -539,9 +663,7 @@ async fn check_for_duplicated(
         let address = Address::from_str(&coin.aggregated_address.as_ref().unwrap())?
             .require_network(client_config.network)?;
 
-        let utxo_list = client_config
-            .chain_client
-            .list_unspent(address.script_pubkey().as_script())?;
+        let utxo_list = discover_unspent(client_config, &address, wallet_blockheight)?;
 
         let mut max_duplicated_index = existing_coins
             .iter()
@@ -579,7 +701,8 @@ async fn finalize_wallet_update(
     wallet: &mut Wallet,
     deferred_errors: Vec<DeferredBip448DepositError>,
 ) -> Result<()> {
-    let duplicated_coins = check_for_duplicated(client_config, &wallet.coins).await?;
+    let duplicated_coins =
+        check_for_duplicated(client_config, &wallet.coins, wallet.blockheight).await?;
 
     wallet.coins.extend(duplicated_coins);
 
@@ -620,6 +743,7 @@ pub async fn update_coins(client_config: &ClientConfig, wallet_name: &str) -> Re
     let mut wallet = get_wallet(&client_config.pool, &wallet_name).await?;
 
     let network = wallet.network.clone();
+    let wallet_blockheight = wallet.blockheight;
     let mut deferred_bip448_deposit_errors = Vec::new();
 
     for coin in wallet.coins.iter_mut() {
@@ -628,18 +752,25 @@ pub async fn update_coins(client_config: &ClientConfig, wallet_name: &str) -> Re
             || coin.status == CoinStatus::UNCONFIRMED
         {
             if bip448_deposit::is_bip448_coin(coin) {
-                let deposit_result =
-                    match check_bip448_deposit(client_config, &wallet.name, coin, &network).await {
-                        std::result::Result::Ok(deposit_result) => deposit_result,
-                        std::result::Result::Err(error) => {
-                            defer_bip448_signature_count_error(
-                                coin,
-                                error,
-                                &mut deferred_bip448_deposit_errors,
-                            )?;
-                            continue;
-                        }
-                    };
+                let deposit_result = match check_bip448_deposit(
+                    client_config,
+                    &wallet.name,
+                    coin,
+                    &network,
+                    wallet_blockheight,
+                )
+                .await
+                {
+                    std::result::Result::Ok(deposit_result) => deposit_result,
+                    std::result::Result::Err(error) => {
+                        defer_bip448_signature_count_error(
+                            coin,
+                            error,
+                            &mut deferred_bip448_deposit_errors,
+                        )?;
+                        continue;
+                    }
+                };
 
                 if let Some(deposit_result) = deposit_result {
                     wallet.activities.push(deposit_result.activity);
@@ -648,7 +779,8 @@ pub async fn update_coins(client_config: &ClientConfig, wallet_name: &str) -> Re
                 continue;
             }
 
-            let deposit_result = check_deposit(client_config, coin, &network).await?;
+            let deposit_result =
+                check_deposit(client_config, coin, &network, wallet_blockheight).await?;
 
             if deposit_result.is_some() {
                 let deposit_result = deposit_result.unwrap();
@@ -885,22 +1017,24 @@ mod tests {
         let mut legacy_coin = incomplete_coin(1, None);
 
         assert!(
-            check_bip448_deposit(&client_config, "wallet", &mut bip448_coin, "regtest",)
+            check_bip448_deposit(&client_config, "wallet", &mut bip448_coin, "regtest", 0)
                 .await?
                 .is_none()
         );
-        assert!(check_deposit(&client_config, &mut legacy_coin, "regtest")
-            .await?
-            .is_none());
+        assert!(
+            check_deposit(&client_config, &mut legacy_coin, "regtest", 0)
+                .await?
+                .is_none()
+        );
 
         bip448_coin.utxo_txid = Some("aa".repeat(32));
         legacy_coin.utxo_vout = Some(0);
         let bip448_error =
-            check_bip448_deposit(&client_config, "wallet", &mut bip448_coin, "regtest")
+            check_bip448_deposit(&client_config, "wallet", &mut bip448_coin, "regtest", 0)
                 .await
                 .err()
                 .expect("partial BIP448 outpoint must fail");
-        let legacy_error = check_deposit(&client_config, &mut legacy_coin, "regtest")
+        let legacy_error = check_deposit(&client_config, &mut legacy_coin, "regtest", 0)
             .await
             .err()
             .expect("partial legacy outpoint must fail");
@@ -925,11 +1059,11 @@ mod tests {
         bip448_coin.aggregated_address = Some("not-queried".to_string());
         legacy_coin.aggregated_address = Some("not-queried".to_string());
         let bip448_error =
-            check_bip448_deposit(&client_config, "wallet", &mut bip448_coin, "regtest")
+            check_bip448_deposit(&client_config, "wallet", &mut bip448_coin, "regtest", 0)
                 .await
                 .err()
                 .expect("address-only BIP448 setup must fail");
-        let legacy_error = check_deposit(&client_config, &mut legacy_coin, "regtest")
+        let legacy_error = check_deposit(&client_config, &mut legacy_coin, "regtest", 0)
             .await
             .err()
             .expect("address-only legacy setup must fail");
@@ -947,11 +1081,11 @@ mod tests {
         legacy_coin.aggregated_address = None;
         legacy_coin.amount = Some(50_000);
         let bip448_error =
-            check_bip448_deposit(&client_config, "wallet", &mut bip448_coin, "regtest")
+            check_bip448_deposit(&client_config, "wallet", &mut bip448_coin, "regtest", 0)
                 .await
                 .err()
                 .expect("amount-only BIP448 setup must fail");
-        let legacy_error = check_deposit(&client_config, &mut legacy_coin, "regtest")
+        let legacy_error = check_deposit(&client_config, &mut legacy_coin, "regtest", 0)
             .await
             .err()
             .expect("amount-only legacy setup must fail");
@@ -969,11 +1103,11 @@ mod tests {
             coin.status = CoinStatus::IN_MEMPOOL;
         }
         let bip448_error =
-            check_bip448_deposit(&client_config, "wallet", &mut bip448_coin, "regtest")
+            check_bip448_deposit(&client_config, "wallet", &mut bip448_coin, "regtest", 0)
                 .await
                 .err()
                 .expect("advanced BIP448 setup must fail");
-        let legacy_error = check_deposit(&client_config, &mut legacy_coin, "regtest")
+        let legacy_error = check_deposit(&client_config, &mut legacy_coin, "regtest", 0)
             .await
             .err()
             .expect("advanced legacy setup must fail");
@@ -990,13 +1124,28 @@ mod tests {
         coin.utxo_txid = Some("aa".repeat(32));
         coin.utxo_vout = Some(0);
 
-        let error = check_bip448_deposit(&client_config, "wallet", &mut coin, "regtest")
+        let error = check_bip448_deposit(&client_config, "wallet", &mut coin, "regtest", 0)
             .await
             .err()
             .expect("missing address must fail before chain access");
         assert!(error.to_string().contains("missing aggregated_address"));
         assert!(!error.to_string().contains("missing amount"));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_or_noncanonical_known_txids_fail_before_rpc() -> Result<()> {
+        let client_config = test_client_config().await?;
+        let address = Address::from_str("bcrt1qgwwa9fcrcvnme0jymg39zm38w6gzudcq3n90tl")?
+            .require_network(Network::Regtest)?;
+        for txid in ["not-a-txid".to_string(), "AA".repeat(32)] {
+            let error = get_known_utxo(&client_config, &address, &txid, 0, None).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("invalid or non-canonical stored funding txid: {txid}")
+            );
+        }
         Ok(())
     }
 
@@ -1192,6 +1341,25 @@ mod tests {
         );
 
         assert_eq!(selected, Some(accepted_utxo));
+    }
+
+    #[test]
+    fn descriptor_activity_assembles_receives_minus_later_spends() {
+        let activity: Vec<DescriptorActivity> = serde_json::from_str(r#"[
+            {"type":"receive","amount":0.00010000,"height":10,"txid":"1111111111111111111111111111111111111111111111111111111111111111","vout":0},
+            {"type":"receive","amount":0.00020000,"height":11,"txid":"2222222222222222222222222222222222222222222222222222222222222222","vout":1},
+            {"type":"spend","height":12,"spend_txid":"4444444444444444444444444444444444444444444444444444444444444444","prevout_txid":"1111111111111111111111111111111111111111111111111111111111111111","prevout_vout":0}
+        ]"#).unwrap();
+        let unspent = unspent_from_descriptor_activity(activity);
+        assert_eq!(unspent.len(), 1);
+        assert_eq!((unspent[0].value, unspent[0].height), (20_000, 11));
+    }
+
+    #[test]
+    fn discovery_retries_the_whole_operation_once() {
+        let mut results = [Err(anyhow!("reorg")), Ok(())].into_iter();
+        retry_discovery_once(|| results.next().unwrap()).unwrap();
+        assert!(results.next().is_none());
     }
 
     #[test]

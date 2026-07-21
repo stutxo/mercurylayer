@@ -1,20 +1,14 @@
-use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use bitcoin::{
-    consensus::deserialize, Amount, BlockHash, Denomination, OutPoint, Script, ScriptBuf,
-    Transaction, Txid,
-};
+use bitcoin::{Amount, BlockHash, Denomination, ScriptBuf, Txid};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::runtime::Builder;
-
-use super::ChainUtxo;
 
 const FILTER_INDEX_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const FILTER_INDEX_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -61,69 +55,6 @@ impl CoreChainClient {
             self.call("estimatesmartfee", &[json!(number_blocks)])?;
 
         Ok(response.feerate.unwrap_or(0.0))
-    }
-
-    pub fn list_unspent(&self, script: &Script) -> Result<Vec<ChainUtxo>> {
-        let descriptor = format!("raw({})", hex::encode(script.as_bytes()));
-        let scan_response: ScanTxOutSetResponse =
-            self.call("scantxoutset", &[json!("start"), json!([descriptor])])?;
-
-        if !scan_response.success {
-            return Err(anyhow!("Bitcoin Core scantxoutset returned success=false"));
-        }
-
-        let mut utxos = scan_response
-            .unspents
-            .into_iter()
-            .map(|unspent| {
-                (
-                    OutPoint {
-                        txid: unspent.txid,
-                        vout: unspent.vout,
-                    },
-                    ChainUtxo {
-                        txid: unspent.txid.to_string(),
-                        vout: unspent.vout,
-                        value: unspent.amount_sats,
-                        height: unspent.height,
-                    },
-                )
-            })
-            .collect::<HashMap<_, _>>();
-
-        let mempool_txids: Vec<Txid> = self.call("getrawmempool", &[])?;
-        let mut mempool_spent_outpoints = HashSet::new();
-
-        for txid in mempool_txids {
-            let tx = self.get_transaction(&txid)?;
-
-            for input in &tx.input {
-                mempool_spent_outpoints.insert(input.previous_output);
-            }
-
-            for (vout, output) in tx.output.iter().enumerate() {
-                if output.script_pubkey.as_script() == script {
-                    utxos.insert(
-                        OutPoint {
-                            txid,
-                            vout: vout as u32,
-                        },
-                        ChainUtxo {
-                            txid: txid.to_string(),
-                            vout: vout as u32,
-                            value: output.value,
-                            height: 0,
-                        },
-                    );
-                }
-            }
-        }
-
-        for spent_outpoint in mempool_spent_outpoints {
-            utxos.remove(&spent_outpoint);
-        }
-
-        Ok(utxos.into_values().collect())
     }
 
     pub fn get_tx_out(
@@ -204,11 +135,6 @@ impl CoreChainClient {
         let tx_hexes = txs.iter().map(hex::encode).collect::<Vec<_>>();
 
         self.call("submitpackage", &[json!(tx_hexes)])
-    }
-
-    fn get_transaction(&self, txid: &Txid) -> Result<Transaction> {
-        let raw_tx = self.get_raw_tx(txid)?;
-        deserialize(&raw_tx).with_context(|| format!("failed to deserialize raw tx {}", txid))
     }
 
     fn call<T>(&self, method: &str, params: &[Value]) -> Result<T>
@@ -418,23 +344,6 @@ pub enum DescriptorActivity {
 #[derive(Debug, Deserialize)]
 struct DescriptorActivityResponse {
     activity: Vec<DescriptorActivity>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ScanTxOutSetResponse {
-    success: bool,
-    #[serde(default)]
-    unspents: Vec<ScanTxOutSetUnspent>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ScanTxOutSetUnspent {
-    txid: Txid,
-    vout: u32,
-    #[serde(rename = "amount")]
-    #[serde(deserialize_with = "deserialize_btc_amount_to_sats")]
-    amount_sats: u64,
-    height: u32,
 }
 
 fn deserialize_script_pubkey<'de, D>(deserializer: D) -> Result<ScriptBuf, D::Error>

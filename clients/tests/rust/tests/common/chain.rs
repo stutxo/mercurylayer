@@ -50,12 +50,19 @@ async fn wait_for_address_utxo_matching(
     matches: impl Fn(&ChainUtxo) -> bool,
 ) -> Result<()> {
     let address = Address::from_str(address)?.require_network(client_config.network)?;
-    let script_pubkey = address.script_pubkey();
+    let descriptor = format!("addr({address})");
 
     for _ in 0..CHAIN_SYNC_TIMEOUT_SECONDS {
-        let utxo_list = client_config
+        let stop_height = client_config.chain_client.tip_height()?;
+        let scan = client_config
             .chain_client
-            .list_unspent(script_pubkey.as_script())?;
+            .scan_blocks(&descriptor, 0, stop_height)?;
+        let activity = client_config.chain_client.descriptor_activity(
+            &scan.relevant_blocks,
+            &descriptor,
+            true,
+        )?;
+        let utxo_list = mercuryrustlib::coin_status::unspent_from_descriptor_activity(activity);
         if utxo_list.iter().any(|unspent| matches(unspent)) {
             return Ok(());
         }
