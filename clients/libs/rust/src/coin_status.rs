@@ -2,7 +2,7 @@ use crate::utils::create_activity;
 use std::str::FromStr;
 
 use anyhow::{anyhow, Ok, Result};
-use bitcoin::Address;
+use bitcoin::{Address, Txid};
 use mercurylib::{
     bip448_statechain::{
         deposit::{self as bip448_deposit, Bip448DepositError},
@@ -488,7 +488,7 @@ async fn check_withdrawal(client_config: &ClientConfig, coin: &mut Coin) -> Resu
         return Err(anyhow!("Coin does not have tx_withdraw or tx_cpfp"));
     }
 
-    let txid = txid.unwrap();
+    let txid = Txid::from_str(&txid.unwrap())?;
 
     if coin.withdrawal_address.is_none() {
         return Err(anyhow!("Coin does not have withdrawal_address"));
@@ -497,35 +497,22 @@ async fn check_withdrawal(client_config: &ClientConfig, coin: &mut Coin) -> Resu
     let address = Address::from_str(&coin.withdrawal_address.as_ref().unwrap())?
         .require_network(client_config.network)?;
 
-    let utxo_list = client_config
-        .chain_client
-        .list_unspent(address.script_pubkey().as_script())?;
+    let tx_out = client_config.chain_client.get_tx_out(&txid, 0, true)?;
 
-    let mut utxo: Option<ChainUtxo> = None;
-
-    for unspent in utxo_list {
-        if unspent.txid == txid {
-            utxo = Some(unspent);
-            break;
-        }
-    }
-
-    if utxo.is_none() {
+    let Some(tx_out) = tx_out else {
         // Sometimes the configured chain backend has not observed the transaction yet.
         // return Err(anyhow!("There is no UTXO with the address {} and the txid {}", coin.withdrawal_address.as_ref().unwrap(), txid));
         return Ok(());
+    };
+
+    if tx_out.script_pubkey != address.script_pubkey() {
+        return Err(anyhow!(
+            "withdrawal transaction vout 0 does not pay the stored address"
+        ));
     }
 
-    let utxo = utxo.unwrap();
-
-    if utxo.height > 0 {
-        let blockheight = client_config.chain_client.tip_height()?;
-
-        let confirmations = blockheight - utxo.height + 1;
-
-        if confirmations as u32 >= client_config.confirmation_target {
-            coin.status = CoinStatus::WITHDRAWN;
-        }
+    if tx_out.confirmations > 0 && tx_out.confirmations >= client_config.confirmation_target {
+        coin.status = CoinStatus::WITHDRAWN;
     }
 
     Ok(())

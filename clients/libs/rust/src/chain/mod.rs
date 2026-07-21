@@ -1,10 +1,11 @@
 mod core;
 
 use anyhow::Result;
-use bitcoin::{Script, Txid};
+use bitcoin::{BlockHash, Script, Txid};
 use serde_json::Value;
 
 use self::core::CoreChainClient;
+pub use self::core::{ChainTxOut, DescriptorActivity, ScanBlocksResult};
 pub(crate) use self::core::{CoreRpcAuth, CoreRpcConfig};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,6 +43,34 @@ impl ChainClient {
 
     pub fn list_unspent(&self, script: &Script) -> Result<Vec<ChainUtxo>> {
         self.core.list_unspent(script)
+    }
+
+    pub fn get_tx_out(
+        &self,
+        txid: &Txid,
+        vout: u32,
+        include_mempool: bool,
+    ) -> Result<Option<ChainTxOut>> {
+        self.core.get_tx_out(txid, vout, include_mempool)
+    }
+
+    pub fn scan_blocks(
+        &self,
+        descriptor: &str,
+        start_height: u32,
+        stop_height: u32,
+    ) -> Result<ScanBlocksResult> {
+        self.core.scan_blocks(descriptor, start_height, stop_height)
+    }
+
+    pub fn descriptor_activity(
+        &self,
+        block_hashes: &[BlockHash],
+        descriptor: &str,
+        include_mempool: bool,
+    ) -> Result<Vec<DescriptorActivity>> {
+        self.core
+            .descriptor_activity(block_hashes, descriptor, include_mempool)
     }
 
     pub fn get_raw_tx(&self, txid: &Txid) -> Result<Vec<u8>> {

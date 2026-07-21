@@ -721,32 +721,29 @@ async fn verify_tx0_output_is_unspent_and_confirmed(
     let script = address.script_pubkey();
     let script = script.as_script();
 
-    let res = chain_client.list_unspent(script)?;
-    let blockheight = chain_client.tip_height()?;
+    let txid = Txid::from_str(&tx0_outpoint.txid)?;
+    let Some(tx_out) = chain_client.get_tx_out(&txid, tx0_outpoint.vout, true)? else {
+        return Ok((false, CoinStatus::UNCONFIRMED));
+    };
 
-    let mut status = CoinStatus::UNCONFIRMED;
-
-    for unspent in res {
-        if unspent.txid == tx0_outpoint.txid && unspent.vout == tx0_outpoint.vout {
-            status = tx0_status_for_utxo_height(unspent.height, blockheight, confirmation_target);
-
-            return Ok((true, status));
-        }
+    if tx_out.script_pubkey.as_script() != script {
+        return Ok((false, CoinStatus::UNCONFIRMED));
     }
 
-    Ok((false, status))
+    Ok((
+        true,
+        tx0_status_for_confirmations(tx_out.confirmations, confirmation_target),
+    ))
 }
 
-fn tx0_status_for_utxo_height(
-    utxo_height: u32,
-    blockheight: u32,
+pub(crate) fn tx0_status_for_confirmations(
+    confirmations: u32,
     confirmation_target: u32,
 ) -> CoinStatus {
-    if utxo_height == 0 {
+    if confirmations == 0 {
         return CoinStatus::UNCONFIRMED;
     }
 
-    let confirmations = blockheight.saturating_sub(utxo_height).saturating_add(1);
     if confirmations >= confirmation_target {
         CoinStatus::CONFIRMED
     } else {
@@ -1037,26 +1034,14 @@ mod tests {
     }
 
     #[test]
-    fn tx0_confirmation_status_never_treats_mempool_height_as_confirmed() {
-        assert_eq!(
-            tx0_status_for_utxo_height(0, 800_000, 2),
-            CoinStatus::UNCONFIRMED
-        );
-        assert_eq!(
-            tx0_status_for_utxo_height(0, 800_000, 0),
-            CoinStatus::UNCONFIRMED
-        );
+    fn tx0_confirmation_status_never_treats_mempool_as_confirmed() {
+        assert_eq!(tx0_status_for_confirmations(0, 2), CoinStatus::UNCONFIRMED);
+        assert_eq!(tx0_status_for_confirmations(0, 0), CoinStatus::UNCONFIRMED);
     }
 
     #[test]
-    fn tx0_confirmation_status_uses_confirmed_heights_only() {
-        assert_eq!(
-            tx0_status_for_utxo_height(800_000, 800_000, 2),
-            CoinStatus::UNCONFIRMED
-        );
-        assert_eq!(
-            tx0_status_for_utxo_height(799_999, 800_000, 2),
-            CoinStatus::CONFIRMED
-        );
+    fn tx0_confirmation_status_uses_confirmation_count() {
+        assert_eq!(tx0_status_for_confirmations(1, 2), CoinStatus::UNCONFIRMED);
+        assert_eq!(tx0_status_for_confirmations(2, 2), CoinStatus::CONFIRMED);
     }
 }

@@ -130,31 +130,16 @@ pub async fn create_backup_transactions(
         if coin.status == CoinStatus::DUPLICATED {
             let address = bitcoin::Address::from_str(&coin.aggregated_address.as_ref().unwrap())?
                 .require_network(client_config.network)?;
-            let utxo_list = client_config
-                .chain_client
-                .list_unspent(address.script_pubkey().as_script())?;
 
-            for unspent in utxo_list {
-                if coin.utxo_txid == Some(unspent.txid.clone())
-                    && coin.utxo_vout == Some(unspent.vout)
-                {
-                    let mut is_confirmed = false;
-
-                    if unspent.height > 0 {
-                        let blockheight = client_config.chain_client.tip_height()?;
-
-                        let confirmations = blockheight - unspent.height + 1;
-
-                        if confirmations as u32 >= client_config.confirmation_target {
-                            is_confirmed = true;
-                        }
-                    }
-
-                    if !is_confirmed {
+            if let (Some(txid), Some(vout)) = (coin.utxo_txid.as_ref(), coin.utxo_vout) {
+                let txid = bitcoin::Txid::from_str(txid)?;
+                if let Some(tx_out) = client_config.chain_client.get_tx_out(&txid, vout, true)? {
+                    if tx_out.script_pubkey == address.script_pubkey()
+                        && (tx_out.confirmations == 0
+                            || tx_out.confirmations < client_config.confirmation_target)
+                    {
                         return Err(anyhow!("The coin with duplicated index {} has not yet been confirmed. This transfer cannot be performed.", coin.duplicate_index));
                     }
-
-                    break;
                 }
             }
         }
