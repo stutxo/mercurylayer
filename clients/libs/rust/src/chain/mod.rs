@@ -1,5 +1,7 @@
 mod core;
 
+use std::str::FromStr;
+
 use anyhow::Result;
 use bitcoin::{BlockHash, Txid};
 use serde_json::Value;
@@ -50,6 +52,22 @@ impl ChainClient {
         self.core.get_tx_out(txid, vout, include_mempool)
     }
 
+    pub(crate) fn get_stored_tx_out(
+        &self,
+        txid: &str,
+        vout: u32,
+        include_mempool: bool,
+    ) -> Result<Option<ChainTxOut>> {
+        let Ok(parsed) = Txid::from_str(txid) else {
+            return Ok(None);
+        };
+        if parsed.to_string() != txid {
+            return Ok(None);
+        }
+
+        self.get_tx_out(&parsed, vout, include_mempool)
+    }
+
     pub fn scan_blocks(
         &self,
         descriptor: &str,
@@ -92,12 +110,25 @@ pub fn normalize_fee_rate_sats_per_byte(mut fee_rate_btc_per_kb: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_fee_rate_sats_per_byte;
+    use super::{normalize_fee_rate_sats_per_byte, ChainClient, CoreRpcAuth, CoreRpcConfig};
 
     #[test]
     fn normalize_fee_rate_uses_current_fallback_for_non_positive_estimates() {
         assert_eq!(normalize_fee_rate_sats_per_byte(0.0), 1.0);
         assert_eq!(normalize_fee_rate_sats_per_byte(-1.0), 1.0);
         assert_eq!(normalize_fee_rate_sats_per_byte(0.00002), 2.0);
+    }
+
+    #[test]
+    fn malformed_and_noncanonical_stored_txids_are_soft_misses_before_rpc() {
+        let client = ChainClient::new(CoreRpcConfig {
+            url: "http://127.0.0.1:1".to_string(),
+            auth: CoreRpcAuth::None,
+        })
+        .unwrap();
+
+        for txid in ["not-a-txid".to_string(), "AA".repeat(32)] {
+            assert_eq!(client.get_stored_tx_out(&txid, 0, true).unwrap(), None);
+        }
     }
 }

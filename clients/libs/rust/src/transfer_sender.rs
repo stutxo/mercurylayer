@@ -132,8 +132,10 @@ pub async fn create_backup_transactions(
                 .require_network(client_config.network)?;
 
             if let (Some(txid), Some(vout)) = (coin.utxo_txid.as_ref(), coin.utxo_vout) {
-                let txid = bitcoin::Txid::from_str(txid)?;
-                if let Some(tx_out) = client_config.chain_client.get_tx_out(&txid, vout, true)? {
+                if let Some(tx_out) = client_config
+                    .chain_client
+                    .get_stored_tx_out(txid, vout, true)?
+                {
                     if tx_out.script_pubkey == address.script_pubkey()
                         && (tx_out.confirmations == 0
                             || tx_out.confirmations < client_config.confirmation_target)

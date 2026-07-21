@@ -108,15 +108,10 @@ fn get_known_utxo(
     vout: u32,
     expected_value: Option<u64>,
 ) -> Result<Option<(ChainUtxo, u32)>> {
-    let txid = match Txid::from_str(txid) {
-        std::result::Result::Ok(parsed) if parsed.to_string() == txid => parsed,
-        _ => {
-            return Err(anyhow!(
-                "invalid or non-canonical stored funding txid: {txid}"
-            ))
-        }
-    };
-    let Some(tx_out) = client_config.chain_client.get_tx_out(&txid, vout, true)? else {
+    let Some(tx_out) = client_config
+        .chain_client
+        .get_stored_tx_out(txid, vout, true)?
+    else {
         return Ok(None);
     };
     if tx_out.script_pubkey != address.script_pubkey()
@@ -134,7 +129,7 @@ fn get_known_utxo(
     };
     Ok(Some((
         ChainUtxo {
-            txid: txid.to_string(),
+            txid: txid.to_owned(),
             vout,
             value: tx_out.value,
             height,
@@ -284,8 +279,6 @@ async fn check_deposit(
         }
     }
 
-    let mut utxo: Option<ChainUtxo> = None;
-
     let expected_amount = coin
         .amount
         .ok_or_else(|| anyhow!("Coin missing amount after deposit setup"))?;
@@ -296,29 +289,47 @@ async fn check_deposit(
     )?
     .require_network(client_config.network)?;
 
-    let utxo_list = discover_unspent(client_config, &address, wallet_blockheight)?;
-
-    for unspent in utxo_list {
-        if unspent.value == u64::from(expected_amount) {
-            utxo = Some(unspent);
-            break;
-        }
-    }
-
-    // No deposit found. No change in the coin status
-    if utxo.is_none() {
-        return Ok(None);
-        // return Err(anyhow!("There is no UTXO with the address {} and the amount {}", coin.aggregated_address.as_ref().unwrap(), coin.amount.unwrap()));
-    }
-
-    let utxo = utxo.unwrap();
+    let (utxo, confirmations) =
+        if let (Some(txid), Some(vout)) = (coin.utxo_txid.as_deref(), coin.utxo_vout) {
+            let Some(utxo) = get_known_utxo(
+                client_config,
+                &address,
+                txid,
+                vout,
+                Some(u64::from(expected_amount)),
+            )?
+            else {
+                return Ok(None);
+            };
+            utxo
+        } else {
+            let utxo_list = discover_unspent(client_config, &address, wallet_blockheight)?;
+            let Some(utxo) = utxo_list
+                .into_iter()
+                .filter(|unspent| unspent.value == u64::from(expected_amount))
+                .min_by_key(|unspent| {
+                    if unspent.height == 0 {
+                        u32::MAX
+                    } else {
+                        unspent.height
+                    }
+                })
+            else {
+                return Ok(None);
+            };
+            let blockheight = client_config.chain_client.tip_height()?;
+            let confirmations = if utxo.height == 0 {
+                0
+            } else {
+                blockheight.saturating_sub(utxo.height).saturating_add(1)
+            };
+            (utxo, confirmations)
+        };
 
     // IN_MEMPOOL. there is nothing to do
-    if utxo.height == 0 && coin.status == CoinStatus::IN_MEMPOOL {
+    if confirmations == 0 && coin.status == CoinStatus::IN_MEMPOOL {
         return Ok(None);
     }
-
-    let blockheight = client_config.chain_client.tip_height()?;
 
     let mut deposit_result: Option<DepositResult> = None;
 
@@ -354,12 +365,10 @@ async fn check_deposit(
         });
     }
 
-    if utxo.height > 0 {
-        let confirmations = blockheight - utxo.height + 1;
-
+    if confirmations > 0 {
         coin.status = CoinStatus::UNCONFIRMED;
 
-        if confirmations as u32 >= client_config.confirmation_target {
+        if confirmations >= client_config.confirmation_target {
             coin.status = CoinStatus::CONFIRMED;
         }
     }
@@ -663,7 +672,28 @@ async fn check_for_duplicated(
         let address = Address::from_str(&coin.aggregated_address.as_ref().unwrap())?
             .require_network(client_config.network)?;
 
-        let utxo_list = discover_unspent(client_config, &address, wallet_blockheight)?;
+        let start_height = match (coin.utxo_txid.as_deref(), coin.utxo_vout) {
+            (Some(txid), Some(vout)) => {
+                match client_config
+                    .chain_client
+                    .get_stored_tx_out(txid, vout, true)?
+                {
+                    Some(tx_out) if tx_out.confirmations > 0 => client_config
+                        .chain_client
+                        .tip_height()?
+                        .saturating_sub(tx_out.confirmations)
+                        .saturating_add(1),
+                    // IN_MEMPOOL is assigned only when this wallet created the deposit address,
+                    // so wallet birth is a safe bound until the primary has a block height.
+                    Some(_) if coin.status == CoinStatus::IN_MEMPOOL => wallet_blockheight,
+                    // A received mempool primary can predate this wallet, and a spent primary no
+                    // longer exposes confirmations. Genesis is the only safe bound for either.
+                    Some(_) | None => 0,
+                }
+            }
+            _ => wallet_blockheight,
+        };
+        let utxo_list = discover_unspent(client_config, &address, start_height)?;
 
         let mut max_duplicated_index = existing_coins
             .iter()
@@ -1135,16 +1165,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_or_noncanonical_known_txids_fail_before_rpc() -> Result<()> {
+    async fn malformed_or_noncanonical_known_txids_are_soft_misses_before_rpc() -> Result<()> {
         let client_config = test_client_config().await?;
         let address = Address::from_str("bcrt1qgwwa9fcrcvnme0jymg39zm38w6gzudcq3n90tl")?
             .require_network(Network::Regtest)?;
         for txid in ["not-a-txid".to_string(), "AA".repeat(32)] {
-            let error = get_known_utxo(&client_config, &address, &txid, 0, None).unwrap_err();
-            assert_eq!(
-                error.to_string(),
-                format!("invalid or non-canonical stored funding txid: {txid}")
-            );
+            assert!(get_known_utxo(&client_config, &address, &txid, 0, None)?.is_none());
         }
         Ok(())
     }
@@ -1163,22 +1189,30 @@ mod tests {
         transferred_coin.index = 3;
         transferred_coin.status = CoinStatus::TRANSFERRED;
         transferred_coin.locktime = Some(42);
+        let mut malformed_coin = sample_coin();
+        malformed_coin.index = 4;
+        malformed_coin.statechain_id = Some("malformed-statechain".to_string());
+        malformed_coin.aggregated_address =
+            Some("bcrt1qgwwa9fcrcvnme0jymg39zm38w6gzudcq3n90tl".to_string());
+        malformed_coin.utxo_txid = Some("not-a-txid".to_string());
         let wallet = sample_wallet(vec![
             bip448_coin,
             legacy_coin,
             duplicated_coin,
             transferred_coin,
+            malformed_coin,
         ]);
         insert_wallet(&client_config.pool, &wallet).await?;
 
         update_coins(&client_config, &wallet.name).await?;
 
         let persisted = get_wallet(&client_config.pool, &wallet.name).await?;
-        assert_eq!(persisted.coins.len(), 4);
+        assert_eq!(persisted.coins.len(), 5);
         assert_eq!(persisted.coins[0].status, CoinStatus::INITIALISED);
         assert_eq!(persisted.coins[1].status, CoinStatus::INITIALISED);
         assert_eq!(persisted.coins[2].status, CoinStatus::INVALIDATED);
         assert_eq!(persisted.coins[3].status, CoinStatus::TRANSFERRED);
+        assert_eq!(persisted.coins[4].status, CoinStatus::UNCONFIRMED);
         assert!(persisted.coins[0].aggregated_address.is_none());
         assert!(persisted.coins[1].aggregated_address.is_none());
 
