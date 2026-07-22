@@ -33,6 +33,8 @@ enum Commands {
         token_id: String,
         amount: u32,
     },
+    /// Print the wallet-derived BIP448 recovery fee address
+    Bip448RecoveryFeeAddress { wallet_name: String },
     /// Broadcast the backup transaction to the network
     BroadcastBackupTransaction {
         wallet_name: String,
@@ -48,10 +50,17 @@ enum Commands {
         /// Recovery role: funding_update or settlement
         role: String,
         /// Address that receives CPFP fee-input change
-        change_address: String,
+        change_address: Option<String>,
         /// Keyless P2A fee input descriptor: txid:vout:value_sats
-        #[arg(long = "fee-input", required = true)]
+        #[arg(
+            long = "fee-input",
+            required_unless_present = "fund_from_wallet",
+            conflicts_with = "fund_from_wallet"
+        )]
         fee_inputs: Vec<String>,
+        /// Discover and sign confirmed fee inputs from the wallet-derived fee address
+        #[arg(long, conflicts_with = "fee_inputs")]
+        fund_from_wallet: bool,
         /// Package fee rate in sats per vbyte
         #[arg(long)]
         fee_rate: Option<f64>,
@@ -167,6 +176,13 @@ async fn main() -> Result<()> {
 
             println!("{}", serde_json::to_string_pretty(&obj).unwrap());
         }
+        Commands::Bip448RecoveryFeeAddress { wallet_name } => {
+            let wallet =
+                mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet_name)
+                    .await?;
+            let obj = json!({"address": wallet.bip448_recovery_fee_key()?.address});
+            println!("{}", serde_json::to_string_pretty(&obj).unwrap());
+        }
         Commands::BroadcastBackupTransaction {
             wallet_name,
             statechain_id,
@@ -189,23 +205,49 @@ async fn main() -> Result<()> {
             role,
             change_address,
             fee_inputs,
+            fund_from_wallet,
             fee_rate,
         } => {
             let role = mercuryrustlib::bip448_recovery::parse_recovery_template_role(&role)?;
-            let fee_inputs = fee_inputs
-                .iter()
-                .map(|input| mercuryrustlib::bip448_recovery::parse_keyless_p2a_fee_input(input))
-                .collect::<Result<Vec<_>>>()?;
-            let result = mercuryrustlib::bip448_recovery::submit_latest_state_recovery_package(
-                &client_config,
-                &wallet_name,
-                &statechain_id,
-                role,
-                &fee_inputs,
-                &change_address,
-                fee_rate,
-            )
-            .await?;
+            let result = if fund_from_wallet {
+                mercuryrustlib::bip448_recovery::submit_wallet_funded_latest_state_recovery_package(
+                    &client_config,
+                    &wallet_name,
+                    &statechain_id,
+                    role,
+                    change_address.as_deref(),
+                    fee_rate,
+                )
+                .await?
+            } else {
+                let fee_inputs = fee_inputs
+                    .iter()
+                    .map(|input| {
+                        mercuryrustlib::bip448_recovery::parse_keyless_p2a_fee_input(input)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let change_address = match change_address {
+                    Some(change_address) => change_address,
+                    None => mercuryrustlib::sqlite_manager::get_wallet(
+                        &client_config.pool,
+                        &wallet_name,
+                    )
+                    .await?
+                    .bip448_recovery_fee_key()?
+                    .address
+                    .to_string(),
+                };
+                mercuryrustlib::bip448_recovery::submit_latest_state_recovery_package(
+                    &client_config,
+                    &wallet_name,
+                    &statechain_id,
+                    role,
+                    &fee_inputs,
+                    &change_address,
+                    fee_rate,
+                )
+                .await?
+            };
 
             let obj = json!(result);
             println!("{}", serde_json::to_string_pretty(&obj).unwrap());
@@ -392,4 +434,33 @@ async fn main() -> Result<()> {
     client_config.pool.close().await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bip448_recovery_requires_exactly_one_fee_source() {
+        let base = [
+            "client-rust",
+            "broadcast-bip448-recovery-package",
+            "wallet",
+            "statechain",
+            "update",
+        ];
+        assert!(Cli::try_parse_from(base).is_err());
+        assert!(Cli::try_parse_from(base.into_iter().chain(["--fund-from-wallet"])).is_ok());
+        assert!(Cli::try_parse_from(
+            base.into_iter()
+                .chain(["--fee-input", &format!("{}:0:20000", "11".repeat(32))])
+        )
+        .is_ok());
+        assert!(Cli::try_parse_from(base.into_iter().chain([
+            "--fund-from-wallet",
+            "--fee-input",
+            &format!("{}:0:20000", "11".repeat(32)),
+        ]))
+        .is_err());
+    }
 }

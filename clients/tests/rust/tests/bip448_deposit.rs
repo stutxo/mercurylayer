@@ -2,6 +2,7 @@ mod common;
 
 use std::{
     collections::HashSet,
+    path::{Path, PathBuf},
     process::{Command, Output},
     str::FromStr,
 };
@@ -11,7 +12,9 @@ use bitcoin::{
     blockdata::opcodes::all::OP_CLTV, consensus::encode, script::Builder, OutPoint, ScriptBuf,
     Transaction, TxOut, Txid,
 };
-use common::bip448_regtest::{fund_p2a_fee_input, FUNDING_AMOUNT_SATS};
+use common::bip448_regtest::{
+    fund_address_output, fund_p2a_fee_input, FEE_INPUT_AMOUNT_SATS, FUNDING_AMOUNT_SATS,
+};
 use mercurylib::bip448_statechain::{
     package::{
         build_anchor_cpfp_package, build_latest_state_recovery_package, Bip448CpfpFeeInput,
@@ -659,8 +662,171 @@ async fn bip448_client_submitter_broadcasts_recovery_package() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+#[ignore = "requires docker regtest stack with Mercury server, lockbox, and active BIP448 Inquisition deployments"]
+async fn bip448_cli_wallet_funded_and_keyless_recovery_packages() -> Result<()> {
+    let _guard = common::test_guard();
+    let client_cli = build_client_cli()?;
+
+    common::bitcoin_core::ensure_wallet_loaded()?;
+    common::bip448_activation::ensure_bip448_deployments_active()?;
+    common::bitcoin_core::ensure_wallet_ready()?;
+    let mercury_client = common::mercury::http_client();
+    common::mercury::wait_until_ready(&mercury_client).await?;
+    let lockbox_client = common::lockbox::http_client();
+    common::lockbox::wait_until_ready(&lockbox_client).await?;
+
+    let client_config = common::prepare_test_env().await?;
+    let wallet =
+        mercuryrustlib::wallet::create_wallet("bip448-wallet-funded-cli", &client_config).await?;
+    mercuryrustlib::sqlite_manager::insert_wallet(&client_config.pool, &wallet).await?;
+    let deposit = create_confirmed_bip448_deposit(&client_config, &wallet).await?;
+
+    let fee_address = run_client_cli(
+        &client_cli,
+        &[
+            "bip448-recovery-fee-address".to_string(),
+            wallet.name.clone(),
+        ],
+    )?;
+    let fee_address = fee_address
+        .get("address")
+        .and_then(Value::as_str)
+        .context("fee-address command omitted address")?;
+    let fee_address = common::bitcoin_core::regtest_address(fee_address)?;
+    fund_address_output(&fee_address, FEE_INPUT_AMOUNT_SATS)?;
+    common::bitcoin_core::mine_block()?;
+
+    let wallet_funded = run_client_cli(
+        &client_cli,
+        &[
+            "broadcast-bip448-recovery-package".to_string(),
+            wallet.name.clone(),
+            deposit.statechain_id,
+            "funding_update".to_string(),
+            "--fund-from-wallet".to_string(),
+            "--fee-rate".to_string(),
+            PACKAGE_FEERATE_SAT_PER_VBYTE.to_string(),
+        ],
+    )?;
+    confirm_cli_recovery_package(&wallet_funded)?;
+
+    let keyless_wallet =
+        mercuryrustlib::wallet::create_wallet("bip448-keyless-cli", &client_config).await?;
+    mercuryrustlib::sqlite_manager::insert_wallet(&client_config.pool, &keyless_wallet).await?;
+    let keyless_deposit = create_confirmed_bip448_deposit(&client_config, &keyless_wallet).await?;
+    let fee_input = fund_p2a_fee_input()?;
+    common::bitcoin_core::mine_block()?;
+    let fee_input = format!(
+        "{}:{}:{}",
+        fee_input.outpoint.txid, fee_input.outpoint.vout, fee_input.value_sats
+    );
+
+    let keyless = run_client_cli(
+        &client_cli,
+        &[
+            "broadcast-bip448-recovery-package".to_string(),
+            keyless_wallet.name,
+            keyless_deposit.statechain_id,
+            "funding_update".to_string(),
+            common::bitcoin_core::getnewaddress()?,
+            "--fee-input".to_string(),
+            fee_input,
+            "--fee-rate".to_string(),
+            PACKAGE_FEERATE_SAT_PER_VBYTE.to_string(),
+        ],
+    )?;
+    confirm_cli_recovery_package(&keyless)?;
+
+    Ok(())
+}
+
 struct Bip448DepositFixture {
     statechain_id: String,
+}
+
+fn build_client_cli() -> Result<PathBuf> {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let output = Command::new(cargo)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args([
+            "build",
+            "--locked",
+            "--package",
+            "client-rust",
+            "--bin",
+            "client-rust",
+            "--message-format=json-render-diagnostics",
+        ])
+        .output()
+        .context("failed to build client-rust for the CLI recovery test")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "client-rust build failed with {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        ));
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|message| {
+            (message.get("reason").and_then(Value::as_str) == Some("compiler-artifact")
+                && message
+                    .get("target")
+                    .and_then(|target| target.get("name"))
+                    .and_then(Value::as_str)
+                    == Some("client-rust"))
+            .then(|| {
+                message
+                    .get("executable")
+                    .and_then(Value::as_str)
+                    .map(PathBuf::from)
+            })
+            .flatten()
+        })
+        .context("client-rust build did not report its executable")
+}
+
+fn run_client_cli(binary: &Path, args: &[String]) -> Result<Value> {
+    let output = Command::new(binary)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("ML_NETWORK", "regtest")
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to execute {}", binary.display()))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "client command failed with {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        ));
+    }
+
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+fn confirm_cli_recovery_package(submission: &Value) -> Result<()> {
+    let parent_txid = submission
+        .get("parent_txid")
+        .and_then(Value::as_str)
+        .context("CLI recovery omitted parent_txid")?
+        .parse::<Txid>()?;
+    let child_txid = submission
+        .get("cpfp_child_txid")
+        .and_then(Value::as_str)
+        .context("CLI recovery omitted cpfp_child_txid")?
+        .parse::<Txid>()?;
+    common::bitcoin_core::assert_in_mempool(&parent_txid)?;
+    common::bitcoin_core::assert_in_mempool(&child_txid)?;
+    common::bitcoin_core::mine_block()?;
+    common::bitcoin_core::assert_confirmed(&parent_txid)?;
+    common::bitcoin_core::assert_confirmed(&child_txid)?;
+
+    Ok(())
 }
 
 fn run_restart_child(wallet_name: &str, checkpoint: Option<&str>) -> Result<Output> {
