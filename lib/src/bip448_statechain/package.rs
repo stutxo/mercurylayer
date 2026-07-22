@@ -1,5 +1,7 @@
 use std::{error::Error, fmt};
 
+pub mod fee_signing;
+
 use bitcoin::{
     absolute, consensus::encode, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
 };
@@ -12,6 +14,7 @@ use crate::bip448_statechain::{
 /// Bitcoin Core TRUC/v3 policy limits a child with an unconfirmed v3 parent to
 /// 1,000 virtual bytes. Recovery packages must satisfy this before submission.
 pub const TRUC_CHILD_MAX_VBYTES: usize = 1_000;
+const TAPROOT_KEY_PATH_SIGNATURE_SIZE: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct Bip448CpfpFeeInput {
@@ -32,6 +35,19 @@ impl Bip448CpfpFeeInput {
             witness: Witness::new(),
         }
     }
+
+    pub fn signed(previous_output: OutPoint, value_sats: u64) -> Self {
+        let mut witness = Witness::new();
+        witness.push([0u8; TAPROOT_KEY_PATH_SIGNATURE_SIZE]);
+
+        Self {
+            previous_output,
+            value_sats,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +62,35 @@ pub struct Bip448RecoveryPackage {
 impl Bip448RecoveryPackage {
     pub fn transactions(&self) -> [&Transaction; 2] {
         [&self.parent_tx, &self.cpfp_child_tx]
+    }
+
+    fn replace_fee_input_witnesses(
+        &mut self,
+        witnesses: Vec<Witness>,
+    ) -> Result<(), Bip448PackageError> {
+        let expected = self.cpfp_child_tx.input.len().saturating_sub(1);
+        if witnesses.len() != expected {
+            return Err(Bip448PackageError::FeeInputWitnessCountMismatch {
+                expected,
+                actual: witnesses.len(),
+            });
+        }
+
+        let estimated_vbytes = self.cpfp_child_tx.vsize();
+        let mut signed_child = self.cpfp_child_tx.clone();
+        for (input, witness) in signed_child.input.iter_mut().skip(1).zip(witnesses) {
+            input.witness = witness;
+        }
+        let final_vbytes = signed_child.vsize();
+        if final_vbytes != estimated_vbytes {
+            return Err(Bip448PackageError::SignedChildVsizeMismatch {
+                estimated_vbytes,
+                final_vbytes,
+            });
+        }
+
+        self.cpfp_child_tx = signed_child;
+        Ok(())
     }
 }
 
@@ -77,6 +122,14 @@ pub enum Bip448PackageError {
     ChildExceedsTrucLimit {
         child_vbytes: usize,
         max_vbytes: usize,
+    },
+    FeeInputWitnessCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    SignedChildVsizeMismatch {
+        estimated_vbytes: usize,
+        final_vbytes: usize,
     },
     UnsupportedRecoveryRole {
         role: Bip448RecoveryTemplateRole,
@@ -136,6 +189,17 @@ impl fmt::Display for Bip448PackageError {
             } => write!(
                 f,
                 "BIP448 CPFP child is {child_vbytes} vB, exceeding TRUC/v3 child limit {max_vbytes} vB"
+            ),
+            Self::FeeInputWitnessCountMismatch { expected, actual } => write!(
+                f,
+                "BIP448 CPFP child requires {expected} fee-input witnesses, got {actual}"
+            ),
+            Self::SignedChildVsizeMismatch {
+                estimated_vbytes,
+                final_vbytes,
+            } => write!(
+                f,
+                "signed BIP448 CPFP child is {final_vbytes} vB, expected {estimated_vbytes} vB"
             ),
             Self::UnsupportedRecoveryRole { role } => {
                 write!(f, "BIP448 recovery package role {} is not supported here", role.as_str())
@@ -386,10 +450,16 @@ fn fee_inputs_value(fee_inputs: &[Bip448CpfpFeeInput]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::fee_signing::sign_cpfp_fee_inputs;
     use super::*;
     use crate::bip448_statechain::transaction::pay_to_anchor_script;
-    use bitcoin::{hashes::Hash, Txid, Witness};
-    use secp256k1::{Secp256k1, SecretKey};
+    use bitcoin::{
+        hashes::Hash,
+        key::TapTweak,
+        sighash::{self, SighashCache, TapSighashType},
+        Address, Network, Txid, Witness,
+    };
+    use secp256k1::{schnorr, KeyPair, Message, Secp256k1, SecretKey};
 
     const PARENT_VALUE: u64 = 50_000;
     const FEE_INPUT_VALUE: u64 = 20_000;
@@ -444,6 +514,34 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    fn signed_fee_inputs(count: usize) -> Vec<Bip448CpfpFeeInput> {
+        (0..count)
+            .map(|i| {
+                let mut txid_bytes = [3u8; 32];
+                txid_bytes[0] = i as u8;
+                Bip448CpfpFeeInput::signed(
+                    OutPoint {
+                        txid: Txid::from_slice(&txid_bytes).unwrap(),
+                        vout: i as u32,
+                    },
+                    FEE_INPUT_VALUE,
+                )
+            })
+            .collect()
+    }
+
+    fn fee_key_and_script() -> (SecretKey, ScriptBuf) {
+        let secp = Secp256k1::new();
+        let key = SecretKey::from_secret_bytes([8u8; 32]).unwrap();
+        let address = Address::p2tr(
+            &secp,
+            key.public_key(&secp).x_only_public_key().0,
+            None,
+            Network::Regtest,
+        );
+        (key, address.script_pubkey())
     }
 
     fn change_script() -> ScriptBuf {
@@ -545,6 +643,138 @@ mod tests {
 
         assert!(matches!(
             build_anchor_cpfp_package(&parent, PARENT_VALUE, 1, &inputs, change_script(), 1.0),
+            Err(Bip448PackageError::ChildExceedsTrucLimit {
+                max_vbytes: TRUC_CHILD_MAX_VBYTES,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn signed_fee_inputs_keep_estimated_vsize_and_verify() {
+        let parent = parent_tx();
+        let fee_inputs = signed_fee_inputs(2);
+        let (fee_secret_key, fee_script_pubkey) = fee_key_and_script();
+        assert!(fee_inputs.iter().all(|input| {
+            input.witness.len() == 1
+                && input.witness.iter().next().unwrap().len() == TAPROOT_KEY_PATH_SIGNATURE_SIZE
+        }));
+
+        let mut package = build_anchor_cpfp_package(
+            &parent,
+            PARENT_VALUE,
+            1,
+            &fee_inputs,
+            fee_script_pubkey.clone(),
+            2.0,
+        )
+        .unwrap();
+        let estimated_child_vbytes = package.cpfp_child_tx.vsize();
+
+        sign_cpfp_fee_inputs(
+            &mut package,
+            &fee_inputs,
+            &fee_script_pubkey,
+            &fee_secret_key,
+        )
+        .unwrap();
+
+        assert_eq!(package.cpfp_child_tx.vsize(), estimated_child_vbytes);
+        assert_eq!(
+            package.package_vbytes,
+            package.parent_tx.vsize() + package.cpfp_child_tx.vsize()
+        );
+        assert!(package.cpfp_child_tx.input[0].witness.is_empty());
+
+        let mut prevouts = vec![parent.output[1].clone()];
+        prevouts.extend(fee_inputs.iter().map(|input| TxOut {
+            value: input.value_sats,
+            script_pubkey: fee_script_pubkey.clone(),
+        }));
+        let secp = Secp256k1::new();
+        let output_key = KeyPair::from_secret_key(&secp, &fee_secret_key)
+            .tap_tweak(&secp, None)
+            .to_inner()
+            .x_only_public_key()
+            .0;
+        for input_index in 1..package.cpfp_child_tx.input.len() {
+            let witness = &package.cpfp_child_tx.input[input_index].witness;
+            let signature_bytes = witness.iter().next().unwrap();
+            assert_eq!(signature_bytes.len(), TAPROOT_KEY_PATH_SIGNATURE_SIZE);
+            let signature = schnorr::Signature::from_slice(signature_bytes).unwrap();
+            let sighash = SighashCache::new(&package.cpfp_child_tx)
+                .taproot_key_spend_signature_hash(
+                    input_index,
+                    &sighash::Prevouts::All(&prevouts),
+                    TapSighashType::Default,
+                )
+                .unwrap();
+            let message: Message = sighash.into();
+            secp.verify_schnorr(&signature, message.as_ref(), &output_key)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn signed_child_rejects_changed_witness_size() {
+        let parent = parent_tx();
+        let mut package = build_anchor_cpfp_package(
+            &parent,
+            PARENT_VALUE,
+            1,
+            &signed_fee_inputs(1),
+            change_script(),
+            1.0,
+        )
+        .unwrap();
+        let estimated_vbytes = package.cpfp_child_tx.vsize();
+        let mut wrong_size_witness = Witness::new();
+        wrong_size_witness.push([0u8; TAPROOT_KEY_PATH_SIGNATURE_SIZE + 8]);
+
+        assert!(matches!(
+            package.replace_fee_input_witnesses(vec![wrong_size_witness]),
+            Err(Bip448PackageError::SignedChildVsizeMismatch {
+                estimated_vbytes: expected,
+                final_vbytes,
+            }) if expected == estimated_vbytes && final_vbytes != expected
+        ));
+        assert_eq!(package.cpfp_child_tx.vsize(), estimated_vbytes);
+    }
+
+    #[test]
+    fn signed_inputs_preserve_package_rejections() {
+        let parent = parent_tx();
+        let dust_sats = change_script().dust_value().to_sat();
+
+        assert!(matches!(
+            build_anchor_cpfp_child(
+                &parent,
+                1,
+                &signed_fee_inputs(1),
+                change_script(),
+                FEE_INPUT_VALUE + 1,
+            ),
+            Err(Bip448PackageError::FeeExceedsFeeInputs { .. })
+        ));
+        assert!(matches!(
+            build_anchor_cpfp_child(
+                &parent,
+                1,
+                &signed_fee_inputs(1),
+                change_script(),
+                FEE_INPUT_VALUE - dust_sats + 1,
+            ),
+            Err(Bip448PackageError::ChangeWouldBeDust { .. })
+        ));
+        assert!(matches!(
+            build_anchor_cpfp_package(
+                &parent,
+                PARENT_VALUE,
+                1,
+                &signed_fee_inputs(30),
+                change_script(),
+                1.0,
+            ),
             Err(Bip448PackageError::ChildExceedsTrucLimit {
                 max_vbytes: TRUC_CHILD_MAX_VBYTES,
                 ..
