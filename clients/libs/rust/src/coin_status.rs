@@ -72,7 +72,7 @@ pub fn unspent_from_descriptor_activity(activity: Vec<DescriptorActivity>) -> Ve
     receives.into_values().collect()
 }
 
-fn discover_unspent(
+pub(crate) fn discover_unspent(
     client_config: &ClientConfig,
     address: &Address,
     start_height: u32,

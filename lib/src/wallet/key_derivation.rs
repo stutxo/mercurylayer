@@ -23,6 +23,11 @@ pub struct KeyData {
     pub address_index: u32,
 }
 
+pub struct Bip448RecoveryFeeKey {
+    pub address: Address,
+    pub secret_key: SecretKey,
+}
+
 impl Wallet {
     fn get_seed(&self) -> Result<[u8; 64], MercuryError> {
         let seed: [u8; 64] = Mnemonic::from_str(&self.mnemonic)?.to_seed("");
@@ -81,6 +86,22 @@ impl Wallet {
             derivation_path,
             change_index,
             address_index,
+        })
+    }
+
+    pub fn bip448_recovery_fee_key(&self) -> Result<Bip448RecoveryFeeKey, MercuryError> {
+        let network = get_network(&self.network)?;
+        let key_data = self.generate_new_key("m/86h/0h/0h", 1, 0)?;
+        let address = Address::p2tr(
+            &Secp256k1::new(),
+            key_data.public_key.x_only_public_key().0,
+            None,
+            network,
+        );
+
+        Ok(Bip448RecoveryFeeKey {
+            address,
+            secret_key: key_data.secret_key,
         })
     }
 
@@ -157,5 +178,53 @@ impl Wallet {
         };
 
         Ok(coin)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wallet::Settings;
+
+    #[test]
+    fn bip448_recovery_fee_address_is_stable() {
+        let wallet = Wallet {
+            name: "wallet".to_string(),
+            mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string(),
+            version: "0.1.0".to_string(),
+            state_entity_endpoint: String::new(),
+            chain_backend: "core".to_string(),
+            chain_endpoint: String::new(),
+            network: "regtest".to_string(),
+            blockheight: 0,
+            initlock: 0,
+            interval: 0,
+            activities: Vec::new(),
+            coins: Vec::new(),
+            settings: Settings {
+                network: "regtest".to_string(),
+                block_explorerURL: None,
+                torProxyHost: None,
+                torProxyPort: None,
+                torProxyControlPassword: None,
+                torProxyControlPort: None,
+                statechainEntityApi: String::new(),
+                torStatechainEntityApi: None,
+                chainBackend: "core".to_string(),
+                chainUrl: String::new(),
+                chainType: None,
+                notifications: false,
+                tutorials: false,
+            },
+        };
+
+        assert_eq!(
+            wallet
+                .bip448_recovery_fee_key()
+                .unwrap()
+                .address
+                .to_string(),
+            "bcrt1p3qkhfews2uk44qtvauqyr2ttdsw7svhkl9nkm9s9c3x4ax5h60wq5jq7et"
+        );
     }
 }
