@@ -7,6 +7,7 @@ use mercurylib::{
     transfer::bip448::Bip448TransferMsg,
     wallet::{BackupTx, Wallet},
 };
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{Pool, Row, Sqlite};
 
@@ -37,13 +38,60 @@ pub(crate) struct Bip448ScanCursor {
     pub last_scanned_block_hash: String,
 }
 
+pub const BIP448_FEE_RESERVATION_TTL_SECONDS: i64 = 60 * 60;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Bip448FeeInputRecord { pub txid: String, pub vout: u32, pub value_sats: u64 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bip448PackageAttemptStatus {
+    Pending, Submitted, Confirmed, Abandoned,
+}
+
+impl Bip448PackageAttemptStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "Pending", Self::Submitted => "Submitted",
+            Self::Confirmed => "Confirmed", Self::Abandoned => "Abandoned",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "Pending" => Ok(Self::Pending), "Submitted" => Ok(Self::Submitted),
+            "Confirmed" => Ok(Self::Confirmed), "Abandoned" => Ok(Self::Abandoned),
+            _ => Err(anyhow!("invalid BIP448 package-attempt status")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Bip448PackageAttempt {
+    pub wallet_name: String, pub statechain_id: String, pub role: String,
+    pub parent_txid: String, pub child_txid: String, pub child_tx_hex: String,
+    pub fee_inputs: Vec<Bip448FeeInputRecord>,
+    pub target_feerate_sat_per_vbyte: f64, pub status: Bip448PackageAttemptStatus,
+}
+
 pub(crate) fn canonical_txid(txid: &str) -> Result<String> {
-    Ok(Txid::from_str(txid).with_context(|| format!("invalid txid {txid}"))?.to_string())
+    Ok(Txid::from_str(txid).context("invalid txid")?.to_string())
+}
+
+fn canonical_wallet_json(wallet: &Wallet) -> Result<String> {
+    let mut wallet = wallet.clone();
+    for coin in &mut wallet.coins {
+        for txid in [&mut coin.utxo_txid, &mut coin.tx_cpfp, &mut coin.tx_withdraw] {
+            if let Some(txid) = txid {
+                *txid = canonical_txid(txid)?;
+            }
+        }
+    }
+    Ok(serde_json::to_string(&wallet)?)
 }
 
 fn canonical_block_hash(block_hash: &str) -> Result<String> {
     Ok(BlockHash::from_str(block_hash)
-        .with_context(|| format!("invalid block hash {block_hash}"))?.to_string())
+        .context("invalid block hash")?.to_string())
 }
 
 pub(crate) async fn load_bip448_scan_state(
@@ -113,6 +161,44 @@ pub(crate) async fn persist_bip448_scan_state(
     )
     .bind(wallet_name).bind(script_pubkey).execute(&mut *transaction).await?;
     sqlx::query(
+        "WITH active_reservations AS (\
+            SELECT json_extract(fee.value, '$.txid') AS txid, \
+                CAST(json_extract(fee.value, '$.vout') AS INTEGER) AS vout, \
+                CAST(json_extract(fee.value, '$.value_sats') AS INTEGER) AS value_sats, \
+                statechain_id || ':' || role AS reservation_id, \
+                unixepoch(updated_at) AS reservation_time \
+            FROM bip448_package_attempts, json_each(fee_inputs_json) AS fee \
+            WHERE wallet_name = $1 AND status IN ('Pending', 'Submitted')\
+         ) \
+         UPDATE bip448_scanned_outpoints AS outpoint SET \
+            reserved_at = CASE \
+                WHEN reserved_by = (\
+                    SELECT reservation_id FROM active_reservations \
+                    WHERE txid = outpoint.txid AND vout = outpoint.vout AND \
+                        value_sats = outpoint.value_sats \
+                    ORDER BY reservation_time DESC, reservation_id DESC LIMIT 1\
+                ) AND reserved_at IS NOT NULL THEN reserved_at \
+                ELSE (\
+                    SELECT reservation_time FROM active_reservations \
+                    WHERE txid = outpoint.txid AND vout = outpoint.vout AND \
+                        value_sats = outpoint.value_sats \
+                    ORDER BY reservation_time DESC, reservation_id DESC LIMIT 1\
+                ) \
+            END, \
+            reserved_by = (\
+                SELECT reservation_id FROM active_reservations \
+                WHERE txid = outpoint.txid AND vout = outpoint.vout AND \
+                    value_sats = outpoint.value_sats \
+                ORDER BY reservation_time DESC, reservation_id DESC LIMIT 1\
+            ) \
+         WHERE wallet_name = $1 AND script_pubkey = $2 AND EXISTS (\
+            SELECT 1 FROM active_reservations \
+            WHERE txid = outpoint.txid AND vout = outpoint.vout AND \
+                value_sats = outpoint.value_sats\
+         )",
+    )
+    .bind(wallet_name).bind(script_pubkey).execute(&mut *transaction).await?;
+    sqlx::query(
         "INSERT INTO bip448_scan_cursors \
             (wallet_name, script_pubkey, last_scanned_height, last_scanned_block_hash) \
          VALUES ($1, $2, $3, $4) \
@@ -144,8 +230,235 @@ pub(crate) async fn clear_bip448_scan_state(
     Ok(())
 }
 
+pub(crate) fn bip448_reservation_id(statechain_id: &str, role: &str) -> String {
+    format!("{statechain_id}:{role}")
+}
+
+pub(crate) async fn upsert_bip448_scanned_outpoint(
+    pool: &Pool<Sqlite>, wallet_name: &str, script_pubkey: &str, outpoint: &ChainUtxo,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO bip448_scanned_outpoints \
+            (wallet_name, txid, vout, script_pubkey, value_sats, height) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         ON CONFLICT(wallet_name, txid, vout) DO UPDATE SET \
+            script_pubkey = excluded.script_pubkey, value_sats = excluded.value_sats, \
+            height = excluded.height",
+    )
+    .bind(wallet_name).bind(canonical_txid(&outpoint.txid)?)
+    .bind(i64::from(outpoint.vout)).bind(script_pubkey)
+    .bind(i64::try_from(outpoint.value)?).bind(i64::from(outpoint.height))
+    .execute(pool).await?;
+    Ok(())
+}
+
+pub(crate) async fn available_bip448_scanned_outpoints(
+    pool: &Pool<Sqlite>, wallet_name: &str, script_pubkey: &str, reservation_id: &str,
+) -> Result<Vec<ChainUtxo>> {
+    let rows = sqlx::query(
+        "SELECT txid, vout, value_sats, height FROM bip448_scanned_outpoints \
+         WHERE wallet_name = $1 AND script_pubkey = $2 AND \
+            (reserved_by IS NULL OR \
+             (reserved_by <> $3 AND reserved_at <= unixepoch() - $4))",
+    )
+    .bind(wallet_name).bind(script_pubkey).bind(reservation_id)
+    .bind(BIP448_FEE_RESERVATION_TTL_SECONDS).fetch_all(pool).await?;
+    rows.into_iter().map(|row| Ok(ChainUtxo {
+        txid: canonical_txid(row.try_get(0)?)?,
+        vout: u32::try_from(row.try_get::<i64, _>(1)?)?,
+        value: u64::try_from(row.try_get::<i64, _>(2)?)?,
+        height: u32::try_from(row.try_get::<i64, _>(3)?)?,
+    })).collect()
+}
+
+pub(crate) async fn ensure_no_orphaned_bip448_reservation(
+    pool: &Pool<Sqlite>, wallet_name: &str, statechain_id: &str, role: &str,
+) -> Result<()> {
+    let reservation_id = bip448_reservation_id(statechain_id, role);
+    let exists = sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(\
+            SELECT 1 FROM bip448_scanned_outpoints \
+            WHERE wallet_name = $1 AND reserved_by = $2\
+         )",
+    )
+    .bind(wallet_name).bind(reservation_id).fetch_one(pool).await?;
+    if exists != 0 {
+        return Err(anyhow!(
+            "BIP448 fee reservation exists without its package attempt"
+        ));
+    }
+    Ok(())
+}
+
+pub async fn get_bip448_package_attempt(
+    pool: &Pool<Sqlite>, wallet_name: &str, statechain_id: &str, role: &str,
+) -> Result<Option<Bip448PackageAttempt>> {
+    let row = sqlx::query(
+        "SELECT parent_txid, child_txid, child_tx_hex, fee_inputs_json, \
+                target_feerate_sat_per_vbyte, status \
+         FROM bip448_package_attempts \
+         WHERE wallet_name = $1 AND statechain_id = $2 AND role = $3",
+    )
+    .bind(wallet_name).bind(statechain_id).bind(role).fetch_optional(pool).await?;
+    row.map(|row| -> Result<_> {
+        let parent_txid: String = row.try_get(0)?;
+        let child_txid: String = row.try_get(1)?;
+        let fee_inputs: Vec<Bip448FeeInputRecord> = serde_json::from_str(row.try_get(3)?)
+            .map_err(|_| anyhow!("invalid BIP448 package-attempt fee inputs"))?;
+        if canonical_txid(&parent_txid)? != parent_txid
+            || canonical_txid(&child_txid)? != child_txid
+            || fee_inputs.iter().any(|input| {
+                canonical_txid(&input.txid).map_or(true, |txid| txid != input.txid)
+            })
+        {
+            return Err(anyhow!("non-canonical BIP448 package-attempt txid"));
+        }
+        Ok(Bip448PackageAttempt {
+            wallet_name: wallet_name.to_owned(), statechain_id: statechain_id.to_owned(),
+            role: role.to_owned(), parent_txid, child_txid, child_tx_hex: row.try_get(2)?,
+            fee_inputs, target_feerate_sat_per_vbyte: row.try_get(4)?,
+            status: Bip448PackageAttemptStatus::parse(row.try_get(5)?)?,
+        })
+    }).transpose()
+}
+
+pub(crate) async fn insert_bip448_package_attempt(
+    pool: &Pool<Sqlite>, attempt: &Bip448PackageAttempt,
+) -> Result<()> {
+    if attempt.status != Bip448PackageAttemptStatus::Pending
+        || !attempt.target_feerate_sat_per_vbyte.is_finite()
+        || attempt.target_feerate_sat_per_vbyte <= 0.0
+    {
+        return Err(anyhow!("invalid BIP448 package attempt"));
+    }
+    let parent_txid = canonical_txid(&attempt.parent_txid)?;
+    let child_txid = canonical_txid(&attempt.child_txid)?;
+    let mut fee_inputs = attempt.fee_inputs.clone();
+    for input in &mut fee_inputs {
+        input.txid = canonical_txid(&input.txid)?;
+    }
+    let reservation_id = bip448_reservation_id(&attempt.statechain_id, &attempt.role);
+    let mut transaction = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO bip448_package_attempts \
+            (wallet_name, statechain_id, role, parent_txid, child_txid, child_tx_hex, \
+             fee_inputs_json, target_feerate_sat_per_vbyte, status) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+    )
+    .bind(&attempt.wallet_name).bind(&attempt.statechain_id).bind(&attempt.role)
+    .bind(parent_txid).bind(child_txid).bind(&attempt.child_tx_hex)
+    .bind(serde_json::to_string(&fee_inputs)?)
+    .bind(attempt.target_feerate_sat_per_vbyte).bind(attempt.status.as_str())
+    .execute(&mut *transaction).await?;
+    for input in &fee_inputs {
+        let result = sqlx::query(
+            "UPDATE bip448_scanned_outpoints SET reserved_by = $1, reserved_at = unixepoch() \
+             WHERE wallet_name = $2 AND txid = $3 AND vout = $4 AND \
+                (reserved_by IS NULL OR \
+                 (reserved_by <> $1 AND reserved_at <= unixepoch() - $5))",
+        )
+        .bind(&reservation_id).bind(&attempt.wallet_name).bind(canonical_txid(&input.txid)?)
+        .bind(i64::from(input.vout)).bind(BIP448_FEE_RESERVATION_TTL_SECONDS)
+        .execute(&mut *transaction).await?;
+        if result.rows_affected() != 1 {
+            return Err(anyhow!("BIP448 fee input is unavailable"));
+        }
+    }
+    transaction.commit().await?;
+    Ok(())
+}
+
+pub(crate) async fn reacquire_bip448_package_attempt_reservations(
+    pool: &Pool<Sqlite>,
+    attempt: &Bip448PackageAttempt,
+) -> Result<()> {
+    if !matches!(
+        attempt.status,
+        Bip448PackageAttemptStatus::Pending | Bip448PackageAttemptStatus::Submitted
+    ) {
+        return Err(anyhow!("BIP448 package attempt is not active"));
+    }
+    let fee_inputs_json = serde_json::to_string(&attempt.fee_inputs)?;
+    let mut transaction = pool.begin().await?;
+    let status = sqlx::query_scalar::<_, String>(
+        "SELECT status FROM bip448_package_attempts \
+         WHERE wallet_name = $1 AND statechain_id = $2 AND role = $3 AND \
+            parent_txid = $4 AND child_txid = $5 AND child_tx_hex = $6 AND \
+            fee_inputs_json = $7 AND target_feerate_sat_per_vbyte = $8",
+    )
+    .bind(&attempt.wallet_name)
+    .bind(&attempt.statechain_id)
+    .bind(&attempt.role)
+    .bind(canonical_txid(&attempt.parent_txid)?)
+    .bind(canonical_txid(&attempt.child_txid)?)
+    .bind(&attempt.child_tx_hex)
+    .bind(fee_inputs_json)
+    .bind(attempt.target_feerate_sat_per_vbyte)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or_else(|| anyhow!("stored BIP448 package attempt changed before replay"))?;
+    if !matches!(
+        Bip448PackageAttemptStatus::parse(&status)?,
+        Bip448PackageAttemptStatus::Pending | Bip448PackageAttemptStatus::Submitted
+    ) {
+        return Err(anyhow!("BIP448 package attempt is not active"));
+    }
+
+    let reservation_id = bip448_reservation_id(&attempt.statechain_id, &attempt.role);
+    for input in &attempt.fee_inputs {
+        let result = sqlx::query(
+            "UPDATE bip448_scanned_outpoints \
+             SET reserved_by = $1, reserved_at = unixepoch() \
+             WHERE wallet_name = $2 AND txid = $3 AND vout = $4 AND value_sats = $5 AND \
+                (reserved_by IS NULL OR reserved_by = $1 OR \
+                 reserved_at <= unixepoch() - $6)",
+        )
+        .bind(&reservation_id)
+        .bind(&attempt.wallet_name)
+        .bind(canonical_txid(&input.txid)?)
+        .bind(i64::from(input.vout))
+        .bind(i64::try_from(input.value_sats)?)
+        .bind(BIP448_FEE_RESERVATION_TTL_SECONDS)
+        .execute(&mut *transaction)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(anyhow!(
+                "stored BIP448 package attempt cannot reacquire its fee inputs"
+            ));
+        }
+    }
+    transaction.commit().await?;
+    Ok(())
+}
+
+pub async fn set_bip448_package_attempt_status(
+    pool: &Pool<Sqlite>, wallet_name: &str, statechain_id: &str, role: &str,
+    status: Bip448PackageAttemptStatus,
+) -> Result<()> {
+    let mut transaction = pool.begin().await?;
+    let result = sqlx::query(
+        "UPDATE bip448_package_attempts SET status = $1, updated_at = CURRENT_TIMESTAMP \
+         WHERE wallet_name = $2 AND statechain_id = $3 AND role = $4",
+    )
+    .bind(status.as_str()).bind(wallet_name).bind(statechain_id).bind(role)
+    .execute(&mut *transaction).await?;
+    if result.rows_affected() != 1 {
+        return Err(anyhow!("BIP448 package attempt is missing"));
+    }
+    if matches!(status, Bip448PackageAttemptStatus::Confirmed | Bip448PackageAttemptStatus::Abandoned) {
+        sqlx::query(
+            "UPDATE bip448_scanned_outpoints SET reserved_by = NULL, reserved_at = NULL \
+             WHERE wallet_name = $1 AND reserved_by = $2",
+        )
+        .bind(wallet_name).bind(bip448_reservation_id(statechain_id, role))
+        .execute(&mut *transaction).await?;
+    }
+    transaction.commit().await?;
+    Ok(())
+}
+
 pub async fn insert_wallet(pool: &Pool<Sqlite>, wallet: &Wallet) -> Result<()> {
-    let wallet_json = json!(wallet).to_string();
+    let wallet_json = canonical_wallet_json(wallet)?;
 
     let query = "INSERT INTO wallet (wallet_name, wallet_json) VALUES ($1, $2)";
 
@@ -175,7 +488,7 @@ pub async fn get_wallet(pool: &Pool<Sqlite>, wallet_name: &str) -> Result<Wallet
 }
 
 pub async fn update_wallet(pool: &Pool<Sqlite>, wallet: &Wallet) -> Result<()> {
-    let wallet_json = json!(wallet).to_string();
+    let wallet_json = canonical_wallet_json(wallet)?;
 
     let query = "UPDATE wallet SET wallet_json = $1 WHERE wallet_name = $2";
 
@@ -332,6 +645,9 @@ async fn upsert_bip448_statechain_record(
     pool: &Pool<Sqlite>,
     record: &Bip448StatechainRecord,
 ) -> Result<()> {
+    let mut record = record.clone();
+    record.funding_outpoint.txid = canonical_txid(&record.funding_outpoint.txid)?;
+    let record = &record;
     let record_json = validated_bip448_record_json(record)?;
     let mut transaction = pool.begin().await?;
     let existing = sqlx::query(
@@ -1068,6 +1384,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wallet_and_accepted_record_persistence_canonicalize_txids() -> Result<()> {
+        let pool = migrated_pool().await?;
+        let mut wallet = sample_wallet();
+        let mut coin = wallet.get_new_coin()?;
+        coin.utxo_txid = Some("AA".repeat(32));
+        coin.utxo_vout = Some(1);
+        coin.tx_cpfp = Some("BB".repeat(32));
+        coin.tx_withdraw = Some("CC".repeat(32));
+        wallet.coins.push(coin);
+        insert_wallet(&pool, &wallet).await?;
+        let stored_coin = get_wallet(&pool, &wallet.name).await?.coins.remove(0);
+        assert_eq!(stored_coin.utxo_txid, Some("aa".repeat(32)));
+        assert_eq!(stored_coin.tx_cpfp, Some("bb".repeat(32)));
+        assert_eq!(stored_coin.tx_withdraw, Some("cc".repeat(32)));
+        wallet.coins[0].utxo_txid = Some("not-a-txid".into());
+        assert!(update_wallet(&pool, &wallet).await.is_err());
+        wallet.coins[0].utxo_txid = Some("aa".repeat(32));
+        wallet.coins[0].tx_cpfp = Some("not-a-txid".into());
+        assert!(update_wallet(&pool, &wallet).await.is_err());
+        wallet.coins[0].tx_cpfp = None;
+        wallet.coins[0].tx_withdraw = Some("not-a-txid".into());
+        assert!(update_wallet(&pool, &wallet).await.is_err());
+
+        let mut record = sample_bip448_record(1);
+        record.funding_outpoint.txid = "AA".repeat(32);
+        upsert_bip448_statechain_record(&pool, &record).await?;
+        assert_eq!(get_bip448_statechain(&pool, &record.wallet_name, &record.statechain_id)
+            .await?.funding_outpoint.txid, "aa".repeat(32));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn bip448_scan_state_round_trips_canonical_txids_and_clears() -> Result<()> {
         let pool = migrated_pool().await?;
         let cursor = Bip448ScanCursor {
@@ -1097,6 +1445,238 @@ mod tests {
         assert_eq!(
             load_bip448_scan_state(&pool, "wallet", "51").await?,
             (None, Vec::new())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn package_attempt_reserves_expires_releases_and_fails_closed() -> Result<()> {
+        let pool = migrated_pool().await?;
+        let fee = ChainUtxo { txid: "aa".repeat(32), vout: 1, value: 50_000, height: 2 };
+        upsert_bip448_scanned_outpoint(&pool, "wallet", "51", &fee).await?;
+        let attempt = Bip448PackageAttempt {
+            wallet_name: "wallet".into(), statechain_id: "statechain".into(),
+            role: "funding_update".into(), parent_txid: "bb".repeat(32),
+            child_txid: "cc".repeat(32), child_tx_hex: "deadbeef".into(),
+            fee_inputs: vec![Bip448FeeInputRecord {
+                txid: fee.txid.clone(), vout: fee.vout, value_sats: fee.value }],
+            target_feerate_sat_per_vbyte: 2.0, status: Bip448PackageAttemptStatus::Pending,
+        };
+        insert_bip448_package_attempt(&pool, &attempt).await?;
+        assert_eq!(get_bip448_package_attempt(&pool, "wallet", "statechain", "funding_update").await?.unwrap(), attempt);
+        assert!(available_bip448_scanned_outpoints(&pool, "wallet", "51", "other").await?.is_empty());
+        sqlx::query("UPDATE bip448_scanned_outpoints SET reserved_at = unixepoch() - $1").bind(BIP448_FEE_RESERVATION_TTL_SECONDS + 1).execute(&pool).await?;
+        assert_eq!(available_bip448_scanned_outpoints(&pool, "wallet", "51", "other").await?.len(), 1);
+        set_bip448_package_attempt_status(&pool, "wallet", "statechain", "funding_update", Bip448PackageAttemptStatus::Abandoned).await?;
+        assert_eq!(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM bip448_scanned_outpoints WHERE reserved_by IS NOT NULL")
+            .fetch_one(&pool).await?, 0);
+        sqlx::query("UPDATE bip448_package_attempts SET fee_inputs_json = '{'").execute(&pool).await?;
+        assert!(get_bip448_package_attempt(&pool, "wallet", "statechain", "funding_update").await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_reset_clears_all_and_rediscovery_restores_only_active_valid_reservations(
+    ) -> Result<()> {
+        let pool = migrated_pool().await?;
+        let fee = ChainUtxo {
+            txid: "aa".repeat(32),
+            vout: 1,
+            value: 50_000,
+            height: 2,
+        };
+        let cursor = Bip448ScanCursor {
+            last_scanned_height: 3,
+            last_scanned_block_hash: "11".repeat(32),
+        };
+        persist_bip448_scan_state(&pool, "wallet", "51", &cursor, &[fee.clone()]).await?;
+        let attempt = Bip448PackageAttempt {
+            wallet_name: "wallet".into(),
+            statechain_id: "statechain".into(),
+            role: "funding_update".into(),
+            parent_txid: "bb".repeat(32),
+            child_txid: "cc".repeat(32),
+            child_tx_hex: "deadbeef".into(),
+            fee_inputs: vec![Bip448FeeInputRecord {
+                txid: fee.txid.clone(),
+                vout: fee.vout,
+                value_sats: fee.value,
+            }],
+            target_feerate_sat_per_vbyte: 2.0,
+            status: Bip448PackageAttemptStatus::Pending,
+        };
+        insert_bip448_package_attempt(&pool, &attempt).await?;
+
+        clear_bip448_scan_state(&pool, "wallet", "51").await?;
+        assert_eq!(
+            load_bip448_scan_state(&pool, "wallet", "51").await?,
+            (None, Vec::new())
+        );
+        persist_bip448_scan_state(&pool, "wallet", "51", &cursor, &[fee.clone()]).await?;
+        assert_eq!(
+            load_bip448_scan_state(&pool, "wallet", "51").await?.1,
+            vec![fee.clone()]
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT reserved_by FROM bip448_scanned_outpoints \
+                 WHERE wallet_name = 'wallet' AND txid = $1 AND vout = 1",
+            )
+            .bind(&fee.txid)
+            .fetch_one(&pool)
+            .await?,
+            bip448_reservation_id("statechain", "funding_update")
+        );
+        persist_bip448_scan_state(&pool, "wallet", "51", &cursor, &[]).await?;
+        assert!(load_bip448_scan_state(&pool, "wallet", "51")
+            .await?
+            .1
+            .is_empty());
+
+        set_bip448_package_attempt_status(
+            &pool,
+            "wallet",
+            "statechain",
+            "funding_update",
+            Bip448PackageAttemptStatus::Abandoned,
+        )
+        .await?;
+        clear_bip448_scan_state(&pool, "wallet", "51").await?;
+        assert!(load_bip448_scan_state(&pool, "wallet", "51")
+            .await?
+            .1
+            .is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn orphaned_same_operation_reservation_rejects_a_rebuilt_attempt() -> Result<()> {
+        let pool = migrated_pool().await?;
+        let fee = ChainUtxo {
+            txid: "aa".repeat(32),
+            vout: 1,
+            value: 50_000,
+            height: 2,
+        };
+        upsert_bip448_scanned_outpoint(&pool, "wallet", "51", &fee).await?;
+        let attempt = Bip448PackageAttempt {
+            wallet_name: "wallet".into(),
+            statechain_id: "statechain".into(),
+            role: "funding_update".into(),
+            parent_txid: "bb".repeat(32),
+            child_txid: "cc".repeat(32),
+            child_tx_hex: "deadbeef".into(),
+            fee_inputs: vec![Bip448FeeInputRecord {
+                txid: fee.txid,
+                vout: fee.vout,
+                value_sats: fee.value,
+            }],
+            target_feerate_sat_per_vbyte: 2.0,
+            status: Bip448PackageAttemptStatus::Pending,
+        };
+        insert_bip448_package_attempt(&pool, &attempt).await?;
+        sqlx::query(
+            "DELETE FROM bip448_package_attempts \
+             WHERE wallet_name = 'wallet' AND statechain_id = 'statechain'",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "UPDATE bip448_scanned_outpoints SET reserved_at = unixepoch() - $1",
+        )
+        .bind(BIP448_FEE_RESERVATION_TTL_SECONDS + 1)
+        .execute(&pool)
+        .await?;
+
+        assert!(ensure_no_orphaned_bip448_reservation(
+            &pool,
+            "wallet",
+            "statechain",
+            "funding_update",
+        )
+        .await
+        .is_err());
+        assert!(available_bip448_scanned_outpoints(
+            &pool,
+            "wallet",
+            "51",
+            &bip448_reservation_id("statechain", "funding_update"),
+        )
+        .await?
+        .is_empty());
+        assert!(insert_bip448_package_attempt(&pool, &attempt).await.is_err());
+        assert!(get_bip448_package_attempt(
+            &pool,
+            "wallet",
+            "statechain",
+            "funding_update",
+        )
+        .await?
+        .is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replay_reacquires_expired_reservations_or_fails_after_reclaim() -> Result<()> {
+        let pool = migrated_pool().await?;
+        let fee = ChainUtxo {
+            txid: "aa".repeat(32),
+            vout: 1,
+            value: 50_000,
+            height: 2,
+        };
+        upsert_bip448_scanned_outpoint(&pool, "wallet", "51", &fee).await?;
+        let attempt = Bip448PackageAttempt {
+            wallet_name: "wallet".into(),
+            statechain_id: "statechain-a".into(),
+            role: "funding_update".into(),
+            parent_txid: "bb".repeat(32),
+            child_txid: "cc".repeat(32),
+            child_tx_hex: "deadbeef".into(),
+            fee_inputs: vec![Bip448FeeInputRecord {
+                txid: fee.txid.clone(),
+                vout: fee.vout,
+                value_sats: fee.value,
+            }],
+            target_feerate_sat_per_vbyte: 2.0,
+            status: Bip448PackageAttemptStatus::Pending,
+        };
+        insert_bip448_package_attempt(&pool, &attempt).await?;
+        sqlx::query(
+            "UPDATE bip448_scanned_outpoints SET reserved_at = unixepoch() - $1",
+        )
+        .bind(BIP448_FEE_RESERVATION_TTL_SECONDS + 1)
+        .execute(&pool)
+        .await?;
+        reacquire_bip448_package_attempt_reservations(&pool, &attempt).await?;
+        assert!(available_bip448_scanned_outpoints(&pool, "wallet", "51", "other")
+            .await?
+            .is_empty());
+
+        sqlx::query(
+            "UPDATE bip448_scanned_outpoints SET reserved_at = unixepoch() - $1",
+        )
+        .bind(BIP448_FEE_RESERVATION_TTL_SECONDS + 1)
+        .execute(&pool)
+        .await?;
+        let mut reclaimed = attempt.clone();
+        reclaimed.statechain_id = "statechain-b".into();
+        reclaimed.parent_txid = "dd".repeat(32);
+        reclaimed.child_txid = "ee".repeat(32);
+        insert_bip448_package_attempt(&pool, &reclaimed).await?;
+        assert!(reacquire_bip448_package_attempt_reservations(&pool, &attempt)
+            .await
+            .is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT reserved_by FROM bip448_scanned_outpoints \
+                 WHERE wallet_name = 'wallet' AND txid = $1 AND vout = 1",
+            )
+            .bind(&fee.txid)
+            .fetch_one(&pool)
+            .await?,
+            bip448_reservation_id(&reclaimed.statechain_id, &reclaimed.role)
         );
         Ok(())
     }

@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use bitcoin::{
     consensus::encode::{deserialize, serialize},
-    Address, Network, Transaction, Txid,
+    Address, Network, OutPoint, Transaction, Txid,
 };
 use serde_json::Value;
 use std::{process::Command, str::FromStr, thread};
@@ -152,6 +152,51 @@ pub fn broadcast_raw_transaction(tx: &Transaction) -> Result<Txid> {
     let txid = execute_bitcoin_command(&format!("{BITCOIN_CLI} sendrawtransaction {tx_hex}"))?;
 
     Ok(Txid::from_str(&txid)?)
+}
+
+pub fn spend_wallet_outpoint(outpoint: OutPoint, value_sats: u64) -> Result<Txid> {
+    const FEE_SATS: u64 = 500;
+    let output_sats = value_sats
+        .checked_sub(FEE_SATS)
+        .ok_or_else(|| anyhow!("wallet outpoint is too small to pay the test fee"))?;
+    let destination = getnewaddress()?;
+    let amount = format!(
+        "{}.{:08}",
+        output_sats / 100_000_000,
+        output_sats % 100_000_000
+    );
+    let unsigned = execute_bitcoin_command(&format!(
+        "{BITCOIN_CLI} createrawtransaction \
+         '[{{\"txid\":\"{}\",\"vout\":{}}}]' \
+         '{{\"{}\":{}}}'",
+        outpoint.txid, outpoint.vout, destination, amount
+    ))?;
+    let signed = execute_bitcoin_command(&format!(
+        "{BITCOIN_CLI} -rpcwallet={BITCOIN_WALLET_NAME} \
+         signrawtransactionwithwallet {unsigned}"
+    ))?;
+    let signed: Value = serde_json::from_str(&signed)?;
+    if signed.get("complete").and_then(Value::as_bool) != Some(true) {
+        return Err(anyhow!("Bitcoin Core wallet did not fully sign the test spend"));
+    }
+    let signed_hex = signed
+        .get("hex")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("signed test spend did not include transaction hex"))?;
+    let txid = execute_bitcoin_command(&format!(
+        "{BITCOIN_CLI} sendrawtransaction {signed_hex}"
+    ))?;
+
+    Ok(Txid::from_str(&txid)?)
+}
+
+pub fn set_wallet_outpoint_locked(outpoint: OutPoint, locked: bool) -> Result<()> {
+    execute_bitcoin_command(&format!(
+        "{BITCOIN_CLI} -rpcwallet={BITCOIN_WALLET_NAME} lockunspent {} \
+         '[{{\"txid\":\"{}\",\"vout\":{}}}]'",
+        !locked, outpoint.txid, outpoint.vout
+    ))?;
+    Ok(())
 }
 
 pub fn submit_package(txs: &[Transaction]) -> Result<Value> {

@@ -1,3 +1,5 @@
+use std::error::Error;
+use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
 use std::thread;
@@ -128,6 +130,25 @@ impl CoreChainClient {
         hex::decode(tx_hex).with_context(|| format!("failed to decode raw tx {}", txid))
     }
 
+    pub fn transaction_confirmations(&self, txid: &Txid) -> Result<Option<u32>> {
+        match self.call::<RawTransactionStatus>(
+            "getrawtransaction",
+            &[json!(txid), json!(true)],
+        ) {
+            Ok(status) => status
+                .confirmations
+                .map(u32::try_from)
+                .transpose()
+                .context("Bitcoin Core returned negative transaction confirmations"),
+            Err(error) if error
+                .downcast_ref::<CoreRpcError>()
+                .is_some_and(|error| error.code == -5) => {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn broadcast_tx(&self, tx_bytes: &[u8]) -> Result<Txid> {
         let tx_hex = hex::encode(tx_bytes);
         let txid: Txid = self.call("sendrawtransaction", &[json!(tx_hex)])?;
@@ -180,6 +201,18 @@ impl CoreChainClient {
                 format!("Bitcoin Core RPC {} failed to read response body", method)
             })?;
 
+            let rpc_response = serde_json::from_str::<Value>(&body);
+            if let Ok(rpc_response) = &rpc_response {
+                if let Some(error) = rpc_response.get("error").filter(|error| !error.is_null()) {
+                    let error: RpcError = serde_json::from_value(error.clone())?;
+                    return Err(CoreRpcError {
+                        method: method.to_owned(),
+                        code: error.code,
+                        message: error.message,
+                    }
+                    .into());
+                }
+            }
             if !status.is_success() {
                 return Err(anyhow!(
                     "Bitcoin Core RPC {} failed with status {} and body {}",
@@ -189,22 +222,12 @@ impl CoreChainClient {
                 ));
             }
 
-            let rpc_response: Value = serde_json::from_str(&body).with_context(|| {
+            let rpc_response = rpc_response.with_context(|| {
                 format!(
                     "Bitcoin Core RPC {} returned invalid JSON response {}",
                     method, body
                 )
             })?;
-
-            if let Some(error) = rpc_response.get("error").filter(|error| !error.is_null()) {
-                let error: RpcError = serde_json::from_value(error.clone())?;
-                return Err(anyhow!(
-                    "Bitcoin Core RPC {} failed with code {}: {}",
-                    method,
-                    error.code,
-                    error.message
-                ));
-            }
 
             let result = rpc_response
                 .get("result")
@@ -296,6 +319,25 @@ struct RpcError {
     message: String,
 }
 
+#[derive(Debug)]
+struct CoreRpcError {
+    method: String,
+    code: i64,
+    message: String,
+}
+
+impl fmt::Display for CoreRpcError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Bitcoin Core RPC {} failed with code {}: {}",
+            self.method, self.code, self.message
+        )
+    }
+}
+
+impl Error for CoreRpcError {}
+
 #[derive(Debug, Deserialize)]
 struct EstimateSmartFeeResponse {
     feerate: Option<f64>,
@@ -305,6 +347,11 @@ struct EstimateSmartFeeResponse {
 struct BlockchainInfoResponse {
     #[serde(rename = "mediantime")]
     median_time: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTransactionStatus {
+    confirmations: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -404,9 +451,17 @@ mod tests {
     use std::str::FromStr;
 
     fn rpc_client(response: &str) -> (CoreChainClient, thread::JoinHandle<Value>) {
+        rpc_client_with_status(response, "200 OK")
+    }
+
+    fn rpc_client_with_status(
+        response: &str,
+        status: &str,
+    ) -> (CoreChainClient, thread::JoinHandle<Value>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let response = response.to_owned();
+        let status = status.to_owned();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0; 8192];
@@ -414,7 +469,7 @@ mod tests {
             let body = String::from_utf8_lossy(&request[..size]);
             let body = body.split_once("\r\n\r\n").unwrap().1;
             let reply = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
                 response.len()
             );
             stream.write_all(reply.as_bytes()).unwrap();
@@ -488,6 +543,31 @@ mod tests {
             error.to_string(),
             "Bitcoin Core RPC gettxout failed with code -5: not found"
         );
+    }
+
+    #[test]
+    fn transaction_confirmations_do_not_depend_on_an_unspent_output() {
+        let txid = Txid::from_str(&"11".repeat(32)).unwrap();
+        let cases = [
+            (
+                r#"{"result":{"txid":"11","confirmations":3,"blockhash":"22"},"error":null}"#,
+                "200 OK",
+                Some(3),
+            ),
+            (r#"{"result":{"txid":"11"},"error":null}"#, "200 OK", None),
+            (
+                r#"{"result":null,"error":{"code":-5,"message":"No such mempool or blockchain transaction"}}"#,
+                "500 Internal Server Error",
+                None,
+            ),
+        ];
+        for (response, status, expected) in cases {
+            let (client, server) = rpc_client_with_status(response, status);
+            assert_eq!(client.transaction_confirmations(&txid).unwrap(), expected);
+            let request = server.join().unwrap();
+            assert_eq!(request["method"], "getrawtransaction");
+            assert_eq!(request["params"], json!([txid, true]));
+        }
     }
 
     #[test]

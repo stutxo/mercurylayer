@@ -10,6 +10,15 @@ use self::core::CoreChainClient;
 pub use self::core::{ChainTxOut, DescriptorActivity, ScanBlocksResult};
 pub(crate) use self::core::{CoreRpcAuth, CoreRpcConfig};
 
+#[cfg(feature = "test-hooks")]
+static SCAN_BLOCKS_CALLS: std::sync::Mutex<Vec<(u32, u32)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(feature = "test-hooks")]
+pub fn take_scan_blocks_calls() -> Vec<(u32, u32)> {
+    std::mem::take(&mut *SCAN_BLOCKS_CALLS.lock().unwrap())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChainUtxo {
     pub txid: String,
@@ -78,6 +87,11 @@ impl ChainClient {
         start_height: u32,
         stop_height: u32,
     ) -> Result<ScanBlocksResult> {
+        #[cfg(feature = "test-hooks")]
+        SCAN_BLOCKS_CALLS
+            .lock()
+            .unwrap()
+            .push((start_height, stop_height));
         self.core
             .scan_blocks(descriptors, start_height, stop_height)
     }
@@ -94,6 +108,10 @@ impl ChainClient {
 
     pub fn get_raw_tx(&self, txid: &Txid) -> Result<Vec<u8>> {
         self.core.get_raw_tx(txid)
+    }
+
+    pub fn transaction_confirmations(&self, txid: &Txid) -> Result<Option<u32>> {
+        self.core.transaction_confirmations(txid)
     }
 
     pub fn broadcast_tx(&self, tx_bytes: &[u8]) -> Result<Txid> {
