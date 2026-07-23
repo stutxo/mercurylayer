@@ -56,10 +56,10 @@ async fn wait_for_address_utxo_matching(
         let stop_height = client_config.chain_client.tip_height()?;
         let scan = client_config
             .chain_client
-            .scan_blocks(&descriptor, 0, stop_height)?;
+            .scan_blocks(&[descriptor.clone()], 0, stop_height)?;
         let activity = client_config.chain_client.descriptor_activity(
             &scan.relevant_blocks,
-            &descriptor,
+            &[descriptor.clone()],
             true,
         )?;
         let utxo_list = mercuryrustlib::coin_status::unspent_from_descriptor_activity(activity);

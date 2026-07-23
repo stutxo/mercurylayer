@@ -155,7 +155,8 @@ pub async fn submit_wallet_funded_latest_state_recovery_package(
         .saturating_sub(sizing_package.cpfp_child_tx.output[0].value)
         .saturating_add(change_dust_sats);
 
-    let candidates = discover_unspent(client_config, &fee_key.address, wallet.blockheight)?;
+    let candidates =
+        discover_unspent(client_config, wallet_name, &fee_key.address, wallet.blockheight).await?;
     let (mut fee_inputs, mut package) = select_confirmed_fee_inputs(
         candidates,
         minimum_required_sats,

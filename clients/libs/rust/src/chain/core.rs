@@ -69,9 +69,13 @@ impl CoreChainClient {
         )
     }
 
+    pub fn get_block_hash(&self, height: u32) -> Result<BlockHash> {
+        self.call("getblockhash", &[json!(height)])
+    }
+
     pub fn scan_blocks(
         &self,
-        descriptor: &str,
+        descriptors: &[String],
         start_height: u32,
         stop_height: u32,
     ) -> Result<ScanBlocksResult> {
@@ -85,7 +89,7 @@ impl CoreChainClient {
             "scanblocks",
             &[
                 json!("start"),
-                json!([descriptor]),
+                json!(descriptors),
                 json!(start_height),
                 json!(stop_height),
                 json!("basic"),
@@ -103,14 +107,14 @@ impl CoreChainClient {
     pub fn descriptor_activity(
         &self,
         block_hashes: &[BlockHash],
-        descriptor: &str,
+        descriptors: &[String],
         include_mempool: bool,
     ) -> Result<Vec<DescriptorActivity>> {
         let response: DescriptorActivityResponse = self.call(
             "getdescriptoractivity",
             &[
                 json!(block_hashes),
-                json!([descriptor]),
+                json!(descriptors),
                 json!(include_mempool),
             ],
         )?;
@@ -332,12 +336,16 @@ pub enum DescriptorActivity {
         height: Option<u32>,
         txid: Txid,
         vout: u32,
+        #[serde(deserialize_with = "deserialize_script_pubkey")]
+        output_spk: ScriptBuf,
     },
     Spend {
         height: Option<u32>,
         spend_txid: Txid,
         prevout_txid: Txid,
         prevout_vout: u32,
+        #[serde(deserialize_with = "deserialize_script_pubkey")]
+        prevout_spk: ScriptBuf,
     },
 }
 

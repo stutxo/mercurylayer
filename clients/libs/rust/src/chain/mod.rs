@@ -52,6 +52,10 @@ impl ChainClient {
         self.core.get_tx_out(txid, vout, include_mempool)
     }
 
+    pub fn get_block_hash(&self, height: u32) -> Result<BlockHash> {
+        self.core.get_block_hash(height)
+    }
+
     pub(crate) fn get_stored_tx_out(
         &self,
         txid: &str,
@@ -70,21 +74,22 @@ impl ChainClient {
 
     pub fn scan_blocks(
         &self,
-        descriptor: &str,
+        descriptors: &[String],
         start_height: u32,
         stop_height: u32,
     ) -> Result<ScanBlocksResult> {
-        self.core.scan_blocks(descriptor, start_height, stop_height)
+        self.core
+            .scan_blocks(descriptors, start_height, stop_height)
     }
 
     pub fn descriptor_activity(
         &self,
         block_hashes: &[BlockHash],
-        descriptor: &str,
+        descriptors: &[String],
         include_mempool: bool,
     ) -> Result<Vec<DescriptorActivity>> {
         self.core
-            .descriptor_activity(block_hashes, descriptor, include_mempool)
+            .descriptor_activity(block_hashes, descriptors, include_mempool)
     }
 
     pub fn get_raw_tx(&self, txid: &Txid) -> Result<Vec<u8>> {

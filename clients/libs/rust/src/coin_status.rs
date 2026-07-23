@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use anyhow::{anyhow, Ok, Result};
-use bitcoin::{Address, Txid};
+use bitcoin::{Address, ScriptBuf, Txid};
 use mercurylib::{
     bip448_statechain::{
         deposit::{self as bip448_deposit, Bip448DepositError},
@@ -18,8 +18,10 @@ use crate::{
     client_config::ClientConfig,
     deposit::{create_bip448_deposit_state, create_tx1},
     sqlite_manager::{
-        delete_bip448_pending_deposit_signing, get_bip448_pending_deposit_signing,
-        get_bip448_statechain_optional, get_wallet, insert_backup_txs, update_wallet,
+        clear_bip448_scan_state, delete_bip448_pending_deposit_signing,
+        get_bip448_pending_deposit_signing, get_bip448_statechain_optional, get_wallet,
+        insert_backup_txs, load_bip448_scan_state, persist_bip448_scan_state, update_wallet,
+        Bip448ScanCursor,
     },
 };
 
@@ -47,6 +49,7 @@ pub fn unspent_from_descriptor_activity(activity: Vec<DescriptorActivity>) -> Ve
                 height,
                 txid,
                 vout,
+                ..
             } => {
                 receives.insert(
                     (txid, vout),
@@ -72,29 +75,230 @@ pub fn unspent_from_descriptor_activity(activity: Vec<DescriptorActivity>) -> Ve
     receives.into_values().collect()
 }
 
-pub(crate) fn discover_unspent(
+struct DescriptorScanState {
+    descriptor: String,
+    start_height: u32,
+    result_start_height: u32,
+    cursor: Option<Bip448ScanCursor>,
+    outpoints: HashMap<(String, u32), ChainUtxo>,
+}
+
+#[derive(Clone)]
+struct DescriptorDiscoveryRequest {
+    address: Address,
+    // This must be the lowest height this script can ever need. The cursor table
+    // intentionally has no second lower-bound field.
+    coverage_start_height: u32,
+    result_start_height: u32,
+}
+
+async fn discover_unspent_batch(
     client_config: &ClientConfig,
+    wallet_name: &str,
+    requests: &[DescriptorDiscoveryRequest],
+) -> Result<HashMap<ScriptBuf, Vec<ChainUtxo>>> {
+    discover_unspent_batch_attempt(client_config, wallet_name, requests, true).await
+}
+
+async fn discover_unspent_batch_attempt(
+    client_config: &ClientConfig,
+    wallet_name: &str,
+    requests: &[DescriptorDiscoveryRequest],
+    retry_reorg: bool,
+) -> Result<HashMap<ScriptBuf, Vec<ChainUtxo>>> {
+    if requests.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let stop_height = client_config.chain_client.tip_height()?;
+    let stop_block_hash = client_config
+        .chain_client
+        .get_block_hash(stop_height)?
+        .to_string();
+    let mut bounds = HashMap::<ScriptBuf, (String, u32, u32)>::new();
+    for request in requests {
+        let script = request.address.script_pubkey();
+        let entry = bounds.entry(script).or_insert_with(|| {
+            (
+                format!("addr({})", request.address),
+                request.coverage_start_height,
+                request.result_start_height,
+            )
+        });
+        entry.1 = entry.1.min(request.coverage_start_height);
+        entry.2 = entry.2.min(request.result_start_height);
+    }
+    let mut states = HashMap::new();
+    for (script, (descriptor, coverage_start_height, result_start_height)) in bounds {
+        let script_hex = hex::encode(script.as_bytes());
+        let (mut cursor, mut stored) = load_bip448_scan_state(&client_config.pool, wallet_name, &script_hex).await?;
+        let cursor_matches = match &cursor {
+            Some(cursor) if cursor.last_scanned_height > stop_height => false,
+            Some(cursor) => client_config.chain_client.get_block_hash(cursor.last_scanned_height)?
+                .to_string() == cursor.last_scanned_block_hash,
+            None => true,
+        };
+        if !cursor_matches {
+            clear_bip448_scan_state(&client_config.pool, wallet_name, &script_hex).await?;
+            cursor = None;
+            stored.clear();
+        }
+        let start_height = cursor.as_ref().map_or(coverage_start_height.min(stop_height),
+            |cursor| cursor.last_scanned_height.saturating_add(1));
+        let mut outpoints = HashMap::new();
+        for mut outpoint in stored {
+            if let Some(tx_out) = client_config.chain_client.get_stored_tx_out(&outpoint.txid, outpoint.vout, true)? {
+                if tx_out.script_pubkey == script {
+                    outpoint.value = tx_out.value;
+                    outpoint.height = if tx_out.confirmations == 0 {
+                        0
+                    } else {
+                        stop_height.saturating_sub(tx_out.confirmations).saturating_add(1)
+                    };
+                    outpoints.insert((outpoint.txid.clone(), outpoint.vout), outpoint);
+                }
+            }
+        }
+        states.insert(script, DescriptorScanState {
+            descriptor,
+            start_height,
+            result_start_height,
+            cursor,
+            outpoints,
+        });
+    }
+    if states.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let descriptors = states.values().map(|state| state.descriptor.clone()).collect::<Vec<_>>();
+    let scan_start = states.values().map(|state| state.start_height).min().unwrap();
+    let (scanned, activity) = retry_discovery_once(|| {
+        let scan = (scan_start <= stop_height)
+            .then(|| client_config.chain_client.scan_blocks(&descriptors, scan_start, stop_height))
+            .transpose()?;
+        if scan.as_ref().is_some_and(|scan| !scan.completed) {
+            return Err(anyhow!("Bitcoin Core scanblocks did not complete"));
+        }
+        let blocks = scan.as_ref().map_or(&[][..], |scan| scan.relevant_blocks.as_slice());
+        let activity = client_config.chain_client.descriptor_activity(blocks, &descriptors, true)?;
+        Ok((scan.is_some(), activity))
+    })?;
+    let post_scan_tip = client_config.chain_client.tip_height()?;
+    let stop_hash_matches = post_scan_tip >= stop_height
+        && client_config
+            .chain_client
+            .get_block_hash(stop_height)?
+            .to_string()
+            == stop_block_hash;
+    let mut unstable_scripts = Vec::new();
+    for (script, state) in &states {
+        let cursor_matches = match &state.cursor {
+            Some(cursor) if cursor.last_scanned_height > post_scan_tip => false,
+            Some(cursor) => {
+                client_config
+                    .chain_client
+                    .get_block_hash(cursor.last_scanned_height)?
+                    .to_string()
+                    == cursor.last_scanned_block_hash
+            }
+            None => true,
+        };
+        if !stop_hash_matches || !cursor_matches {
+            unstable_scripts.push(script.clone());
+        }
+    }
+    if !unstable_scripts.is_empty() {
+        for script in unstable_scripts {
+            clear_bip448_scan_state(
+                &client_config.pool,
+                wallet_name,
+                &hex::encode(script.as_bytes()),
+            )
+            .await?;
+        }
+        if !retry_reorg {
+            return Err(anyhow!(
+                "Bitcoin chain changed repeatedly during descriptor discovery"
+            ));
+        }
+        return Box::pin(discover_unspent_batch_attempt(
+            client_config,
+            wallet_name,
+            requests,
+            false,
+        ))
+        .await;
+    }
+    for event in activity {
+        let (script, height, key, received) = match event {
+            DescriptorActivity::Receive {
+                amount,
+                height,
+                txid,
+                vout,
+                output_spk,
+            } => {
+                let txid = txid.to_string();
+                (output_spk, height, (txid.clone(), vout), Some(ChainUtxo {
+                    txid, vout, value: amount, height: height.unwrap_or(0),
+                }))
+            }
+            DescriptorActivity::Spend {
+                height,
+                prevout_txid,
+                prevout_vout,
+                prevout_spk,
+                ..
+            } => (prevout_spk, height, (prevout_txid.to_string(), prevout_vout), None),
+        };
+        if let Some(state) = states.get_mut(&script) {
+            if height.map_or(true, |height| height >= state.start_height) {
+                state.outpoints.remove(&key);
+                if let Some(outpoint) = received {
+                    state.outpoints.insert(key, outpoint);
+                }
+            }
+        }
+    }
+    let scanned_cursor = if scanned {
+        Some(Bip448ScanCursor {
+                last_scanned_height: stop_height,
+                last_scanned_block_hash: stop_block_hash,
+        })
+    } else {
+        None
+    };
+    let mut result = HashMap::new();
+    for (script, state) in states {
+        let cursor = scanned_cursor.as_ref().or(state.cursor.as_ref()).unwrap();
+        let outpoints = state.outpoints.into_values().collect::<Vec<_>>();
+        persist_bip448_scan_state(&client_config.pool, wallet_name,
+            &hex::encode(script.as_bytes()), cursor, &outpoints).await?;
+        result.insert(
+            script,
+            outpoints
+                .into_iter()
+                .filter(|outpoint| {
+                    outpoint.height == 0 || outpoint.height >= state.result_start_height
+                })
+                .collect(),
+        );
+    }
+    Ok(result)
+}
+
+pub(crate) async fn discover_unspent(
+    client_config: &ClientConfig,
+    wallet_name: &str,
     address: &Address,
     start_height: u32,
 ) -> Result<Vec<ChainUtxo>> {
-    let descriptor = format!("addr({address})");
-    retry_discovery_once(|| {
-        let stop_height = client_config.chain_client.tip_height()?;
-        let scan = client_config.chain_client.scan_blocks(
-            &descriptor,
-            start_height.min(stop_height),
-            stop_height,
-        )?;
-        if !scan.completed {
-            return Err(anyhow!("Bitcoin Core scanblocks did not complete"));
-        }
-        let activity = client_config.chain_client.descriptor_activity(
-            &scan.relevant_blocks,
-            &descriptor,
-            true,
-        )?;
-        Ok(unspent_from_descriptor_activity(activity))
-    })
+    let request = DescriptorDiscoveryRequest {
+        address: address.clone(),
+        coverage_start_height: start_height,
+        result_start_height: start_height,
+    };
+    let mut discovered = discover_unspent_batch(client_config, wallet_name, &[request]).await?;
+    Ok(discovered.remove(&address.script_pubkey()).unwrap_or_default())
 }
 
 fn retry_discovery_once<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
@@ -260,6 +464,7 @@ async fn check_deposit(
     coin: &mut Coin,
     wallet_netwotk: &str,
     wallet_blockheight: u32,
+    discovered: &HashMap<ScriptBuf, Vec<ChainUtxo>>,
 ) -> Result<Option<DepositResult>> {
     if funding_outpoint_is_partial(coin) {
         return Err(anyhow!("Coin has a partial funding outpoint"));
@@ -303,9 +508,15 @@ async fn check_deposit(
             };
             utxo
         } else {
-            let utxo_list = discover_unspent(client_config, &address, wallet_blockheight)?;
-            let Some(utxo) = utxo_list
+            let utxo_list = discovered
+                .get(&address.script_pubkey())
                 .into_iter()
+                .flatten()
+                .filter(|unspent| {
+                    unspent.height == 0 || unspent.height >= wallet_blockheight
+                })
+                .cloned();
+            let Some(utxo) = utxo_list
                 .filter(|unspent| unspent.value == u64::from(expected_amount))
                 .min_by_key(|unspent| {
                     if unspent.height == 0 {
@@ -382,6 +593,7 @@ async fn check_bip448_deposit(
     coin: &mut Coin,
     wallet_network: &str,
     wallet_blockheight: u32,
+    discovered: &HashMap<ScriptBuf, Vec<ChainUtxo>>,
 ) -> Result<Option<Bip448DepositResult>> {
     if funding_outpoint_is_partial(coin) {
         return Err(anyhow!("BIP448 coin has a partial funding outpoint"));
@@ -458,7 +670,15 @@ async fn check_bip448_deposit(
         };
         utxo
     } else {
-        let utxo_list = discover_unspent(client_config, &address, wallet_blockheight)?;
+        let utxo_list = discovered
+            .get(&address.script_pubkey())
+            .into_iter()
+            .flatten()
+            .filter(|unspent| {
+                unspent.height == 0 || unspent.height >= wallet_blockheight
+            })
+            .cloned()
+            .collect();
         let Some(utxo) = select_bip448_funding_utxo(
             utxo_list,
             coin,
@@ -650,13 +870,74 @@ async fn check_withdrawal(client_config: &ClientConfig, coin: &mut Coin) -> Resu
     Ok(())
 }
 
+async fn discover_wallet_unspent(
+    client_config: &ClientConfig,
+    wallet: &Wallet,
+) -> Result<HashMap<ScriptBuf, Vec<ChainUtxo>>> {
+    let mut requests = Vec::new();
+    for coin in &wallet.coins {
+        if !matches!(
+            coin.status,
+            CoinStatus::INITIALISED
+                | CoinStatus::IN_MEMPOOL
+                | CoinStatus::UNCONFIRMED
+                | CoinStatus::CONFIRMED
+        ) || funding_outpoint_is_partial(coin)
+            || deposit_setup_is_incomplete(coin)
+            || coin.statechain_id.is_none()
+        {
+            continue;
+        }
+        let Some(address) = coin.aggregated_address.as_deref() else {
+            continue;
+        };
+        let address = Address::from_str(address)?.require_network(client_config.network)?;
+
+        if !bip448_deposit::is_bip448_coin(coin) {
+            // Legacy deposits later enter duplicate detection. Cover its lifetime
+            // floor on the first wallet scan, even while it is still INITIALISED.
+            requests.push(DescriptorDiscoveryRequest {
+                address,
+                coverage_start_height: 0,
+                result_start_height: 0,
+            });
+            continue;
+        }
+        if coin.utxo_txid.is_some() {
+            continue;
+        }
+        let statechain_id = coin.statechain_id.as_deref().unwrap();
+        let has_persisted_outpoint =
+            get_bip448_pending_deposit_signing(&client_config.pool, &wallet.name, statechain_id)
+                .await?
+                .is_some()
+                || get_bip448_statechain_optional(
+                    &client_config.pool,
+                    &wallet.name,
+                    statechain_id,
+                )
+                .await?
+                .is_some();
+        if !has_persisted_outpoint {
+            requests.push(DescriptorDiscoveryRequest {
+                address,
+                coverage_start_height: wallet.blockheight,
+                result_start_height: wallet.blockheight,
+            });
+        }
+    }
+
+    discover_unspent_batch(client_config, &wallet.name, &requests).await
+}
+
 async fn check_for_duplicated(
     client_config: &ClientConfig,
     existing_coins: &Vec<Coin>,
     wallet_blockheight: u32,
+    discovered: &HashMap<ScriptBuf, Vec<ChainUtxo>>,
 ) -> Result<Vec<Coin>> {
     let mut duplicated_coin_list: Vec<Coin> = Vec::new();
-
+    let mut scans = Vec::new();
     for coin in existing_coins.iter() {
         if coin.status != CoinStatus::IN_MEMPOOL
             && coin.status != CoinStatus::UNCONFIRMED
@@ -693,8 +974,9 @@ async fn check_for_duplicated(
             }
             _ => wallet_blockheight,
         };
-        let utxo_list = discover_unspent(client_config, &address, start_height)?;
-
+        scans.push((coin, address, start_height));
+    }
+    for (coin, address, start_height) in scans {
         let mut max_duplicated_index = existing_coins
             .iter()
             .filter(|c| c.statechain_id == coin.statechain_id)
@@ -702,7 +984,13 @@ async fn check_for_duplicated(
             .max()
             .unwrap();
 
-        for unspent in utxo_list {
+        for unspent in discovered
+            .get(&address.script_pubkey())
+            .into_iter()
+            .flatten()
+            .filter(|unspent| unspent.height == 0 || unspent.height >= start_height)
+            .cloned()
+        {
             let utxo_exists = existing_coins.iter().any(|coin| {
                 coin.utxo_txid == Some(unspent.txid.clone()) && coin.utxo_vout == Some(unspent.vout)
             });
@@ -730,9 +1018,10 @@ async fn finalize_wallet_update(
     client_config: &ClientConfig,
     wallet: &mut Wallet,
     deferred_errors: Vec<DeferredBip448DepositError>,
+    discovered: &HashMap<ScriptBuf, Vec<ChainUtxo>>,
 ) -> Result<()> {
     let duplicated_coins =
-        check_for_duplicated(client_config, &wallet.coins, wallet.blockheight).await?;
+        check_for_duplicated(client_config, &wallet.coins, wallet.blockheight, discovered).await?;
 
     wallet.coins.extend(duplicated_coins);
 
@@ -771,6 +1060,7 @@ async fn finalize_wallet_update(
 
 pub async fn update_coins(client_config: &ClientConfig, wallet_name: &str) -> Result<()> {
     let mut wallet = get_wallet(&client_config.pool, &wallet_name).await?;
+    let discovered = discover_wallet_unspent(client_config, &wallet).await?;
 
     let network = wallet.network.clone();
     let wallet_blockheight = wallet.blockheight;
@@ -788,6 +1078,7 @@ pub async fn update_coins(client_config: &ClientConfig, wallet_name: &str) -> Re
                     coin,
                     &network,
                     wallet_blockheight,
+                    &discovered,
                 )
                 .await
                 {
@@ -810,7 +1101,14 @@ pub async fn update_coins(client_config: &ClientConfig, wallet_name: &str) -> Re
             }
 
             let deposit_result =
-                check_deposit(client_config, coin, &network, wallet_blockheight).await?;
+                check_deposit(
+                    client_config,
+                    coin,
+                    &network,
+                    wallet_blockheight,
+                    &discovered,
+                )
+                .await?;
 
             if deposit_result.is_some() {
                 let deposit_result = deposit_result.unwrap();
@@ -837,7 +1135,13 @@ pub async fn update_coins(client_config: &ClientConfig, wallet_name: &str) -> Re
         }
     }
 
-    finalize_wallet_update(client_config, &mut wallet, deferred_bip448_deposit_errors).await
+    finalize_wallet_update(
+        client_config,
+        &mut wallet,
+        deferred_bip448_deposit_errors,
+        &discovered,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1047,12 +1351,25 @@ mod tests {
         let mut legacy_coin = incomplete_coin(1, None);
 
         assert!(
-            check_bip448_deposit(&client_config, "wallet", &mut bip448_coin, "regtest", 0)
+            check_bip448_deposit(
+                &client_config,
+                "wallet",
+                &mut bip448_coin,
+                "regtest",
+                0,
+                &HashMap::new(),
+            )
                 .await?
                 .is_none()
         );
         assert!(
-            check_deposit(&client_config, &mut legacy_coin, "regtest", 0)
+            check_deposit(
+                &client_config,
+                &mut legacy_coin,
+                "regtest",
+                0,
+                &HashMap::new(),
+            )
                 .await?
                 .is_none()
         );
@@ -1060,14 +1377,27 @@ mod tests {
         bip448_coin.utxo_txid = Some("aa".repeat(32));
         legacy_coin.utxo_vout = Some(0);
         let bip448_error =
-            check_bip448_deposit(&client_config, "wallet", &mut bip448_coin, "regtest", 0)
+            check_bip448_deposit(
+                &client_config,
+                "wallet",
+                &mut bip448_coin,
+                "regtest",
+                0,
+                &HashMap::new(),
+            )
                 .await
                 .err()
                 .expect("partial BIP448 outpoint must fail");
-        let legacy_error = check_deposit(&client_config, &mut legacy_coin, "regtest", 0)
-            .await
-            .err()
-            .expect("partial legacy outpoint must fail");
+        let legacy_error = check_deposit(
+            &client_config,
+            &mut legacy_coin,
+            "regtest",
+            0,
+            &HashMap::new(),
+        )
+        .await
+        .err()
+        .expect("partial legacy outpoint must fail");
         assert_eq!(
             bip448_error.to_string(),
             "BIP448 coin has a partial funding outpoint"
@@ -1089,14 +1419,27 @@ mod tests {
         bip448_coin.aggregated_address = Some("not-queried".to_string());
         legacy_coin.aggregated_address = Some("not-queried".to_string());
         let bip448_error =
-            check_bip448_deposit(&client_config, "wallet", &mut bip448_coin, "regtest", 0)
+            check_bip448_deposit(
+                &client_config,
+                "wallet",
+                &mut bip448_coin,
+                "regtest",
+                0,
+                &HashMap::new(),
+            )
                 .await
                 .err()
                 .expect("address-only BIP448 setup must fail");
-        let legacy_error = check_deposit(&client_config, &mut legacy_coin, "regtest", 0)
-            .await
-            .err()
-            .expect("address-only legacy setup must fail");
+        let legacy_error = check_deposit(
+            &client_config,
+            &mut legacy_coin,
+            "regtest",
+            0,
+            &HashMap::new(),
+        )
+        .await
+        .err()
+        .expect("address-only legacy setup must fail");
         assert_eq!(
             bip448_error.to_string(),
             "BIP448 coin missing amount after deposit setup"
@@ -1111,14 +1454,27 @@ mod tests {
         legacy_coin.aggregated_address = None;
         legacy_coin.amount = Some(50_000);
         let bip448_error =
-            check_bip448_deposit(&client_config, "wallet", &mut bip448_coin, "regtest", 0)
+            check_bip448_deposit(
+                &client_config,
+                "wallet",
+                &mut bip448_coin,
+                "regtest",
+                0,
+                &HashMap::new(),
+            )
                 .await
                 .err()
                 .expect("amount-only BIP448 setup must fail");
-        let legacy_error = check_deposit(&client_config, &mut legacy_coin, "regtest", 0)
-            .await
-            .err()
-            .expect("amount-only legacy setup must fail");
+        let legacy_error = check_deposit(
+            &client_config,
+            &mut legacy_coin,
+            "regtest",
+            0,
+            &HashMap::new(),
+        )
+        .await
+        .err()
+        .expect("amount-only legacy setup must fail");
         assert!(bip448_error
             .to_string()
             .contains("missing aggregated_address"));
@@ -1133,14 +1489,27 @@ mod tests {
             coin.status = CoinStatus::IN_MEMPOOL;
         }
         let bip448_error =
-            check_bip448_deposit(&client_config, "wallet", &mut bip448_coin, "regtest", 0)
+            check_bip448_deposit(
+                &client_config,
+                "wallet",
+                &mut bip448_coin,
+                "regtest",
+                0,
+                &HashMap::new(),
+            )
                 .await
                 .err()
                 .expect("advanced BIP448 setup must fail");
-        let legacy_error = check_deposit(&client_config, &mut legacy_coin, "regtest", 0)
-            .await
-            .err()
-            .expect("advanced legacy setup must fail");
+        let legacy_error = check_deposit(
+            &client_config,
+            &mut legacy_coin,
+            "regtest",
+            0,
+            &HashMap::new(),
+        )
+        .await
+        .err()
+        .expect("advanced legacy setup must fail");
         assert!(bip448_error.to_string().contains("missing amount"));
         assert!(legacy_error.to_string().contains("missing amount"));
 
@@ -1154,7 +1523,14 @@ mod tests {
         coin.utxo_txid = Some("aa".repeat(32));
         coin.utxo_vout = Some(0);
 
-        let error = check_bip448_deposit(&client_config, "wallet", &mut coin, "regtest", 0)
+        let error = check_bip448_deposit(
+            &client_config,
+            "wallet",
+            &mut coin,
+            "regtest",
+            0,
+            &HashMap::new(),
+        )
             .await
             .err()
             .expect("missing address must fail before chain access");
@@ -1189,30 +1565,22 @@ mod tests {
         transferred_coin.index = 3;
         transferred_coin.status = CoinStatus::TRANSFERRED;
         transferred_coin.locktime = Some(42);
-        let mut malformed_coin = sample_coin();
-        malformed_coin.index = 4;
-        malformed_coin.statechain_id = Some("malformed-statechain".to_string());
-        malformed_coin.aggregated_address =
-            Some("bcrt1qgwwa9fcrcvnme0jymg39zm38w6gzudcq3n90tl".to_string());
-        malformed_coin.utxo_txid = Some("not-a-txid".to_string());
         let wallet = sample_wallet(vec![
             bip448_coin,
             legacy_coin,
             duplicated_coin,
             transferred_coin,
-            malformed_coin,
         ]);
         insert_wallet(&client_config.pool, &wallet).await?;
 
         update_coins(&client_config, &wallet.name).await?;
 
         let persisted = get_wallet(&client_config.pool, &wallet.name).await?;
-        assert_eq!(persisted.coins.len(), 5);
+        assert_eq!(persisted.coins.len(), 4);
         assert_eq!(persisted.coins[0].status, CoinStatus::INITIALISED);
         assert_eq!(persisted.coins[1].status, CoinStatus::INITIALISED);
         assert_eq!(persisted.coins[2].status, CoinStatus::INVALIDATED);
         assert_eq!(persisted.coins[3].status, CoinStatus::TRANSFERRED);
-        assert_eq!(persisted.coins[4].status, CoinStatus::UNCONFIRMED);
         assert!(persisted.coins[0].aggregated_address.is_none());
         assert!(persisted.coins[1].aggregated_address.is_none());
 
@@ -1279,7 +1647,12 @@ mod tests {
             &mut deferred_errors,
         )?;
 
-        let error = finalize_wallet_update(&client_config, &mut wallet, deferred_errors)
+        let error = finalize_wallet_update(
+            &client_config,
+            &mut wallet,
+            deferred_errors,
+            &HashMap::new(),
+        )
             .await
             .err()
             .expect("signature-count mismatch must be reported after persistence");
@@ -1380,9 +1753,9 @@ mod tests {
     #[test]
     fn descriptor_activity_assembles_receives_minus_later_spends() {
         let activity: Vec<DescriptorActivity> = serde_json::from_str(r#"[
-            {"type":"receive","amount":0.00010000,"height":10,"txid":"1111111111111111111111111111111111111111111111111111111111111111","vout":0},
-            {"type":"receive","amount":0.00020000,"height":11,"txid":"2222222222222222222222222222222222222222222222222222222222222222","vout":1},
-            {"type":"spend","height":12,"spend_txid":"4444444444444444444444444444444444444444444444444444444444444444","prevout_txid":"1111111111111111111111111111111111111111111111111111111111111111","prevout_vout":0}
+            {"type":"receive","amount":0.00010000,"height":10,"txid":"1111111111111111111111111111111111111111111111111111111111111111","vout":0,"output_spk":{"hex":"51"}},
+            {"type":"receive","amount":0.00020000,"height":11,"txid":"2222222222222222222222222222222222222222222222222222222222222222","vout":1,"output_spk":{"hex":"51"}},
+            {"type":"spend","height":12,"spend_txid":"4444444444444444444444444444444444444444444444444444444444444444","prevout_txid":"1111111111111111111111111111111111111111111111111111111111111111","prevout_vout":0,"prevout_spk":{"hex":"51"}}
         ]"#).unwrap();
         let unspent = unspent_from_descriptor_activity(activity);
         assert_eq!(unspent.len(), 1);

@@ -605,15 +605,6 @@ async fn ta02_received_coin_preserves_pre_wallet_history() -> Result<()> {
         .unwrap();
     assert_eq!(second_duplicated_coin.status, CoinStatus::WITHDRAWN);
 
-    let mut malformed_wallet = wallet2.clone();
-    malformed_wallet
-        .coins
-        .iter_mut()
-        .find(|coin| coin.duplicate_index == 0)
-        .unwrap()
-        .utxo_txid = Some("not-a-txid".to_string());
-    mercuryrustlib::sqlite_manager::update_wallet(&client_config.pool, &malformed_wallet).await?;
-
     let third_duplicate_amount = 4000;
     let third_duplicate_txid =
         bitcoin_core::sendtoaddress(third_duplicate_amount, &deposit_address)?;

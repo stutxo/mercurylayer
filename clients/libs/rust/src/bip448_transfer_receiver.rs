@@ -273,11 +273,13 @@ async fn has_persisted_bip448_receipt(
     else {
         return Ok(false);
     };
+    let mut funding_outpoint = msg.funding_outpoint.clone();
+    funding_outpoint.txid = Txid::from_str(&funding_outpoint.txid)?.to_string();
 
     if record.wallet_name != wallet_name
         || record.statechain_id != msg.statechain_id
         || record.aggregate_pubkey != msg.aggregate_pubkey
-        || record.funding_outpoint != msg.funding_outpoint
+        || record.funding_outpoint != funding_outpoint
         || record.challenge_delay != msg.challenge_delay
         || record.amount_sats != msg.amount_sats
         || record.network != msg.network
@@ -445,11 +447,15 @@ fn build_transfer_record(
         return Err(anyhow!("BIP448 transfer latest state is not canonical"));
     }
 
+    let mut funding_outpoint = verified.msg.funding_outpoint.clone();
+    funding_outpoint.txid = verified.chain_facts.funding_outpoint.txid.to_string();
+    funding_outpoint.vout = verified.chain_facts.funding_outpoint.vout;
+    funding_outpoint.value_sats = verified.chain_facts.funding_output.value;
     Ok(Bip448StatechainRecord {
         wallet_name: wallet_name.to_string(),
         statechain_id: verified.msg.statechain_id.clone(),
         aggregate_pubkey: aggregate_pubkey.to_string(),
-        funding_outpoint: verified.msg.funding_outpoint.clone(),
+        funding_outpoint,
         latest_state_number: latest_state.state_number,
         challenge_delay: latest_state.challenge_delay,
         amount_sats: verified.chain_facts.funding_output.value,
@@ -722,9 +728,25 @@ mod tests {
         attempt(&fixture, &pool, &mut coin, &mut activities, Rc::clone(&transport)).await.unwrap();
         crate::sqlite_manager::insert_wallet(&pool, &test_wallet(coin.clone())).await.unwrap();
         let current_server = PublicKey::from_str(coin.server_pubkey.as_deref().unwrap()).unwrap();
-        let outcome = resolve_already_updated(&pool, "wallet", &coin, &fixture.msg, &current_server).await.unwrap();
+        let mut replay = fixture.msg.clone();
+        replay.funding_outpoint.txid.make_ascii_uppercase();
+        let outcome = resolve_already_updated(&pool, "wallet", &coin, &replay, &current_server).await.unwrap();
         assert!(matches!(outcome, Bip448ReceiveOutcome::AlreadyProcessed));
         assert_eq!(activities.len(), 1);
+    }
+
+    #[tokio::test]
+    #[rustfmt::skip]
+    async fn accepted_transfer_canonicalizes_an_uppercase_funding_txid() {
+        let mut fixture = fixture();
+        fixture.msg.funding_outpoint.txid.make_ascii_uppercase();
+        fixture.mailbox = fixture.msg.encrypt(&PublicKey::from_str(&fixture.coin.auth_pubkey).unwrap()).unwrap();
+        let mut coin = fixture.coin.clone(); let mut activities = Vec::new();
+        let pool = pool().await; let transport = transport();
+        attempt(&fixture, &pool, &mut coin, &mut activities, transport).await.unwrap();
+        let record = crate::sqlite_manager::get_bip448_statechain(&pool, "wallet", "statechain").await.unwrap();
+        assert_eq!(record.funding_outpoint.txid, "42".repeat(32));
+        assert_eq!(coin.utxo_txid.as_deref(), Some("4242424242424242424242424242424242424242424242424242424242424242"));
     }
 
     #[tokio::test]
