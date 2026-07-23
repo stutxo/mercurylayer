@@ -216,17 +216,59 @@ async fn upsert_bip448_statechain_record(
     record: &Bip448StatechainRecord,
 ) -> Result<()> {
     let record_json = validated_bip448_record_json(record)?;
-    let query = "\
-        INSERT INTO bip448_statechains (\
-            wallet_name, statechain_id, aggregate_pubkey, funding_txid, funding_vout, \
-            funding_value_sats, latest_state_number, challenge_delay, amount_sats, network, \
-            record_json\
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
-        ON CONFLICT(wallet_name, statechain_id) DO UPDATE SET \
-            updated_at = CURRENT_TIMESTAMP \
-        WHERE bip448_statechains.record_json = excluded.record_json";
+    let mut transaction = pool.begin().await?;
+    let existing = sqlx::query(
+        "SELECT record_json FROM bip448_statechains \
+         WHERE wallet_name = $1 AND statechain_id = $2",
+    )
+    .bind(&record.wallet_name)
+    .bind(&record.statechain_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
 
-    let result = sqlx::query(query)
+    if let Some(row) = existing {
+        let stored_json: String = row.get(0);
+        if stored_json == record_json {
+            transaction.commit().await?;
+            return Ok(());
+        }
+
+        let stored: Bip448StatechainRecord = serde_json::from_str(&stored_json)?;
+        if stored.wallet_name != record.wallet_name
+            || stored.statechain_id != record.statechain_id
+            || stored.aggregate_pubkey != record.aggregate_pubkey
+            || stored.funding_outpoint != record.funding_outpoint
+            || stored.amount_sats != record.amount_sats
+            || stored.network != record.network
+            || stored.challenge_delay != record.challenge_delay
+        {
+            return Err(anyhow!("BIP448 accepted state immutable identity mismatch"));
+        }
+        if stored.latest_state_number != 1 || record.latest_state_number != 2 {
+            return Err(anyhow!(
+                "BIP448 accepted state must be an exact replay or a monotonic 1-to-2 transition"
+            ));
+        }
+
+        sqlx::query(
+            "UPDATE bip448_statechains SET \
+                latest_state_number = $1, record_json = $2, updated_at = CURRENT_TIMESTAMP \
+             WHERE wallet_name = $3 AND statechain_id = $4",
+        )
+        .bind(i64::from(record.latest_state_number))
+        .bind(record_json)
+        .bind(&record.wallet_name)
+        .bind(&record.statechain_id)
+        .execute(&mut *transaction)
+        .await?;
+    } else {
+        sqlx::query(
+            "INSERT INTO bip448_statechains (\
+                wallet_name, statechain_id, aggregate_pubkey, funding_txid, funding_vout, \
+                funding_value_sats, latest_state_number, challenge_delay, amount_sats, network, \
+                record_json\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+        )
         .bind(&record.wallet_name)
         .bind(&record.statechain_id)
         .bind(&record.aggregate_pubkey)
@@ -238,14 +280,11 @@ async fn upsert_bip448_statechain_record(
         .bind(record.amount_sats as i64)
         .bind(&record.network)
         .bind(record_json)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await?;
-    if result.rows_affected() != 1 {
-        return Err(anyhow!(
-            "BIP448 accepted state already exists with different canonical identity"
-        ));
     }
 
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -937,26 +976,90 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bip448_latest_state_round_trips_and_conflicting_identity_cannot_overwrite(
-    ) -> Result<()> {
+    async fn bip448_latest_state_allows_one_to_two_transition_and_exact_replay() -> Result<()> {
         let pool = migrated_pool().await?;
-        let record = sample_bip448_record(1);
+        let state_one = sample_bip448_record(1);
+        let state_two = sample_bip448_record(2);
 
-        upsert_bip448_statechain_record(&pool, &record).await?;
+        upsert_bip448_statechain_record(&pool, &state_one).await?;
         let roundtrip =
-            get_bip448_statechain(&pool, &record.wallet_name, &record.statechain_id).await?;
+            get_bip448_statechain(&pool, &state_one.wallet_name, &state_one.statechain_id).await?;
+        assert_eq!(roundtrip, state_one);
 
-        assert_eq!(roundtrip, record);
-
-        upsert_bip448_statechain_record(&pool, &record).await?;
-        let conflicting = sample_bip448_record(2);
-        let error = upsert_bip448_statechain_record(&pool, &conflicting)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("different canonical identity"));
+        upsert_bip448_statechain_record(&pool, &state_two).await?;
         let roundtrip =
-            get_bip448_statechain(&pool, &record.wallet_name, &record.statechain_id).await?;
-        assert_eq!(roundtrip, record);
+            get_bip448_statechain(&pool, &state_two.wallet_name, &state_two.statechain_id).await?;
+        assert_eq!(roundtrip, state_two);
+
+        upsert_bip448_statechain_record(&pool, &state_two).await?;
+        let roundtrip =
+            get_bip448_statechain(&pool, &state_two.wallet_name, &state_two.statechain_id).await?;
+        assert_eq!(roundtrip, state_two);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bip448_latest_state_rejects_immutable_identity_changes() -> Result<()> {
+        let pool = migrated_pool().await?;
+        let state_one = sample_bip448_record(1);
+        upsert_bip448_statechain_record(&pool, &state_one).await?;
+
+        let mut aggregate_pubkey = sample_bip448_record(2);
+        aggregate_pubkey.aggregate_pubkey = "03".to_string() + &"12".repeat(32);
+        let mut funding_outpoint = sample_bip448_record(2);
+        funding_outpoint.funding_outpoint.vout = 1;
+        let mut amount_sats = sample_bip448_record(2);
+        amount_sats.amount_sats += 1;
+        let mut network = sample_bip448_record(2);
+        network.network = "bitcoin".to_string();
+        let mut challenge_delay = sample_bip448_record(2);
+        challenge_delay.challenge_delay += 1;
+
+        for conflicting in [
+            aggregate_pubkey,
+            funding_outpoint,
+            amount_sats,
+            network,
+            challenge_delay,
+        ] {
+            let error = upsert_bip448_statechain_record(&pool, &conflicting)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "BIP448 accepted state immutable identity mismatch"
+            );
+        }
+        let persisted =
+            get_bip448_statechain(&pool, &state_one.wallet_name, &state_one.statechain_id).await?;
+        assert_eq!(persisted, state_one);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bip448_latest_state_rejects_rollback_and_divergent_same_state() -> Result<()> {
+        let pool = migrated_pool().await?;
+        let state_one = sample_bip448_record(1);
+        let state_two = sample_bip448_record(2);
+        upsert_bip448_statechain_record(&pool, &state_one).await?;
+        upsert_bip448_statechain_record(&pool, &state_two).await?;
+
+        let mut divergent_state_two = state_two.clone();
+        divergent_state_two.latest_state.update_tx = "04000000".to_string();
+        for rejected in [state_one, divergent_state_two] {
+            let error = upsert_bip448_statechain_record(&pool, &rejected)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "BIP448 accepted state must be an exact replay or a monotonic 1-to-2 transition"
+            );
+        }
+        let persisted =
+            get_bip448_statechain(&pool, &state_two.wallet_name, &state_two.statechain_id).await?;
+        assert_eq!(persisted, state_two);
 
         Ok(())
     }
@@ -992,9 +1095,12 @@ mod tests {
             .cpfp_child_templates
             .push(sample_cpfp_child_template());
 
-        upsert_bip448_statechain_record(&pool, &rejected_update)
+        let error = upsert_bip448_statechain_record(&pool, &rejected_update)
             .await
             .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cannot contain unverified CPFP child templates"));
         let persisted =
             get_bip448_statechain(&pool, &accepted.wallet_name, &accepted.statechain_id).await?;
         assert_eq!(persisted, accepted);
