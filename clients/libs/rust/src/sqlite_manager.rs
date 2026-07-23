@@ -1,4 +1,7 @@
-use anyhow::{anyhow, Result};
+use std::str::FromStr;
+
+use anyhow::{anyhow, Context, Result};
+use bitcoin::{BlockHash, Txid};
 use mercurylib::{
     bip448_statechain::{script, storage::Bip448StatechainRecord},
     transfer::bip448::Bip448TransferMsg,
@@ -7,6 +10,7 @@ use mercurylib::{
 use serde_json::json;
 use sqlx::{Pool, Row, Sqlite};
 
+use crate::chain::ChainUtxo;
 use crate::deposit::Bip448AcceptedDepositState;
 use crate::transfer_receiver::bip448_transfer_receiver::Bip448AcceptedTransferState;
 
@@ -25,6 +29,119 @@ pub struct Bip448PendingDepositSigning {
     pub client_public_nonce: String,
     pub blinding_factor: String,
     pub server_public_nonce: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Bip448ScanCursor {
+    pub last_scanned_height: u32,
+    pub last_scanned_block_hash: String,
+}
+
+pub(crate) fn canonical_txid(txid: &str) -> Result<String> {
+    Ok(Txid::from_str(txid).with_context(|| format!("invalid txid {txid}"))?.to_string())
+}
+
+fn canonical_block_hash(block_hash: &str) -> Result<String> {
+    Ok(BlockHash::from_str(block_hash)
+        .with_context(|| format!("invalid block hash {block_hash}"))?.to_string())
+}
+
+pub(crate) async fn load_bip448_scan_state(
+    pool: &Pool<Sqlite>, wallet_name: &str, script_pubkey: &str,
+) -> Result<(Option<Bip448ScanCursor>, Vec<ChainUtxo>)> {
+    let cursor = sqlx::query(
+        "SELECT last_scanned_height, last_scanned_block_hash \
+         FROM bip448_scan_cursors WHERE wallet_name = $1 AND script_pubkey = $2",
+    )
+    .bind(wallet_name).bind(script_pubkey).fetch_optional(pool).await?
+    .map(|row| -> Result<_> {
+        Ok(Bip448ScanCursor {
+            last_scanned_height: u32::try_from(row.try_get::<i64, _>(0)?)?,
+            last_scanned_block_hash: canonical_block_hash(row.try_get(1)?)?,
+        })
+    })
+    .transpose()?;
+    let rows = sqlx::query(
+        "SELECT txid, vout, value_sats, height FROM bip448_scanned_outpoints \
+         WHERE wallet_name = $1 AND script_pubkey = $2",
+    )
+    .bind(wallet_name).bind(script_pubkey).fetch_all(pool).await?;
+    let outpoints = rows
+        .into_iter()
+        .map(|row| Ok(ChainUtxo {
+            txid: canonical_txid(row.try_get(0)?)?,
+            vout: u32::try_from(row.try_get::<i64, _>(1)?)?,
+            value: u64::try_from(row.try_get::<i64, _>(2)?)?,
+            height: u32::try_from(row.try_get::<i64, _>(3)?)?,
+        }))
+        .collect::<Result<Vec<_>>>()?;
+    Ok((cursor, outpoints))
+}
+
+pub(crate) async fn persist_bip448_scan_state(
+    pool: &Pool<Sqlite>, wallet_name: &str, script_pubkey: &str,
+    cursor: &Bip448ScanCursor, outpoints: &[ChainUtxo],
+) -> Result<()> {
+    let block_hash = canonical_block_hash(&cursor.last_scanned_block_hash)?;
+    let outpoints = outpoints
+        .iter()
+        .map(|outpoint| Ok((canonical_txid(&outpoint.txid)?, outpoint.vout,
+            outpoint.value, outpoint.height)))
+        .collect::<Result<Vec<_>>>()?;
+    let mut transaction = pool.begin().await?;
+    sqlx::query(
+        "UPDATE bip448_scanned_outpoints SET height = -1 \
+         WHERE wallet_name = $1 AND script_pubkey = $2",
+    )
+    .bind(wallet_name).bind(script_pubkey).execute(&mut *transaction).await?;
+    for (txid, vout, value, height) in outpoints {
+        sqlx::query(
+            "INSERT INTO bip448_scanned_outpoints \
+                (wallet_name, txid, vout, script_pubkey, value_sats, height) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT(wallet_name, txid, vout) DO UPDATE SET \
+                script_pubkey = excluded.script_pubkey, value_sats = excluded.value_sats, \
+                height = excluded.height",
+        )
+        .bind(wallet_name).bind(txid).bind(i64::from(vout)).bind(script_pubkey)
+        .bind(i64::try_from(value)?).bind(i64::from(height))
+        .execute(&mut *transaction).await?;
+    }
+    sqlx::query(
+        "DELETE FROM bip448_scanned_outpoints \
+         WHERE wallet_name = $1 AND script_pubkey = $2 AND height = -1",
+    )
+    .bind(wallet_name).bind(script_pubkey).execute(&mut *transaction).await?;
+    sqlx::query(
+        "INSERT INTO bip448_scan_cursors \
+            (wallet_name, script_pubkey, last_scanned_height, last_scanned_block_hash) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT(wallet_name, script_pubkey) DO UPDATE SET \
+            last_scanned_height = excluded.last_scanned_height, \
+            last_scanned_block_hash = excluded.last_scanned_block_hash, \
+            updated_at = CURRENT_TIMESTAMP",
+    )
+    .bind(wallet_name).bind(script_pubkey).bind(i64::from(cursor.last_scanned_height))
+    .bind(block_hash).execute(&mut *transaction).await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+pub(crate) async fn clear_bip448_scan_state(
+    pool: &Pool<Sqlite>, wallet_name: &str, script_pubkey: &str,
+) -> Result<()> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query(
+        "DELETE FROM bip448_scanned_outpoints \
+         WHERE wallet_name = $1 AND script_pubkey = $2",
+    )
+    .bind(wallet_name).bind(script_pubkey).execute(&mut *transaction).await?;
+    sqlx::query(
+        "DELETE FROM bip448_scan_cursors WHERE wallet_name = $1 AND script_pubkey = $2",
+    )
+    .bind(wallet_name).bind(script_pubkey).execute(&mut *transaction).await?;
+    transaction.commit().await?;
+    Ok(())
 }
 
 pub async fn insert_wallet(pool: &Pool<Sqlite>, wallet: &Wallet) -> Result<()> {
@@ -931,6 +1048,9 @@ mod tests {
         assert!(table_exists(&pool, "bip448_transfer_messages").await?);
         assert!(table_exists(&pool, "bip448_pending_deposit_signings").await?);
         assert!(table_exists(&pool, "bip448_pending_transfer_signings").await?);
+        assert!(table_exists(&pool, "bip448_scan_cursors").await?);
+        assert!(table_exists(&pool, "bip448_scanned_outpoints").await?);
+        assert!(table_exists(&pool, "bip448_package_attempts").await?);
 
         let wallet = sample_wallet();
         insert_wallet(&pool, &wallet).await?;
@@ -944,6 +1064,40 @@ mod tests {
         assert_eq!(roundtrip_backup_txs.len(), 1);
         assert_eq!(roundtrip_backup_txs[0].tx_n, 1);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bip448_scan_state_round_trips_canonical_txids_and_clears() -> Result<()> {
+        let pool = migrated_pool().await?;
+        let cursor = Bip448ScanCursor {
+            last_scanned_height: 42,
+            last_scanned_block_hash: "22".repeat(32),
+        };
+        persist_bip448_scan_state(
+            &pool,
+            "wallet",
+            "51",
+            &cursor,
+            &[ChainUtxo {
+                txid: "AA".repeat(32),
+                vout: 1,
+                value: 50_000,
+                height: 40,
+            }],
+        )
+        .await?;
+
+        let (stored_cursor, outpoints) =
+            load_bip448_scan_state(&pool, "wallet", "51").await?;
+        assert_eq!(stored_cursor, Some(cursor));
+        assert_eq!(outpoints[0].txid, "aa".repeat(32));
+
+        clear_bip448_scan_state(&pool, "wallet", "51").await?;
+        assert_eq!(
+            load_bip448_scan_state(&pool, "wallet", "51").await?,
+            (None, Vec::new())
+        );
         Ok(())
     }
 
