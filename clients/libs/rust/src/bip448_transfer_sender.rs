@@ -65,9 +65,20 @@ pub async fn transfer_bip448_sender(
         ensure_persisted_transfer_delivered(
             || verify_persisted_transfer_completed(client_config, &transfer_msg, &receiver_user_pubkey),
             || async {
-                upload_transfer_msg(client_config, &coin, &recipient_auth_pubkey, &transfer_msg).await?;
+                let encrypted_transfer_msg =
+                    upload_transfer_msg(client_config, &coin, &recipient_auth_pubkey, &transfer_msg).await?;
                 bip448_process_checkpoint("transfer_msg_uploaded");
-                Ok(())
+                Ok(encrypted_transfer_msg)
+            },
+            |encrypted_transfer_msg| {
+                let recipient_auth = recipient_auth.as_str();
+                async move {
+                    transfer_message_is_stored(
+                        client_config,
+                        recipient_auth,
+                        &encrypted_transfer_msg,
+                    ).await
+                }
             },
         ).await?;
         finish_transfer(client_config, &mut wallet, coin_index).await?;
@@ -88,26 +99,42 @@ pub async fn transfer_bip448_sender(
     let transfer_msg = build_transfer_msg(&record, &coin, receiver_user_pubkey, &x1, &transfer_signature, &artifacts, signing_metadata)?;
     insert_or_update_bip448_transfer_msg(&client_config.pool, wallet_name, &recipient_auth, &transfer_msg).await?;
     bip448_process_checkpoint("transfer_msg_persisted");
-    upload_transfer_msg(client_config, &coin, &recipient_auth_pubkey, &transfer_msg).await?;
+    let encrypted_transfer_msg =
+        upload_transfer_msg(client_config, &coin, &recipient_auth_pubkey, &transfer_msg).await?;
     bip448_process_checkpoint("transfer_msg_uploaded");
+    if !matches!(
+        transfer_message_is_stored(client_config, &recipient_auth, &encrypted_transfer_msg).await,
+        Ok(true)
+    ) {
+        return Err(anyhow!("transfer message was not stored"));
+    }
     finish_transfer(client_config, &mut wallet, coin_index).await
 }
-async fn ensure_persisted_transfer_delivered<C, CF, U, UF>(
+async fn ensure_persisted_transfer_delivered<C, CF, U, UF, S, SF>(
     mut verify_completed: C,
     upload: U,
+    verify_stored: S,
 ) -> Result<()>
 where
     C: FnMut() -> CF,
     CF: Future<Output = Result<bool>>,
     U: FnOnce() -> UF,
-    UF: Future<Output = Result<()>>,
+    UF: Future<Output = Result<String>>,
+    S: FnOnce(String) -> SF,
+    SF: Future<Output = Result<bool>>,
 {
     if matches!(verify_completed().await, Ok(true)) {
         return Ok(());
     }
 
     let upload_error = match upload().await {
-        Ok(()) => return Ok(()),
+        Ok(encrypted_transfer_msg) => {
+            return if matches!(verify_stored(encrypted_transfer_msg).await, Ok(true)) {
+                Ok(())
+            } else {
+                Err(anyhow!("transfer message was not stored"))
+            }
+        }
         Err(error) => error,
     };
     if matches!(verify_completed().await, Ok(true)) {
@@ -115,6 +142,30 @@ where
     } else {
         Err(upload_error)
     }
+}
+async fn transfer_message_is_stored(
+    client_config: &ClientConfig,
+    recipient_auth_pubkey: &str,
+    encrypted_transfer_msg: &str,
+) -> Result<bool> {
+    let path = format!(
+        "transfer/get_msg_addr/{}",
+        recipient_auth_pubkey.to_string()
+    );
+    let client = client_config.get_reqwest_client()?;
+    let request = client.get(&format!("{}/{}", client_config.statechain_entity, path));
+    let value = request.send().await?.text().await?;
+    let response: mercurylib::transfer::receiver::GetMsgAddrResponsePayload =
+        serde_json::from_str(value.as_str())?;
+    Ok(mailbox_contains_transfer_message(
+        &response.list_enc_transfer_msg,
+        encrypted_transfer_msg,
+    ))
+}
+fn mailbox_contains_transfer_message(messages: &[String], encrypted_transfer_msg: &str) -> bool {
+    messages
+        .iter()
+        .any(|message| message == encrypted_transfer_msg)
 }
 async fn verify_persisted_transfer_completed(
     client_config: &ClientConfig,
@@ -361,23 +412,23 @@ async fn upload_transfer_msg(
     coin: &Coin,
     recipient_auth_pubkey: &PublicKey,
     transfer_msg: &Bip448TransferMsg,
-) -> Result<()> {
-    let enc_transfer_msg = transfer_msg.encrypt(recipient_auth_pubkey)?;
+) -> Result<String> {
+    let payload = TransferUpdateMsgRequestPayload {
+        statechain_id: transfer_msg.statechain_id.clone(),
+        auth_sig: coin.signed_statechain_id.clone().ok_or_else(|| anyhow!("BIP448 transfer coin missing signed_statechain_id"))?,
+        new_user_auth_key: recipient_auth_pubkey.to_string(),
+        enc_transfer_msg: transfer_msg.encrypt(recipient_auth_pubkey)?,
+    };
     let response = client_config
         .get_reqwest_client()?
         .post(format!("{}/transfer/update_msg", client_config.statechain_entity))
-        .json(&TransferUpdateMsgRequestPayload {
-            statechain_id: transfer_msg.statechain_id.clone(),
-            auth_sig: coin.signed_statechain_id.clone().ok_or_else(|| anyhow!("BIP448 transfer coin missing signed_statechain_id"))?,
-            new_user_auth_key: recipient_auth_pubkey.to_string(),
-            enc_transfer_msg,
-        })
+        .json(&payload)
         .send()
         .await?;
     if !response.status().is_success() {
         return Err(anyhow!("Failed to update transfer message"));
     }
-    Ok(())
+    Ok(payload.enc_transfer_msg)
 }
 async fn finish_transfer(
     client_config: &ClientConfig,
@@ -431,12 +482,55 @@ mod tests {
                 uploads.set(uploads.get() + 1);
                 std::future::ready(Err(anyhow!("upload must be skipped")))
             },
+            |_| std::future::ready(Err(anyhow!("storage check must be skipped"))),
         )
         .await
         .unwrap();
 
         assert_eq!(checks.get(), 1);
         assert_eq!(uploads.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn successful_upload_requires_retrievable_message() {
+        ensure_persisted_transfer_delivered(
+            || std::future::ready(Ok(false)),
+            || std::future::ready(Ok("current ciphertext".to_string())),
+            |encrypted_transfer_msg| {
+                std::future::ready(Ok(encrypted_transfer_msg == "current ciphertext"))
+            },
+        )
+        .await
+        .unwrap();
+
+        for stored in [Ok(false), Err(anyhow!("mailbox unavailable"))] {
+            let error = ensure_persisted_transfer_delivered(
+                || std::future::ready(Ok(false)),
+                || std::future::ready(Ok("current ciphertext".to_string())),
+                move |encrypted_transfer_msg| {
+                    assert_eq!(encrypted_transfer_msg, "current ciphertext");
+                    std::future::ready(stored)
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.to_string(), "transfer message was not stored");
+        }
+    }
+
+    #[test]
+    fn mailbox_must_contain_the_current_ciphertext() {
+        let old_message = "old ciphertext".to_string();
+        let current_message = "current ciphertext".to_string();
+
+        assert!(!mailbox_contains_transfer_message(
+            &[old_message.clone()],
+            &current_message,
+        ));
+        assert!(mailbox_contains_transfer_message(
+            &[old_message, current_message.clone()],
+            &current_message,
+        ));
     }
 
     #[tokio::test]
@@ -449,6 +543,7 @@ mod tests {
                 std::future::ready(Ok(completed))
             },
             || std::future::ready(Err(anyhow!("rotated authentication key"))),
+            |_| std::future::ready(Err(anyhow!("storage check must be skipped"))),
         )
         .await
         .unwrap();
@@ -457,6 +552,7 @@ mod tests {
         let error = ensure_persisted_transfer_delivered(
             || std::future::ready(Ok(false)),
             || std::future::ready(Err(anyhow!("original upload error"))),
+            |_| std::future::ready(Err(anyhow!("storage check must be skipped"))),
         )
         .await
         .unwrap_err();
@@ -465,6 +561,7 @@ mod tests {
         let error = ensure_persisted_transfer_delivered(
             || std::future::ready(Err(anyhow!("completion evidence unavailable"))),
             || std::future::ready(Err(anyhow!("original upload error"))),
+            |_| std::future::ready(Err(anyhow!("storage check must be skipped"))),
         )
         .await
         .unwrap_err();
