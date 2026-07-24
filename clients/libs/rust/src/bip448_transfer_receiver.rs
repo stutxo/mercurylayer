@@ -612,7 +612,8 @@ mod tests {
 
     #[rustfmt::skip]
     fn fixture() -> Fixture {
-        let msg: Bip448TransferMsg = serde_json::from_str(MSG).unwrap();
+        let mut msg: Bip448TransferMsg = serde_json::from_str(MSG).unwrap();
+        for entry in &mut msg.state_history { entry.owner_public_key = PublicKey::from_str(&entry.owner_public_key).unwrap().x_only_public_key().0.to_string(); }
         let coin = test_coin(5, 8);
         let aggregate = PublicKey::from_str(&msg.aggregate_pubkey).unwrap();
         let secp = Secp256k1::new();

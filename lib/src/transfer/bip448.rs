@@ -1099,7 +1099,7 @@ mod tests {
         let entry = Bip448StateHistoryEntry {
             state_number,
             state_locktime,
-            owner_public_key: owner_public_key.to_string(),
+            owner_public_key: owner_public_key.x_only_public_key().0.to_string(),
             update_template_hash: latest.update_template_hash.clone(),
             settlement_template_hash: latest.settlement_template_hash.clone(),
             update_signature: metadata.update_signature,
@@ -1139,6 +1139,22 @@ mod tests {
             6,
             4,
             &[3, 5, 6],
+        )
+    }
+
+    fn four_state_transfer_fixture() -> TransferFixture {
+        transfer_fixture_with_history(
+            &[
+                TEST_STATE_LOCKTIME,
+                TEST_STATE_LOCKTIME + 10,
+                TEST_STATE_LOCKTIME + 20,
+                TEST_STATE_LOCKTIME + 30,
+            ],
+            5,
+            2,
+            6,
+            4,
+            &[3, 8, 5, 6],
         )
     }
 
@@ -2295,22 +2311,33 @@ mod tests {
         let mut fixture = transfer_fixture();
         fixture.msg.latest_state.signing_metadata.update_signature = "00".repeat(64);
         assert_eq!(transfer_error(&fixture), InvalidUpdateSignature);
-
-        let mut fixture = three_state_transfer_fixture();
-        fixture.msg.state_history[1].update_signature = "00".repeat(64);
-        assert_eq!(transfer_error(&fixture), InvalidUpdateSignature);
     }
 
     #[test]
-    fn bip448_transfer_rejects_wrong_blinding_evidence() {
-        let mut fixture = three_state_transfer_fixture();
+    fn bip448_transfer_rejects_tampered_middle_history() {
+        let mut fixture = four_state_transfer_fixture();
+        fixture.msg.state_history[1].update_signature = "00".repeat(64);
+        assert_eq!(transfer_error(&fixture), InvalidUpdateSignature);
+
+        let mut fixture = four_state_transfer_fixture();
         fixture.msg.state_history[1].blinding_factor = "18".repeat(32);
         assert_eq!(transfer_error(&fixture), InvalidBlindedChallenge);
 
-        let mut fixture = three_state_transfer_fixture();
+        let secp = Secp256k1::new();
+        let mut fixture = four_state_transfer_fixture();
+        fixture.msg.state_history[1].owner_public_key = SecretKey::from_secret_bytes([9u8; 32])
+            .unwrap()
+            .public_key(&secp)
+            .x_only_public_key()
+            .0
+            .to_string();
+        assert_eq!(transfer_error(&fixture), InvalidStateHistory);
+
+        let mut fixture = four_state_transfer_fixture();
         fixture.msg.state_history[1].owner_public_key = SecretKey::from_secret_bytes([8u8; 32])
             .unwrap()
-            .public_key(&Secp256k1::new())
+            .public_key(&secp)
+            .negate()
             .to_string();
         assert_eq!(transfer_error(&fixture), InvalidStateHistory);
     }

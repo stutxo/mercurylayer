@@ -342,6 +342,37 @@ async fn bip448_deposit_recovers_through_update_and_settlement_packages() -> Res
     Ok(())
 }
 
+async fn transfer_and_accept_bip448(
+    client_config: &ClientConfig,
+    sender_wallet: &str,
+    receiver_wallet: &str,
+    statechain_id: &str,
+) -> Result<Bip448StatechainRecord> {
+    let recipient_address =
+        mercuryrustlib::transfer_receiver::new_transfer_address(client_config, receiver_wallet)
+            .await?;
+    mercuryrustlib::bip448_transfer_sender::transfer_bip448_sender(
+        client_config,
+        &recipient_address,
+        sender_wallet,
+        statechain_id,
+    )
+    .await?;
+    let receive_result =
+        mercuryrustlib::transfer_receiver::execute(client_config, receiver_wallet).await?;
+    assert!(!receive_result.is_there_batch_locked);
+    assert_eq!(
+        receive_result.received_statechain_ids,
+        vec![statechain_id.to_string()]
+    );
+    mercuryrustlib::sqlite_manager::get_bip448_statechain(
+        &client_config.pool,
+        receiver_wallet,
+        statechain_id,
+    )
+    .await
+}
+
 #[tokio::test]
 #[ignore = "requires docker regtest stack with Mercury server, lockbox, and active BIP448 Inquisition deployments"]
 async fn bip448_one_hop_transfer_accepts_and_recovers_state_two() -> Result<()> {
@@ -360,9 +391,7 @@ async fn bip448_one_hop_transfer_accepts_and_recovers_state_two() -> Result<()> 
         mercuryrustlib::wallet::create_wallet("bip448-one-hop-sender", &client_config).await?;
     let receiver =
         mercuryrustlib::wallet::create_wallet("bip448-one-hop-receiver", &client_config).await?;
-    let next_receiver =
-        mercuryrustlib::wallet::create_wallet("bip448-one-hop-next", &client_config).await?;
-    for wallet in [&sender, &receiver, &next_receiver] {
+    for wallet in [&sender, &receiver] {
         mercuryrustlib::sqlite_manager::insert_wallet(&client_config.pool, wallet).await?;
     }
 
@@ -434,28 +463,6 @@ async fn bip448_one_hop_transfer_accepts_and_recovers_state_two() -> Result<()> 
     assert_eq!(received_coin.statechain_protocol.as_deref(), Some("bip448"));
     let receiver_backup_address = received_coin.backup_address.clone();
 
-    let second_recipient_address = mercuryrustlib::transfer_receiver::new_transfer_address(
-        &client_config,
-        &next_receiver.name,
-    )
-    .await?;
-    let second_transfer = mercuryrustlib::bip448_transfer_sender::transfer_bip448_sender(
-        &client_config,
-        &second_recipient_address,
-        &receiver.name,
-        &deposit.statechain_id,
-    )
-    .await
-    .expect_err("a received state-2 coin must not be transferable again");
-    assert_eq!(
-        second_transfer.to_string(),
-        "only one-hop transfer of a fresh deposit is supported in the prototype"
-    );
-    assert_eq!(
-        common::lockbox::get_signature_count(&lockbox_client, &deposit.statechain_id).await?,
-        2
-    );
-
     let fee_inputs = confirmed_p2a_fee_inputs(2)?;
     let change_address = common::bitcoin_core::getnewaddress()?;
     let update = mercuryrustlib::bip448_recovery::submit_latest_state_recovery_package(
@@ -508,6 +515,199 @@ async fn bip448_one_hop_transfer_accepts_and_recovers_state_two() -> Result<()> 
         u64::from(FUNDING_AMOUNT_SATS),
     )
     .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires docker regtest stack with Mercury server, lockbox, and active BIP448 Inquisition deployments"]
+async fn bip448_two_hop_transfer_accepts_and_recovers_state_three() -> Result<()> {
+    let _guard = common::test_guard();
+
+    common::bitcoin_core::ensure_wallet_loaded()?;
+    common::bip448_activation::ensure_bip448_deployments_active()?;
+    common::bitcoin_core::ensure_wallet_ready()?;
+    let mercury_client = common::mercury::http_client();
+    common::mercury::wait_until_ready(&mercury_client).await?;
+    let lockbox_client = common::lockbox::http_client();
+    common::lockbox::wait_until_ready(&lockbox_client).await?;
+
+    let client_config = common::prepare_test_env().await?;
+    let sender =
+        mercuryrustlib::wallet::create_wallet("bip448-two-hop-sender", &client_config).await?;
+    let middle =
+        mercuryrustlib::wallet::create_wallet("bip448-two-hop-middle", &client_config).await?;
+    let receiver =
+        mercuryrustlib::wallet::create_wallet("bip448-two-hop-receiver", &client_config).await?;
+    for wallet in [&sender, &middle, &receiver] {
+        mercuryrustlib::sqlite_manager::insert_wallet(&client_config.pool, wallet).await?;
+    }
+
+    let deposit = create_confirmed_bip448_deposit(&client_config, &sender).await?;
+    common::bitcoin_core::mine_blocks(client_config.confirmation_target)?;
+    mercuryrustlib::coin_status::update_coins(&client_config, &sender.name).await?;
+    assert_eq!(
+        common::lockbox::get_signature_count(&lockbox_client, &deposit.statechain_id).await?,
+        1
+    );
+
+    let state_two = transfer_and_accept_bip448(
+        &client_config,
+        &sender.name,
+        &middle.name,
+        &deposit.statechain_id,
+    )
+    .await?;
+    assert_eq!(state_two.latest_state_number, 2);
+    assert_eq!(
+        common::lockbox::get_signature_count(&lockbox_client, &deposit.statechain_id).await?,
+        2
+    );
+
+    let state_three = transfer_and_accept_bip448(
+        &client_config,
+        &middle.name,
+        &receiver.name,
+        &deposit.statechain_id,
+    )
+    .await?;
+    assert_eq!(state_three.latest_state_number, 3);
+    assert_eq!(state_three.latest_state.state_number, 3);
+    assert_eq!(
+        state_three
+            .latest_state
+            .signing_metadata
+            .server_signature_count,
+        3
+    );
+    assert_eq!(
+        common::lockbox::get_signature_count(&lockbox_client, &deposit.statechain_id).await?,
+        3
+    );
+
+    let receiver_wallet =
+        mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &receiver.name).await?;
+    let received_coin = receiver_wallet
+        .coins
+        .iter()
+        .find(|coin| coin.statechain_id.as_deref() == Some(&deposit.statechain_id))
+        .context("final receiver does not contain the accepted state-3 BIP448 coin")?;
+    assert_eq!(received_coin.status, CoinStatus::CONFIRMED);
+    let receiver_backup_address = received_coin.backup_address.clone();
+
+    let fee_inputs = confirmed_p2a_fee_inputs(2)?;
+    let change_address = common::bitcoin_core::getnewaddress()?;
+    let update = mercuryrustlib::bip448_recovery::submit_latest_state_recovery_package(
+        &client_config,
+        &receiver.name,
+        &deposit.statechain_id,
+        Bip448RecoveryTemplateRole::FundingUpdate,
+        &fee_inputs[..1],
+        &change_address,
+        Some(PACKAGE_FEERATE_SAT_PER_VBYTE),
+    )
+    .await?;
+    let update_txid = Txid::from_str(&update.parent_txid)?;
+    let update_child_txid = Txid::from_str(&update.cpfp_child_txid)?;
+    common::bitcoin_core::assert_in_mempool(&update_txid)?;
+    common::bitcoin_core::assert_in_mempool(&update_child_txid)?;
+    common::bitcoin_core::mine_block()?;
+    common::bitcoin_core::assert_confirmed(&update_txid)?;
+    common::bitcoin_core::assert_confirmed(&update_child_txid)?;
+
+    common::bitcoin_core::mine_blocks(state_three.challenge_delay as u32)?;
+
+    let settlement = mercuryrustlib::bip448_recovery::submit_latest_state_recovery_package(
+        &client_config,
+        &receiver.name,
+        &deposit.statechain_id,
+        Bip448RecoveryTemplateRole::Settlement,
+        &fee_inputs[1..],
+        &change_address,
+        Some(PACKAGE_FEERATE_SAT_PER_VBYTE),
+    )
+    .await?;
+    let settlement_txid = Txid::from_str(&settlement.parent_txid)?;
+    let settlement_child_txid = Txid::from_str(&settlement.cpfp_child_txid)?;
+    common::bitcoin_core::assert_in_mempool(&settlement_txid)?;
+    common::bitcoin_core::assert_in_mempool(&settlement_child_txid)?;
+    common::bitcoin_core::mine_block()?;
+    common::bitcoin_core::assert_confirmed(&settlement_txid)?;
+    common::bitcoin_core::assert_confirmed(&settlement_child_txid)?;
+
+    common::chain::wait_for_address_outpoint(
+        &client_config,
+        &receiver_backup_address,
+        OutPoint {
+            txid: settlement_txid,
+            vout: 0,
+        },
+        u64::from(FUNDING_AMOUNT_SATS),
+    )
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires docker regtest stack with Mercury server, lockbox, and active BIP448 Inquisition deployments"]
+async fn bip448_same_wallet_second_hop_advances_to_state_three() -> Result<()> {
+    let _guard = common::test_guard();
+
+    common::bitcoin_core::ensure_wallet_loaded()?;
+    common::bip448_activation::ensure_bip448_deployments_active()?;
+    common::bitcoin_core::ensure_wallet_ready()?;
+    let mercury_client = common::mercury::http_client();
+    common::mercury::wait_until_ready(&mercury_client).await?;
+    let lockbox_client = common::lockbox::http_client();
+    common::lockbox::wait_until_ready(&lockbox_client).await?;
+
+    let client_config = common::prepare_test_env().await?;
+    let sender =
+        mercuryrustlib::wallet::create_wallet("bip448-state-three-sender", &client_config).await?;
+    let holder =
+        mercuryrustlib::wallet::create_wallet("bip448-state-three-same-wallet", &client_config)
+            .await?;
+    for wallet in [&sender, &holder] {
+        mercuryrustlib::sqlite_manager::insert_wallet(&client_config.pool, wallet).await?;
+    }
+
+    let deposit = create_confirmed_bip448_deposit(&client_config, &sender).await?;
+    common::bitcoin_core::mine_blocks(client_config.confirmation_target)?;
+    mercuryrustlib::coin_status::update_coins(&client_config, &sender.name).await?;
+    let state_two = transfer_and_accept_bip448(
+        &client_config,
+        &sender.name,
+        &holder.name,
+        &deposit.statechain_id,
+    )
+    .await?;
+    assert_eq!(state_two.latest_state_number, 2);
+
+    let state_three = transfer_and_accept_bip448(
+        &client_config,
+        &holder.name,
+        &holder.name,
+        &deposit.statechain_id,
+    )
+    .await?;
+    assert_eq!(state_three.latest_state_number, 3);
+    assert_eq!(state_three.latest_state.state_number, 3);
+    assert_eq!(
+        common::lockbox::get_signature_count(&lockbox_client, &deposit.statechain_id).await?,
+        3
+    );
+
+    let wallet =
+        mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &holder.name).await?;
+    assert!(wallet.coins.iter().any(|coin| {
+        coin.statechain_id.as_deref() == Some(deposit.statechain_id.as_str())
+            && coin.status == CoinStatus::CONFIRMED
+    }));
+    assert!(wallet.coins.iter().any(|coin| {
+        coin.statechain_id.as_deref() == Some(deposit.statechain_id.as_str())
+            && coin.status == CoinStatus::IN_TRANSFER
+    }));
 
     Ok(())
 }
