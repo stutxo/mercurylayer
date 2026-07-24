@@ -1130,6 +1130,7 @@ async fn mercury_statechain_info_returns_ordered_bip448_rows_and_transfer_clears
     let second_signing_id = hex::encode([0x5au8; 32]);
     let second_row =
         complete_bip448_signing_round(&mercury_client, &coin, second_signing_id.clone()).await?;
+    let second_nonce = second_row.0.clone();
     let second_challenge = second_row.1.clone();
     insert_completed_legacy_signature_row(&statechain_id).await?;
     insert_completed_bip448_signature_row(&format!("foreign-{statechain_id}")).await?;
@@ -1164,7 +1165,11 @@ async fn mercury_statechain_info_returns_ordered_bip448_rows_and_transfer_clears
     let incomplete_info = mercury::statechain_info(&mercury_client, &statechain_id).await?;
     assert_eq!(incomplete_info.num_sigs, 2);
     assert_eq!(incomplete_info.statechain_info.len(), 1);
-    assert_eq!(incomplete_info.statechain_info[0].tx_n, 2);
+    assert_eq!(incomplete_info.statechain_info[0].tx_n, 1);
+    assert_eq!(
+        lockbox::normalize_hex(&incomplete_info.statechain_info[0].server_pubnonce),
+        second_nonce
+    );
     assert_eq!(
         incomplete_info.statechain_info[0].challenge,
         second_challenge
@@ -1184,7 +1189,16 @@ async fn mercury_statechain_info_returns_ordered_bip448_rows_and_transfer_clears
 
     let post_transfer_info = mercury::statechain_info(&mercury_client, &statechain_id).await?;
     assert_eq!(post_transfer_info.num_sigs, 2);
-    assert!(post_transfer_info.statechain_info.is_empty());
+    assert_eq!(post_transfer_info.statechain_info.len(), 1);
+    assert_eq!(post_transfer_info.statechain_info[0].tx_n, 1);
+    assert_eq!(
+        lockbox::normalize_hex(&post_transfer_info.statechain_info[0].server_pubnonce),
+        second_nonce
+    );
+    assert_eq!(
+        post_transfer_info.statechain_info[0].challenge,
+        second_challenge
+    );
 
     lockbox::delete_statechain(&lockbox_client, &statechain_id).await?;
 
