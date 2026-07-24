@@ -698,7 +698,7 @@ impl Bip448LatestState {
             Bip448RecoveryTemplateRole::FundingUpdate => {
                 let initial_state = crate::bip448_statechain::deposit::INITIAL_BIP448_STATE_NUMBER;
                 if self.state_number != initial_state
-                    && !(allow_transferred_funding_state && self.state_number == initial_state + 1)
+                    && !(allow_transferred_funding_state && self.state_number > initial_state)
                 {
                     return Err(Bip448RecoveryVerifyError::UnsupportedInitialStateNumber {
                         state_number: self.state_number,
@@ -1027,6 +1027,19 @@ mod tests {
         assert_eq!(roundtrip, record);
         assert!(!json.contains("backup_txs"));
         assert!(!json.contains("backup_transactions"));
+    }
+
+    #[test]
+    fn transferred_funding_reconstruction_accepts_state_three_only_when_allowed() {
+        let mut state = sample_latest_state();
+        state.state_number = 3;
+        state.cpfp_child_templates.clear();
+
+        assert_eq!(state.verify_reconstruction_metadata(true), Ok(()));
+        assert_eq!(
+            state.verify_reconstruction_metadata(false),
+            Err(Bip448RecoveryVerifyError::UnsupportedInitialStateNumber { state_number: 3 })
+        );
     }
 
     #[test]

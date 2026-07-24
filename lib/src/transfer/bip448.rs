@@ -6,7 +6,7 @@ use bitcoin::{
 };
 use secp256k1::{
     musig::{BlindingFactor, PublicNonce},
-    schnorr, PublicKey, Secp256k1, Signing, Verification,
+    schnorr, PublicKey, Secp256k1, Signing, Verification, XOnlyPublicKey,
 };
 use serde::{Deserialize, Serialize};
 
@@ -209,6 +209,7 @@ pub struct Bip448TransferMsg {
 pub struct Bip448StateHistoryEntry {
     pub state_number: u32,
     pub state_locktime: u32,
+    pub owner_public_key: String,
     pub update_template_hash: String,
     pub settlement_template_hash: String,
     pub update_signature: String,
@@ -473,11 +474,9 @@ pub fn verify_bip448_transfer_msg(
     statechain_info: &StatechainInfoResponsePayload,
     chain_facts: &Bip448TransferChainFacts,
 ) -> Result<(), Bip448TransferVerifyError> {
-    const TRANSFER_STATE_NUMBER: u32 = 2;
-
     let secp = Secp256k1::new();
     let expected_fee_bump_policy = Bip448FeeBumpPolicy::ZeroFeeEphemeralAnchor;
-    if msg.msg_version != 1 {
+    if msg.msg_version != 2 {
         return Err(Bip448TransferVerifyError::UnsupportedMessageVersion);
     }
     let network = Network::from_str(&msg.network)
@@ -489,13 +488,13 @@ pub fn verify_bip448_transfer_msg(
         return Err(Bip448TransferVerifyError::InvalidNetworkOrChallengeDelay);
     }
 
-    if statechain_info.num_sigs != TRANSFER_STATE_NUMBER
-        || msg.latest_state_number != TRANSFER_STATE_NUMBER
-        || msg.state_history.len() != TRANSFER_STATE_NUMBER as usize
-        || msg.server_signature_count != u64::from(TRANSFER_STATE_NUMBER)
-        || msg.latest_state.state_number != TRANSFER_STATE_NUMBER
-        || msg.latest_state.signing_metadata.server_signature_count
-            != u64::from(TRANSFER_STATE_NUMBER)
+    let n = msg.latest_state_number;
+    if n < 2
+        || statechain_info.num_sigs != n
+        || msg.state_history.len() != n as usize
+        || msg.server_signature_count != u64::from(n)
+        || msg.latest_state.state_number != n
+        || msg.latest_state.signing_metadata.server_signature_count != u64::from(n)
     {
         return Err(Bip448TransferVerifyError::InvalidSignatureCount);
     }
@@ -553,20 +552,6 @@ pub fn verify_bip448_transfer_msg(
         .map_err(transfer_binding_error)?;
     let aggregate_pubkey = binding.aggregate_pubkey().clone();
 
-    let recovery_script = Address::p2tr(
-        &secp,
-        receiver_user_pubkey.x_only_public_key().0,
-        None,
-        chain_facts.expected_network,
-    )
-    .script_pubkey();
-    let sender_recovery_script = Address::p2tr(
-        &secp,
-        sender_user_pubkey.x_only_public_key().0,
-        None,
-        chain_facts.expected_network,
-    )
-    .script_pubkey();
     for (index, entry) in msg.state_history.iter().enumerate() {
         let expected_state_number = index as u32 + 1;
         let signing_row = statechain_info
@@ -577,6 +562,15 @@ pub fn verify_bip448_transfer_msg(
         if signing_row.statechain_id != msg.statechain_id {
             return Err(Bip448TransferVerifyError::InvalidStateHistory);
         }
+        let owner_public_key = XOnlyPublicKey::from_str(&entry.owner_public_key)
+            .map_err(|_| Bip448TransferVerifyError::InvalidStateHistory)?;
+        let recovery_script = Address::p2tr(
+            &secp,
+            owner_public_key,
+            None,
+            chain_facts.expected_network,
+        )
+        .script_pubkey();
         verify_history_entry(
             &secp,
             entry,
@@ -585,32 +579,43 @@ pub fn verify_bip448_transfer_msg(
             &aggregate_pubkey,
             chain_facts.funding_outpoint,
             chain_facts.funding_output.value,
-            if expected_state_number == 1 {
-                &sender_recovery_script
-            } else {
-                &recovery_script
-            },
+            &recovery_script,
             msg.challenge_delay,
             expected_fee_bump_policy,
         )?;
     }
+    if msg.state_history[n as usize - 1].owner_public_key
+        != receiver_user_pubkey.x_only_public_key().0.to_string()
+        || msg.state_history[n as usize - 2].owner_public_key
+            != sender_user_pubkey.x_only_public_key().0.to_string()
+    {
+        return Err(Bip448TransferVerifyError::InvalidStateHistory);
+    }
 
-    let first_locktime = msg.state_history[0].state_locktime;
-    let latest_locktime = msg.state_history[1].state_locktime;
-    let stride = latest_locktime
-        .checked_sub(first_locktime)
-        .ok_or(Bip448TransferVerifyError::InvalidStateLocktime)?;
-    let _ = bip448_script::checked_next_state_locktime(
-        absolute::LockTime::from_consensus(first_locktime),
-        stride,
-    )
-    .map_err(|_| Bip448TransferVerifyError::InvalidStateLocktime)?;
+    for entries in msg.state_history.windows(2) {
+        let stride = entries[1]
+            .state_locktime
+            .checked_sub(entries[0].state_locktime)
+            .ok_or(Bip448TransferVerifyError::InvalidStateLocktime)?;
+        let next_locktime = bip448_script::checked_next_state_locktime(
+            absolute::LockTime::from_consensus(entries[0].state_locktime),
+            stride,
+        )
+        .map_err(|_| Bip448TransferVerifyError::InvalidStateLocktime)?;
+        if next_locktime.to_consensus_u32() != entries[1].state_locktime {
+            return Err(Bip448TransferVerifyError::InvalidStateLocktime);
+        }
+    }
+    let last_entry = msg
+        .state_history
+        .last()
+        .ok_or(Bip448TransferVerifyError::InvalidStateHistory)?;
     bip448_transaction::validate_immediately_final(
-        absolute::LockTime::from_consensus(latest_locktime),
+        absolute::LockTime::from_consensus(last_entry.state_locktime),
         chain_facts.median_time_past,
     )
     .map_err(|_| Bip448TransferVerifyError::InvalidStateLocktime)?;
-    if !latest_history_matches_state(&msg.state_history[1], &msg.latest_state) {
+    if !latest_history_matches_state(last_entry, &msg.latest_state) {
         return Err(Bip448TransferVerifyError::InvalidStateHistory);
     }
 
@@ -619,6 +624,13 @@ pub fn verify_bip448_transfer_msg(
     let post_transfer_server_pubkey = aggregate_pubkey
         .combine(&receiver_user_pubkey.negate())
         .map_err(|_| Bip448TransferVerifyError::InvalidKeyContinuity)?;
+    let recovery_script = Address::p2tr(
+        &secp,
+        receiver_user_pubkey.x_only_public_key().0,
+        None,
+        chain_facts.expected_network,
+    )
+    .script_pubkey();
     let mut recovery_msg = msg.clone();
     recovery_msg.server_public_key = post_transfer_server_pubkey.to_string();
     let mut recovery_context = Bip448TrustedRecoveryContext::new(
@@ -627,7 +639,7 @@ pub fn verify_bip448_transfer_msg(
         chain_facts.median_time_past,
         chain_facts.funding_outpoint,
         chain_facts.funding_output.clone(),
-        u64::from(TRANSFER_STATE_NUMBER),
+        u64::from(msg.latest_state_number),
         DEFAULT_BIP448_CHALLENGE_DELAY,
         expected_fee_bump_policy,
         receiver_user_pubkey,
@@ -1002,10 +1014,17 @@ mod tests {
         aggregate_pubkey: &PublicKey,
         funding_outpoint: OutPoint,
         funding_value: u64,
-        recovery_script: ScriptBuf,
+        owner_public_key: &PublicKey,
         state_number: u32,
         state_locktime: u32,
     ) -> (Bip448StateHistoryEntry, Bip448LatestState, StatechainInfo) {
+        let recovery_script = Address::p2tr(
+            secp,
+            owner_public_key.x_only_public_key().0,
+            None,
+            Network::Regtest,
+        )
+        .script_pubkey();
         let artifacts = build_funding_recovery_artifacts(
             secp,
             aggregate_pubkey,
@@ -1080,6 +1099,7 @@ mod tests {
         let entry = Bip448StateHistoryEntry {
             state_number,
             state_locktime,
+            owner_public_key: owner_public_key.to_string(),
             update_template_hash: latest.update_template_hash.clone(),
             settlement_template_hash: latest.settlement_template_hash.clone(),
             update_signature: metadata.update_signature,
@@ -1104,11 +1124,54 @@ mod tests {
         state1_locktime: u32,
         state2_locktime: u32,
     ) -> TransferFixture {
+        transfer_fixture_with_history(&[state1_locktime, state2_locktime], 3, 4, 5, 6, &[3, 5])
+    }
+
+    fn three_state_transfer_fixture() -> TransferFixture {
+        transfer_fixture_with_history(
+            &[
+                TEST_STATE_LOCKTIME,
+                TEST_STATE_LOCKTIME + 10,
+                TEST_STATE_LOCKTIME + 20,
+            ],
+            5,
+            2,
+            6,
+            4,
+            &[3, 5, 6],
+        )
+    }
+
+    fn three_state_transfer_fixture_with_last_stride(last_stride: u32) -> TransferFixture {
+        transfer_fixture_with_history(
+            &[
+                TEST_STATE_LOCKTIME,
+                TEST_STATE_LOCKTIME + 10,
+                TEST_STATE_LOCKTIME + 10 + last_stride,
+            ],
+            5,
+            2,
+            6,
+            4,
+            &[3, 5, 6],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn transfer_fixture_with_history(
+        state_locktimes: &[u32],
+        sender_seed: u8,
+        server_seed: u8,
+        receiver_seed: u8,
+        x1_seed: u8,
+        owner_seeds: &[u8],
+    ) -> TransferFixture {
+        assert_eq!(state_locktimes.len(), owner_seeds.len());
         let secp = Secp256k1::new();
-        let sender_secret = SecretKey::from_secret_bytes([3u8; 32]).unwrap();
-        let server_secret = SecretKey::from_secret_bytes([4u8; 32]).unwrap();
-        let receiver_secret = SecretKey::from_secret_bytes([5u8; 32]).unwrap();
-        let x1_secret = SecretKey::from_secret_bytes([6u8; 32]).unwrap();
+        let sender_secret = SecretKey::from_secret_bytes([sender_seed; 32]).unwrap();
+        let server_secret = SecretKey::from_secret_bytes([server_seed; 32]).unwrap();
+        let receiver_secret = SecretKey::from_secret_bytes([receiver_seed; 32]).unwrap();
+        let x1_secret = SecretKey::from_secret_bytes([x1_seed; 32]).unwrap();
         let aggregate_secret = SecretKey::from_secret_bytes([7u8; 32]).unwrap();
         let sender_pubkey = sender_secret.public_key(&secp);
         let server_pubkey = server_secret.public_key(&secp);
@@ -1120,40 +1183,32 @@ mod tests {
         );
         let funding_outpoint = outpoint(0x42, 0);
         let funding_value = 100_000;
-        let recovery_script = Address::p2tr(
-            &secp,
-            receiver_pubkey.x_only_public_key().0,
-            None,
-            Network::Regtest,
-        )
-        .script_pubkey();
-        let sender_recovery_script = Address::p2tr(
-            &secp,
-            sender_pubkey.x_only_public_key().0,
-            None,
-            Network::Regtest,
-        )
-        .script_pubkey();
-        let (state1, _, info1) = signed_history_state(
-            &secp,
-            &aggregate_secret,
-            &aggregate_pubkey,
-            funding_outpoint,
-            funding_value,
-            sender_recovery_script,
-            1,
-            state1_locktime,
-        );
-        let (state2, latest_state, info2) = signed_history_state(
-            &secp,
-            &aggregate_secret,
-            &aggregate_pubkey,
-            funding_outpoint,
-            funding_value,
-            recovery_script,
-            2,
-            state2_locktime,
-        );
+        let mut state_history = Vec::new();
+        let mut signing_rows = Vec::new();
+        let mut latest_state = None;
+        for (index, (&state_locktime, &owner_seed)) in
+            state_locktimes.iter().zip(owner_seeds).enumerate()
+        {
+            let owner_public_key = SecretKey::from_secret_bytes([owner_seed; 32])
+                .unwrap()
+                .public_key(&secp);
+            let state_number = index as u32 + 1;
+            let (entry, state, signing_row) = signed_history_state(
+                &secp,
+                &aggregate_secret,
+                &aggregate_pubkey,
+                funding_outpoint,
+                funding_value,
+                &owner_public_key,
+                state_number,
+                state_locktime,
+            );
+            state_history.push(entry);
+            signing_rows.push(signing_row);
+            latest_state = Some(state);
+        }
+        let latest_state = latest_state.unwrap();
+        let latest_state_number = state_locktimes.len() as u32;
         let mut authorization_data = Vec::new();
         authorization_data.extend_from_slice(&funding_outpoint.txid[..]);
         authorization_data.extend_from_slice(&funding_outpoint.vout.to_le_bytes());
@@ -1170,7 +1225,7 @@ mod tests {
             ),
         };
         let msg = Bip448TransferMsg {
-            msg_version: 1,
+            msg_version: 2,
             statechain_id: "statechain".to_string(),
             transfer_signature: transfer_signature.to_string(),
             sender_user_public_key: sender_pubkey.to_string(),
@@ -1182,24 +1237,24 @@ mod tests {
                 vout: funding_outpoint.vout,
                 value_sats: funding_value,
             },
-            latest_state_number: 2,
+            latest_state_number,
             challenge_delay: DEFAULT_BIP448_CHALLENGE_DELAY,
             amount_sats: funding_value,
             network: Network::Regtest.to_string(),
             value_schedule: latest_state.value_schedule.clone(),
-            server_signature_count: 2,
+            server_signature_count: u64::from(latest_state_number),
             latest_state,
             t1: SecretKey::from_secret_bytes([9u8; 32])
                 .unwrap()
                 .to_secret_bytes(),
-            state_history: vec![state1, state2],
+            state_history,
         };
         TransferFixture {
             msg,
             info: StatechainInfoResponsePayload {
                 enclave_public_key: server_pubkey.to_string(),
-                num_sigs: 2,
-                statechain_info: vec![info1, info2],
+                num_sigs: latest_state_number,
+                statechain_info: signing_rows,
                 x1_pub: Some(x1_secret.public_key(&secp).to_string()),
             },
             facts: Bip448TransferChainFacts {
@@ -1222,7 +1277,7 @@ mod tests {
     fn transfer_message_serialization_round_trips_without_legacy_backups() {
         let latest_state = latest_state();
         let msg = Bip448TransferMsg {
-            msg_version: 1,
+            msg_version: 2,
             statechain_id: "statechain".to_string(),
             transfer_signature: "ab".repeat(64),
             sender_user_public_key: "02".to_string() + &"12".repeat(32),
@@ -1281,7 +1336,7 @@ mod tests {
         let (latest_state, funding_outpoint, recovery_script) =
             reconstructible_latest_state(&secp, &aggregate_secret, &aggregate_pubkey);
         let msg = Bip448TransferMsg {
-            msg_version: 1,
+            msg_version: 2,
             statechain_id: "statechain".to_string(),
             transfer_signature: "ab".repeat(64),
             sender_user_public_key: "02".to_string() + &"12".repeat(32),
@@ -1388,7 +1443,7 @@ mod tests {
             Bip448CsfsKeyMetadata::from_aggregate_pubkey(&secp, &aggregate_pub);
 
         let msg = Bip448TransferMsg {
-            msg_version: 1,
+            msg_version: 2,
             statechain_id: "statechain".to_string(),
             transfer_signature: "ab".repeat(64),
             sender_user_public_key: "02".to_string() + &"12".repeat(32),
@@ -1832,7 +1887,7 @@ mod tests {
             reconstructible_latest_state(&secp, &aggregate_secret, &aggregate_pub);
 
         let msg = Bip448TransferMsg {
-            msg_version: 1,
+            msg_version: 2,
             statechain_id: "statechain".to_string(),
             transfer_signature: "ab".repeat(64),
             sender_user_public_key: "02".to_string() + &"12".repeat(32),
@@ -2065,7 +2120,7 @@ mod tests {
             FUTURE_LOCKTIME,
         );
         let msg = Bip448TransferMsg {
-            msg_version: 1,
+            msg_version: 2,
             statechain_id: "statechain".to_string(),
             transfer_signature: "ab".repeat(64),
             sender_user_public_key: "02".to_string() + &"12".repeat(32),
@@ -2132,7 +2187,7 @@ mod tests {
         uppercase_funding_outpoint.txid.make_ascii_uppercase();
 
         let msg = Bip448TransferMsg {
-            msg_version: 1,
+            msg_version: 2,
             statechain_id: "statechain".to_string(),
             transfer_signature: "ab".repeat(64),
             sender_user_public_key: "02".to_string() + &"12".repeat(32),
@@ -2205,6 +2260,9 @@ mod tests {
         let fixture = transfer_fixture();
         assert!(fixture.msg.latest_state.state_locktime > script::INITIAL_STATE_LOCKTIME_MAX);
         verify_bip448_transfer_msg(&fixture.msg, &fixture.info, &fixture.facts).unwrap();
+
+        let fixture = three_state_transfer_fixture();
+        verify_bip448_transfer_msg(&fixture.msg, &fixture.info, &fixture.facts).unwrap();
     }
 
     #[test]
@@ -2223,8 +2281,12 @@ mod tests {
 
     #[test]
     fn bip448_transfer_rejects_signature_count_history_mismatch() {
-        let mut fixture = transfer_fixture();
-        fixture.info.num_sigs = 3;
+        let mut fixture = three_state_transfer_fixture();
+        fixture.info.num_sigs = 2;
+        assert_eq!(transfer_error(&fixture), InvalidSignatureCount);
+
+        let mut fixture = three_state_transfer_fixture();
+        fixture.msg.state_history.pop();
         assert_eq!(transfer_error(&fixture), InvalidSignatureCount);
     }
 
@@ -2234,16 +2296,23 @@ mod tests {
         fixture.msg.latest_state.signing_metadata.update_signature = "00".repeat(64);
         assert_eq!(transfer_error(&fixture), InvalidUpdateSignature);
 
-        let mut fixture = transfer_fixture();
-        fixture.msg.state_history[0].update_signature = "00".repeat(64);
+        let mut fixture = three_state_transfer_fixture();
+        fixture.msg.state_history[1].update_signature = "00".repeat(64);
         assert_eq!(transfer_error(&fixture), InvalidUpdateSignature);
     }
 
     #[test]
     fn bip448_transfer_rejects_wrong_blinding_evidence() {
-        let mut fixture = transfer_fixture();
-        fixture.msg.state_history[0].blinding_factor = "16".repeat(32);
+        let mut fixture = three_state_transfer_fixture();
+        fixture.msg.state_history[1].blinding_factor = "18".repeat(32);
         assert_eq!(transfer_error(&fixture), InvalidBlindedChallenge);
+
+        let mut fixture = three_state_transfer_fixture();
+        fixture.msg.state_history[1].owner_public_key = SecretKey::from_secret_bytes([8u8; 32])
+            .unwrap()
+            .public_key(&Secp256k1::new())
+            .to_string();
+        assert_eq!(transfer_error(&fixture), InvalidStateHistory);
     }
 
     #[test]
@@ -2260,6 +2329,11 @@ mod tests {
         let mut fixture = transfer_fixture();
         fixture.msg.state_history[1].state_locktime = 1;
         assert_eq!(transfer_error(&fixture), InvalidStateLocktime);
+
+        for stride in [0, script::FUTURE_STATE_STRIDE_MAX + 1] {
+            let fixture = three_state_transfer_fixture_with_last_stride(stride);
+            assert_eq!(transfer_error(&fixture), InvalidStateLocktime);
+        }
     }
 
     #[test]
