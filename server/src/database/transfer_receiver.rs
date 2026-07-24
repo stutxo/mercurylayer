@@ -19,14 +19,12 @@ const DELETE_SIGNING_GUARDS_AFTER_TRANSFER_QUERY: &str = "\
         RETURNING 1\
     ), \
     deleted_bip448 AS (\
-        DELETE FROM bip448_signature_data WHERE statechain_id = $1 RETURNING 1\
+        DELETE FROM bip448_signature_data WHERE statechain_id = $1 \
+          AND server_partial_sig IS NULL RETURNING 1\
     ) \
     SELECT 1";
 
-pub async fn get_statechain_info(pool: &sqlx::PgPool, statechain_id: &str) -> Vec<StatechainInfo> {
-    let mut result = Vec::<StatechainInfo>::new();
-
-    let query = "\
+const GET_STATECHAIN_INFO_QUERY: &str = "\
         WITH signing_protocol AS (\
             SELECT COALESCE((\
                 SELECT protocol \
@@ -58,22 +56,22 @@ pub async fn get_statechain_info(pool: &sqlx::PgPool, statechain_id: &str) -> Ve
                        server_partial_sig, created_at, \
                        ROW_NUMBER() OVER (ORDER BY id ASC)::INTEGER AS tx_n \
                 FROM bip448_signature_data \
-                WHERE statechain_id = $1\
+                WHERE statechain_id = $1 \
+                  AND server_pubnonce IS NOT NULL \
+                  AND challenge IS NOT NULL \
+                  AND server_partial_sig IS NOT NULL\
             ) AS signature \
             CROSS JOIN signing_protocol AS owner \
-            WHERE signature.server_pubnonce IS NOT NULL \
-              AND signature.challenge IS NOT NULL \
-              AND NOT (\
-                  signature.negate_seckey IS NOT NULL \
-                  AND signature.server_partial_sig IS NULL\
-              ) \
-              AND owner.protocol = $3\
+            WHERE owner.protocol = $3\
         ) \
         SELECT statechain_id, server_pubnonce, challenge, tx_n \
         FROM statechain_rows \
         ORDER BY tx_n ASC, insertion_order ASC";
 
-    let rows = sqlx::query(query)
+pub async fn get_statechain_info(pool: &sqlx::PgPool, statechain_id: &str) -> Vec<StatechainInfo> {
+    let mut result = Vec::<StatechainInfo>::new();
+
+    let rows = sqlx::query(GET_STATECHAIN_INFO_QUERY)
         .bind(statechain_id)
         .bind(crate::database::sign::LEGACY_SIGNING_PROTOCOL)
         .bind(crate::database::sign::BIP448_SIGNING_PROTOCOL)
@@ -340,5 +338,32 @@ pub async fn update_unlock_transfer(
             .execute(pool)
             .await
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_bip448_rows_survive_transfer_and_projection_stays_contiguous() {
+        assert!(DELETE_SIGNING_GUARDS_AFTER_TRANSFER_QUERY.contains(
+            "DELETE FROM bip448_signature_data WHERE statechain_id = $1 \
+             AND server_partial_sig IS NULL RETURNING 1"
+        ));
+        assert!(GET_STATECHAIN_INFO_QUERY.contains(
+            "FROM bip448_signature_data WHERE statechain_id = $1 \
+             AND server_pubnonce IS NOT NULL AND challenge IS NOT NULL \
+             AND server_partial_sig IS NOT NULL"
+        ));
+
+        let rows = [(1, Some("partial-1")), (2, None), (3, Some("partial-3"))];
+        let projection = rows
+            .into_iter()
+            .filter(|(_, partial)| partial.is_some())
+            .enumerate()
+            .map(|(index, (id, _))| (id, index + 1))
+            .collect::<Vec<_>>();
+        assert_eq!(projection, [(1, 1), (3, 2)]);
     }
 }
