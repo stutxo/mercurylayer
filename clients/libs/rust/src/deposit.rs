@@ -33,7 +33,8 @@ use crate::{
     client_config::ClientConfig,
     sqlite_manager::{
         delete_bip448_pending_deposit_signing, get_bip448_pending_deposit_signing, get_wallet,
-        insert_bip448_pending_deposit_signing_if_absent, insert_or_update_bip448_statechain,
+        history_entry, insert_bip448_pending_deposit_signing_if_absent,
+        insert_bip448_state_history_entry, insert_or_update_bip448_statechain,
         update_bip448_pending_deposit_server_public_nonce, update_wallet,
         Bip448PendingDepositSigning,
     },
@@ -313,6 +314,16 @@ pub async fn create_bip448_deposit_state(
     coin.blinding_factor = Some(signing_data.blinding_factor);
 
     insert_or_update_bip448_statechain(&client_config.pool, &accepted).await?;
+    insert_bip448_state_history_entry(
+        &client_config.pool,
+        wallet_name,
+        &statechain_id,
+        &history_entry(
+            &accepted.record().latest_state,
+            PublicKey::from_str(&coin.user_pubkey)?.x_only_public_key().0,
+        ),
+    )
+    .await?;
     bip448_process_checkpoint("accepted_persisted");
     delete_bip448_pending_deposit_signing(
         &client_config.pool,

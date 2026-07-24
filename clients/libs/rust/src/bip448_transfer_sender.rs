@@ -31,7 +31,9 @@ use crate::{
     transfer_sender::get_new_x1,
     utils,
 };
-const ELIGIBILITY_ERROR: &str = "only one-hop transfer of a fresh deposit is supported in the prototype";
+const ELIGIBILITY_ERROR: &str =
+    "only transfer of a CONFIRMED BIP448 coin at its accepted latest state is supported";
+const INCOMPLETE_HISTORY_ERROR: &str = "BIP448 state history is incomplete for this coin";
 #[cfg(feature = "test-hooks")]
 fn bip448_process_checkpoint(checkpoint: &str) {
     if std::env::var("ML_BIP448_RESTART_CHILD").as_deref() == Ok("1") && std::env::var("ML_BIP448_TEST_CHECKPOINT").as_deref() == Ok(checkpoint) {
@@ -85,9 +87,15 @@ pub async fn transfer_bip448_sender(
         return Ok(());
     }
     if has_bip448_transfer_msg_for_statechain(&client_config.pool, wallet_name, statechain_id).await? { return Err(anyhow!("BIP448 persisted transfer message does not match the recipient address")); }
+    let state_history =
+        outgoing_state_history(&client_config.pool, wallet_name, &record).await?;
     let existing_pending = get_bip448_pending_transfer_signing(&client_config.pool, wallet_name, statechain_id).await?;
     let current_count = bip448_signature_count(client_config, statechain_id).await?;
-    ensure_signature_count(current_count, existing_pending.is_some())?;
+    ensure_signature_count(
+        current_count,
+        record.latest_state_number,
+        existing_pending.is_some(),
+    )?;
     let coin = wallet.coins[coin_index].clone();
     if PublicKey::from_str(&coin.user_pubkey)?.combine(&PublicKey::from_str(coin.server_pubkey.as_deref().ok_or_else(|| anyhow!("BIP448 transfer coin missing server_pubkey"))?)?)? != PublicKey::from_str(&record.aggregate_pubkey)? { return Err(anyhow!("BIP448 transfer coin keys do not match the accepted aggregate public key")); }
     let transfer_signature = create_transfer_signature(recipient_address, &record.funding_outpoint.txid, record.funding_outpoint.vout, &coin.user_privkey)?;
@@ -95,8 +103,19 @@ pub async fn transfer_bip448_sender(
     let (artifacts, pending) = pending_or_new_transfer_signing(client_config, wallet_name, &record, &coin, &receiver_user_pubkey, existing_pending).await?;
     let x1 = match fresh_x1 { Some(x1) => x1, None => get_new_x1(client_config, statechain_id, coin.signed_statechain_id.as_deref().ok_or_else(|| anyhow!("BIP448 transfer coin missing signed_statechain_id"))?, &recipient_auth, None).await? };
     bip448_process_checkpoint("pending_persisted");
-    let signing_metadata = sign_state_two(client_config, &coin, &record, &artifacts, &pending).await?;
-    let transfer_msg = build_transfer_msg(&record, &coin, receiver_user_pubkey, &x1, &transfer_signature, &artifacts, signing_metadata)?;
+    let signing_metadata =
+        sign_next_state(client_config, &coin, &record, &artifacts, &pending).await?;
+    let transfer_msg = build_transfer_msg(&record, &coin, receiver_user_pubkey, &x1, &transfer_signature, &artifacts, signing_metadata, state_history)?;
+    insert_bip448_state_history_entry(
+        &client_config.pool,
+        wallet_name,
+        statechain_id,
+        transfer_msg
+            .state_history
+            .last()
+            .ok_or_else(|| anyhow!(INCOMPLETE_HISTORY_ERROR))?,
+    )
+    .await?;
     insert_or_update_bip448_transfer_msg(&client_config.pool, wallet_name, &recipient_auth, &transfer_msg).await?;
     bip448_process_checkpoint("transfer_msg_persisted");
     let encrypted_transfer_msg =
@@ -182,17 +201,37 @@ async fn verify_persisted_transfer_completed(
         .is_ok_and(|expected| current_server == expected))
 }
 fn ensure_local_eligibility(latest_state_number: u32, status: &CoinStatus) -> Result<()> {
-    if latest_state_number != 1 || status != &CoinStatus::CONFIRMED { return Err(eligibility_error()); }
+    if latest_state_number < 1 || status != &CoinStatus::CONFIRMED { return Err(eligibility_error()); }
     Ok(())
 }
-fn ensure_signature_count(count: u64, resuming: bool) -> Result<()> {
-    if count != 1 && !(resuming && count == 2) {
+fn ensure_signature_count(count: u64, latest: u32, resuming: bool) -> Result<()> {
+    if count != u64::from(latest) && !(resuming && count == u64::from(latest) + 1) {
         return Err(eligibility_error());
     }
     Ok(())
 }
 fn eligibility_error() -> anyhow::Error {
     anyhow!(ELIGIBILITY_ERROR)
+}
+async fn outgoing_state_history(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    wallet_name: &str,
+    record: &Bip448StatechainRecord,
+) -> Result<Vec<Bip448StateHistoryEntry>> {
+    let history = get_bip448_state_history(pool, wallet_name, &record.statechain_id)
+        .await?
+        .into_iter()
+        .filter(|entry| (1..=record.latest_state_number).contains(&entry.state_number))
+        .collect::<Vec<_>>();
+    if history.len() != record.latest_state_number as usize
+        || history
+            .iter()
+            .enumerate()
+            .any(|(index, entry)| entry.state_number != index as u32 + 1)
+    {
+        return Err(anyhow!(INCOMPLETE_HISTORY_ERROR));
+    }
+    Ok(history)
 }
 async fn pending_or_new_transfer_signing(
     client_config: &ClientConfig,
@@ -203,7 +242,7 @@ async fn pending_or_new_transfer_signing(
     existing: Option<Bip448PendingDepositSigning>,
 ) -> Result<(Bip448RecoveryArtifacts, Bip448PendingDepositSigning)> {
     if let Some(pending) = existing {
-        let _ = checked_next_state_locktime(absolute::LockTime::from_consensus(record.latest_state.state_locktime), pending.state_locktime.checked_sub(record.latest_state.state_locktime).ok_or_else(|| anyhow!("BIP448 pending transfer state locktime does not advance state 1"))?)?;
+        let _ = checked_next_state_locktime(absolute::LockTime::from_consensus(record.latest_state.state_locktime), pending.state_locktime.checked_sub(record.latest_state.state_locktime).ok_or_else(|| anyhow!("BIP448 pending transfer state locktime does not advance the latest state"))?)?;
         let artifacts = transfer_artifacts(record, receiver_user_pubkey, pending.state_locktime)?;
         validate_pending(&pending, record, &artifacts)?;
         return Ok((artifacts, pending));
@@ -254,7 +293,7 @@ fn transfer_artifacts(
     Ok(build_funding_recovery_artifacts(
         &secp, &PublicKey::from_str(&record.aggregate_pubkey)?,
         OutPoint { txid: Txid::from_str(&record.funding_outpoint.txid)?, vout: record.funding_outpoint.vout },
-        record.funding_outpoint.value_sats, recovery_script, 2,
+        record.funding_outpoint.value_sats, recovery_script, record.latest_state_number + 1,
         absolute::LockTime::from_consensus(state_locktime), record.challenge_delay,
         record.latest_state.fee_bump_policy,
     )?)
@@ -270,11 +309,11 @@ fn validate_pending(
         || pending.update_template_hash != hex::encode(artifacts.update_template_hash.to_byte_array())
         || pending.settlement_template_hash != hex::encode(artifacts.settlement_template_hash.to_byte_array())
     {
-        return Err(anyhow!("BIP448 pending transfer signing does not match the state-2 templates"));
+        return Err(anyhow!("BIP448 pending transfer signing does not match the next-state templates"));
     }
     Ok(())
 }
-async fn sign_state_two(
+async fn sign_next_state(
     client_config: &ClientConfig,
     coin: &Coin,
     record: &Bip448StatechainRecord,
@@ -316,8 +355,9 @@ async fn sign_state_two(
     let signature = session.aggregate_and_verify(&[&client_partial, &server_partial])?;
     bip448_process_checkpoint("final_signature_completed");
     let server_signature_count = bip448_signature_count(client_config, &record.statechain_id).await?;
-    if server_signature_count != 2 {
-        return Err(anyhow!("BIP448 state-2 signing completed with server signature count {server_signature_count}; expected 2"));
+    let expected_signature_count = u64::from(record.latest_state_number + 1);
+    if server_signature_count != expected_signature_count {
+        return Err(anyhow!("BIP448 next-state signing completed with server signature count {server_signature_count}; expected {expected_signature_count}"));
     }
     Ok(Bip448SigningMetadata {
         role: Bip448RecoveryTemplateRole::FundingUpdate,
@@ -361,6 +401,7 @@ fn build_transfer_msg(
     transfer_signature: &str,
     artifacts: &Bip448RecoveryArtifacts,
     signing_metadata: Bip448SigningMetadata,
+    mut state_history: Vec<Bip448StateHistoryEntry>,
 ) -> Result<Bip448TransferMsg> {
     let secp = Secp256k1::new();
     let aggregate_pubkey = PublicKey::from_str(&record.aggregate_pubkey)?;
@@ -375,37 +416,30 @@ fn build_transfer_msg(
         .add_tweak(&Scalar::from_be_bytes(x1_bytes)?)?
         .to_secret_bytes();
     let server_public_key = coin.server_pubkey.clone().ok_or_else(|| anyhow!("BIP448 transfer coin missing server_pubkey"))?;
+    state_history.push(history_entry(
+        &latest_state,
+        receiver_user_pubkey.x_only_public_key().0,
+    ));
+    let receiver_user_public_key = receiver_user_pubkey.to_string();
     Ok(Bip448TransferMsg {
-        msg_version: 1,
+        msg_version: 2,
         statechain_id: record.statechain_id.clone(),
         transfer_signature: transfer_signature.to_string(),
         sender_user_public_key: coin.user_pubkey.clone(),
-        receiver_user_public_key: receiver_user_pubkey.to_string(),
+        receiver_user_public_key,
         server_public_key,
         aggregate_pubkey: aggregate_pubkey.to_string(),
         funding_outpoint: record.funding_outpoint.clone(),
-        latest_state_number: 2,
+        latest_state_number: record.latest_state_number + 1,
         challenge_delay: record.challenge_delay,
         amount_sats: record.amount_sats,
         network: record.network.clone(),
         value_schedule: latest_state.value_schedule.clone(),
         server_signature_count: latest_state.signing_metadata.server_signature_count,
         t1,
-        state_history: vec![history_entry(&record.latest_state), history_entry(&latest_state)],
+        state_history,
         latest_state,
     })
-}
-fn history_entry(state: &Bip448LatestState) -> Bip448StateHistoryEntry {
-    Bip448StateHistoryEntry {
-        state_number: state.state_number,
-        state_locktime: state.state_locktime,
-        update_template_hash: state.update_template_hash.clone(),
-        settlement_template_hash: state.settlement_template_hash.clone(),
-        update_signature: state.signing_metadata.update_signature.clone(),
-        client_public_nonce: state.signing_metadata.client_public_nonce.clone(),
-        server_public_nonce: state.signing_metadata.server_public_nonce.clone(),
-        blinding_factor: state.signing_metadata.blinding_factor.clone(),
-    }
 }
 async fn upload_transfer_msg(
     client_config: &ClientConfig,
@@ -462,10 +496,14 @@ mod tests {
     #[test]
     fn signature_count_rejects_mismatch_and_allows_resume() {
         assert_eq!(
-            ensure_signature_count(3, false).unwrap_err().to_string(),
+            ensure_signature_count(4, 3, false)
+                .unwrap_err()
+                .to_string(),
             ELIGIBILITY_ERROR
         );
-        assert!(ensure_signature_count(2, true).is_ok());
+        assert!(ensure_signature_count(3, 3, false).is_ok());
+        assert!(ensure_signature_count(4, 3, true).is_ok());
+        assert!(ensure_local_eligibility(2, &CoinStatus::CONFIRMED).is_ok());
     }
 
     #[tokio::test]

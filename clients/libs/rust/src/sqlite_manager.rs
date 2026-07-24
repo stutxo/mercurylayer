@@ -3,12 +3,16 @@ use std::str::FromStr;
 use anyhow::{anyhow, Context, Result};
 use bitcoin::{BlockHash, Txid};
 use mercurylib::{
-    bip448_statechain::{script, storage::Bip448StatechainRecord},
-    transfer::bip448::Bip448TransferMsg,
+    bip448_statechain::{
+        script,
+        storage::{Bip448LatestState, Bip448StatechainRecord},
+    },
+    transfer::bip448::{Bip448StateHistoryEntry, Bip448TransferMsg},
     wallet::{BackupTx, Wallet},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use secp256k1::XOnlyPublicKey;
 use sqlx::{Pool, Row, Sqlite};
 
 use crate::chain::ChainUtxo;
@@ -677,9 +681,9 @@ async fn upsert_bip448_statechain_record(
         {
             return Err(anyhow!("BIP448 accepted state immutable identity mismatch"));
         }
-        if stored.latest_state_number != 1 || record.latest_state_number != 2 {
+        if record.latest_state_number != stored.latest_state_number + 1 {
             return Err(anyhow!(
-                "BIP448 accepted state must be an exact replay or a monotonic 1-to-2 transition"
+                "BIP448 accepted state must be an exact replay or a monotonic single-step transition"
             ));
         }
 
@@ -719,6 +723,80 @@ async fn upsert_bip448_statechain_record(
 
     transaction.commit().await?;
     Ok(())
+}
+
+pub(crate) fn history_entry(
+    state: &Bip448LatestState,
+    owner_public_key: XOnlyPublicKey,
+) -> Bip448StateHistoryEntry {
+    Bip448StateHistoryEntry {
+        state_number: state.state_number,
+        state_locktime: state.state_locktime,
+        owner_public_key: owner_public_key.to_string(),
+        update_template_hash: state.update_template_hash.clone(),
+        settlement_template_hash: state.settlement_template_hash.clone(),
+        update_signature: state.signing_metadata.update_signature.clone(),
+        client_public_nonce: state.signing_metadata.client_public_nonce.clone(),
+        server_public_nonce: state.signing_metadata.server_public_nonce.clone(),
+        blinding_factor: state.signing_metadata.blinding_factor.clone(),
+    }
+}
+
+pub async fn insert_bip448_state_history_entry(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    entry: &Bip448StateHistoryEntry,
+) -> Result<()> {
+    let entry_json = serde_json::to_string(entry)?;
+    let mut transaction = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO bip448_state_history \
+            (wallet_name, statechain_id, state_number, entry_json) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT(wallet_name, statechain_id, state_number) DO NOTHING",
+    )
+    .bind(wallet_name)
+    .bind(statechain_id)
+    .bind(i64::from(entry.state_number))
+    .bind(&entry_json)
+    .execute(&mut *transaction)
+    .await?;
+    let stored: String = sqlx::query_scalar(
+        "SELECT entry_json FROM bip448_state_history \
+         WHERE wallet_name = $1 AND statechain_id = $2 AND state_number = $3",
+    )
+    .bind(wallet_name)
+    .bind(statechain_id)
+    .bind(i64::from(entry.state_number))
+    .fetch_one(&mut *transaction)
+    .await?;
+    if stored != entry_json {
+        return Err(anyhow!(
+            "BIP448 state history conflicts with the persisted entry"
+        ));
+    }
+    transaction.commit().await?;
+    Ok(())
+}
+
+pub async fn get_bip448_state_history(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+) -> Result<Vec<Bip448StateHistoryEntry>> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT entry_json FROM bip448_state_history \
+         WHERE wallet_name = $1 AND statechain_id = $2 \
+         ORDER BY state_number",
+    )
+    .bind(wallet_name)
+    .bind(statechain_id)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|entry_json| serde_json::from_str(&entry_json).map_err(anyhow::Error::from))
+    .collect()
 }
 
 pub async fn get_bip448_statechain(
@@ -956,11 +1034,12 @@ pub async fn insert_bip448_pending_transfer_signing_if_absent(
     ))?;
     let accepted =
         get_bip448_statechain_optional(pool, &signing.wallet_name, &signing.statechain_id).await?;
-    if !accepted.as_ref().is_some_and(|record| record.latest_state_number == 1 && record.funding_outpoint.txid == signing.funding_txid && record.funding_outpoint.vout == signing.funding_vout && record.funding_outpoint.value_sats == signing.funding_value_sats) {
+    if !accepted.as_ref().is_some_and(|record| record.funding_outpoint.txid == signing.funding_txid && record.funding_outpoint.vout == signing.funding_vout && record.funding_outpoint.value_sats == signing.funding_value_sats) {
         return Err(anyhow!(
-            "BIP448 pending transfer signing requires a matching accepted state-1 record"
+            "BIP448 pending transfer signing requires a matching accepted record at the coin's latest state"
         ));
     }
+    let latest_state_number = accepted.unwrap().latest_state_number;
     let query = "\
         INSERT INTO bip448_pending_transfer_signings (\
             wallet_name, statechain_id, funding_txid, funding_vout, funding_value_sats, \
@@ -969,7 +1048,7 @@ pub async fn insert_bip448_pending_transfer_signing_if_absent(
         ) SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13 \
         WHERE EXISTS (\
             SELECT 1 FROM bip448_statechains \
-            WHERE wallet_name = $1 AND statechain_id = $2 AND latest_state_number = 1 AND funding_txid = $3 AND funding_vout = $4 AND funding_value_sats = $5\
+            WHERE wallet_name = $1 AND statechain_id = $2 AND latest_state_number = $14 AND funding_txid = $3 AND funding_vout = $4 AND funding_value_sats = $5\
         ) \
         ON CONFLICT(wallet_name, statechain_id) DO NOTHING";
 
@@ -987,6 +1066,7 @@ pub async fn insert_bip448_pending_transfer_signing_if_absent(
         .bind(&signing.client_public_nonce)
         .bind(&signing.blinding_factor)
         .bind(&signing.server_public_nonce)
+        .bind(i64::from(latest_state_number))
         .execute(pool)
         .await?;
 
@@ -1299,7 +1379,7 @@ mod tests {
             .cpfp_child_templates
             .push(sample_cpfp_child_template());
         Bip448TransferMsg {
-            msg_version: 1,
+            msg_version: 2,
             statechain_id: "statechain".to_string(),
             transfer_signature: "ab".repeat(64),
             sender_user_public_key: "02".to_string() + &"12".repeat(32),
@@ -1335,7 +1415,7 @@ mod tests {
     async fn assert_sender_ineligible(config: &ClientConfig) {
         let error = transfer_bip448_sender(config, "unused", "wallet", "statechain")
             .await.unwrap_err();
-        assert_eq!(error.to_string(), "only one-hop transfer of a fresh deposit is supported in the prototype");
+        assert_eq!(error.to_string(), "only transfer of a CONFIRMED BIP448 coin at its accepted latest state is supported");
     }
     #[tokio::test]
     async fn bip448_sender_exercises_record_coin_state_and_status_guards() -> Result<()> {
@@ -1350,7 +1430,7 @@ mod tests {
         assert_sender_ineligible(&config).await;
         wallet.coins[0].status = CoinStatus::CONFIRMED;
         let config = sender_test_config(migrated_pool().await?)?;
-        insert_wallet(&config.pool, &wallet).await?; upsert_bip448_statechain_record(&config.pool, &sample_bip448_record(2)).await?;
+        insert_wallet(&config.pool, &wallet).await?; upsert_bip448_statechain_record(&config.pool, &sample_bip448_record(0)).await?;
         assert_sender_ineligible(&config).await;
         Ok(())
     }
@@ -1367,6 +1447,7 @@ mod tests {
         assert!(table_exists(&pool, "bip448_scan_cursors").await?);
         assert!(table_exists(&pool, "bip448_scanned_outpoints").await?);
         assert!(table_exists(&pool, "bip448_package_attempts").await?);
+        assert!(table_exists(&pool, "bip448_state_history").await?);
 
         let wallet = sample_wallet();
         insert_wallet(&pool, &wallet).await?;
@@ -1380,6 +1461,43 @@ mod tests {
         assert_eq!(roundtrip_backup_txs.len(), 1);
         assert_eq!(roundtrip_backup_txs[0].tx_n, 1);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bip448_sender_fails_before_signing_when_history_is_incomplete() -> Result<()> {
+        let config = sender_test_config(migrated_pool().await?)?;
+        let mut wallet = sample_wallet();
+        let mut coin = wallet.get_new_coin()?;
+        coin.statechain_protocol =
+            Some(mercurylib::bip448_statechain::deposit::BIP448_COIN_PROTOCOL.into());
+        coin.statechain_id = Some("statechain".into());
+        coin.status = CoinStatus::CONFIRMED;
+        wallet.coins.push(coin);
+        let recipient_address = wallet.get_new_coin()?.address;
+        insert_wallet(&config.pool, &wallet).await?;
+        let record = sample_bip448_record(2);
+        upsert_bip448_statechain_record(&config.pool, &record).await?;
+
+        let error =
+            transfer_bip448_sender(&config, &recipient_address, "wallet", "statechain")
+                .await
+                .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "BIP448 state history is incomplete for this coin"
+        );
+        assert!(get_bip448_pending_transfer_signing(&config.pool, "wallet", "statechain")
+            .await?
+            .is_none());
+        assert_eq!(
+            get_bip448_statechain(&config.pool, "wallet", "statechain")
+                .await?
+                .latest_state
+                .signing_metadata
+                .server_signature_count,
+            2
+        );
         Ok(())
     }
 
@@ -1710,10 +1828,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bip448_latest_state_allows_one_to_two_transition_and_exact_replay() -> Result<()> {
+    async fn bip448_latest_state_allows_single_step_transitions_and_exact_replay() -> Result<()> {
         let pool = migrated_pool().await?;
         let state_one = sample_bip448_record(1);
         let state_two = sample_bip448_record(2);
+        let state_three = sample_bip448_record(3);
 
         upsert_bip448_statechain_record(&pool, &state_one).await?;
         let roundtrip =
@@ -1725,10 +1844,12 @@ mod tests {
             get_bip448_statechain(&pool, &state_two.wallet_name, &state_two.statechain_id).await?;
         assert_eq!(roundtrip, state_two);
 
-        upsert_bip448_statechain_record(&pool, &state_two).await?;
+        upsert_bip448_statechain_record(&pool, &state_three).await?;
         let roundtrip =
-            get_bip448_statechain(&pool, &state_two.wallet_name, &state_two.statechain_id).await?;
-        assert_eq!(roundtrip, state_two);
+            get_bip448_statechain(&pool, &state_three.wallet_name, &state_three.statechain_id).await?;
+        assert_eq!(roundtrip, state_three);
+
+        upsert_bip448_statechain_record(&pool, &state_three).await?;
 
         Ok(())
     }
@@ -1773,27 +1894,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bip448_latest_state_rejects_rollback_and_divergent_same_state() -> Result<()> {
+    async fn bip448_latest_state_rejects_rollback_skip_and_divergent_same_state() -> Result<()> {
         let pool = migrated_pool().await?;
         let state_one = sample_bip448_record(1);
         let state_two = sample_bip448_record(2);
+        let state_three = sample_bip448_record(3);
         upsert_bip448_statechain_record(&pool, &state_one).await?;
         upsert_bip448_statechain_record(&pool, &state_two).await?;
+        upsert_bip448_statechain_record(&pool, &state_three).await?;
 
-        let mut divergent_state_two = state_two.clone();
-        divergent_state_two.latest_state.update_tx = "04000000".to_string();
-        for rejected in [state_one, divergent_state_two] {
+        let mut divergent_state_three = state_three.clone();
+        divergent_state_three.latest_state.update_tx = "04000000".to_string();
+        for rejected in [state_two, divergent_state_three] {
             let error = upsert_bip448_statechain_record(&pool, &rejected)
                 .await
                 .unwrap_err();
             assert_eq!(
                 error.to_string(),
-                "BIP448 accepted state must be an exact replay or a monotonic 1-to-2 transition"
+                "BIP448 accepted state must be an exact replay or a monotonic single-step transition"
             );
         }
         let persisted =
-            get_bip448_statechain(&pool, &state_two.wallet_name, &state_two.statechain_id).await?;
-        assert_eq!(persisted, state_two);
+            get_bip448_statechain(&pool, &state_three.wallet_name, &state_three.statechain_id).await?;
+        assert_eq!(persisted, state_three);
+
+        let skip_pool = migrated_pool().await?;
+        upsert_bip448_statechain_record(&skip_pool, &state_one).await?;
+        let error = upsert_bip448_statechain_record(&skip_pool, &state_three)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "BIP448 accepted state must be an exact replay or a monotonic single-step transition"
+        );
 
         Ok(())
     }
@@ -1930,8 +2063,8 @@ mod tests {
         let error = insert_bip448_pending_transfer_signing_if_absent(&pool, &pending)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("accepted state-1 record"));
-        let accepted = sample_bip448_record(1); pending.funding_txid = accepted.funding_outpoint.txid.clone(); pending.funding_vout = accepted.funding_outpoint.vout; pending.funding_value_sats = accepted.funding_outpoint.value_sats; upsert_bip448_statechain_record(&pool, &accepted).await?;
+        assert!(error.to_string().contains("coin's latest state"));
+        let accepted = sample_bip448_record(3); pending.funding_txid = accepted.funding_outpoint.txid.clone(); pending.funding_vout = accepted.funding_outpoint.vout; pending.funding_value_sats = accepted.funding_outpoint.value_sats; upsert_bip448_statechain_record(&pool, &accepted).await?;
         let persisted = insert_bip448_pending_transfer_signing_if_absent(&pool, &pending).await?;
         assert_eq!(persisted.state_locktime, 1_000_000_001);
 
