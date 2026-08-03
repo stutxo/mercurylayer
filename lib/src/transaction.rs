@@ -5,7 +5,7 @@ use bitcoin::{
     hashes::Hash,
     psbt::{Input, Psbt, PsbtSighashType},
     sighash::{self, SighashCache, TapSighash, TapSighashType},
-    taproot::{self, TapTweakHash},
+    taproot::{self, TapTweakHash, TaprootSpendInfo},
     Address, Network, OutPoint, PrivateKey, ScriptBuf, Transaction, TxIn, TxOut, Txid, Witness,
 };
 use secp256k1::{
@@ -312,6 +312,75 @@ pub fn get_musig_session(
     Ok(session)
 }
 
+pub fn get_bip448_withdrawal_partial_sig_request(
+    coin: &Coin,
+    funding_outpoint: OutPoint,
+    funding_value_sats: u64,
+    block_height: u32,
+    fee_rate_sats_per_byte: f64,
+    to_address: &str,
+    network: Network,
+) -> core::result::Result<PartialSignatureMsg1, MercuryError> {
+    let secp = Secp256k1::new();
+    let aggregate_pubkey = PublicKey::from_str(
+        coin.aggregated_pubkey
+            .as_deref()
+            .ok_or(MercuryError::TransactionReconstructionError)?,
+    )?;
+    let funding_spend_info = crate::bip448_statechain::script::funding_spend_info(
+        &secp,
+        aggregate_pubkey.x_only_public_key().0,
+    )
+    .map_err(|_| MercuryError::TransactionReconstructionError)?;
+    let funding_script =
+        crate::bip448_statechain::script::output_script_pubkey(&funding_spend_info);
+    let recorded_script = Address::from_str(
+        coin.aggregated_address
+            .as_deref()
+            .ok_or(MercuryError::TransactionReconstructionError)?,
+    )?
+    .require_network(network)?
+    .script_pubkey();
+    if recorded_script != funding_script
+        || coin.utxo_txid.as_deref() != Some(&funding_outpoint.txid.to_string())
+        || coin.utxo_vout != Some(funding_outpoint.vout)
+        || coin.amount.map(u64::from) != Some(funding_value_sats)
+    {
+        return Err(MercuryError::TransactionReconstructionError);
+    }
+
+    let unsigned_tx = Transaction {
+        version: 2,
+        lock_time: absolute::LockTime::from_height(get_locktime_for_withdrawal_transaction(
+            block_height,
+        ))?,
+        input: vec![TxIn {
+            previous_output: funding_outpoint,
+            script_sig: ScriptBuf::new(),
+            sequence: bitcoin::Sequence(0),
+            witness: Witness::default(),
+        }],
+        output: vec![create_tx_out(
+            coin,
+            fee_rate_sats_per_byte,
+            to_address,
+            network,
+        )?],
+    };
+    let funding_output = TxOut {
+        value: funding_value_sats,
+        script_pubkey: funding_script,
+    };
+    let hash = SighashCache::new(&unsigned_tx).taproot_key_spend_signature_hash(
+        0,
+        &sighash::Prevouts::All(&[funding_output]),
+        TapSighashType::All,
+    )?;
+    let encoded_unsigned_tx = hex::encode(bitcoin::consensus::encode::serialize(&unsigned_tx));
+
+    calculate_bip448_keypath_musig_session(coin, hash, encoded_unsigned_tx, &funding_spend_info)
+}
+
 pub fn calculate_musig_session(
     coin: &Coin,
     hash: TapSighash,
@@ -322,6 +391,114 @@ pub fn calculate_musig_session(
     let aggregate_pubkey = PublicKey::from_str(&coin.aggregated_pubkey.as_ref().unwrap())?;
 
     let tap_tweak = TapTweakHash::from_key_and_tweak(aggregate_pubkey.x_only_public_key().0, None);
+    let tap_tweak_bytes = tap_tweak.as_byte_array();
+
+    // tranform tweak: Scalar to SecretKey
+    let tweak = SecretKey::from_slice(tap_tweak_bytes)?;
+
+    let (parity_acc, output_pubkey, out_tweak32) =
+        blinded_musig_pubkey_xonly_tweak_add(&secp, &aggregate_pubkey, tweak);
+
+    let client_pub_nonce_bytes = hex::decode(coin.public_nonce.as_ref().unwrap())?;
+    let client_pub_nonce = MusigPubNonce::from_slice(client_pub_nonce_bytes.as_slice())?;
+
+    let server_pubnonce_hex = coin.server_public_nonce.as_ref().unwrap().to_string();
+    let server_pub_nonce_bytes = hex::decode(&server_pubnonce_hex)?;
+    let server_pub_nonce = MusigPubNonce::from_slice(server_pub_nonce_bytes.as_slice())?;
+
+    let aggnonce = MusigAggNonce::new(&[&client_pub_nonce, &server_pub_nonce]);
+
+    let blinding_factor_bytes = hex::decode(coin.blinding_factor.as_ref().unwrap())?;
+    let blinding_factor = BlindingFactor::from_slice(blinding_factor_bytes.as_slice())?;
+
+    let msg: Message = hash.into();
+
+    let session = MusigSession::new_blinded_without_key_agg_cache(
+        &secp,
+        &output_pubkey,
+        aggnonce,
+        msg,
+        None,
+        &blinding_factor,
+        out_tweak32,
+    );
+
+    let negate_seckey = blinded_musig_negate_seckey(&secp, &output_pubkey, parity_acc);
+
+    let client_seckey = PrivateKey::from_wif(&coin.user_privkey)?.inner;
+
+    let client_pubkey = PublicKey::from_str(&coin.user_pubkey)?;
+
+    let client_keypair = KeyPair::from_secret_key(&secp, &client_seckey);
+
+    let client_sec_nonce_bytes = hex::decode(coin.secret_nonce.as_ref().unwrap())?;
+    let client_sec_nonce_bytes: [u8; 132] = client_sec_nonce_bytes.try_into().unwrap();
+    let client_sec_nonce = MusigSecNonce::from_slice(client_sec_nonce_bytes);
+
+    let client_partial_sig = session.blinded_partial_sign_without_keyaggcoeff(
+        &secp,
+        client_sec_nonce,
+        &client_keypair,
+        negate_seckey,
+    )?;
+
+    assert!(session.blinded_musig_partial_sig_verify(
+        &secp,
+        &client_partial_sig,
+        &client_pub_nonce,
+        &client_pubkey,
+        &output_pubkey,
+        parity_acc
+    ));
+
+    let encoded_session = hex::encode(session.serialize());
+
+    session.remove_fin_nonce_from_session();
+
+    let negate_seckey = match negate_seckey {
+        true => 1,
+        false => 0,
+    };
+
+    let blinded_session = session.remove_fin_nonce_from_session();
+
+    let statechain_id = coin.statechain_id.as_ref().unwrap();
+    let signed_statechain_id = coin.signed_statechain_id.as_ref().unwrap();
+
+    let payload = PartialSignatureRequestPayload {
+        statechain_id: statechain_id.to_string(),
+        negate_seckey,
+        session: hex::encode(blinded_session.serialize()),
+        signed_statechain_id: signed_statechain_id.to_string(),
+        server_pub_nonce: server_pubnonce_hex,
+    };
+
+    let client_partial_sig_hex = hex::encode(client_partial_sig.serialize());
+
+    Ok(PartialSignatureMsg1 {
+        msg: hex::encode(hash.as_byte_array()),
+        output_pubkey: output_pubkey.to_string(),
+        client_partial_sig: client_partial_sig_hex,
+        encoded_session,
+        encoded_unsigned_tx,
+        partial_signature_request_payload: payload,
+    })
+}
+
+pub fn calculate_bip448_keypath_musig_session(
+    coin: &Coin,
+    hash: TapSighash,
+    encoded_unsigned_tx: String,
+    funding_spend_info: &TaprootSpendInfo,
+) -> core::result::Result<PartialSignatureMsg1, MercuryError> {
+    let secp = Secp256k1::new();
+
+    let aggregate_pubkey = PublicKey::from_str(&coin.aggregated_pubkey.as_ref().unwrap())?;
+
+    let tap_tweak = TapTweakHash::from_key_and_tweak(
+        aggregate_pubkey.x_only_public_key().0,
+        funding_spend_info.merkle_root(),
+    );
     let tap_tweak_bytes = tap_tweak.as_byte_array();
 
     // tranform tweak: Scalar to SecretKey
@@ -505,6 +682,7 @@ mod tests {
         wallet::{CoinStatus, Settings, Wallet},
     };
     use bitcoin::Network;
+    use secp256k1::musig::new_musig_nonce_pair;
 
     fn sample_wallet(name: &str, mnemonic: &str) -> Wallet {
         Wallet {
@@ -614,5 +792,111 @@ mod tests {
         let backup_address = get_user_backup_address(&coin, "regtest".to_string()).unwrap();
 
         assert_eq!(backup_address, coin.backup_address);
+    }
+
+    #[test]
+    fn bip448_withdrawal_signature_verifies_against_funding_output_key() {
+        let secp = Secp256k1::new();
+        let mut coin = sample_coin();
+        let client_seckey = PrivateKey::from_wif(&coin.user_privkey).unwrap().inner;
+        let server_seckey = SecretKey::from_slice(&[7; 32]).unwrap();
+        let server_keypair = KeyPair::from_secret_key(&secp, &server_seckey);
+        let server_pubkey = server_keypair.public_key();
+        let aggregate_pubkey = PublicKey::from_str(&coin.user_pubkey)
+            .unwrap()
+            .combine(&server_pubkey)
+            .unwrap();
+        let spend_info = crate::bip448_statechain::script::funding_spend_info(
+            &secp,
+            aggregate_pubkey.x_only_public_key().0,
+        )
+        .unwrap();
+        let funding_outpoint = OutPoint {
+            txid: Txid::from_slice(&[42; 32]).unwrap(),
+            vout: 1,
+        };
+        coin.server_pubkey = Some(server_pubkey.to_string());
+        coin.aggregated_pubkey = Some(aggregate_pubkey.to_string());
+        coin.aggregated_address = Some(
+            Address::from_script(
+                &crate::bip448_statechain::script::output_script_pubkey(&spend_info),
+                Network::Regtest,
+            )
+            .unwrap()
+            .to_string(),
+        );
+        coin.utxo_txid = Some(funding_outpoint.txid.to_string());
+        coin.utxo_vout = Some(funding_outpoint.vout);
+        let client_nonce = create_and_commit_nonces(&coin).unwrap();
+        coin.secret_nonce = Some(client_nonce.secret_nonce);
+        coin.public_nonce = Some(client_nonce.public_nonce);
+        coin.blinding_factor = Some(client_nonce.blinding_factor);
+        let (server_sec_nonce, server_pub_nonce) = new_musig_nonce_pair(
+            &secp,
+            MusigSessionId::assume_unique_per_nonce_gen([9; 32]),
+            None,
+            Some(server_seckey),
+            server_pubkey,
+            None,
+            None,
+        )
+        .unwrap();
+        coin.server_public_nonce = Some(hex::encode(server_pub_nonce.serialize()));
+
+        let msg1 = get_bip448_withdrawal_partial_sig_request(
+            &coin,
+            funding_outpoint,
+            50_000,
+            101,
+            1.0,
+            &coin.backup_address,
+            Network::Regtest,
+        )
+        .unwrap();
+        let blinded_session: [u8; 133] =
+            hex::decode(&msg1.partial_signature_request_payload.session)
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let server_partial = MusigSession::from_slice(blinded_session)
+            .blinded_partial_sign_without_keyaggcoeff(
+                &secp,
+                server_sec_nonce,
+                &server_keypair,
+                msg1.partial_signature_request_payload.negate_seckey == 1,
+            )
+            .unwrap();
+        let signature = create_signature(
+            msg1.msg.clone(),
+            msg1.client_partial_sig,
+            hex::encode(server_partial.serialize()),
+            msg1.encoded_session,
+            msg1.output_pubkey,
+        )
+        .unwrap();
+        let unsigned_tx: Transaction =
+            bitcoin::consensus::deserialize(&hex::decode(&msg1.encoded_unsigned_tx).unwrap())
+                .unwrap();
+        let sighash = SighashCache::new(&unsigned_tx)
+            .taproot_key_spend_signature_hash(
+                0,
+                &sighash::Prevouts::All(&[TxOut {
+                    value: 50_000,
+                    script_pubkey: crate::bip448_statechain::script::output_script_pubkey(
+                        &spend_info,
+                    ),
+                }]),
+                TapSighashType::All,
+            )
+            .unwrap();
+        assert_eq!(msg1.msg, hex::encode(sighash.as_byte_array()));
+        secp.verify_schnorr(
+            &Signature::from_str(&signature).unwrap(),
+            Message::from(sighash).as_ref(),
+            &spend_info.output_key().to_inner(),
+        )
+        .unwrap();
+        assert_eq!(unsigned_tx.input[0].previous_output, funding_outpoint);
+        assert_ne!(client_seckey, server_seckey);
     }
 }
