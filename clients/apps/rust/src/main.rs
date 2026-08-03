@@ -76,6 +76,14 @@ enum Commands {
         fee_rate: Option<f64>,
         duplicated_index: Option<u32>,
     },
+    /// Withdraw a BIP448 statechain coin cooperatively to a bitcoin address
+    Bip448Withdraw {
+        wallet_name: String,
+        statechain_id: String,
+        to_address: String,
+        /// Transaction fee rate in sats per byte
+        fee_rate: Option<f64>,
+    },
     /// Generate a transfer address to receive funds
     NewTransferAddress {
         wallet_name: String,
@@ -292,6 +300,22 @@ async fn main() -> Result<()> {
                 &to_address,
                 fee_rate,
                 duplicated_index,
+            )
+            .await?;
+        }
+        Commands::Bip448Withdraw {
+            wallet_name,
+            statechain_id,
+            to_address,
+            fee_rate,
+        } => {
+            mercuryrustlib::coin_status::update_coins(&client_config, &wallet_name).await?;
+            mercuryrustlib::bip448_withdraw::execute(
+                &client_config,
+                &wallet_name,
+                &statechain_id,
+                &to_address,
+                fee_rate,
             )
             .await?;
         }

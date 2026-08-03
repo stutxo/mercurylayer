@@ -74,7 +74,7 @@ pub async fn complete_withdraw(
     statechain_id: &str,
     signed_statechain_id: &str,
     client_config: &ClientConfig,
-) -> Result<()> {
+) -> Result<String> {
     let endpoint = client_config.statechain_entity.clone();
     let path = "withdraw/complete";
 
@@ -93,5 +93,5 @@ pub async fn complete_withdraw(
         return Err(anyhow!(response_body));
     }
 
-    Ok(())
+    Ok(response.text().await?)
 }
