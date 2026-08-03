@@ -586,8 +586,6 @@ pub fn verify_bip448_transfer_msg(
     }
     if msg.state_history[n as usize - 1].owner_public_key
         != receiver_user_pubkey.x_only_public_key().0.to_string()
-        || msg.state_history[n as usize - 2].owner_public_key
-            != sender_user_pubkey.x_only_public_key().0.to_string()
     {
         return Err(Bip448TransferVerifyError::InvalidStateHistory);
     }

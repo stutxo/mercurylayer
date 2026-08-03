@@ -618,7 +618,9 @@ pub(crate) async fn insert_or_update_bip448_statechain_from_transfer(
     pool: &Pool<Sqlite>,
     accepted: &Bip448AcceptedTransferState,
 ) -> Result<()> {
-    upsert_bip448_statechain_record(pool, accepted.record()).await
+    // A verified transfer can advance over signed superseded states. The typed
+    // acceptance gate proves the complete history before this persistence step.
+    upsert_bip448_statechain_record_with_policy(pool, accepted.record(), true).await
 }
 
 fn validated_bip448_record_json(record: &Bip448StatechainRecord) -> Result<String> {
@@ -648,6 +650,14 @@ fn validated_bip448_record_json(record: &Bip448StatechainRecord) -> Result<Strin
 async fn upsert_bip448_statechain_record(
     pool: &Pool<Sqlite>,
     record: &Bip448StatechainRecord,
+) -> Result<()> {
+    upsert_bip448_statechain_record_with_policy(pool, record, false).await
+}
+
+async fn upsert_bip448_statechain_record_with_policy(
+    pool: &Pool<Sqlite>,
+    record: &Bip448StatechainRecord,
+    allow_verified_transfer_skip: bool,
 ) -> Result<()> {
     let mut record = record.clone();
     record.funding_outpoint.txid = canonical_txid(&record.funding_outpoint.txid)?;
@@ -681,7 +691,12 @@ async fn upsert_bip448_statechain_record(
         {
             return Err(anyhow!("BIP448 accepted state immutable identity mismatch"));
         }
-        if record.latest_state_number != stored.latest_state_number + 1 {
+        let valid_transition = if allow_verified_transfer_skip {
+            record.latest_state_number > stored.latest_state_number
+        } else {
+            record.latest_state_number == stored.latest_state_number + 1
+        };
+        if !valid_transition {
             return Err(anyhow!(
                 "BIP448 accepted state must be an exact replay or a monotonic single-step transition"
             ));
@@ -1216,6 +1231,11 @@ pub async fn get_bip448_transfer_msg(
 }
 
 pub async fn has_bip448_transfer_msg_for_statechain(pool: &Pool<Sqlite>, wallet_name: &str, statechain_id: &str) -> Result<bool> { Ok(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM bip448_transfer_messages WHERE wallet_name = $1 AND statechain_id = $2").bind(wallet_name).bind(statechain_id).fetch_one(pool).await? != 0) }
+pub async fn delete_bip448_transfer_msgs(pool: &Pool<Sqlite>, wallet_name: &str, statechain_id: &str) -> Result<()> {
+    sqlx::query("DELETE FROM bip448_transfer_messages WHERE wallet_name = $1 AND statechain_id = $2")
+        .bind(wallet_name).bind(statechain_id).execute(pool).await?;
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
