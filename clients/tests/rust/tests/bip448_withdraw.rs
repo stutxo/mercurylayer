@@ -86,6 +86,6 @@ async fn bip448_cooperative_withdrawal_closed_list() -> Result<()> {
     assert_eq!(common::lockbox::get_signature_count(&lockbox, &committed_id).await?, 2);
     let recipient_address = mercuryrustlib::transfer_receiver::new_transfer_address(&config, &recipient.name).await?;
     let error = mercuryrustlib::bip448_transfer_sender::transfer_bip448_sender(&config, &recipient_address, &committed.name, &committed_id).await.unwrap_err();
-    assert_eq!(error.to_string(), "only transfer of a CONFIRMED BIP448 coin at its accepted latest state is supported");
+    assert_eq!(error.to_string(), "BIP448 signature count does not match any supported transfer state");
     Ok(())
 }

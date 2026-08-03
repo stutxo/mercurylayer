@@ -56,8 +56,6 @@ async fn bip448_transfer_survives_signing_and_upload_restarts() -> Result<()> {
             assert!(get_encrypted_msg(&mercury, &auth_pubkey).await.is_err(), "plaintext checkpoint must fire before upload");
             assert_exit(&run_child(&sender_name, &statechain_id, &recipient, Some("transfer_msg_uploaded"))?, RESTART_EXIT, "replayed upload checkpoint")?;
             first_ciphertext = Some(get_encrypted_msg(&mercury, &auth_pubkey).await?);
-            let rejected = run_child(&sender_name, &statechain_id, &wrong_recipient, None)?;
-            assert!(!rejected.status.success() && String::from_utf8_lossy(&rejected.stderr).contains("persisted transfer message does not match the recipient address"));
             let rejected = run_child(&sender_name, &statechain_id, &same_auth_wrong_user, None)?;
             assert!(!rejected.status.success() && String::from_utf8_lossy(&rejected.stderr).contains("persisted transfer message does not match the recipient address"));
             assert_eq!(get_encrypted_msg(&mercury, &auth_pubkey).await?, first_ciphertext.as_ref().unwrap().clone());
@@ -164,6 +162,153 @@ async fn bip448_sender_finishes_after_receiver_rotates_auth_key() -> Result<()> 
     assert_eq!(get_encrypted_msgs(&mercury, &auth_pubkey).await?, mailbox_before);
     recovered.pool.close().await;
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires docker regtest stack with Mercury server, lockbox, and active BIP448 Inquisition deployments"]
+async fn bip448_retarget_before_signing_reuses_next_state() -> Result<()> {
+    let _guard = common::test_guard();
+    let config = phase8_9_config().await?;
+    let suffix = uuid::Uuid::new_v4();
+    let sender = create_wallet(&config, &format!("bip448-retarget-before-a-{suffix}")).await?;
+    let first_receiver = create_wallet(&config, &format!("bip448-retarget-before-b-{suffix}")).await?;
+    let replacement = create_wallet(&config, &format!("bip448-retarget-before-c-{suffix}")).await?;
+    let statechain_id = create_confirmed_deposit(&config, &sender).await?;
+    let first_address = mercuryrustlib::transfer_receiver::new_transfer_address(&config, &first_receiver.name).await?;
+    let replacement_address = mercuryrustlib::transfer_receiver::new_transfer_address(&config, &replacement.name).await?;
+    config.pool.close().await;
+
+    assert_exit(
+        &run_child(&sender.name, &statechain_id, &first_address, Some("pending_persisted"))?,
+        RESTART_EXIT,
+        "retarget before sign/second",
+    )?;
+    let resumed = mercuryrustlib::client_config::load().await;
+    let aborted = mercuryrustlib::sqlite_manager::get_bip448_pending_transfer_signing(
+        &resumed.pool, &sender.name, &statechain_id,
+    ).await?.context("aborted transfer signing is missing")?;
+    let lockbox = common::lockbox::http_client();
+    assert_eq!(common::lockbox::get_signature_count(&lockbox, &statechain_id).await?, 1);
+    mercuryrustlib::bip448_transfer_sender::transfer_bip448_sender(
+        &resumed, &replacement_address, &sender.name, &statechain_id,
+    ).await?;
+    let replacement_auth = mercurylib::decode_transfer_address(&replacement_address)?.2.to_string();
+    let replacement_msg = mercuryrustlib::sqlite_manager::get_bip448_transfer_msg(
+        &resumed.pool, &sender.name, &statechain_id, &replacement_auth,
+    ).await?;
+    assert_ne!(replacement_msg.latest_state.signing_metadata.signing_id, aborted.signing_id);
+    assert_ne!(replacement_msg.latest_state.signing_metadata.client_public_nonce, aborted.client_public_nonce);
+    let received = mercuryrustlib::transfer_receiver::execute(&resumed, &replacement.name).await?;
+    assert_eq!(received.received_statechain_ids, vec![statechain_id.clone()]);
+    let accepted = mercuryrustlib::sqlite_manager::get_bip448_statechain(
+        &resumed.pool, &replacement.name, &statechain_id,
+    ).await?;
+    assert_eq!(accepted.latest_state_number, 2);
+    assert_eq!(common::lockbox::get_signature_count(&lockbox, &statechain_id).await?, 2);
+    resumed.pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires docker regtest stack with Mercury server, lockbox, and active BIP448 Inquisition deployments"]
+async fn bip448_retarget_after_signing_preserves_superseded_history() -> Result<()> {
+    let _guard = common::test_guard();
+    let config = phase8_9_config().await?;
+    let suffix = uuid::Uuid::new_v4();
+    let sender = create_wallet(&config, &format!("bip448-retarget-after-a-{suffix}")).await?;
+    let first_receiver = create_wallet(&config, &format!("bip448-retarget-after-b-{suffix}")).await?;
+    let replacement = create_wallet(&config, &format!("bip448-retarget-after-c-{suffix}")).await?;
+    let statechain_id = create_confirmed_deposit(&config, &sender).await?;
+    let first_address = mercuryrustlib::transfer_receiver::new_transfer_address(&config, &first_receiver.name).await?;
+    let first_user_key = mercurylib::decode_transfer_address(&first_address)?.1.x_only_public_key().0.to_string();
+    let first_auth_key = mercurylib::decode_transfer_address(&first_address)?.2.to_string();
+    let replacement_address = mercuryrustlib::transfer_receiver::new_transfer_address(&config, &replacement.name).await?;
+    config.pool.close().await;
+
+    assert_exit(
+        &run_child(&sender.name, &statechain_id, &first_address, Some("transfer_msg_uploaded"))?,
+        RESTART_EXIT,
+        "retarget after signing",
+    )?;
+    let mercury = common::mercury::http_client();
+    assert_eq!(get_encrypted_msgs(&mercury, &first_auth_key).await?.len(), 1);
+    let resumed = mercuryrustlib::client_config::load().await;
+    mercuryrustlib::bip448_transfer_sender::transfer_bip448_sender(
+        &resumed, &replacement_address, &sender.name, &statechain_id,
+    ).await?;
+    assert!(get_encrypted_msgs(&mercury, &first_auth_key).await?.is_empty());
+    let first_result = mercuryrustlib::transfer_receiver::execute(&resumed, &first_receiver.name).await?;
+    assert!(first_result.received_statechain_ids.is_empty());
+    let replacement_result = mercuryrustlib::transfer_receiver::execute(&resumed, &replacement.name).await?;
+    assert_eq!(replacement_result.received_statechain_ids, vec![statechain_id.clone()]);
+    let accepted = mercuryrustlib::sqlite_manager::get_bip448_statechain(
+        &resumed.pool, &replacement.name, &statechain_id,
+    ).await?;
+    assert_eq!(accepted.latest_state_number, 3);
+    let history = mercuryrustlib::sqlite_manager::get_bip448_state_history(
+        &resumed.pool, &replacement.name, &statechain_id,
+    ).await?;
+    assert_eq!(history.iter().map(|entry| entry.state_number).collect::<Vec<_>>(), vec![1, 2, 3]);
+    assert_eq!(history[1].owner_public_key, first_user_key);
+    assert!(history[1].state_locktime < history[2].state_locktime);
+    let lockbox = common::lockbox::http_client();
+    assert_eq!(common::lockbox::get_signature_count(&lockbox, &statechain_id).await?, 3);
+    resumed.pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires docker regtest stack with Mercury server, lockbox, and active BIP448 Inquisition deployments"]
+async fn bip448_cancel_returns_coin_and_allows_real_transfer() -> Result<()> {
+    let _guard = common::test_guard();
+    let config = phase8_9_config().await?;
+    let suffix = uuid::Uuid::new_v4();
+    let sender = create_wallet(&config, &format!("bip448-cancel-a-{suffix}")).await?;
+    let receiver = create_wallet(&config, &format!("bip448-cancel-b-{suffix}")).await?;
+    let statechain_id = create_confirmed_deposit(&config, &sender).await?;
+    let receiver_address = mercuryrustlib::transfer_receiver::new_transfer_address(&config, &receiver.name).await?;
+    config.pool.close().await;
+
+    assert_exit(
+        &run_child(&sender.name, &statechain_id, &receiver_address, Some("transfer_msg_uploaded"))?,
+        RESTART_EXIT,
+        "cancel after signing",
+    )?;
+    let resumed = mercuryrustlib::client_config::load().await;
+    assert_eq!(
+        mercuryrustlib::bip448_transfer_sender::cancel_bip448_transfer(
+            &resumed, &sender.name, &statechain_id,
+        ).await?,
+        3,
+    );
+    let cancelled = mercuryrustlib::sqlite_manager::get_bip448_statechain(
+        &resumed.pool, &sender.name, &statechain_id,
+    ).await?;
+    assert_eq!(cancelled.latest_state_number, 3);
+    mercuryrustlib::bip448_transfer_sender::transfer_bip448_sender(
+        &resumed, &receiver_address, &sender.name, &statechain_id,
+    ).await?;
+    let received = mercuryrustlib::transfer_receiver::execute(&resumed, &receiver.name).await?;
+    assert_eq!(received.received_statechain_ids, vec![statechain_id.clone()]);
+    let accepted = mercuryrustlib::sqlite_manager::get_bip448_statechain(
+        &resumed.pool, &receiver.name, &statechain_id,
+    ).await?;
+    assert_eq!(accepted.latest_state_number, 4);
+    let lockbox = common::lockbox::http_client();
+    assert_eq!(common::lockbox::get_signature_count(&lockbox, &statechain_id).await?, 4);
+    resumed.pool.close().await;
+    Ok(())
+}
+
+async fn phase8_9_config() -> Result<ClientConfig> {
+    common::bitcoin_core::ensure_wallet_loaded()?;
+    common::bip448_activation::ensure_bip448_deployments_active()?;
+    common::bitcoin_core::ensure_wallet_ready()?;
+    let mercury = common::mercury::http_client();
+    common::mercury::wait_until_ready(&mercury).await?;
+    let lockbox = common::lockbox::http_client();
+    common::lockbox::wait_until_ready(&lockbox).await?;
+    common::prepare_test_env().await
 }
 async fn create_wallet(config: &ClientConfig, name: &str) -> Result<Wallet> {
     let wallet = mercuryrustlib::wallet::create_wallet(name, config).await?;
