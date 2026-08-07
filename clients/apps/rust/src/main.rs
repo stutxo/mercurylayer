@@ -107,6 +107,8 @@ enum Commands {
         wallet_name: String,
         statechain_id: String,
         to_address: String,
+        /// Batch id for atomic transfers
+        batch_id: Option<String>,
     },
     /// Cancel an in-flight BIP448 transfer by transferring back to this wallet
     Bip448TransferCancel { wallet_name: String, statechain_id: String },
@@ -373,10 +375,11 @@ async fn main() -> Result<()> {
             wallet_name,
             statechain_id,
             to_address,
+            batch_id,
         } => {
             mercuryrustlib::coin_status::update_coins(&client_config, &wallet_name).await?;
             mercuryrustlib::bip448_transfer_sender::transfer_bip448_sender(
-                &client_config, &to_address, &wallet_name, &statechain_id,
+                &client_config, &to_address, &wallet_name, &statechain_id, batch_id,
             ).await?;
             println!("{}", serde_json::to_string_pretty(&json!({"Transfer": "sent"})).unwrap());
         }

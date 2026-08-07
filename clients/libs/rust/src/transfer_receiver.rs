@@ -59,12 +59,14 @@ pub struct MessageResult {
 enum Bip448ReceiveOutcome {
     Legacy,
     Processed(MessageResult),
+    BatchLocked,
     AlreadyProcessed,
 }
 
 enum Bip448MessageDisposition {
     Legacy,
     Processed,
+    BatchLocked,
     AlreadyProcessed,
     Rejected,
 }
@@ -80,6 +82,9 @@ fn handle_bip448_message_result(
                 received_statechain_ids.push(statechain_id);
             }
             Bip448MessageDisposition::Processed
+        }
+        std::result::Result::Ok(Bip448ReceiveOutcome::BatchLocked) => {
+            Bip448MessageDisposition::BatchLocked
         }
         std::result::Result::Ok(Bip448ReceiveOutcome::AlreadyProcessed) => {
             Bip448MessageDisposition::AlreadyProcessed
@@ -182,6 +187,10 @@ pub async fn execute(
                     &mut received_statechain_ids,
                 ) {
                     Bip448MessageDisposition::Legacy => {}
+                    Bip448MessageDisposition::BatchLocked => {
+                        is_there_batch_locked = true;
+                        continue;
+                    }
                     Bip448MessageDisposition::Processed
                     | Bip448MessageDisposition::AlreadyProcessed
                     | Bip448MessageDisposition::Rejected => {
@@ -275,6 +284,10 @@ pub async fn execute(
                     &mut received_statechain_ids,
                 ) {
                     Bip448MessageDisposition::Legacy => {}
+                    Bip448MessageDisposition::BatchLocked => {
+                        is_there_batch_locked = true;
+                        continue;
+                    }
                     Bip448MessageDisposition::Processed => {
                         temp_coins.push(new_coin.clone());
                         continue;

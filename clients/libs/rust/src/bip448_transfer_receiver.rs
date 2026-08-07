@@ -244,7 +244,6 @@ async fn transfer_bip448_receiver(
         },
     )
     .await
-    .map(Bip448ReceiveOutcome::Processed)
 }
 
 async fn resolve_already_updated(
@@ -317,7 +316,11 @@ async fn persist_accepted_transfer(
     activities: &mut Vec<Activity>,
     verified: Bip448VerifiedTransfer,
     response: super::TransferReceiveRequestResult,
-) -> Result<MessageResult> {
+) -> Result<Bip448ReceiveOutcome> {
+    if response.is_batch_locked {
+        return Ok(Bip448ReceiveOutcome::BatchLocked);
+    }
+
     let completed = Bip448CompletedKeyUpdate::new(
         &verified,
         response
@@ -336,11 +339,11 @@ async fn persist_accepted_transfer(
     *coin = updated_coin;
     activities.push(activity);
 
-    Ok(MessageResult {
+    Ok(Bip448ReceiveOutcome::Processed(MessageResult {
         is_batch_locked: false,
         statechain_id: Some(verified.msg.statechain_id),
         duplicated_coins: Vec::new(),
-    })
+    }))
 }
 
 pub(crate) async fn transfer_chain_facts(
@@ -667,7 +670,7 @@ mod tests {
     async fn attempt(
         fixture: &Fixture, pool: &sqlx::Pool<sqlx::Sqlite>, coin: &mut Coin,
         activities: &mut Vec<Activity>, transport: Rc<RefCell<Transport>>,
-    ) -> Result<MessageResult> {
+    ) -> Result<Bip448ReceiveOutcome> {
         let msg = decrypt_transfer_message(&fixture.mailbox, &coin.auth_privkey)?.ok_or_else(|| anyhow!("unexpected legacy message"))?;
         let mut info: StatechainInfoResponsePayload = serde_json::from_str(INFO)?;
         info.enclave_public_key = transport.borrow().server.clone();
@@ -713,7 +716,8 @@ mod tests {
     async fn full_happy_path_verifies_requests_persists_and_updates_coin() {
         let fixture = fixture(); let mut coin = fixture.coin.clone(); let mut activities = Vec::new();
         let pool = pool().await; let transport = transport();
-        let result = attempt(&fixture, &pool, &mut coin, &mut activities, Rc::clone(&transport)).await.unwrap();
+        let outcome = attempt(&fixture, &pool, &mut coin, &mut activities, Rc::clone(&transport)).await.unwrap();
+        let result = match outcome { Bip448ReceiveOutcome::Processed(result) => result, _ => panic!("happy path did not process the transfer") };
         let record = crate::sqlite_manager::get_bip448_statechain(&pool, "wallet", "statechain").await.unwrap();
         let history = crate::sqlite_manager::get_bip448_state_history(&pool, "wallet", "statechain").await.unwrap();
         assert_eq!(result.statechain_id.as_deref(), Some("statechain"));
@@ -725,6 +729,29 @@ mod tests {
         assert_eq!(coin.status, CoinStatus::CONFIRMED);
         assert_eq!(activities.len(), 1);
         assert_eq!((transport.borrow().verifies, transport.borrow().unlocks, transport.borrow().posts), (1, 1, 1));
+    }
+
+    #[tokio::test]
+    #[rustfmt::skip]
+    async fn locked_batch_response_returns_without_mutating_client_state() {
+        let fixture = fixture();
+        let mut coin = fixture.coin.clone();
+        let coin_before = serde_json::to_string(&coin).unwrap();
+        let mut activities = Vec::new();
+        let pool = pool().await;
+        let info: StatechainInfoResponsePayload = serde_json::from_str(INFO).unwrap();
+        let verified = Bip448VerifiedTransfer::new(fixture.msg.clone(), &info, fixture.facts.clone()).unwrap();
+
+        let outcome = persist_accepted_transfer(
+            &pool, "wallet", &mut coin, &mut activities, verified,
+            super::super::TransferReceiveRequestResult { is_batch_locked: true, server_pubkey: None },
+        ).await.unwrap();
+
+        assert!(matches!(outcome, Bip448ReceiveOutcome::BatchLocked));
+        assert_eq!(serde_json::to_string(&coin).unwrap(), coin_before);
+        assert!(activities.is_empty());
+        assert!(crate::sqlite_manager::get_bip448_statechain_optional(&pool, "wallet", "statechain").await.unwrap().is_none());
+        assert!(crate::sqlite_manager::get_bip448_state_history(&pool, "wallet", "statechain").await.unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -141,6 +141,10 @@ impl Bip448AcceptedDepositState {
     }
 }
 
+fn populate_bip448_deposit_locktime(coin: &mut Coin, accepted: &Bip448AcceptedDepositState) {
+    coin.locktime = Some(accepted.record().latest_state.state_locktime);
+}
+
 pub async fn get_deposit_bitcoin_address(
     client_config: &ClientConfig,
     wallet_name: &str,
@@ -312,6 +316,7 @@ pub async fn create_bip448_deposit_state(
     coin.public_nonce = Some(signing_data.client_public_nonce);
     coin.server_public_nonce = Some(signing_data.server_public_nonce);
     coin.blinding_factor = Some(signing_data.blinding_factor);
+    populate_bip448_deposit_locktime(coin, &accepted);
 
     insert_or_update_bip448_statechain(&client_config.pool, &accepted).await?;
     insert_bip448_state_history_entry(
@@ -1016,6 +1021,12 @@ mod tests {
 
         let accepted =
             Bip448AcceptedDepositState::new(record.clone(), &first_templates, 1_900_000_000)?;
+        let mut accepted_coin = coin.clone();
+        populate_bip448_deposit_locktime(&mut accepted_coin, &accepted);
+        assert_eq!(
+            accepted_coin.locktime,
+            Some(accepted.record().latest_state.state_locktime)
+        );
         insert_or_update_bip448_statechain(&client_config.pool, &accepted).await?;
         let persisted_accepted = crate::sqlite_manager::get_bip448_statechain_optional(
             &client_config.pool,

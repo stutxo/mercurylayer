@@ -1433,7 +1433,7 @@ mod tests {
             pool, tor_proxy: None, max_fee_rate: 10.0 })
     }
     async fn assert_sender_ineligible(config: &ClientConfig) {
-        let error = transfer_bip448_sender(config, "unused", "wallet", "statechain")
+        let error = transfer_bip448_sender(config, "unused", "wallet", "statechain", None)
             .await.unwrap_err();
         assert_eq!(error.to_string(), "only transfer of a CONFIRMED BIP448 coin at its accepted latest state is supported");
     }
@@ -1500,7 +1500,7 @@ mod tests {
         upsert_bip448_statechain_record(&config.pool, &record).await?;
 
         let error =
-            transfer_bip448_sender(&config, &recipient_address, "wallet", "statechain")
+            transfer_bip448_sender(&config, &recipient_address, "wallet", "statechain", None)
                 .await
                 .unwrap_err();
         assert_eq!(

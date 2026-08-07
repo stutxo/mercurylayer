@@ -356,6 +356,7 @@ async fn transfer_and_accept_bip448(
         &recipient_address,
         sender_wallet,
         statechain_id,
+        None,
     )
     .await?;
     let receive_result =
@@ -418,6 +419,7 @@ async fn bip448_one_hop_transfer_accepts_and_recovers_state_two() -> Result<()> 
         &recipient_address,
         &sender.name,
         &deposit.statechain_id,
+        None,
     )
     .await?;
     assert_eq!(
@@ -744,6 +746,7 @@ async fn bip448_same_wallet_transfer_advances_the_accepted_record_to_state_two()
         &recipient_address,
         &wallet.name,
         &deposit.statechain_id,
+        None,
     )
     .await?;
     let receive_result =

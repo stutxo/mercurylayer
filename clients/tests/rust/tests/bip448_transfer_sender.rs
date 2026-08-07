@@ -14,6 +14,7 @@ async fn bip448_transfer_restart_child() -> Result<()> {
     let result = mercuryrustlib::bip448_transfer_sender::transfer_bip448_sender(
         &config, &std::env::var("ML_BIP448_RESTART_RECIPIENT")?,
         &std::env::var("ML_BIP448_RESTART_WALLET")?, &std::env::var("ML_BIP448_RESTART_STATECHAIN_ID")?,
+        None,
     ).await;
     config.pool.close().await;
     result
@@ -190,7 +191,7 @@ async fn bip448_retarget_before_signing_reuses_next_state() -> Result<()> {
     let lockbox = common::lockbox::http_client();
     assert_eq!(common::lockbox::get_signature_count(&lockbox, &statechain_id).await?, 1);
     mercuryrustlib::bip448_transfer_sender::transfer_bip448_sender(
-        &resumed, &replacement_address, &sender.name, &statechain_id,
+        &resumed, &replacement_address, &sender.name, &statechain_id, None,
     ).await?;
     let replacement_auth = mercurylib::decode_transfer_address(&replacement_address)?.2.to_string();
     let replacement_msg = mercuryrustlib::sqlite_manager::get_bip448_transfer_msg(
@@ -234,7 +235,7 @@ async fn bip448_retarget_after_signing_preserves_superseded_history() -> Result<
     assert_eq!(get_encrypted_msgs(&mercury, &first_auth_key).await?.len(), 1);
     let resumed = mercuryrustlib::client_config::load().await;
     mercuryrustlib::bip448_transfer_sender::transfer_bip448_sender(
-        &resumed, &replacement_address, &sender.name, &statechain_id,
+        &resumed, &replacement_address, &sender.name, &statechain_id, None,
     ).await?;
     assert!(get_encrypted_msgs(&mercury, &first_auth_key).await?.is_empty());
     let first_result = mercuryrustlib::transfer_receiver::execute(&resumed, &first_receiver.name).await?;
@@ -286,7 +287,7 @@ async fn bip448_cancel_returns_coin_and_allows_real_transfer() -> Result<()> {
     ).await?;
     assert_eq!(cancelled.latest_state_number, 3);
     mercuryrustlib::bip448_transfer_sender::transfer_bip448_sender(
-        &resumed, &receiver_address, &sender.name, &statechain_id,
+        &resumed, &receiver_address, &sender.name, &statechain_id, None,
     ).await?;
     let received = mercuryrustlib::transfer_receiver::execute(&resumed, &receiver.name).await?;
     assert_eq!(received.received_statechain_ids, vec![statechain_id.clone()]);

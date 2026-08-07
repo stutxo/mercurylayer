@@ -28,7 +28,7 @@ async fn deposit(config: &ClientConfig, wallet: &Wallet) -> Result<String> {
 
 async fn transfer(config: &ClientConfig, sender: &Wallet, receiver: &Wallet, id: &str) -> Result<()> {
     let address = mercuryrustlib::transfer_receiver::new_transfer_address(config, &receiver.name).await?;
-    mercuryrustlib::bip448_transfer_sender::transfer_bip448_sender(config, &address, &sender.name, id).await?;
+    mercuryrustlib::bip448_transfer_sender::transfer_bip448_sender(config, &address, &sender.name, id, None).await?;
     let received = mercuryrustlib::transfer_receiver::execute(config, &receiver.name).await?;
     assert_eq!(received.received_statechain_ids, vec![id.to_string()]);
     Ok(())
@@ -85,7 +85,7 @@ async fn bip448_cooperative_withdrawal_closed_list() -> Result<()> {
     assert_eq!(stopped.unwrap_err().to_string(), "BIP448 withdraw stopped after signature for test");
     assert_eq!(common::lockbox::get_signature_count(&lockbox, &committed_id).await?, 2);
     let recipient_address = mercuryrustlib::transfer_receiver::new_transfer_address(&config, &recipient.name).await?;
-    let error = mercuryrustlib::bip448_transfer_sender::transfer_bip448_sender(&config, &recipient_address, &committed.name, &committed_id).await.unwrap_err();
+    let error = mercuryrustlib::bip448_transfer_sender::transfer_bip448_sender(&config, &recipient_address, &committed.name, &committed_id, None).await.unwrap_err();
     assert_eq!(error.to_string(), "BIP448 signature count does not match any supported transfer state");
     Ok(())
 }

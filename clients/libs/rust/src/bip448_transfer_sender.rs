@@ -58,6 +58,7 @@ pub async fn transfer_bip448_sender(
     recipient_address: &str,
     wallet_name: &str,
     statechain_id: &str,
+    batch_id: Option<String>,
 ) -> Result<()> {
     let mut wallet = get_wallet(&client_config.pool, wallet_name).await?;
     let record = get_bip448_statechain_optional(&client_config.pool, wallet_name, statechain_id).await?.ok_or_else(eligibility_error)?;
@@ -131,7 +132,7 @@ pub async fn transfer_bip448_sender(
     } else { None };
     let x1 = map_new_x1_result(get_new_x1(client_config, statechain_id,
         coin.signed_statechain_id.as_deref().ok_or_else(|| anyhow!("BIP448 transfer coin missing signed_statechain_id"))?,
-        &recipient_auth, None).await)?;
+        &recipient_auth, batch_id).await)?;
     if plan.clear_local_attempt {
         if let Some(pending) = existing_pending.as_ref() {
             delete_bip448_pending_transfer_signing(&client_config.pool, wallet_name, statechain_id, &pending.signing_id).await?;
@@ -571,7 +572,7 @@ pub async fn cancel_bip448_transfer(
     statechain_id: &str,
 ) -> Result<u32> {
     let recipient_address = crate::transfer_receiver::new_transfer_address(client_config, wallet_name).await?;
-    transfer_bip448_sender(client_config, &recipient_address, wallet_name, statechain_id).await?;
+    transfer_bip448_sender(client_config, &recipient_address, wallet_name, statechain_id, None).await?;
     let received = crate::transfer_receiver::execute(client_config, wallet_name).await?;
     if received.is_there_batch_locked { return Err(anyhow!(BATCHED_PENDING_ERROR)); }
     if !received.received_statechain_ids.iter().any(|id| id == statechain_id) {

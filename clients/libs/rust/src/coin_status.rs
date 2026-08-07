@@ -794,6 +794,7 @@ fn restore_bip448_deposit_state_from_record(
     coin.public_nonce = Some(signing_metadata.client_public_nonce.clone());
     coin.server_public_nonce = Some(signing_metadata.server_public_nonce.clone());
     coin.blinding_factor = Some(signing_metadata.blinding_factor.clone());
+    coin.locktime = Some(record.latest_state.state_locktime);
 
     Ok(())
 }
@@ -1700,6 +1701,7 @@ mod tests {
         assert_eq!(coin.public_nonce, Some("88".repeat(66)));
         assert_eq!(coin.server_public_nonce, Some("99".repeat(66)));
         assert_eq!(coin.blinding_factor, Some("aa".repeat(32)));
+        assert_eq!(coin.locktime, Some(record.latest_state.state_locktime));
 
         Ok(())
     }
