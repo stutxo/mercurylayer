@@ -65,7 +65,11 @@ pub async fn transfer_bip448_sender(
     let coin_index = wallet
         .coins
         .iter()
-        .position(|coin| coin.statechain_id.as_deref() == Some(statechain_id) && coin.status == CoinStatus::CONFIRMED && mercurylib::bip448_statechain::deposit::is_bip448_coin(coin))
+        .enumerate()
+        .filter(|(_, coin)| coin.statechain_id.as_deref() == Some(statechain_id) && mercurylib::bip448_statechain::deposit::is_bip448_coin(coin))
+        .filter_map(|(index, coin)| transfer_status_priority(&coin.status).map(|priority| (priority, index)))
+        .min_by_key(|(priority, _)| *priority)
+        .map(|(_, index)| index)
         .ok_or_else(eligibility_error)?;
     ensure_local_eligibility(record.latest_state_number, &wallet.coins[coin_index].status)?;
     if !validate_address(recipient_address, &wallet.network)? {
@@ -245,8 +249,15 @@ async fn verify_persisted_transfer_completed(
         .is_ok_and(|expected| current_server == expected))
 }
 fn ensure_local_eligibility(latest_state_number: u32, status: &CoinStatus) -> Result<()> {
-    if latest_state_number < 1 || status != &CoinStatus::CONFIRMED { return Err(eligibility_error()); }
+    if latest_state_number < 1 || transfer_status_priority(status).is_none() { return Err(eligibility_error()); }
     Ok(())
+}
+fn transfer_status_priority(status: &CoinStatus) -> Option<u8> {
+    match status {
+        CoinStatus::CONFIRMED => Some(0),
+        CoinStatus::IN_TRANSFER => Some(1),
+        _ => None,
+    }
 }
 fn transfer_state_plan(
     count: u64,
@@ -624,6 +635,14 @@ mod tests {
                 reuse_signed_state: false, clear_local_attempt: false });
         assert_eq!(transfer_state_plan(4, 3, false, true, None).unwrap().state_number, 5);
         assert!(ensure_local_eligibility(2, &CoinStatus::CONFIRMED).is_ok());
+        assert!(ensure_local_eligibility(2, &CoinStatus::IN_TRANSFER).is_ok());
+    }
+
+    #[test]
+    fn coin_selection_status_gate_accepts_confirmed_and_in_transfer() {
+        assert_eq!(transfer_status_priority(&CoinStatus::CONFIRMED), Some(0));
+        assert_eq!(transfer_status_priority(&CoinStatus::IN_TRANSFER), Some(1));
+        assert_eq!(transfer_status_priority(&CoinStatus::INITIALISED), None);
     }
 
     #[test]

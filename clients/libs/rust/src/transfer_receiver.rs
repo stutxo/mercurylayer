@@ -71,27 +71,36 @@ enum Bip448MessageDisposition {
     Rejected,
 }
 
+const EXPIRED_BATCH_TIME_ERROR: &str = "Batch time has expired";
+
 fn handle_bip448_message_result(
     result: Result<Bip448ReceiveOutcome>,
     received_statechain_ids: &mut Vec<String>,
-) -> Bip448MessageDisposition {
+) -> Result<Bip448MessageDisposition> {
     match result {
-        std::result::Result::Ok(Bip448ReceiveOutcome::Legacy) => Bip448MessageDisposition::Legacy,
+        std::result::Result::Ok(Bip448ReceiveOutcome::Legacy) => {
+            Ok(Bip448MessageDisposition::Legacy)
+        }
         std::result::Result::Ok(Bip448ReceiveOutcome::Processed(message_result)) => {
             if let Some(statechain_id) = message_result.statechain_id {
                 received_statechain_ids.push(statechain_id);
             }
-            Bip448MessageDisposition::Processed
+            Ok(Bip448MessageDisposition::Processed)
         }
         std::result::Result::Ok(Bip448ReceiveOutcome::BatchLocked) => {
-            Bip448MessageDisposition::BatchLocked
+            Ok(Bip448MessageDisposition::BatchLocked)
         }
         std::result::Result::Ok(Bip448ReceiveOutcome::AlreadyProcessed) => {
-            Bip448MessageDisposition::AlreadyProcessed
+            Ok(Bip448MessageDisposition::AlreadyProcessed)
+        }
+        std::result::Result::Err(error)
+            if error.to_string() == EXPIRED_BATCH_TIME_ERROR =>
+        {
+            Err(error)
         }
         std::result::Result::Err(error) => {
             println!("BIP448 processing error: {error}");
-            Bip448MessageDisposition::Rejected
+            Ok(Bip448MessageDisposition::Rejected)
         }
     }
 }
@@ -185,7 +194,7 @@ pub async fn execute(
                 match handle_bip448_message_result(
                     bip448_result,
                     &mut received_statechain_ids,
-                ) {
+                )? {
                     Bip448MessageDisposition::Legacy => {}
                     Bip448MessageDisposition::BatchLocked => {
                         is_there_batch_locked = true;
@@ -282,7 +291,7 @@ pub async fn execute(
                 match handle_bip448_message_result(
                     bip448_result,
                     &mut received_statechain_ids,
-                ) {
+                )? {
                     Bip448MessageDisposition::Legacy => {}
                     Bip448MessageDisposition::BatchLocked => {
                         is_there_batch_locked = true;
@@ -875,15 +884,30 @@ mod tests {
                 duplicated_coins: Vec::new(),
             })),
             &mut received_statechain_ids,
-        );
+        )
+        .unwrap();
         let failure = handle_bip448_message_result(
             Err(anyhow!("invalid later message")),
             &mut received_statechain_ids,
-        );
+        )
+        .unwrap();
 
         assert!(matches!(success, Bip448MessageDisposition::Processed));
         assert!(matches!(failure, Bip448MessageDisposition::Rejected));
         assert_eq!(received_statechain_ids, vec!["accepted-statechain"]);
+    }
+
+    #[test]
+    fn bip448_expired_batch_error_propagates_exactly() {
+        let mut received_statechain_ids = Vec::new();
+
+        let result = handle_bip448_message_result(
+            Err(anyhow!(EXPIRED_BATCH_TIME_ERROR)),
+            &mut received_statechain_ids,
+        );
+
+        assert_eq!(result.err().unwrap().to_string(), EXPIRED_BATCH_TIME_ERROR);
+        assert!(received_statechain_ids.is_empty());
     }
 
     #[test]
@@ -893,7 +917,8 @@ mod tests {
         let disposition = handle_bip448_message_result(
             Ok(Bip448ReceiveOutcome::AlreadyProcessed),
             &mut received_statechain_ids,
-        );
+        )
+        .unwrap();
 
         assert!(matches!(
             disposition,
@@ -909,7 +934,8 @@ mod tests {
         let disposition = handle_bip448_message_result(
             Ok(Bip448ReceiveOutcome::Legacy),
             &mut received_statechain_ids,
-        );
+        )
+        .unwrap();
 
         assert!(matches!(disposition, Bip448MessageDisposition::Legacy));
         assert!(received_statechain_ids.is_empty());

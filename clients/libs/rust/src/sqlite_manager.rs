@@ -1445,7 +1445,7 @@ mod tests {
         upsert_bip448_statechain_record(&config.pool, &sample_bip448_record(1)).await?; assert_sender_ineligible(&config).await;
         let mut coin = wallet.get_new_coin()?;
         coin.statechain_protocol = Some(mercurylib::bip448_statechain::deposit::BIP448_COIN_PROTOCOL.into());
-        coin.statechain_id = Some("statechain".into()); coin.status = CoinStatus::IN_TRANSFER;
+        coin.statechain_id = Some("statechain".into()); coin.status = CoinStatus::TRANSFERRED;
         wallet.coins.push(coin); update_wallet(&config.pool, &wallet).await?;
         assert_sender_ineligible(&config).await;
         wallet.coins[0].status = CoinStatus::CONFIRMED;
