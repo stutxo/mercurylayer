@@ -16,6 +16,8 @@ mod tb03_simple_atomic_transfer;
 mod tb04_simple_lightning_latch;
 #[path = "scenarios/tb05_timelock.rs"]
 mod tb05_timelock;
+#[path = "scenarios/tb06_bip448_lightning_latch.rs"]
+mod tb06_bip448_lightning_latch;
 #[path = "scenarios/tm01_sender_double_spends.rs"]
 mod tm01_sender_double_spends;
 #[path = "scenarios/tv01.rs"]
