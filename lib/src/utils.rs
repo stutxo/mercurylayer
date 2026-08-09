@@ -6,8 +6,6 @@ use crate::{wallet::Coin, MercuryError};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ServerConfig {
-    pub initlock: u32,
-    pub interval: u32,
     pub batchtimeout: u32,
     pub version: String,
 }

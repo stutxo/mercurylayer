@@ -1,6 +1,4 @@
-network = "testnet"
-lockheight_init = 1000
-lh_decrement = 10
+network = "regtest"
 batch_timeout = 120 # seconds
 db_user = "postgres"
 db_password = "postgres"
@@ -8,18 +6,6 @@ db_host = "localhost"
 db_port = 5432
 db_name = "mercury"
 token_server_url = "http://localhost:8001" # URL of the token server (optional)
-
-[nostr_info]
-relay_server = "wss://relay.damus.io/"
-relay_interval = 15
-nostr_privkey = "nsec17e0nvplcze4k7q9nazrw0k3aracwhg6vmuareewjp83ta89njw5spjcgzs"
-server_url = "http://mercury_server.xyz"
-location = "UK"
-active = true
-onchain_payments = false
-ln_payments = true
-fee = 0.0001
-unit = "BTC"
 
 [[enclaves]]
 url = "http://0.0.0.0:18080"
@@ -42,4 +28,3 @@ url = "http://0.0.0.0:18080"
 allow_deposit = true
 
 # env var: ENCLAVES='[{"url": "http://0.0.0.0:18080", "allow_deposit": true}, {"url": "http://0.0.0.0:18080", "allow_deposit": false}]'
-# env var: NOSTR_INFO='{"relay_server": "wss://relay.damus.io/", "relay_interval": 10, "nostr_privkey": "nsec17e0nvplcze4k7q9nazrw0k3aracwhg6vmuareewjp83ta89njw5spjcgzs"}'

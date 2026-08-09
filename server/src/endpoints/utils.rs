@@ -123,8 +123,6 @@ pub async fn info_config() -> status::Custom<Json<Value>> {
     let version: &str = env!("CARGO_PKG_VERSION");
 
     let server_config = mercurylib::utils::ServerConfig {
-        initlock: config.lockheight_init,
-        interval: config.lh_decrement,
         batchtimeout: config.batch_timeout,
         version: version.to_string(),
     };

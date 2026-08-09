@@ -9,39 +9,11 @@ pub struct Enclave {
     pub allow_deposit: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct NostrInfo {
-    /// Nostr Relay server
-    pub relay_server: String,
-    /// Relay interval
-    pub relay_interval: u32,
-    /// Nostr private key
-    pub nostr_privkey: String,
-    /// Sever url
-    pub server_url: String,
-    /// Optional server location
-    pub location: Option<String>,
-    /// Optional server status
-    pub active: Option<bool>,
-    /// Accepts onchain payments
-    pub onchain_payments: bool,
-    /// Accepts LN payments
-    pub ln_payments: bool,
-    /// Fee charged by the server
-    pub fee: f64,
-    /// Fee currency unit
-    pub unit: String,
-}
-
 /// Config struct storing all StataChain Entity config
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServerConfig {
     /// Bitcoin network name (testnet, regtest, mainnet)
     pub network: String,
-    /// Initial deposit backup nlocktime
-    pub lockheight_init: u32,
-    /// Transfer nlocktime decrement
-    pub lh_decrement: u32,
     /// Batch timeout
     pub batch_timeout: u32,
     /// Enclave server list
@@ -56,8 +28,6 @@ pub struct ServerConfig {
     pub db_port: u16,
     /// Database name
     pub db_name: String,
-    /// Nostr info
-    pub nostr_info: Option<NostrInfo>,
     /// URL of the token server
     pub token_server_url: Option<String>,
 }
@@ -66,8 +36,6 @@ impl Default for ServerConfig {
     fn default() -> ServerConfig {
         ServerConfig {
             network: String::from("regtest"),
-            lockheight_init: 10000,
-            lh_decrement: 100,
             batch_timeout: 120,
             enclaves: vec![
                 Enclave {
@@ -84,7 +52,6 @@ impl Default for ServerConfig {
             db_host: String::from("db_server"),
             db_port: 5432,
             db_name: String::from("mercury"),
-            nostr_info: None,
             token_server_url: None,
         }
     }
@@ -94,8 +61,6 @@ impl Default for ServerConfig {
     fn from(config: ConfigRs) -> Self {
         ServerConfig {
             network: config.get::<String>("network").unwrap_or_else(|_| String::new()),
-            lockheight_init: config.get::<u32>("lockheight_init").unwrap_or(0),
-            lh_decrement: config.get::<u32>("lh_decrement").unwrap_or(0),
             batch_timeout: config.get::<u32>("batch_timeout").unwrap_or(0),
             enclaves: config.get::<Vec<Enclave>>("enclaves").unwrap_or_else(|_| Vec::new()),
             db_user: config.get::<String>("db_user").unwrap_or_else(|_| String::new()),
@@ -139,27 +104,6 @@ impl ServerConfig {
             settings.as_ref().unwrap().get::<Vec<Enclave>>(key).unwrap()
         };
 
-        let get_env_or_config_nostr_info = |key: &str, env_var: &str| -> Option<NostrInfo> {
-            let env_nostr_info = env::var(env_var);
-
-            if env_nostr_info.is_ok() {
-                let res = serde_json::from_str::<NostrInfo>(&env_nostr_info.unwrap()).unwrap();
-                return Some(res);
-            }
-
-            if settings.as_ref().is_none() {
-                return None;
-            }
-
-            let res = settings.as_ref().unwrap().get::<NostrInfo>(key);
-
-            if res.is_ok() {
-                return Some(res.unwrap());
-            } else {
-                return None;
-            }
-        };
-
         let get_optional_env_or_config = |key: &str, env_var: &str| -> Option<String> {
             let env_var = env::var(env_var);
 
@@ -182,12 +126,6 @@ impl ServerConfig {
 
         ServerConfig {
             network: get_env_or_config("network", "BITCOIN_NETWORK"),
-            lockheight_init: get_env_or_config("lockheight_init", "LOCKHEIGHT_INIT")
-                .parse::<u32>()
-                .unwrap(),
-            lh_decrement: get_env_or_config("lh_decrement", "LH_DECREMENT")
-                .parse::<u32>()
-                .unwrap(),
             batch_timeout: get_env_or_config("batch_timeout", "BATCH_TIMEOUT")
                 .parse::<u32>()
                 .unwrap(),
@@ -199,7 +137,6 @@ impl ServerConfig {
                 .parse::<u16>()
                 .unwrap(),
             db_name: get_env_or_config("db_name", "DB_NAME"),
-            nostr_info: get_env_or_config_nostr_info("nostr_info", "NOSTR_INFO"),
             token_server_url: get_optional_env_or_config("token_server_url", "TOKEN_SERVER_URL"),
         }
     }

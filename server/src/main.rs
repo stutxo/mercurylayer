@@ -6,14 +6,11 @@ mod server_config;
 #[macro_use]
 extern crate rocket;
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
 use endpoints::utils;
 use rocket::fairing::{Fairing, Info};
 use rocket::http::Header;
 use rocket::{
     serde::json::{json, Value},
-    tokio::{self, time::interval},
     Request, Response,
 };
 use server::StateChainEntity;
@@ -41,77 +38,6 @@ fn not_found(req: &Request) -> Value {
     json!(message)
 }
 
-async fn broadcast_nip_100(
-    nostr_info: &server_config::NostrInfo,
-    published_at: u64,
-    timelock: u32,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let relay_server = &nostr_info.relay_server;
-    let nostr_privkey = &nostr_info.nostr_privkey;
-    let server_url = &nostr_info.server_url;
-    let location = &nostr_info.location;
-    let status = &nostr_info.active;
-    let onchain_payments = &nostr_info.onchain_payments.to_string();
-    let ln_payments = &nostr_info.ln_payments.to_string();
-    let fee = &nostr_info.fee.to_string();
-    let unit = &nostr_info.unit;
-
-    let sec_key = nostr_sdk::Keys::parse(nostr_privkey)?;
-
-    let content = "Mercury server descritpion";
-    let mut tags = vec![
-        nostr_sdk::Tag::custom(nostr_sdk::TagKind::Custom("url".into()), [server_url]),
-        nostr_sdk::Tag::custom(
-            nostr_sdk::TagKind::Custom("published_at".into()),
-            [published_at.to_string()],
-        ),
-        nostr_sdk::Tag::custom(
-            nostr_sdk::TagKind::Custom("timelock".into()),
-            [timelock.to_string()],
-        ),
-    ];
-
-    if location.is_some() {
-        tags.push(nostr_sdk::Tag::custom(
-            nostr_sdk::TagKind::Custom("location".into()),
-            [location.as_ref().unwrap()],
-        ));
-    }
-
-    tags.push(nostr_sdk::Tag::custom(
-        nostr_sdk::TagKind::Custom("fee".into()),
-        [fee, unit, ln_payments, onchain_payments],
-    ));
-
-    if status.is_some() {
-        let status_desc = if status.unwrap() { "active" } else { "offline" };
-        tags.push(nostr_sdk::Tag::custom(
-            nostr_sdk::TagKind::Custom("status".into()),
-            [status_desc],
-        ));
-    }
-
-    let client = nostr_sdk::Client::new(sec_key.clone());
-
-    client.add_relay(relay_server).await?;
-
-    client.connect().await;
-
-    let created_at = nostr_sdk::Timestamp::now();
-
-    let event = nostr_sdk::EventBuilder::new(nostr_sdk::Kind::Custom(39101), content.to_string())
-        .tags(tags)
-        .custom_created_at(created_at)
-        .sign_with_keys(&sec_key)?;
-
-    /* println!("Event as JSON:");
-    println!("{}", serde_json::to_string_pretty(&event)?); */
-
-    client.send_event(event).await?;
-
-    Ok(())
-}
-
 #[rocket::main]
 async fn main() {
     env_logger::init();
@@ -124,34 +50,6 @@ async fn main() {
         .run(&statechain_entity.pool)
         .await
         .unwrap();
-
-    if let Some(nostr_info) = statechain_entity.config.nostr_info.clone() {
-        /* println!("nostr_info: {:?}", nostr_info); */
-        println!("Nostr info found. Starting NIP-100 broadcast");
-
-        let interval_seconds = nostr_info.relay_interval as u64;
-        let timelock = statechain_entity.config.lockheight_init;
-
-        tokio::spawn(async move {
-            let mut ticker = interval(Duration::from_secs(interval_seconds));
-
-            let start = SystemTime::now();
-            let since_the_epoch = start.duration_since(UNIX_EPOCH).unwrap();
-            let published_at = since_the_epoch.as_secs();
-
-            loop {
-                ticker.tick().await;
-                let result = broadcast_nip_100(&nostr_info, published_at, timelock).await;
-                if let Err(e) = result {
-                    println!("Error: {:?}", e);
-                } /* else {
-                      println!("NIP-100 broadcasted");
-                  } */
-            }
-        });
-    } else {
-        println!("No Nostr info found in config file");
-    }
 
     let _ = rocket::build()
         .mount(

@@ -120,8 +120,6 @@ services:
       - token-server-v2
     environment:
       BITCOIN_NETWORK: regtest
-      LOCKHEIGHT_INIT: 1000
-      LH_DECREMENT: 10
       DB_USER: postgres
       DB_PASSWORD: postgres
       DB_HOST: db_server
@@ -129,18 +127,6 @@ services:
       DB_NAME: mercury
       BATCH_TIMEOUT: 20
       ENCLAVES: '[{"url": "http://lockbox:18080", "allow_deposit": true}]'
-      NOSTR_INFO: '{
-        "relay_server": "wss://relay.damus.io/", 
-        "relay_interval": 15, 
-        "nostr_privkey": "nsec17e0nvplcze4k7q9nazrw0k3aracwhg6vmuareewjp83ta89njw5spjcgzs", 
-        "server_url": "http://mercury_server.xyz", 
-        "location": "UK",
-        "active": true,
-        "onchain_payments": false,
-        "ln_payments": true,
-        "fee": 0.0001,
-        "unit": "BTC"
-        }'
       TOKEN_SERVER_URL: http://token-server-v2:8001
     ports:
       - "8000:8000"
