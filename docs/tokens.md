@@ -1,64 +1,66 @@
-# Token payment system
+# Deposit tokens
 
-Deposit tokens authorize creation of a statechain deposit. In production, tokens are paid onchain through `token-server-v2`. The token server does not sign transactions and does not hold private keys; it uses a Bitcoin Core/Inquisition watch-only descriptor wallet to generate receive addresses and verify payment UTXOs.
+Mercury can issue either an on-chain payment token through the optional token
+server or a free local token for a non-mainnet development network. A token is
+consumed when `/deposit/init/pod` successfully initializes a statechain; it is
+not the statecoin funding output.
 
-## Components
+## Token-server configuration
 
-- Mercury server exposes `/deposit/get_token` and `/deposit/init/pod`.
-- `token-server-v2` exposes `/token/token_gen` and `/token/token_verify/<token_id>`.
-- Bitcoin Core/Inquisition provides token payment addresses and UTXO confirmation status through wallet RPC.
-- The token database stores `token_id`, `onchain_address`, `confirmed`, and `spent`.
+The token Rocket service reads these settings keys and environment variables:
 
-## Token generation
+| TOML key | Environment variable | Meaning |
+| --- | --- | --- |
+| `public_key_descriptor` | `PUBLIC_KEY_DESCRIPTOR` | descriptor used by the Core wallet setup |
+| `network` | `BITCOIN_NETWORK` | Bitcoin network string |
+| `core_rpc_url` | `CORE_RPC_URL` | Core/Inquisition RPC URL |
+| `core_rpc_auth` | `CORE_RPC_AUTH` | optional `none`, `userpass`, or `cookie` |
+| `core_rpc_user` | `CORE_RPC_USER` | username for `userpass` |
+| `core_rpc_password` | `CORE_RPC_PASSWORD` | password for `userpass` |
+| `core_rpc_cookie_file` | `CORE_RPC_COOKIE_FILE` | cookie path for `cookie` |
+| `core_rpc_wallet` | `CORE_RPC_WALLET` | optional wallet name; default `mercury_tokens` |
+| `core_rpc_wallet_create` | `CORE_RPC_WALLET_CREATE` | optional boolean; default `true` |
+| `fee` | `FEE` | exact token payment amount in satoshis |
+| `confirmation_target` | `CONFIRMATION_TARGET` | required confirmations |
+| `db_user` | `DB_USER` | PostgreSQL user |
+| `db_password` | `DB_PASSWORD` | PostgreSQL password |
+| `db_host` | `DB_HOST` | PostgreSQL host |
+| `db_port` | `DB_PORT` | PostgreSQL port |
+| `db_name` | `DB_NAME` | PostgreSQL database |
 
-Clients request tokens through Mercury:
+Mercury selects this service with its optional `token_server_url` setting or
+`TOKEN_SERVER_URL` environment variable.
 
-```text
-GET /deposit/get_token
-```
+## On-chain token flow
 
-If `TOKEN_SERVER_URL` is configured, Mercury calls `token-server-v2`:
-
-```text
-GET /token/token_gen
-```
-
-`token-server-v2` then:
-
-1. Gets a new address from the configured Core/Inquisition token wallet.
-2. Generates a UUID `token_id`.
-3. Inserts a token row with `confirmed = false` and `spent = false`.
-4. Returns the token payment details.
-
-Mercury returns the token response to the client in this shape:
+`GET /token/token_gen` asks the configured Core wallet for a new address,
+generates a UUID token ID, inserts a row with `confirmed = false` and
+`spent = false`, and returns:
 
 ```json
 {
   "token_id": "...",
-  "payment_method": "onchain",
   "deposit_address": "...",
-  "fee": 10000,
-  "confirmation_target": 2
+  "fee": 1000,
+  "confirmation_target": 1
 }
 ```
 
-For local non-mainnet development, if `TOKEN_SERVER_URL` is not configured, Mercury can issue a free token directly from its own database. Free token generation is not supported on mainnet.
+The numbers above illustrate the fields; their actual values come from the
+token-server settings. Pay exactly `fee` satoshis to `deposit_address`.
 
-## Token payment and verification
+`GET /token/token_verify/<token_id>` returns 404 for an unknown ID. If the row
+is already confirmed or spent, it returns the stored booleans. Otherwise it:
 
-The client pays exactly `fee` sats to `deposit_address` and waits for the configured `confirmation_target` confirmations.
+1. parses the stored address and requires the configured network;
+2. calls `listunspent` for the dedicated token wallet and address;
+3. selects an output whose value is exactly the configured fee;
+4. returns both flags false if no such output exists or its confirmation count
+   is below the target; and
+5. marks and returns `confirmed = true` once the target is met. A target of
+   zero confirms an exact-value output immediately.
 
-During verification, `token-server-v2`:
-
-1. Loads the token row by `token_id`.
-2. Returns the stored status immediately if the token is already confirmed or spent.
-3. Validates the stored onchain address against the configured Bitcoin network.
-4. Calls Core/Inquisition wallet RPC `listunspent` for that address.
-5. Looks for a UTXO with `amount_sats == fee`.
-6. Checks that the UTXO has at least `confirmation_target` confirmations.
-7. Marks the token confirmed once payment is found with enough confirmations.
-
-The verification response is:
+Every `200` verification response has this shape:
 
 ```json
 {
@@ -67,53 +69,69 @@ The verification response is:
 }
 ```
 
-or:
+The boolean values reflect the current row.
+
+With `token_server_url` configured, Mercury's `GET /deposit/get_token` proxies
+`/token/token_gen` and adds `payment_method = "onchain"`. Its shared response
+has `token_id`, `payment_method`, `deposit_address`, `fee`, and
+`confirmation_target`.
+
+## Free local token flow
+
+When `token_server_url` is absent and Mercury's configured network is not
+mainnet, `GET /deposit/get_token` inserts a local token with
+`confirmed = true`, `spent = false`, and no on-chain address. It returns:
 
 ```json
 {
-  "confirmed": false,
-  "spent": false
+  "token_id": "...",
+  "payment_method": "free",
+  "deposit_address": null,
+  "fee": 0,
+  "confirmation_target": 0
 }
 ```
 
-## Deposit process
+The free branch returns an internal-server error when Mercury is configured
+with the literal network string `mainnet`. This is a development guard, not a
+statement of deployment readiness on any other network.
 
-When a client initializes a deposit, it signs the `token_id` with its auth key and sends the signed token to Mercury:
+## Token consumption during deposit initialization
+
+`POST /deposit/init/pod` receives `auth_key`, `token_id`, and
+`signed_token_id`. Mercury verifies the Schnorr signature of the token ID,
+rejects an authentication key already assigned to a statechain, requires a
+known unspent token, and requires confirmation. For an unconfirmed on-chain
+row it asks the token server to verify the payment. It then requests a new
+lockbox public key, inserts the Mercury statechain row, and updates the token
+row to `spent = true`.
+
+The final `tokens` table has only these columns:
 
 ```text
-POST /deposit/init/pod
+id serial4 PRIMARY KEY
+token_id varchar NULL UNIQUE
+onchain_address varchar NULL
+confirmed boolean DEFAULT false
+spent boolean DEFAULT false
 ```
 
-Mercury verifies the auth signature over the `token_id`. If `TOKEN_SERVER_URL` is configured, Mercury then calls `token-server-v2`:
+The exact API schemas are in [openapi.yaml](openapi.yaml), and the literal
+table definition is in [server_db.md](server_db.md).
 
-```text
-GET /token/token_verify/<token_id>
-```
+## Prototype boundaries
 
-The deposit proceeds only if the token is confirmed and unspent. After a successful deposit, Mercury marks the token spent in its database.
-
-## Sequence
-
-```mermaid
-sequenceDiagram
-    participant Client
-    participant Mercury
-    participant TokenServer as token-server-v2
-    participant Core as Bitcoin Core/Inquisition
-
-    Client->>Mercury: GET /deposit/get_token
-    Mercury->>TokenServer: GET /token/token_gen
-    TokenServer->>Core: getnewaddress
-    TokenServer-->>Mercury: {token_id, deposit_address, fee, confirmation_target}
-    Mercury-->>Client: TokenResponse
-    Client->>Core: Pay fee sats to deposit_address
-    Client->>Mercury: POST /deposit/init/pod {token_id, auth_key, signed_token_id}
-    Mercury->>TokenServer: GET /token/token_verify/{token_id}
-    TokenServer->>Core: listunspent for deposit_address
-    TokenServer-->>Mercury: {confirmed, spent}
-    Mercury-->>Client: Deposit init response or token error
-```
-
-## Removed legacy flow
-
-The current token flow does not use a payment processor, `processor_id`, Lightning invoice, or `token_init` endpoint. Token payment verification is based on Core/Inquisition wallet UTXOs for the generated onchain address.
+- Exact legacy duplicate-deposit behavior is not reproduced: paying one
+  BIP448 deposit address more than once does not create another wallet coin.
+- There is no chain watcher and no automatic selection of a stale state's
+  funding source.
+- The stale-state end-to-end proof manually selects, rebinds, submits, and
+  mines transactions from test code; the running services do not orchestrate
+  it.
+- BIP448 consensus execution requires the Bitcoin Inquisition revision pinned
+  by this repository.
+- This is not software for Bitcoin mainnet or production use.
+- Start with fresh Mercury and lockbox databases and a fresh client wallet
+  database; old data is not migrated.
+- Passing tests establish only the assertions and paths that those tests
+  execute.

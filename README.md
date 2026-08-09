@@ -1,15 +1,38 @@
-# Mercury Layer
+# Mercury Layer BIP448 prototype
 
-Mercury Layer is a Layer 2 protocol for Bitcoin that enables the self-custodial transfer of coins (UTXOs) without on-chain transactions.
+This repository is a proof-of-concept statechain implementation built around
+BIP448 transaction templates and the consensus rules available in the pinned
+Bitcoin Inquisition environment. It contains:
 
-This repository contains the server, Rust client, and lockbox implementations. Lockbox stores key material, performs partial signatures, and exposes the signer HTTP API consumed by the Mercury server. The client is run by the user as a standalone Rust application that makes HTTP requests to the server API.
+- the Rust Mercury HTTP server and shared protocol library;
+- the Rust wallet library and `client-rust` command-line application;
+- the C++ lockbox service for sealed key shares, BIP448 nonces, partial
+  signatures, key updates, and signature counts;
+- the optional token HTTP server; and
+- unit tests plus ignored Docker/Inquisition integration suites.
 
-```mermaid
-graph LR;
-    Server-->Client;
-    Lockbox-->Server
-```
+Start with [Usage.md](Usage.md), use [Test.md](Test.md) for the executable test
+matrix, and read the [BIP448 protocol description](docs/bip448_rebindable_statechains.md).
+The [documentation index](docs/README.md) links the API, database, client,
+batch/latch, token, and test references.
 
-# License
+The annotated tag `bip448-legacy-inclusive-baseline` preserves the older,
+legacy-inclusive source tree for historical inspection. It is not a claim that
+the current implementation reproduces every behavior in that tree.
 
-Mercury Layer is released under the terms of the GNU General Public License. See for more information https://opensource.org/licenses/GPL-3.0
+## Prototype boundaries
+
+- Exact legacy duplicate-deposit behavior is not reproduced: paying one
+  BIP448 deposit address more than once does not create another wallet coin.
+- There is no chain watcher and no automatic selection of a stale state's
+  funding source.
+- The stale-state end-to-end proof manually selects, rebinds, submits, and
+  mines transactions from test code; the running services do not orchestrate
+  it.
+- BIP448 consensus execution requires the Bitcoin Inquisition revision pinned
+  by this repository.
+- This is not software for Bitcoin mainnet or production use.
+- Start with fresh Mercury and lockbox databases and a fresh client wallet
+  database; old data is not migrated.
+- Passing tests establish only the assertions and paths that those tests
+  execute.

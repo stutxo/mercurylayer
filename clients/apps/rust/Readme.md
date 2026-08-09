@@ -1,31 +1,62 @@
-# Mercury Layer Client
+# `client-rust`
 
-Mercury layer client provides a user interface to the Mercury Layer protocol, via the Mercury Layer server. 
+This crate is the command-line front end to the BIP448 wallet library. From the
+workspace root, invoke it as `cargo run -p client-rust -- <COMMAND>`. From this
+directory, `cargo run -- <COMMAND>` is equivalent.
 
-# Running
+## Commands and arguments
 
-1. Run the `lockbox` and `server` projects on localhost, or start the local stack with `docker compose -f docker-compose-lockbox.yml up --build`.
-2. Ensure the Mercury server is reachable on localhost.
-3. Run one of the commands below
+The complete Clap surface is:
 
-# Some commands
+```text
+create-wallet <NAME>
+new-token
+new-bip448-deposit-address <WALLET_NAME> <TOKEN_ID> <AMOUNT>
+bip448-recovery-fee-address <WALLET_NAME>
+broadcast-bip448-recovery-package [OPTIONS] <WALLET_NAME> <STATECHAIN_ID> <ROLE> [CHANGE_ADDRESS]
+list-statecoins <WALLET_NAME>
+bip448-withdraw <WALLET_NAME> <STATECHAIN_ID> <TO_ADDRESS> [FEE_RATE]
+new-transfer-address [OPTIONS] <WALLET_NAME>
+bip448-transfer-send <WALLET_NAME> <STATECHAIN_ID> <TO_ADDRESS> [BATCH_ID]
+bip448-transfer-cancel <WALLET_NAME> <STATECHAIN_ID>
+transfer-receive <WALLET_NAME>
+payment-hash <WALLET_NAME> <STATECHAIN_ID>
+confirm-pending-invoice <WALLET_NAME> <STATECHAIN_ID>
+retrieve-pre-image <WALLET_NAME> <STATECHAIN_ID> <BATCH_ID>
+get-payment-hash <BATCH_ID>
+```
 
-`cargo run create-wallet <wallet_name>` to create a wallet
+`new-transfer-address` accepts `-b` or `--generate-batch-id`.
 
-`cargo run new-token` to create a new token
+`broadcast-bip448-recovery-package` documents only the canonical roles
+`funding_update` and `settlement`. It requires exactly one of:
 
-`cargo run new-deposit-address <wallet_name> <token> <amount>` creates a deposit address
+- one or more `--fee-input <FEE_INPUTS>` options, each formatted
+  `txid:vout:value_sats`; or
+- `--fund-from-wallet`.
 
-`cargo run list-statecoins <wallet_name>` shows wallet coins
+It also accepts `--fee-rate <FEE_RATE>`. The optional positional
+`CHANGE_ADDRESS` is used for fee-input change. `bip448-withdraw` has its own
+optional positional `FEE_RATE`.
 
-`cargo run new-transfer-address <wallet_name>` generates a statechain address to receive statechain coins
+Configuration is loaded by the wallet library. `ML_SETTINGS_FILE` selects the
+settings file; `ML_NETWORK=regtest` selects `regtest.Settings.toml` only when
+that variable is absent. Current settings fields and command output are listed
+in the [client guide](../../../docs/client_guide.md).
 
-`cargo run transfer-send <wallet_name> <statechain-id> <statechain-address> ` transfers the specified statechain coin to the specified address
+## Prototype boundaries
 
-`cargo run transfer-receive <wallet_name>` scans for new statechain transfers
-
-`cargo run withdraw <wallet_name> <statechain-id> <btc-address> <optional_fee_rate>` withdraws the statechain coin to the specified bitcoin address
-
-`cargo run broadcast-backup-transaction <wallet_name> <statechain-id> <btc-address> <optional_fee_rate>` broadcasts the backup transaction to the network
-
-This is a work in progress. Several changes to the project are expected.
+- Exact legacy duplicate-deposit behavior is not reproduced: paying one
+  BIP448 deposit address more than once does not create another wallet coin.
+- There is no chain watcher and no automatic selection of a stale state's
+  funding source.
+- The stale-state end-to-end proof manually selects, rebinds, submits, and
+  mines transactions from test code; the running services do not orchestrate
+  it.
+- BIP448 consensus execution requires the Bitcoin Inquisition revision pinned
+  by this repository.
+- This is not software for Bitcoin mainnet or production use.
+- Start with fresh Mercury and lockbox databases and a fresh client wallet
+  database; old data is not migrated.
+- Passing tests establish only the assertions and paths that those tests
+  execute.

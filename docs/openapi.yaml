@@ -1,37 +1,52 @@
-openapi: 3.0.0
+openapi: 3.0.3
 info:
-  title: Mercury Layer APIs
-  version: 0.5.0
-  description: Current Mercury server routes and token-server-v2 routes.
+  title: Mercury Layer BIP448 prototype API
+  version: 0.2.1
+  description: |
+    This contract describes the functional Rocket routes mounted by the
+    Mercury server and token server in this repository.
+
+    Prototype boundaries:
+    - Exact legacy duplicate-deposit behavior is not reproduced; another
+      payment to one BIP448 deposit address does not become another wallet coin.
+    - No chain watcher or automatic stale-state source selection is implemented.
+    - The stale-state end-to-end proof is manually orchestrated by test code.
+    - BIP448 consensus execution requires the repository-pinned Bitcoin
+      Inquisition environment.
+    - The repository makes no Bitcoin mainnet or production-use claim.
+    - Fresh Mercury and lockbox databases and a fresh client wallet database
+      are required; old data is not migrated.
+    - Passing tests establish only the assertions and paths they execute.
+servers:
+  - url: http://127.0.0.1:8000
+    description: Mercury Rocket service
 tags:
-  - name: Mercury
-    description: Mercury server API
-  - name: token-server-v2
-    description: Token payment API used by Mercury when TOKEN_SERVER_URL is configured
+  - name: Deposit
+  - name: BIP448 signing
+  - name: Transfer
+  - name: Latch
+  - name: Withdrawal
+  - name: Info
+  - name: Token
 paths:
   /deposit/get_token:
     get:
-      tags:
-        - Mercury
-      summary: Get a deposit token
-      operationId: deposit_get_token
-      description: Returns a free non-mainnet token when TOKEN_SERVER_URL is unset, or proxies token generation to token-server-v2 when configured.
+      tags: [Deposit]
+      summary: Create a Mercury deposit token
       responses:
         '200':
-          description: Token response
+          description: Token created
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/TokenResponse'
         '500':
-          $ref: '#/components/responses/Error'
+          $ref: '#/components/responses/MessageError'
 
   /deposit/init/pod:
     post:
-      tags:
-        - Mercury
-      summary: Initialize a statechain deposit
-      operationId: deposit_init_pod
+      tags: [Deposit]
+      summary: Initialize a lockbox-backed statechain
       requestBody:
         required: true
         content:
@@ -40,126 +55,208 @@ paths:
               $ref: '#/components/schemas/DepositMsg1'
       responses:
         '200':
-          description: Deposit initialized
+          description: Statechain initialized
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/DepositMsg1Response'
         '400':
-          $ref: '#/components/responses/Error'
+          $ref: '#/components/responses/MessageError'
         '404':
-          $ref: '#/components/responses/Error'
+          $ref: '#/components/responses/MessageError'
         '410':
-          $ref: '#/components/responses/Error'
+          $ref: '#/components/responses/MessageError'
         '500':
-          $ref: '#/components/responses/Error'
+          $ref: '#/components/responses/MessageError'
 
-  /sign/first:
+  /bip448-statechain/sign/first:
     post:
-      tags:
-        - Mercury
-      summary: Start the signing protocol
-      operationId: sign_first
+      tags: [BIP448 signing]
+      summary: Begin an idempotent blinded BIP448 signing round
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/SignFirstRequestPayload'
+              $ref: '#/components/schemas/Bip448SignFirstRequest'
       responses:
         '200':
           description: Server public nonce
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SignFirstResponsePayload'
+                $ref: '#/components/schemas/Bip448SignFirstResponse'
+        '400':
+          $ref: '#/components/responses/MessageError'
         '401':
-          $ref: '#/components/responses/Error'
+          $ref: '#/components/responses/MessageError'
+        '404':
+          $ref: '#/components/responses/MessageError'
+        '409':
+          $ref: '#/components/responses/MessageError'
+        '422':
+          $ref: '#/components/responses/MessageError'
         '500':
-          $ref: '#/components/responses/Error'
+          $ref: '#/components/responses/MessageError'
 
-  /sign/second:
+  /bip448-statechain/sign/second:
     post:
-      tags:
-        - Mercury
-      summary: Complete the signing protocol
-      operationId: sign_second
+      tags: [BIP448 signing]
+      summary: Complete or exactly replay a blinded BIP448 signing round
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/PartialSignatureRequestPayload'
+              $ref: '#/components/schemas/Bip448SignSecondRequest'
       responses:
         '200':
           description: Server partial signature
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/PartialSignatureResponsePayload'
+                $ref: '#/components/schemas/Bip448SignSecondResponse'
+        '400':
+          $ref: '#/components/responses/MessageError'
         '401':
-          $ref: '#/components/responses/Error'
+          $ref: '#/components/responses/MessageError'
+        '404':
+          $ref: '#/components/responses/MessageError'
+        '409':
+          $ref: '#/components/responses/MessageError'
+        '422':
+          $ref: '#/components/responses/MessageError'
         '500':
-          $ref: '#/components/responses/Error'
+          $ref: '#/components/responses/MessageError'
 
-  /info/config:
+  /bip448-statechain/signature-count/{statechain_id}:
     get:
-      tags:
-        - Mercury
-      summary: Get Mercury server operating parameters
-      operationId: info_config
-      responses:
-        '200':
-          description: Mercury server configuration
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/InfoConfigResponse'
-        '500':
-          $ref: '#/components/responses/Error'
-
-  /info/keylist:
-    get:
-      tags:
-        - Mercury
-      summary: Get the current server public key share list
-      operationId: info_keylist
-      responses:
-        '200':
-          description: Key list
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/KeyListResponsePayload'
-        '500':
-          $ref: '#/components/responses/Error'
-
-  /info/statechain/{statechain_id}:
-    get:
-      tags:
-        - Mercury
-      summary: Get current statechain information
-      operationId: info_statechain
+      tags: [BIP448 signing]
+      summary: Read the lockbox BIP448 signature count
       parameters:
         - $ref: '#/components/parameters/StatechainId'
       responses:
         '200':
-          description: Statechain information
+          description: Signature count
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/StatechainInfoResponsePayload'
+                $ref: '#/components/schemas/Bip448SignatureCountResponse'
+        '400':
+          $ref: '#/components/responses/MessageError'
         '404':
-          $ref: '#/components/responses/Error'
+          $ref: '#/components/responses/MessageError'
+        '409':
+          $ref: '#/components/responses/MessageError'
         '500':
-          $ref: '#/components/responses/Error'
+          $ref: '#/components/responses/MessageError'
+
+  /transfer/paymenthash/{batch_id}:
+    get:
+      tags: [Latch]
+      summary: Read the payment hash for a stored batch preimage
+      parameters:
+        - $ref: '#/components/parameters/BatchId'
+      responses:
+        '200':
+          description: Payment hash
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentHashResponse'
+        '404':
+          $ref: '#/components/responses/MessageError'
+
+  /transfer/paymenthash:
+    post:
+      tags: [Latch]
+      summary: Create and lock a batch preimage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentHashRequest'
+      responses:
+        '200':
+          description: Payment hash
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentHashResponse'
+        '500':
+          $ref: '#/components/responses/MessageError'
+
+  /transfer/transfer_preimage:
+    post:
+      tags: [Latch]
+      summary: Retrieve an available transfer preimage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransferPreimageRequest'
+      responses:
+        '200':
+          description: Preimage
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferPreimageResponse'
+        '403':
+          $ref: '#/components/responses/MessageError'
+        '404':
+          $ref: '#/components/responses/MessageError'
+        '500':
+          $ref: '#/components/responses/MessageError'
+
+  /transfer/sender:
+    post:
+      tags: [Transfer]
+      summary: Create server transfer state for a recipient
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransferSenderRequest'
+      responses:
+        '200':
+          description: Transfer secret share
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferSenderResponse'
+        '400':
+          $ref: '#/components/responses/MessageError'
+        '500':
+          $ref: '#/components/responses/MessageError'
+
+  /transfer/update_msg:
+    post:
+      tags: [Transfer]
+      summary: Store the encrypted transfer message
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransferUpdateMsgRequest'
+      responses:
+        '200':
+          description: Message updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdatedResponse'
+        '500':
+          $ref: '#/components/responses/MessageError'
 
   /transfer/get_msg_addr/{new_auth_key}:
     get:
-      tags:
-        - Mercury
-      summary: Get encrypted transfer messages for a recipient auth key
-      operationId: transfer_get_msg_addr
+      tags: [Transfer]
+      summary: Read encrypted messages for a recipient authentication key
       parameters:
         - name: new_auth_key
           in: path
@@ -168,72 +265,42 @@ paths:
             type: string
       responses:
         '200':
-          description: Encrypted transfer messages
+          description: Encrypted messages
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/GetMsgAddrResponsePayload'
+                $ref: '#/components/schemas/GetMsgAddrResponse'
         '500':
-          $ref: '#/components/responses/Error'
+          $ref: '#/components/responses/MessageError'
 
-  /transfer/sender:
-    post:
-      tags:
-        - Mercury
-      summary: Initialize a statechain transfer as sender
-      operationId: transfer_sender
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/TransferSenderRequestPayload'
+  /info/statechain/{statechain_id}:
+    get:
+      tags: [Info]
+      summary: Read BIP448 signing rows and current server key data
+      parameters:
+        - $ref: '#/components/parameters/StatechainId'
       responses:
         '200':
-          description: Transfer sender nonce material
+          description: Statechain information
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TransferSenderResponsePayload'
-        '400':
-          $ref: '#/components/responses/Error'
+                $ref: '#/components/schemas/StatechainInfoResponse'
+        '404':
+          $ref: '#/components/responses/MessageError'
         '500':
-          $ref: '#/components/responses/Error'
-
-  /transfer/update_msg:
-    post:
-      tags:
-        - Mercury
-      summary: Store encrypted transfer message
-      operationId: transfer_update_msg
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/TransferUpdateMsgRequestPayload'
-      responses:
-        '200':
-          description: Transfer message update status
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TransferUpdateMsgResponse'
-        '500':
-          $ref: '#/components/responses/Error'
+          $ref: '#/components/responses/MessageError'
 
   /transfer/unlock:
     post:
-      tags:
-        - Mercury
-      summary: Unlock a pending transfer
-      operationId: transfer_unlock
+      tags: [Latch]
+      summary: Unlock a transfer for the current owner or stored recipient
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TransferUnlockRequestPayload'
+              $ref: '#/components/schemas/TransferUnlockRequest'
       responses:
         '200':
           description: Transfer unlocked
@@ -242,165 +309,111 @@ paths:
               schema:
                 $ref: '#/components/schemas/MessageResponse'
         '403':
-          $ref: '#/components/responses/Error'
+          $ref: '#/components/responses/MessageError'
         '500':
-          $ref: '#/components/responses/Error'
+          $ref: '#/components/responses/MessageError'
 
   /transfer/receiver:
     post:
-      tags:
-        - Mercury
-      summary: Complete a statechain transfer as receiver
-      operationId: transfer_receiver
+      tags: [Transfer]
+      summary: Rotate the lockbox share to an authorized recipient
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/TransferReceiverRequestPayload'
+              $ref: '#/components/schemas/TransferReceiverRequest'
       responses:
         '200':
-          description: Receiver transfer completion response
+          description: Updated server public key
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TransferReceiverPostResponsePayload'
+                $ref: '#/components/schemas/TransferReceiverResponse'
         '400':
-          description: Transfer batch validation error
+          description: Batch locked or expired
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TransferReceiverErrorResponsePayload'
+                $ref: '#/components/schemas/TransferReceiverErrorResponse'
         '404':
-          $ref: '#/components/responses/Error'
+          $ref: '#/components/responses/MessageError'
         '500':
-          $ref: '#/components/responses/Error'
+          $ref: '#/components/responses/MessageError'
 
-  /transfer/paymenthash/{batch_id}:
+  /withdraw/complete:
+    post:
+      tags: [Withdrawal]
+      summary: Delete server rows after a cooperative withdrawal broadcast
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WithdrawCompleteRequest'
+      responses:
+        '200':
+          description: Statechain rows deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+        '500':
+          $ref: '#/components/responses/MessageError'
+
+  /info/config:
     get:
-      tags:
-        - Mercury
-      summary: Get payment hash for a lightning latch batch
-      operationId: transfer_get_paymenthash
+      tags: [Info]
+      summary: Read the public batch timeout and package version
+      responses:
+        '200':
+          description: Public server configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InfoConfigResponse'
+
+  /token/token_gen:
+    servers:
+      - url: http://127.0.0.1:8001
+        description: Token Rocket service
+    get:
+      tags: [Token]
+      summary: Create an on-chain token payment request
+      responses:
+        '200':
+          description: Token payment request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenGenResponse'
+        '500':
+          $ref: '#/components/responses/MessageError'
+
+  /token/token_verify/{token_id}:
+    servers:
+      - url: http://127.0.0.1:8001
+        description: Token Rocket service
+    get:
+      tags: [Token]
+      summary: Check token payment confirmation and spent flags
       parameters:
-        - name: batch_id
+        - name: token_id
           in: path
           required: true
           schema:
             type: string
       responses:
         '200':
-          description: Payment hash
+          description: Token flags
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/PaymentHashResponsePayload'
+                $ref: '#/components/schemas/TokenVerifyResponse'
         '404':
-          $ref: '#/components/responses/Error'
-
-  /transfer/paymenthash:
-    post:
-      tags:
-        - Mercury
-      summary: Create payment hash for a lightning latch batch
-      operationId: transfer_post_paymenthash
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/PaymentHashRequestPayload'
-      responses:
-        '200':
-          description: Payment hash
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PaymentHashResponsePayload'
+          $ref: '#/components/responses/MessageError'
         '500':
-          $ref: '#/components/responses/Error'
-
-  /transfer/transfer_preimage:
-    post:
-      tags:
-        - Mercury
-      summary: Retrieve a lightning latch transfer preimage
-      operationId: transfer_preimage
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/TransferPreimageRequestPayload'
-      responses:
-        '200':
-          description: Transfer preimage
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TransferPreimageResponsePayload'
-        '403':
-          $ref: '#/components/responses/Error'
-        '404':
-          $ref: '#/components/responses/Error'
-
-  /withdraw/complete:
-    post:
-      tags:
-        - Mercury
-      summary: Complete withdrawal and delete statechain server state
-      operationId: withdraw_complete
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/WithdrawCompletePayload'
-      responses:
-        '200':
-          description: Statechain deleted
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/MessageResponse'
-        '500':
-          $ref: '#/components/responses/Error'
-
-  /token/token_gen:
-    get:
-      tags:
-        - token-server-v2
-      summary: Generate an onchain paid token
-      operationId: token_server_token_gen
-      responses:
-        '200':
-          description: Token payment details
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TokenServerTokenResponse'
-        '500':
-          $ref: '#/components/responses/Error'
-
-  /token/token_verify/{token_id}:
-    get:
-      tags:
-        - token-server-v2
-      summary: Verify token payment status
-      operationId: token_server_token_verify
-      parameters:
-        - $ref: '#/components/parameters/TokenId'
-      responses:
-        '200':
-          description: Token status
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TokenStatusResponse'
-        '404':
-          $ref: '#/components/responses/Error'
-        '500':
-          $ref: '#/components/responses/Error'
+          $ref: '#/components/responses/MessageError'
 
 components:
   parameters:
@@ -410,38 +423,22 @@ components:
       required: true
       schema:
         type: string
-    TokenId:
-      name: token_id
+    BatchId:
+      name: batch_id
       in: path
       required: true
       schema:
         type: string
 
   responses:
-    Error:
-      description: Error response
+    MessageError:
+      description: Request, upstream, or internal error
       content:
         application/json:
           schema:
-            $ref: '#/components/schemas/ErrorResponse'
+            $ref: '#/components/schemas/MessageResponse'
 
   schemas:
-    ErrorResponse:
-      type: object
-      properties:
-        error:
-          type: string
-        message:
-          type: string
-
-    MessageResponse:
-      type: object
-      required:
-        - message
-      properties:
-        message:
-          type: string
-
     TokenResponse:
       type: object
       required:
@@ -455,59 +452,21 @@ components:
           type: string
         payment_method:
           type: string
-          enum:
-            - free
-            - onchain
         deposit_address:
           type: string
           nullable: true
         fee:
           type: integer
-          format: uint64
+          format: int64
           minimum: 0
         confirmation_target:
           type: integer
-          format: uint64
+          format: int64
           minimum: 0
-
-    TokenServerTokenResponse:
-      type: object
-      required:
-        - token_id
-        - deposit_address
-        - fee
-        - confirmation_target
-      properties:
-        token_id:
-          type: string
-        deposit_address:
-          type: string
-        fee:
-          type: integer
-          format: uint64
-          minimum: 0
-        confirmation_target:
-          type: integer
-          format: uint32
-          minimum: 0
-
-    TokenStatusResponse:
-      type: object
-      required:
-        - confirmed
-        - spent
-      properties:
-        confirmed:
-          type: boolean
-        spent:
-          type: boolean
 
     DepositMsg1:
       type: object
-      required:
-        - auth_key
-        - token_id
-        - signed_token_id
+      required: [auth_key, token_id, signed_token_id]
       properties:
         auth_key:
           type: string
@@ -518,171 +477,118 @@ components:
 
     DepositMsg1Response:
       type: object
-      required:
-        - server_pubkey
-        - statechain_id
+      required: [server_pubkey, statechain_id]
       properties:
         server_pubkey:
-          description: Server public key share
           type: string
         statechain_id:
           type: string
 
-    SignFirstRequestPayload:
+    Bip448SignFirstRequest:
       type: object
-      required:
-        - statechain_id
-        - signed_statechain_id
+      required: [statechain_id, signed_statechain_id, signing_id]
       properties:
         statechain_id:
           type: string
         signed_statechain_id:
           type: string
+        signing_id:
+          type: string
+          description: Opaque client-generated 32-byte hexadecimal identifier
+          pattern: '^[0-9A-Fa-f]{64}$'
 
-    SignFirstResponsePayload:
+    Bip448SignFirstResponse:
       type: object
-      required:
-        - server_pubnonce
+      required: [server_pubnonce]
       properties:
         server_pubnonce:
           type: string
 
-    PartialSignatureRequestPayload:
+    Bip448SignSecondRequest:
       type: object
       required:
         - statechain_id
+        - signed_statechain_id
+        - signing_id
         - negate_seckey
         - session
-        - signed_statechain_id
         - server_pub_nonce
       properties:
         statechain_id:
           type: string
-        negate_seckey:
-          type: integer
-          format: uint8
-          minimum: 0
-        session:
-          type: string
         signed_statechain_id:
           type: string
+        signing_id:
+          type: string
+          pattern: '^[0-9A-Fa-f]{64}$'
+        negate_seckey:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 1
+        session:
+          type: string
+          description: Hexadecimal 133-byte blinded Mercury MuSig session
         server_pub_nonce:
           type: string
 
-    PartialSignatureResponsePayload:
+    Bip448SignSecondResponse:
       type: object
-      required:
-        - partial_sig
+      required: [partial_sig]
       properties:
         partial_sig:
           type: string
 
-    InfoConfigResponse:
+    Bip448SignatureCountResponse:
       type: object
-      required:
-        - initlock
-        - interval
-        - batchtimeout
-        - version
+      required: [sig_count]
       properties:
-        initlock:
+        sig_count:
           type: integer
-          format: uint32
+          format: int64
           minimum: 0
-        interval:
-          type: integer
-          format: uint32
-          minimum: 0
-        batchtimeout:
-          type: integer
-          format: uint32
-          minimum: 0
-        version:
-          type: string
 
-    PubKeyInfo:
+    PaymentHashRequest:
       type: object
-      required:
-        - server_pubkey
-        - tx_n
-        - created_at
-      properties:
-        server_pubkey:
-          type: string
-        tx_n:
-          type: integer
-          format: uint32
-          minimum: 0
-        created_at:
-          type: string
-
-    KeyListResponsePayload:
-      type: object
-      required:
-        - list_keyinfo
-      properties:
-        list_keyinfo:
-          type: array
-          items:
-            $ref: '#/components/schemas/PubKeyInfo'
-
-    StatechainInfo:
-      type: object
-      required:
-        - statechain_id
-        - server_pubnonce
-        - challenge
-        - tx_n
+      required: [statechain_id, auth_sig, batch_id]
       properties:
         statechain_id:
           type: string
-        server_pubnonce:
+        auth_sig:
           type: string
-        challenge:
+        batch_id:
           type: string
-        tx_n:
-          type: integer
-          format: uint32
-          minimum: 0
 
-    StatechainInfoResponsePayload:
+    PaymentHashResponse:
       type: object
-      required:
-        - enclave_public_key
-        - num_sigs
-        - statechain_info
-        - x1_pub
+      required: [hash]
       properties:
-        enclave_public_key:
+        hash:
           type: string
-        num_sigs:
-          type: integer
-          format: uint32
-          minimum: 0
-        statechain_info:
-          type: array
-          items:
-            $ref: '#/components/schemas/StatechainInfo'
-        x1_pub:
-          type: string
-          nullable: true
 
-    GetMsgAddrResponsePayload:
+    TransferPreimageRequest:
       type: object
-      required:
-        - list_enc_transfer_msg
+      required: [statechain_id, auth_sig, previous_user_auth_key, batch_id]
       properties:
-        list_enc_transfer_msg:
-          type: array
-          items:
-            type: string
+        statechain_id:
+          type: string
+        auth_sig:
+          type: string
+        previous_user_auth_key:
+          type: string
+        batch_id:
+          type: string
 
-    TransferSenderRequestPayload:
+    TransferPreimageResponse:
       type: object
-      required:
-        - statechain_id
-        - auth_sig
-        - new_user_auth_key
+      required: [preimage]
+      properties:
+        preimage:
+          type: string
+
+    TransferSenderRequest:
+      type: object
+      required: [statechain_id, auth_sig, new_user_auth_key]
       properties:
         statechain_id:
           type: string
@@ -694,21 +600,16 @@ components:
           type: string
           nullable: true
 
-    TransferSenderResponsePayload:
+    TransferSenderResponse:
       type: object
-      required:
-        - x1
+      required: [x1]
       properties:
         x1:
           type: string
 
-    TransferUpdateMsgRequestPayload:
+    TransferUpdateMsgRequest:
       type: object
-      required:
-        - statechain_id
-        - auth_sig
-        - new_user_auth_key
-        - enc_transfer_msg
+      required: [statechain_id, auth_sig, new_user_auth_key, enc_transfer_msg]
       properties:
         statechain_id:
           type: string
@@ -719,19 +620,58 @@ components:
         enc_transfer_msg:
           type: string
 
-    TransferUpdateMsgResponse:
+    UpdatedResponse:
       type: object
-      required:
-        - updated
+      required: [updated]
       properties:
         updated:
           type: boolean
 
-    TransferUnlockRequestPayload:
+    GetMsgAddrResponse:
       type: object
-      required:
-        - statechain_id
-        - auth_sig
+      required: [list_enc_transfer_msg]
+      properties:
+        list_enc_transfer_msg:
+          type: array
+          items:
+            type: string
+
+    StatechainInfoRow:
+      type: object
+      required: [statechain_id, server_pubnonce, challenge, tx_n]
+      properties:
+        statechain_id:
+          type: string
+        server_pubnonce:
+          type: string
+        challenge:
+          type: string
+        tx_n:
+          type: integer
+          format: int32
+          minimum: 0
+
+    StatechainInfoResponse:
+      type: object
+      required: [enclave_public_key, num_sigs, statechain_info, x1_pub]
+      properties:
+        enclave_public_key:
+          type: string
+        num_sigs:
+          type: integer
+          format: int32
+          minimum: 0
+        statechain_info:
+          type: array
+          items:
+            $ref: '#/components/schemas/StatechainInfoRow'
+        x1_pub:
+          type: string
+          nullable: true
+
+    TransferUnlockRequest:
+      type: object
+      required: [statechain_id, auth_sig]
       properties:
         statechain_id:
           type: string
@@ -741,12 +681,9 @@ components:
           type: string
           nullable: true
 
-    TransferReceiverRequestPayload:
+    TransferReceiverRequest:
       type: object
-      required:
-        - statechain_id
-        - t2
-        - auth_sig
+      required: [statechain_id, t2, auth_sig]
       properties:
         statechain_id:
           type: string
@@ -758,82 +695,72 @@ components:
         auth_sig:
           type: string
 
-    TransferReceiverPostResponsePayload:
+    TransferReceiverResponse:
       type: object
-      required:
-        - server_pubkey
+      required: [server_pubkey]
       properties:
         server_pubkey:
           type: string
 
-    TransferReceiverErrorResponsePayload:
+    TransferReceiverErrorResponse:
       type: object
-      required:
-        - code
-        - message
+      required: [code, message]
       properties:
         code:
           type: string
-          enum:
-            - StatecoinBatchLockedError
-            - ExpiredBatchTimeError
+          enum: [StatecoinBatchLockedError, ExpiredBatchTimeError]
         message:
           type: string
 
-    PaymentHashRequestPayload:
+    WithdrawCompleteRequest:
       type: object
-      required:
-        - statechain_id
-        - auth_sig
-        - batch_id
-      properties:
-        statechain_id:
-          type: string
-        auth_sig:
-          type: string
-        batch_id:
-          type: string
-
-    PaymentHashResponsePayload:
-      type: object
-      required:
-        - hash
-      properties:
-        hash:
-          type: string
-
-    TransferPreimageRequestPayload:
-      type: object
-      required:
-        - statechain_id
-        - auth_sig
-        - previous_user_auth_key
-        - batch_id
-      properties:
-        statechain_id:
-          type: string
-        auth_sig:
-          type: string
-        previous_user_auth_key:
-          type: string
-        batch_id:
-          type: string
-
-    TransferPreimageResponsePayload:
-      type: object
-      required:
-        - preimage
-      properties:
-        preimage:
-          type: string
-
-    WithdrawCompletePayload:
-      type: object
-      required:
-        - statechain_id
-        - signed_statechain_id
+      required: [statechain_id, signed_statechain_id]
       properties:
         statechain_id:
           type: string
         signed_statechain_id:
+          type: string
+
+    InfoConfigResponse:
+      type: object
+      required: [batchtimeout, version]
+      properties:
+        batchtimeout:
+          type: integer
+          format: int32
+          minimum: 0
+        version:
+          type: string
+
+    TokenGenResponse:
+      type: object
+      required: [token_id, deposit_address, fee, confirmation_target]
+      properties:
+        token_id:
+          type: string
+        deposit_address:
+          type: string
+        fee:
+          type: integer
+          format: int64
+          minimum: 0
+        confirmation_target:
+          type: integer
+          format: int32
+          minimum: 0
+
+    TokenVerifyResponse:
+      type: object
+      required: [confirmed, spent]
+      properties:
+        confirmed:
+          type: boolean
+        spent:
+          type: boolean
+
+    MessageResponse:
+      type: object
+      required: [message]
+      properties:
+        message:
           type: string

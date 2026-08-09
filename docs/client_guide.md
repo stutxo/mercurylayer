@@ -1,288 +1,253 @@
-# Mercury layer client guide
+# BIP448 client guide
 
-These instructions describe setting up and using the standalone Rust client to send testnet coins on Mercury Layer.
+The Rust client stores wallets and canonical BIP448 state records in SQLite,
+uses Bitcoin Core/Inquisition as its only chain backend, and talks to the
+Mercury Rocket service over HTTP.
 
-This guide describes the use of the client implimentations to deposit, transfer and withdraw bitcoins via a test enviroment. The clients communicate with the bitcoin network through a Bitcoin Core/Inquisition RPC endpoint configured in the client settings.
+Run examples from the workspace root with this prefix:
 
-For the purposes of the examples in this guide, a version of the bitcoin signet is used to simulate the main bitcoin network. 
-
-
-## Rust client
-
-The rust client acts as a standalone command line client for mercury layer that can demonstrate the main wallet operations. The wallet state is saved in a local `sqlite` database. 
-
-Initially, Rust must be installed. To do this on a Linux or MacOS system, simply run:
-
-```
-curl https://sh.rustup.rs -sSf | sh
+```text
+RUSTUP_TOOLCHAIN=1.92.0 cargo run -p client-rust --
 ```
 
-To use the standalone client app, first clone the mercurylayer repository:
+The complete argument grammar is in [Usage.md](../Usage.md).
 
-```
-git clone https://github.com/commerceblock/mercurylayer.git
-```
+## Client settings
 
-Then switch to the `dev` branch:
+The current settings keys are:
 
-```
-cd mercurylayer
-git checkout dev
-```
+| Key | Requirement |
+| --- | --- |
+| `statechain_entity` | required Mercury base URL |
+| `chain_backend` | optional; defaults to and only accepts `core` |
+| `core_rpc_url` | required when the Core backend is selected |
+| `core_rpc_auth` | optional: `none`, `userpass`, or `cookie` |
+| `core_rpc_user`, `core_rpc_password` | required together for `userpass` |
+| `core_rpc_cookie_file` | required for `cookie`; relative paths resolve beside the settings file |
+| `network` | required: `signet`, `testnet`, `regtest`, or `bitcoin` |
+| `fee_rate_tolerance` | required integer, loaded as a floating-point value |
+| `database_file` | required SQLite filename or URL |
+| `confirmation_target` | required unsigned confirmation count |
+| `tor_proxy` | optional proxy URL |
+| `max_fee_rate` | required integer sat/vbyte cap, loaded as a floating-point value |
 
-Then change directory to the standalone client:
+`ML_SETTINGS_FILE` selects a settings file. A value containing a path or file
+extension is used directly; otherwise `.toml` is appended. If it is unset,
+`ML_NETWORK=regtest` selects `regtest.Settings.toml`; all other cases select
+`Settings.toml`.
 
-```
-cd /clients/apps/rust
-```
+## Create a wallet and token
 
-In this directory is the `Settings.toml` file for the client. This needs to be edited (using any text editor, e.g. vi or nano) to set the mercury server endpoint and Bitcoin Core/Inquisition RPC connection.
-
-For the purposes of demonstration, use the following `Settings.toml`: 
-
-```
-statechain_entity = "http://test.mercurylayer.com:8500"
-chain_backend = "core"
-core_rpc_url = "http://127.0.0.1:38332"
-core_rpc_auth = "userpass"
-core_rpc_user = "mercury"
-core_rpc_password = "mercury"
-network = "signet"
-fee_rate_tolerance = 5
-database_file="wallet.db"
-confirmation_target = 2
-max_fee_rate = 1
+```text
+cargo run -p client-rust -- create-wallet alice
+cargo run -p client-rust -- new-token
 ```
 
-The Core/Inquisition RPC endpoint must be your own signet node or another trusted node you operate; the values above assume a local signet RPC service.
-The node must run with `-blockfilterindex=1` and retain full block data back to the earliest Tx0 height among its coins because received coins can predate the wallet and client UTXO discovery reads compact filters and then the matching blocks.
+Wallet creation prints a debug line beginning `Wallet created:`. `new-token`
+prints this JSON shape:
 
-The test mercury key server URL is: `http://test.mercurylayer.com:8500`
-
-> Note that this is a test server. It is free to use, but there is no guarantee of persistence or security. Use only for testnet or signet coins. 
-
-Once the settings are complete, initialise a wallet using:
-
-```
-cargo run create-wallet <wallet_name>
-```
-
-Running this with name `test_wallet` should return an object like:
-
-```
-Wallet created: Wallet { name: "test_wallet", mnemonic: "core parade visual doctor region beach approve slim refuse drip rigid develop", version: "0.1.0", state_entity_endpoint: "http://test.mercurylayer.com:8500", chain_backend: "core", chain_endpoint: "http://127.0.0.1:38332", network: "signet", blockheight: 2820795, initlock: 25920, interval: 6, tokens: [], activities: [], coins: [] }
-```
-
-In order to use the mercury layer key server, an access token is required in order to create a shared key. For the test server, tokens can be generated as follows from the command line:
-
-```
-cargo run new-token
-```
-
-Which will return a `token_id` e.g. `e7d8c299-7121-48b3-bc78-8c70bf4c9691`
-
-With a valid token, it is then possible to generate a shared key and address to deposit testnet bitcoin into:
-
-```
-cargo run new-deposit-address <wallet_name> <token> <amount>
-```
-
-For example the following will initialise a coin for an amount of 200000 sats. 
-
-```
-cargo run new-deposit-address test_wallet e7d8c299-7121-48b3-bc78-8c70bf4c9691 200000
-```
-
-This command will then generate the shared key with the server and display the address, e.g.:
-
-```
+```json
 {
-  "address": "tb1p0rl49a3ddl44y9y9wsazp29ez3rgp97dqljsdrpqmanklppx4qgscahkex"
+  "token_id": "...",
+  "payment_method": "free or onchain",
+  "deposit_address": null,
+  "fee": 0,
+  "confirmation_target": 0
 }
 ```
 
-Copy the address and pay the specified amount to it. For the mutinynet signet network, this payment can be made directly via the faucet: [faucet.mutinynet.com](https://faucet.mutinynet.com/)
+For an on-chain token, `deposit_address` is a string and the fee and target are
+the token-server values. For a local free token, it is `null` and both numbers
+are zero. See [tokens.md](tokens.md) for the exact verification flow.
 
-Once paid, run:
+## Create and fund one statechain
 
-```
-cargo run list-statecoins <wallet-name>
-```
-
-To list the coins in the wallet and complete the deposit process. 
-
-This will return e.g.:
-
-```
-[
-  {
-    "coin.address": "tml1qqpruc0ty5zl4z25juqaq5d8vrgl6d28tktl7cuh8ygus47vgy0d9kgr2weknc939dy8sdlxy8w8ffwaczvzu844rcs33cwvdgerh2ytdwtsvajeh6",
-    "coin.aggregated_address": "tb1p0rl49a3ddl44y9y9wsazp29ez3rgp97dqljsdrpqmanklppx4qgscahkex",
-    "coin.amount": 100000,
-    "coin.locktime": 1189682,
-    "coin.statechain_id": "99e79535933642758735620e621e8e9b",
-    "coin.status": "UNCONFIRMED",
-    "coin.user_pubkey": "023e61eb2505fa89549701d051a760d1fd35475d97ff63973911c857cc411ed2d9"
-  }
-]
+```text
+cargo run -p client-rust -- \
+  new-bip448-deposit-address alice <TOKEN_ID> 50000
 ```
 
-Once the `coin.status` shows `CONFIRMED`, the coin can be transferred. 
+`AMOUNT` is parsed as an unsigned 32-bit satoshi amount. The command initializes
+the Mercury/lockbox statechain, records the address and amount metadata, saves
+the wallet, and prints the result below. It does not construct or sign state 1.
+Later, after a normal coin-status refresh discovers the confirmed funding UTXO,
+the BIP448 deposit-state path constructs state 1, persists its restart signing
+journal, signs it, and stores the accepted state.
 
-To generate a statecoin receieve address, run:
-
-```
-cargo run new-transfer-address <wallet_name>
-```
-
-Which will generate a mercury layer address to recieve a coin to. e.g.:
-
-```
+```json
 {
-  "new_transfer_address:": "tml1qqp7m5tc9auxgwka84tez9vksky2lsp5uftyhhduakt75j8yq46wh3crh26fwzxw2akc43d9m0pvuhmuq57tcdtw7pz96zfsz8ck3d3jjf3q04re26"
+  "address": "...",
+  "statechain_id": "...",
+  "aggregate_pubkey": "..."
 }
 ```
 
-This address can then be used to send a specified coin (with `statechain_id`) coin to a specified statechain address:
+Send exactly the requested amount to `address`. Wallet refresh happens when
+commands such as `list-statecoins`, transfer, or withdrawal update coin status
+through Bitcoin Core. `list-statecoins alice` prints an array whose object keys
+are exactly:
 
-```
-cargo run transfer-send <wallet_name> <statechain-id> <statechain-address>
+```text
+coin.user_pubkey
+coin.aggregated_address
+coin.address
+coin.statechain_id
+coin.amount
+coin.status
+coin.locktime
 ```
 
-For example, with the confirmed coin above (`coin.statechain_id: "99e79535933642758735620e621e8e9b"`)
+The status progresses through the exercised values such as `IN_MEMPOOL`,
+`UNCONFIRMED`, and `CONFIRMED` as chain facts change. A second payment to the
+same BIP448 deposit address is not turned into a second wallet coin. To create
+another statechain, request another token and another BIP448 deposit address.
 
-```
-cargo run transfer-send test_wallet tml1qqp7m5tc9auxgwka84tez9vksky2lsp5uftyhhduakt75j8yq46wh3crh26fwzxw2akc43d9m0pvuhmuq57tcdtw7pz96zfsz8ck3d3jjf3q04re26 99e79535933642758735620e621e8e9b
+## Transfer
+
+The recipient creates an address:
+
+```text
+cargo run -p client-rust -- new-transfer-address bob
 ```
 
-This will return:
+The JSON key printed for the address is literally `new_transfer_address:`:
 
+```json
+{
+  "new_transfer_address:": "..."
+}
 ```
+
+With `-b` or `--generate-batch-id`, the object also contains `batch_id`.
+A transfer address may receive distinct statechains; this is different from
+funding one deposit address repeatedly.
+
+The current owner sends a confirmed coin:
+
+```text
+cargo run -p client-rust -- \
+  bip448-transfer-send alice <STATECHAIN_ID> <TRANSFER_ADDRESS> [BATCH_ID]
+```
+
+On success it prints:
+
+```json
 {
   "Transfer": "sent"
 }
 ```
 
-The recevier then runs the following command to finalise the receipt of the coin and update the key share:
+The recipient polls and validates messages with:
 
-```
-cargo run transfer-receive <wallet_name>
-```
-
-The coin will then appear in the coins list:
-
-```
-cargo run list-statecoins <wallet-name>
+```text
+cargo run -p client-rust -- transfer-receive bob
 ```
 
-To send the coin back to a standard on-chain bitcoin address, simply run:
+It prints a JSON array of accepted statechain IDs. While a batch is locked, it
+prints a waiting message and retries every five seconds. Before mutating the
+wallet, the BIP448 path validates the transfer authorization, chain funding
+facts, server key and count, every history row, signatures, reconstructed
+templates, value schedule, and locktimes described in the
+[protocol document](bip448_rebindable_statechains.md).
 
-```
-cargo run withdraw <wallet_name> <statechain-id> <btc-address> <optional_fee_rate>
-```
+The sender can cancel an in-flight BIP448 transfer:
 
-For the demo test coins, these can be sent back to an address generated by the faucet: [faucet.mutinynet.com](https://faucet.mutinynet.com/)
-
-In case the coin expires and the mercury server is unavailable, the backup transaction can be used as follows:
-
-```
-cargo run broadcast-backup-transaction <wallet_name> <statechain-id> <btc-address> <optional_fee_rate>
-```
-
-## Atomic swap process
-
-To perform an atomic swap of two separate mercurylayer coins, first create four separate wallets:
-
-```
-cargo run create-wallet wallet1
-cargo run create-wallet wallet2
-cargo run create-wallet wallet3
-cargo run create-wallet wallet4
+```text
+cargo run -p client-rust -- bip448-transfer-cancel alice <STATECHAIN_ID>
 ```
 
-Generate a new deposit token:
+Cancellation transfers to a new address in the same wallet and prints the new
+`state_number`. It creates a later state; it does not roll the counter back.
 
-```
-cargo run new-token
-```
+## Batch/latch commands
 
-```
-cargo run cargo run new-deposit-address wallet1 <token> 100000
-```
+`payment-hash <WALLET_NAME> <STATECHAIN_ID>` creates a random batch ID and
+preimage on Mercury and prints:
 
-Deposit signet bitcoin to the generated address, then:
-
-```
-cargo run list-statecoins wallet1 
-```
-
-Repeat this for `wallet2`:
-
-```
-cargo run new-token
+```json
+{
+  "hash": "...",
+  "batch_id": "..."
+}
 ```
 
-```
-cargo run cargo run new-deposit-address wallet2 <token> 100000
+`confirm-pending-invoice <WALLET_NAME> <STATECHAIN_ID>` unlocks the pending
+transfer and has no success output. `retrieve-pre-image <WALLET_NAME>
+<STATECHAIN_ID> <BATCH_ID>` prints `pre_image`. `get-payment-hash <BATCH_ID>`
+prints `payment_hash` when Mercury returns a hash. The precise one-coin behavior
+and test limits are in [atomic_transfer.md](atomic_transfer.md).
+
+## Recovery packages
+
+Get the wallet-derived fee address with:
+
+```text
+cargo run -p client-rust -- bip448-recovery-fee-address alice
 ```
 
-Deposit signet bitcoin to the generated address, then:
+It prints `{ "address": "..." }`. After funding that address and confirming
+its input, submit the latest update package with:
 
-```
-cargo run list-statecoins wallet2 
-```
-
-Generate a transfer address for `wallet3` with the `-b` flag (this generates a `bacth_id` for the atomic transfer. 
-
-```
-cargo run new-transfer-address wallet3 -b
+```text
+cargo run -p client-rust -- \
+  broadcast-bip448-recovery-package alice <STATECHAIN_ID> funding_update \
+  --fund-from-wallet --fee-rate 2
 ```
 
-Returning, e.g.:
+The `funding_update` role selects the update parent already stored in the
+accepted latest-state record. After that parent confirms and its relative delay
+passes, the `settlement` role selects the settlement parent already stored in
+the same record. Alternatively, provide one or more
+`--fee-input txid:vout:value_sats` values instead of `--fund-from-wallet`.
+Exactly one CPFP fee-input source is required.
 
-```
-New transfer address: tml1qqprzt7lf9p2zcjwflh6cywsce2v9mkl6ns8gucahd8mhlcq95cxj6gz5mrr3m9yjekk75pshe2reylpud0utvtj88g86qvzng2d20rrs36qmlg40j # (example)
-Batch Id: 2e9ac416-24e1-4c29-b4d7-5f7d35b062f8 # (example)
-```
+The success JSON fields are:
 
-Generate a transfer address for `wallet4`:
-
-```
-cargo run new-transfer-address w4
-```
-
-Returning, e.g.:
-
-```
-New transfer address: tml1qqplxlutx9asvxycyd9yqf9vf0gk2j4cnxzqgt7csz09mt8hdttq25grrsr32ma25el9c760je3w3m305r0hskul3cjguwlx39jrsnr94ljswq87hv # (example)
-```
-
-Then `wallet1` send to `wallet3` supplying the `bacth_id`:
-
-```
-cargo run transfer-send <wallet_name> <statechain_id> <recipient_address> <optional_batch_id>
+```text
+statechain_id
+role
+parent_txid
+cpfp_child_txid
+package_fee_sats
+package_vbytes
+package_feerate_sat_per_vbyte
+submitpackage_response
 ```
 
-E.g.:
+The command submits the parent and P2A CPFP child through Core
+`submitpackage`. Neither the role nor the fee-input option selects a stale
+protocol prevout, and this public command does not call the low-level rebinding
+helpers. Older-output rebinding is exercised only by the manually orchestrated
+stale-state E2E test; the client does not watch the chain, choose that source,
+or run that sequence on its own.
 
-```
-cargo run transfer-send wallet1 b8a2a15d508743609600bb93b7d75c9e tml1qqprzt7lf9p2zcjwflh6cywsce2v9mkl6ns8gucahd8mhlcq95cxj6gz5mrr3m9yjekk75pshe2reylpud0utvtj88g86qvzng2d20rrs36qmlg40j 2e9ac416-24e1-4c29-b4d7-5f7d35b062f8
-```
+## Cooperative withdrawal
 
-Then `wallet2` send their coin to `wallet4` supplying the same `bacth_id`:
-
-```
-cargo run transfer-send wallet2 c3da091f8c3f46438c4f51aa6f7de2e4 tml1qqplxlutx9asvxycyd9yqf9vf0gk2j4cnxzqgt7csz09mt8hdttq25grrsr32ma25el9c760je3w3m305r0hskul3cjguwlx39jrsnr94ljswq87hv 2e9ac416-24e1-4c29-b4d7-5f7d35b062f8
-```
-
-Both receiving wallets then need to perform `transfer-recieve` within the timeout period specified by the server.
-
-```
-cargo run transfer-receive wallet3
+```text
+cargo run -p client-rust -- \
+  bip448-withdraw alice <STATECHAIN_ID> <TO_ADDRESS> [FEE_RATE]
 ```
 
-This will show the message `Statecoin batch still locked. Waiting until expiration or unlock.`, until the other coin is also succesfully recieved:
+The optional fee rate is sat/byte. The client requires an accepted BIP448 coin
+in `CONFIRMED` or `IN_TRANSFER`, rejects an outstanding transfer signing, signs
+the funding output's Taproot key path with Mercury/lockbox, broadcasts the
+transaction, persists `WITHDRAWING`, and calls `/withdraw/complete`. The
+command has no success output. Later status refresh can promote a confirmed
+transaction to `WITHDRAWN`.
 
-```
-cargo run transfer-receive wallet4
-```
+## Prototype boundaries
+
+- Exact legacy duplicate-deposit behavior is not reproduced: paying one
+  BIP448 deposit address more than once does not create another wallet coin.
+- There is no chain watcher and no automatic selection of a stale state's
+  funding source.
+- The stale-state end-to-end proof manually selects, rebinds, submits, and
+  mines transactions from test code; the running services do not orchestrate
+  it.
+- BIP448 consensus execution requires the Bitcoin Inquisition revision pinned
+  by this repository.
+- This is not software for Bitcoin mainnet or production use.
+- Start with fresh Mercury and lockbox databases and a fresh client wallet
+  database; old data is not migrated.
+- Passing tests establish only the assertions and paths that those tests
+  execute.
