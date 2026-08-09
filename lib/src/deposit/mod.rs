@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
-use crate::{error::MercuryError, utils::get_network, wallet::Coin};
-use bitcoin::{hashes::sha256, secp256k1, Address, PrivateKey};
+use crate::{error::MercuryError, wallet::Coin};
+use bitcoin::{hashes::sha256, secp256k1, PrivateKey};
 use secp256k1::{Message, PublicKey, Secp256k1};
 use serde::{Deserialize, Serialize};
 
@@ -37,12 +37,6 @@ pub struct DepositInitResult {
     pub server_pubkey: String,
     pub statechain_id: String,
     pub signed_statechain_id: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AggregatedPublicKey {
-    pub aggregate_pubkey: String,
-    pub aggregate_address: String,
 }
 
 pub fn create_deposit_msg1(coin: &Coin, token_id: &str) -> Result<DepositMsg1, MercuryError> {
@@ -89,34 +83,11 @@ pub fn handle_deposit_msg_1_response(
     })
 }
 
-pub fn create_aggregated_address(
-    coin: &Coin,
-    network: String,
-) -> Result<AggregatedPublicKey, MercuryError> {
-    let network = get_network(&network)?;
-
-    let secp = Secp256k1::new();
-
-    let user_pubkey_share = PublicKey::from_str(&coin.user_pubkey)?;
-    let server_pubkey_share = PublicKey::from_str(&coin.server_pubkey.as_ref().unwrap())?;
-
-    let aggregate_pubkey = user_pubkey_share.combine(&server_pubkey_share)?;
-
-    let aggregated_xonly_pubkey = aggregate_pubkey.x_only_public_key().0;
-
-    let aggregate_address = Address::p2tr(&secp, aggregated_xonly_pubkey, None, network);
-
-    Ok(AggregatedPublicKey {
-        aggregate_pubkey: aggregate_pubkey.to_string(),
-        aggregate_address: aggregate_address.to_string(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::wallet::{Settings, Wallet};
-    use secp256k1::{schnorr::Signature, SecretKey, XOnlyPublicKey};
+    use secp256k1::{schnorr::Signature, XOnlyPublicKey};
 
     fn sample_wallet() -> Wallet {
         Wallet {
@@ -128,8 +99,6 @@ mod tests {
             chain_endpoint: "http://127.0.0.1:18443".to_string(),
             network: "regtest".to_string(),
             blockheight: 0,
-            initlock: 1_000,
-            interval: 10,
             activities: Vec::new(),
             coins: Vec::new(),
             settings: Settings {
@@ -171,28 +140,5 @@ mod tests {
         assert!(Secp256k1::new()
             .verify_schnorr(&signature, message.as_ref(), &auth_key)
             .is_ok());
-    }
-
-    #[test]
-    fn create_aggregated_address_combines_user_and_server_keys() {
-        let secp = Secp256k1::new();
-        let mut coin = sample_wallet().get_new_coin().unwrap();
-        let server_secret_key = SecretKey::from_slice(&[7u8; 32]).unwrap();
-        let server_pubkey = server_secret_key.public_key(&secp);
-        let user_pubkey = PublicKey::from_str(&coin.user_pubkey).unwrap();
-        let expected_pubkey = user_pubkey.combine(&server_pubkey).unwrap();
-        let expected_address = Address::p2tr(
-            &secp,
-            expected_pubkey.x_only_public_key().0,
-            None,
-            bitcoin::Network::Regtest,
-        );
-
-        coin.server_pubkey = Some(server_pubkey.to_string());
-
-        let aggregated = create_aggregated_address(&coin, "regtest".to_string()).unwrap();
-
-        assert_eq!(aggregated.aggregate_pubkey, expected_pubkey.to_string());
-        assert_eq!(aggregated.aggregate_address, expected_address.to_string());
     }
 }

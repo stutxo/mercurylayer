@@ -1,28 +1,13 @@
-use std::str::FromStr;
-
-use bitcoin::{
-    hashes::{sha256, Hash},
-    sighash::{self, SighashCache, TapSighashType},
-    taproot::TapTweakHash,
-    Address, PrivateKey, Sequence, Transaction, TxOut, Txid,
-};
+use bitcoin::{hashes::sha256, PrivateKey, Txid};
 use secp256k1::{
-    musig::{
-        blinded_musig_pubkey_xonly_tweak_add, AggregatedNonce as MusigAggNonce, BlindingFactor,
-        PublicNonce as MusigPubNonce, Session as MusigSession,
-    },
-    schnorr::Signature,
-    KeyPair, Message, PublicKey, Scalar, Secp256k1, SecretKey, Verification, XOnlyPublicKey,
+    schnorr::Signature, KeyPair, Message, PublicKey, Secp256k1, SecretKey, Verification,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::{
     error::MercuryError,
-    utils::get_network,
-    wallet::{get_previous_outpoint, BackupTx, Coin, CoinStatus, Wallet},
+    wallet::{Coin, CoinStatus, Wallet},
 };
-
-use super::{TransferMsg, TxOutpoint};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TransferUnlockRequestPayload {
@@ -84,15 +69,7 @@ pub struct StatechainInfoResponsePayload {
     pub x1_pub: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct NewKeyInfo {
-    pub aggregate_pubkey: String,
-    pub aggregate_address: String,
-    pub signed_statechain_id: String,
-    pub amount: u32,
-}
-
-pub fn duplicate_coin_to_initialized_state(
+pub fn clone_transfer_address_coin_to_initialized_state(
     wallet: &Wallet,
     auth_pubkey: &str,
 ) -> Result<Coin, MercuryError> {
@@ -131,67 +108,10 @@ pub fn duplicate_coin_to_initialized_state(
         public_nonce: None,
         blinding_factor: None,
         server_public_nonce: None,
-        tx_cpfp: None,
         tx_withdraw: None,
         withdrawal_address: None,
         status: CoinStatus::INITIALISED,
-        duplicate_index: coin.duplicate_index,
     })
-}
-
-pub fn decrypt_transfer_msg(
-    encrypted_message: &str,
-    private_key_wif: &str,
-) -> Result<TransferMsg, MercuryError> {
-    let client_auth_key = PrivateKey::from_wif(private_key_wif)?.inner;
-
-    let decoded_enc_message = hex::decode(encrypted_message)?;
-
-    let decrypted_msg = ecies::decrypt(
-        client_auth_key.secret_bytes().as_slice(),
-        decoded_enc_message.as_slice(),
-    )
-    .unwrap();
-
-    let decrypted_msg_str = String::from_utf8(decrypted_msg).unwrap();
-
-    let transfer_msg: TransferMsg = serde_json::from_str(decrypted_msg_str.as_str()).unwrap();
-
-    Ok(transfer_msg)
-}
-
-pub fn get_tx0_outpoint(backup_transactions: &Vec<BackupTx>) -> Result<TxOutpoint, MercuryError> {
-    let mut backup_transactions = backup_transactions.clone();
-
-    backup_transactions.sort_by(|a, b| a.tx_n.cmp(&b.tx_n));
-
-    let bkp_tx1 = backup_transactions
-        .first()
-        .ok_or(MercuryError::NoBackupTransactionFound)?;
-
-    get_previous_outpoint(bkp_tx1)
-}
-
-pub fn verify_transfer_signature(
-    new_user_pubkey: &str,
-    tx0_outpoint: &TxOutpoint,
-    transfer_msg: &TransferMsg,
-) -> Result<bool, MercuryError> {
-    let new_user_pubkey = PublicKey::from_str(new_user_pubkey)?;
-    let sender_public_key = PublicKey::from_str(&transfer_msg.user_public_key)?;
-    let input_vout = tx0_outpoint.vout;
-    let input_txid = Txid::from_str(&tx0_outpoint.txid)?;
-    let signature = Signature::from_str(&transfer_msg.transfer_signature)?;
-    let secp = Secp256k1::verification_only();
-
-    Ok(verify_transfer_signature_with_keys(
-        &secp,
-        &new_user_pubkey,
-        &input_txid,
-        input_vout,
-        &sender_public_key,
-        &signature,
-    ))
 }
 
 pub(crate) fn verify_transfer_signature_with_keys<C: Verification>(
@@ -216,428 +136,6 @@ pub(crate) fn verify_transfer_signature_with_keys<C: Verification>(
     .is_ok()
 }
 
-pub fn validate_tx0_output_pubkey(
-    enclave_public_key: &str,
-    transfer_msg: &TransferMsg,
-    tx0_outpoint: &TxOutpoint,
-    tx0_hex: &str,
-    network: &str,
-) -> Result<bool, MercuryError> {
-    let network = get_network(&network)?;
-
-    let enclave_public_key = PublicKey::from_str(enclave_public_key).unwrap();
-    let sender_public_key = PublicKey::from_str(&transfer_msg.user_public_key)?;
-
-    let transfer_aggregate_pubkey = sender_public_key.combine(&enclave_public_key).unwrap();
-    let transfer_aggregate_xonly_pubkey = transfer_aggregate_pubkey.x_only_public_key().0;
-
-    let secp = Secp256k1::new();
-
-    let transfer_aggregate_address =
-        Address::p2tr(&secp, transfer_aggregate_xonly_pubkey, None, network);
-
-    let transfer_aggregate_xonly_pubkey =
-        XOnlyPublicKey::from_slice(transfer_aggregate_address.script_pubkey()[2..].as_bytes())
-            .unwrap();
-
-    let tx0: Transaction = bitcoin::consensus::encode::deserialize(&hex::decode(&tx0_hex)?)?;
-
-    let tx0_output = tx0.output[tx0_outpoint.vout as usize].clone();
-
-    let tx0_output_xonly_pubkey =
-        XOnlyPublicKey::from_slice(tx0_output.script_pubkey[2..].as_bytes()).unwrap();
-
-    Ok(transfer_aggregate_xonly_pubkey == tx0_output_xonly_pubkey)
-}
-
-pub fn verify_latest_backup_tx_pays_to_user_pubkey(
-    transfer_msg: &TransferMsg,
-    client_pubkey_share: &str,
-    network: &str,
-) -> Result<bool, MercuryError> {
-    let client_pubkey_share = PublicKey::from_str(&client_pubkey_share)?;
-
-    let network = get_network(&network)?;
-
-    let last_bkp_tx = transfer_msg.backup_transactions.last();
-
-    if last_bkp_tx.is_none() {
-        return Err(MercuryError::NoBackupTransactionFound);
-    }
-
-    let last_bkp_tx = last_bkp_tx.unwrap();
-
-    let last_tx: Transaction =
-        bitcoin::consensus::encode::deserialize(&hex::decode(&last_bkp_tx.tx)?)?;
-
-    let output = &last_tx.output[0];
-
-    let aggregate_address = Address::p2tr(
-        &Secp256k1::new(),
-        client_pubkey_share.x_only_public_key().0,
-        None,
-        network,
-    );
-
-    Ok(output.script_pubkey == aggregate_address.script_pubkey())
-}
-
-pub fn get_output_address_from_tx0(
-    tx0_outpoint: &TxOutpoint,
-    tx0_hex: &str,
-    network: &str,
-) -> Result<String, MercuryError> {
-    let network = get_network(&network)?;
-
-    let tx0: Transaction = bitcoin::consensus::encode::deserialize(&hex::decode(&tx0_hex)?)?;
-
-    let tx0_output = tx0.output[tx0_outpoint.vout as usize].clone();
-
-    let output_script_pubkey = tx0_output.script_pubkey;
-
-    let address = Address::from_script(&output_script_pubkey.as_script(), network)?;
-
-    Ok(address.to_string())
-}
-
-pub fn get_amount_from_tx0(tx0_hex: &str, tx0_outpoint: &TxOutpoint) -> Result<u64, MercuryError> {
-    let tx0: Transaction = bitcoin::consensus::encode::deserialize(&hex::decode(&tx0_hex)?)?;
-
-    assert!(tx0_outpoint.txid == tx0.txid().to_string());
-
-    Ok(tx0.output[tx0_outpoint.vout as usize].value)
-}
-
-pub fn validate_signature_scheme(
-    backup_transactions: &Vec<BackupTx>,
-    statechain_info: &StatechainInfoResponsePayload,
-    tx0_hex: &str,
-    current_blockheight: u32,
-    fee_rate_tolerance: f64,
-    current_fee_rate_sats_per_byte: f64,
-    lockheight_init: u32,
-    interval: u32,
-) -> Result<u32, MercuryError> {
-    let mut previous_lock_time: Option<u32> = None;
-
-    let mut sig_scheme_validation = true;
-
-    for backup_tx in backup_transactions.iter() {
-        let statechain_info = statechain_info
-            .statechain_info
-            .iter()
-            .find(|info| info.tx_n == backup_tx.tx_n);
-
-        if statechain_info.is_none() {
-            println!("statechain_info not found");
-            sig_scheme_validation = false;
-            break;
-        }
-
-        let statechain_info = statechain_info.unwrap();
-
-        let is_signature_valid = verify_transaction_signature(
-            &backup_tx.tx,
-            &tx0_hex,
-            fee_rate_tolerance,
-            current_fee_rate_sats_per_byte,
-        );
-        if is_signature_valid.is_err() {
-            println!("{}", is_signature_valid.err().unwrap().to_string());
-            sig_scheme_validation = false;
-            break;
-        }
-
-        let is_blinded_musig_scheme_valid =
-            verify_blinded_musig_scheme(&backup_tx, &tx0_hex, statechain_info);
-        if is_blinded_musig_scheme_valid.is_err() {
-            println!(
-                "{}",
-                is_blinded_musig_scheme_valid.err().unwrap().to_string()
-            );
-            sig_scheme_validation = false;
-            break;
-        }
-
-        if verify_transaction_sequence(&backup_tx.tx).is_err() {
-            println!("transaction sequence is not correct");
-            sig_scheme_validation = false;
-            break;
-        }
-
-        if verify_if_locktime_is_reasonable_tx_version_and_output_size(
-            &backup_tx.tx,
-            current_blockheight,
-            lockheight_init,
-        )
-        .is_err()
-        {
-            println!("locktime is not reasonable");
-            sig_scheme_validation = false;
-            break;
-        }
-
-        if reconstruct_transaction(&backup_tx.tx).is_err() {
-            println!("reconstruction failed");
-            sig_scheme_validation = false;
-            break;
-        }
-
-        if previous_lock_time.is_some() {
-            let prev_lock_time = previous_lock_time.unwrap();
-            let current_lock_time = crate::utils::get_blockheight(&backup_tx)?;
-            if (prev_lock_time - current_lock_time) as i32 != interval as i32 {
-                println!("interval is not correct");
-                sig_scheme_validation = false;
-                break;
-            }
-        }
-
-        previous_lock_time = Some(crate::utils::get_blockheight(&backup_tx)?);
-    }
-
-    if !sig_scheme_validation {
-        return Err(MercuryError::SignatureSchemeValidationError);
-    }
-
-    if previous_lock_time.is_none() {
-        return Err(MercuryError::NoPreviousLockTimeError);
-    }
-
-    Ok(previous_lock_time.unwrap())
-}
-
-pub fn verify_transaction_signature(
-    tx_n_hex: &str,
-    tx0_hex: &str,
-    fee_rate_tolerance: f64,
-    current_fee_rate_sats_per_byte: f64,
-) -> Result<(), MercuryError> {
-    let tx_n: Transaction = bitcoin::consensus::encode::deserialize(&hex::decode(&tx_n_hex)?)?;
-
-    let witness = tx_n.input[0].witness.clone();
-
-    let witness_data = witness.nth(0).unwrap();
-
-    // the last element is the hash type
-    let signature_data = witness_data.split_last().unwrap().1;
-
-    let signature = Signature::from_slice(signature_data).unwrap();
-
-    let tx0: Transaction = bitcoin::consensus::encode::deserialize(&hex::decode(&tx0_hex)?)?;
-
-    let vout = tx_n.input[0].previous_output.vout as usize;
-
-    let tx0_output = tx0.output[vout].clone();
-
-    let xonly_pubkey =
-        XOnlyPublicKey::from_slice(tx0_output.script_pubkey[2..].as_bytes()).unwrap();
-
-    let sighash_type = TapSighashType::All;
-
-    let hash = SighashCache::new(tx_n.clone())
-        .taproot_key_spend_signature_hash(
-            0,
-            &sighash::Prevouts::All(&[TxOut {
-                value: tx0_output.value,
-                script_pubkey: tx0_output.script_pubkey.clone(),
-            }]),
-            sighash_type,
-        )
-        .unwrap();
-
-    let msg: Message = hash.into();
-
-    let fee = tx0_output.value - tx_n.output[0].value;
-    let fee_rate = fee as f64 / tx_n.vsize() as f64;
-
-    if (fee_rate + fee_rate_tolerance) < current_fee_rate_sats_per_byte {
-        return Err(MercuryError::FeeTooLow);
-    }
-
-    if (fee_rate - fee_rate_tolerance) > current_fee_rate_sats_per_byte {
-        return Err(MercuryError::FeeTooHigh);
-    }
-
-    if !Secp256k1::new()
-        .verify_schnorr(&signature, msg.as_ref(), &xonly_pubkey)
-        .is_ok()
-    {
-        return Err(MercuryError::InvalidSignature);
-    }
-
-    Ok(())
-}
-
-pub fn verify_transaction_sequence(tx_n_hex: &str) -> Result<(), MercuryError> {
-    let tx_n: Transaction = bitcoin::consensus::encode::deserialize(&hex::decode(&tx_n_hex)?)?;
-
-    if tx_n.input.is_empty() {
-        return Err(MercuryError::EmptyInput);
-    }
-
-    if tx_n.input.len() > 1 {
-        return Err(MercuryError::Tx1HasMoreThanOneInput);
-    }
-
-    let input = tx_n.input.first().unwrap();
-
-    if input.sequence != Sequence(0) {
-        return Err(MercuryError::TransactionSequenceDifferentThanZeroError);
-    }
-
-    Ok(())
-}
-
-pub fn verify_if_locktime_is_reasonable_tx_version_and_output_size(
-    tx_n_hex: &str,
-    current_blockheight: u32,
-    lockheight_init: u32,
-) -> Result<(), MercuryError> {
-    let tx_n: Transaction = bitcoin::consensus::encode::deserialize(&hex::decode(&tx_n_hex)?)?;
-
-    if tx_n.version != 2 {
-        return Err(MercuryError::TransactionVersionError);
-    }
-
-    if tx_n.output.len() > 1 {
-        return Err(MercuryError::TxHasMoreThanOneOutput);
-    }
-
-    let lock_time = tx_n.lock_time;
-
-    if !(lock_time.is_block_height()) {
-        return Err(MercuryError::LocktimeNotBlockHeightError);
-    }
-
-    if lock_time.to_consensus_u32() <= current_blockheight {
-        return Err(MercuryError::LocktimeTooLow);
-    }
-
-    if current_blockheight + lockheight_init < lock_time.to_consensus_u32() {
-        return Err(MercuryError::LocktimeTooHigh);
-    }
-
-    Ok(())
-}
-
-pub fn reconstruct_transaction(tx_n_hex: &str) -> Result<(), MercuryError> {
-    let tx_n: Transaction = bitcoin::consensus::encode::deserialize(&hex::decode(&tx_n_hex)?)?;
-
-    // this assumes that the transaction has only one input and one output (suposedly checked before)
-    let output = tx_n.output[0].clone();
-    let input = tx_n.input[0].clone();
-    let locktime = tx_n.lock_time;
-
-    let new_tx = Transaction {
-        version: 2,
-        lock_time: locktime,
-        input: [input].to_vec(),
-        output: [output].to_vec(),
-    };
-
-    let serialized_new_tx = hex::encode(bitcoin::consensus::encode::serialize(&new_tx));
-
-    if tx_n_hex != serialized_new_tx {
-        return Err(MercuryError::TransactionReconstructionError);
-    }
-
-    Ok(())
-}
-
-fn get_tx_hash(tx_0: &Transaction, tx_n: &Transaction) -> Result<Message, MercuryError> {
-    let witness = tx_n.input[0].witness.clone();
-
-    if witness.nth(0).is_none() {
-        return Err(MercuryError::EmptyWitness);
-    }
-
-    let witness_data = witness.nth(0).unwrap();
-
-    let vout = tx_n.input[0].previous_output.vout as usize;
-
-    let tx_0_output = tx_0.output[vout].clone();
-
-    if witness_data.last().is_none() {
-        return Err(MercuryError::EmptyWitnessData);
-    }
-
-    // let sighash_type = TapSighashType::from_consensus_u8(witness_data.last().unwrap().to_owned())?;
-    let sighash_type = TapSighashType::All;
-
-    let hash = SighashCache::new(tx_n).taproot_key_spend_signature_hash(
-        0,
-        &sighash::Prevouts::All(&[TxOut {
-            value: tx_0_output.value,
-            script_pubkey: tx_0_output.script_pubkey.clone(),
-        }]),
-        sighash_type,
-    )?;
-
-    let msg: Message = hash.into();
-
-    Ok(msg)
-}
-
-pub fn verify_blinded_musig_scheme(
-    backup_tx: &BackupTx,
-    tx0_hex: &str,
-    statechain_info: &StatechainInfo,
-) -> Result<(), MercuryError> {
-    let client_public_nonce =
-        MusigPubNonce::from_slice(hex::decode(&backup_tx.client_public_nonce)?.as_slice())?;
-
-    let server_public_nonce =
-        MusigPubNonce::from_slice(hex::decode(&backup_tx.server_public_nonce)?.as_slice())?;
-
-    let client_public_key = PublicKey::from_str(&backup_tx.client_public_key)?;
-
-    let server_public_key = PublicKey::from_str(&backup_tx.server_public_key)?;
-
-    let blinding_factor =
-        BlindingFactor::from_slice(hex::decode(&backup_tx.blinding_factor)?.as_slice())?;
-
-    let secp = Secp256k1::new();
-
-    let aggregate_pubkey = client_public_key.combine(&server_public_key)?;
-
-    let tap_tweak = TapTweakHash::from_key_and_tweak(aggregate_pubkey.x_only_public_key().0, None);
-    let tap_tweak_bytes = tap_tweak.as_byte_array();
-
-    let tweak = SecretKey::from_slice(tap_tweak_bytes)?;
-
-    let (_, output_pubkey, out_tweak32) =
-        blinded_musig_pubkey_xonly_tweak_add(&secp, &aggregate_pubkey, tweak);
-
-    let aggnonce = MusigAggNonce::new(&[&client_public_nonce, &server_public_nonce]);
-
-    let tx_0: Transaction = bitcoin::consensus::encode::deserialize(&hex::decode(&tx0_hex)?)?;
-
-    let tx_n: Transaction = bitcoin::consensus::encode::deserialize(&hex::decode(&backup_tx.tx)?)?;
-
-    let msg = get_tx_hash(&tx_0, &tx_n)?;
-
-    let session = MusigSession::new_blinded_without_key_agg_cache(
-        &secp,
-        &output_pubkey,
-        aggnonce,
-        msg,
-        None,
-        &blinding_factor,
-        out_tweak32,
-    );
-    // END repeated code
-
-    let challenge = session.get_challenge_from_session();
-    let challenge = hex::encode(challenge);
-
-    if statechain_info.challenge != challenge {
-        return Err(MercuryError::IncorrectChallenge);
-    }
-
-    Ok(())
-}
-
 pub(crate) fn validate_t1pub(
     t1: &[u8; 32],
     x1_pub: &PublicKey,
@@ -649,62 +147,6 @@ pub(crate) fn validate_t1pub(
     let result_pubkey = sender_public_key.combine(&x1_pub)?;
 
     Ok(result_pubkey == public_t1)
-}
-
-fn calculate_t2(
-    transfer_msg: &TransferMsg,
-    client_seckey_share: &SecretKey,
-) -> Result<SecretKey, MercuryError> {
-    let t1 = Scalar::from_be_bytes(transfer_msg.t1)?;
-
-    let negated_seckey = client_seckey_share.negate();
-
-    let t2 = negated_seckey.add_tweak(&t1)?;
-
-    Ok(t2)
-}
-
-pub fn create_transfer_receiver_request_payload(
-    statechain_info: &StatechainInfoResponsePayload,
-    transfer_msg: &TransferMsg,
-    coin: &Coin,
-) -> Result<TransferReceiverRequestPayload, MercuryError> {
-    if statechain_info.x1_pub.is_none() {
-        return Err(MercuryError::NoX1Pub);
-    }
-
-    let x1_pub = statechain_info.x1_pub.as_ref().unwrap();
-
-    let x1_pub = PublicKey::from_str(x1_pub)?;
-
-    let sender_public_key = PublicKey::from_str(&transfer_msg.user_public_key)?;
-
-    let client_seckey_share = PrivateKey::from_wif(&coin.user_privkey)?.inner;
-
-    let client_auth_key = PrivateKey::from_wif(&coin.auth_privkey)?.inner;
-
-    if !validate_t1pub(&transfer_msg.t1, &x1_pub, &sender_public_key)? {
-        return Err(MercuryError::InvalidT1);
-    }
-
-    let t2 = calculate_t2(&transfer_msg, &client_seckey_share)?;
-
-    let t2_hex = hex::encode(t2.secret_bytes());
-
-    let secp = Secp256k1::new();
-
-    let client_auth_keypair = KeyPair::from_seckey_slice(&secp, client_auth_key.as_ref())?;
-    let msg = Message::from_hashed_data::<sha256::Hash>(t2_hex.as_bytes());
-    let auth_sig = secp.sign_schnorr(msg.as_ref(), &client_auth_keypair);
-
-    let transfer_receiver_request_payload = TransferReceiverRequestPayload {
-        statechain_id: transfer_msg.statechain_id.clone(),
-        batch_data: None,
-        t2: t2_hex,
-        auth_sig: auth_sig.to_string(),
-    };
-
-    Ok(transfer_receiver_request_payload)
 }
 
 pub fn sign_message(message: &str, coin: &Coin) -> Result<String, MercuryError> {
@@ -719,79 +161,21 @@ pub fn sign_message(message: &str, coin: &Coin) -> Result<String, MercuryError> 
     Ok(signed_message.to_string())
 }
 
-pub fn get_new_key_info(
-    server_public_key_hex: &str,
-    coin: &Coin,
-    statechain_id: &str,
-    tx0_outpoint: &TxOutpoint,
-    tx0_hex: &str,
-    network: &str,
-) -> Result<NewKeyInfo, MercuryError> {
-    let network = get_network(&network)?;
-
-    let client_auth_key = PrivateKey::from_wif(&coin.auth_privkey)?.inner;
-
-    let client_pubkey_share = PublicKey::from_str(&coin.user_pubkey)?;
-
-    let server_pubkey_share = PublicKey::from_str(server_public_key_hex)?;
-
-    let aggregate_pubkey = client_pubkey_share.combine(&server_pubkey_share)?;
-
-    let aggregated_xonly_pubkey = aggregate_pubkey.x_only_public_key().0;
-
-    let secp = Secp256k1::new();
-
-    let aggregate_address = Address::p2tr(&secp, aggregated_xonly_pubkey, None, network);
-
-    let xonly_pubkey =
-        XOnlyPublicKey::from_slice(aggregate_address.script_pubkey()[2..].as_bytes()).unwrap();
-
-    let tx0: Transaction = bitcoin::consensus::encode::deserialize(&hex::decode(&tx0_hex)?)?;
-
-    let tx0_output = tx0.output[tx0_outpoint.vout as usize].clone();
-
-    let tx0_output_xonly_pubkey =
-        XOnlyPublicKey::from_slice(tx0_output.script_pubkey[2..].as_bytes()).unwrap();
-
-    if tx0_output_xonly_pubkey != xonly_pubkey {
-        return Err(MercuryError::IncorrectAggregatedPublicKey);
-    }
-
-    let p2tr_agg_address = Address::p2tr(&secp, aggregated_xonly_pubkey, None, network);
-
-    let client_auth_keypair = KeyPair::from_seckey_slice(&secp, client_auth_key.as_ref())?;
-    let msg = Message::from_hashed_data::<sha256::Hash>(statechain_id.to_string().as_bytes());
-    let signed_statechain_id = secp.sign_schnorr(msg.as_ref(), &client_auth_keypair);
-
-    Ok(NewKeyInfo {
-        aggregate_pubkey: aggregate_pubkey.to_string(),
-        aggregate_address: p2tr_agg_address.to_string(),
-        signed_statechain_id: signed_statechain_id.to_string(),
-        amount: tx0_output.value as u32,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        transfer::{sender::create_transfer_signature, TxOutpoint},
-        wallet::{BackupTx, CoinStatus, Settings, Wallet},
-    };
-    use bitcoin::{absolute, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+    use crate::wallet::Settings;
 
-    fn sample_wallet(name: &str, mnemonic: &str) -> Wallet {
+    fn sample_wallet() -> Wallet {
         Wallet {
-            name: name.to_string(),
-            mnemonic: mnemonic.to_string(),
+            name: "wallet".to_string(),
+            mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string(),
             version: "0.1.0".to_string(),
             state_entity_endpoint: "http://statechain".to_string(),
             chain_backend: "core".to_string(),
             chain_endpoint: "http://127.0.0.1:18443".to_string(),
             network: "regtest".to_string(),
             blockheight: 0,
-            initlock: 1_000,
-            interval: 10,
             activities: Vec::new(),
             coins: Vec::new(),
             settings: Settings {
@@ -812,55 +196,14 @@ mod tests {
         }
     }
 
-    fn sample_backup_tx(tx_n: u32, txid_byte: u8, vout: u32, lock_height: u32) -> BackupTx {
-        let txid = Txid::from_str(&hex::encode([txid_byte; 32])).unwrap();
-        let backup_address = sample_wallet(
-            "recipient",
-            "legal winner thank year wave sausage worth useful legal winner thank yellow",
-        )
-        .get_new_coin()
-        .unwrap()
-        .backup_address;
-        let tx = Transaction {
-            version: 2,
-            lock_time: absolute::LockTime::from_height(lock_height).unwrap(),
-            input: vec![TxIn {
-                previous_output: OutPoint { txid, vout },
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence(0),
-                witness: Witness::default(),
-            }],
-            output: vec![TxOut {
-                value: 10_000,
-                script_pubkey: Address::from_str(&backup_address)
-                    .unwrap()
-                    .require_network(bitcoin::Network::Regtest)
-                    .unwrap()
-                    .script_pubkey(),
-            }],
-        };
-
-        BackupTx {
-            tx_n,
-            tx: hex::encode(bitcoin::consensus::encode::serialize(&tx)),
-            client_public_nonce: String::new(),
-            server_public_nonce: String::new(),
-            client_public_key: String::new(),
-            server_public_key: String::new(),
-            blinding_factor: String::new(),
-        }
-    }
-
     #[test]
-    fn duplicate_coin_to_initialized_state_clears_transfer_state() {
-        let mut wallet = sample_wallet(
-            "sender",
-            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
-        );
+    fn clone_transfer_address_coin_copies_identity_and_resets_state() {
+        let mut wallet = sample_wallet();
         let mut coin = wallet.get_new_coin().unwrap();
         coin.server_pubkey = Some("server-pubkey".to_string());
         coin.aggregated_pubkey = Some("aggregated-pubkey".to_string());
         coin.aggregated_address = Some("aggregated-address".to_string());
+        coin.statechain_protocol = Some("bip448".to_string());
         coin.utxo_txid = Some("utxo-txid".to_string());
         coin.utxo_vout = Some(1);
         coin.amount = Some(10_000);
@@ -871,127 +214,39 @@ mod tests {
         coin.public_nonce = Some("public-nonce".to_string());
         coin.blinding_factor = Some("blinding-factor".to_string());
         coin.server_public_nonce = Some("server-public-nonce".to_string());
-        coin.tx_cpfp = Some("cpfp".to_string());
         coin.tx_withdraw = Some("withdraw".to_string());
         coin.withdrawal_address = Some("withdrawal-address".to_string());
         coin.status = CoinStatus::CONFIRMED;
-        coin.duplicate_index = 3;
         wallet.coins.push(coin.clone());
 
-        let duplicated_coin =
-            duplicate_coin_to_initialized_state(&wallet, &coin.auth_pubkey).unwrap();
+        let cloned =
+            clone_transfer_address_coin_to_initialized_state(&wallet, &coin.auth_pubkey).unwrap();
 
-        assert_eq!(duplicated_coin.user_privkey, coin.user_privkey);
-        assert_eq!(duplicated_coin.auth_privkey, coin.auth_privkey);
-        assert_eq!(duplicated_coin.address, coin.address);
-        assert_eq!(duplicated_coin.duplicate_index, 3);
-        assert_eq!(duplicated_coin.status, CoinStatus::INITIALISED);
-        assert!(duplicated_coin.server_pubkey.is_none());
-        assert!(duplicated_coin.aggregated_pubkey.is_none());
-        assert!(duplicated_coin.utxo_txid.is_none());
-        assert!(duplicated_coin.amount.is_none());
-        assert!(duplicated_coin.statechain_id.is_none());
-        assert!(duplicated_coin.secret_nonce.is_none());
-        assert!(duplicated_coin.tx_withdraw.is_none());
-    }
-
-    #[test]
-    fn get_tx0_outpoint_uses_the_lowest_tx_n_backup_tx() {
-        let backup_transactions = vec![
-            sample_backup_tx(4, 0xaa, 1, 1_020),
-            sample_backup_tx(1, 0xbb, 2, 1_010),
-            sample_backup_tx(2, 0xcc, 3, 1_015),
-        ];
-
-        let outpoint = get_tx0_outpoint(&backup_transactions).unwrap();
-
-        assert_eq!(outpoint.txid, hex::encode([0xbbu8; 32]));
-        assert_eq!(outpoint.vout, 2);
-    }
-
-    #[test]
-    fn verify_transfer_signature_binds_the_signature_to_the_recipient_user_key() {
-        let sender_coin = sample_wallet(
-            "sender",
-            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
-        )
-        .get_new_coin()
-        .unwrap();
-        let recipient_coin = sample_wallet(
-            "recipient",
-            "legal winner thank year wave sausage worth useful legal winner thank yellow",
-        )
-        .get_new_coin()
-        .unwrap();
-        let other_recipient =
-            sample_wallet("other", "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong")
-                .get_new_coin()
-                .unwrap();
-        let txid = hex::encode([0x11u8; 32]);
-        let vout = 1;
-        let transfer_signature = create_transfer_signature(
-            &recipient_coin.address,
-            &txid,
-            vout,
-            &sender_coin.user_privkey,
-        )
-        .unwrap();
-        let transfer_msg = crate::transfer::TransferMsg {
-            statechain_id: "statechain-1".to_string(),
-            transfer_signature,
-            backup_transactions: Vec::new(),
-            t1: [0u8; 32],
-            user_public_key: sender_coin.user_pubkey.clone(),
-        };
-        let tx0_outpoint = TxOutpoint { txid, vout };
-
-        assert!(verify_transfer_signature(
-            &recipient_coin.user_pubkey,
-            &tx0_outpoint,
-            &transfer_msg
-        )
-        .unwrap());
-        assert!(!verify_transfer_signature(
-            &other_recipient.user_pubkey,
-            &tx0_outpoint,
-            &transfer_msg
-        )
-        .unwrap());
-    }
-
-    #[test]
-    fn verify_transaction_sequence_requires_a_single_zero_sequence_input() {
-        let valid_tx = sample_backup_tx(1, 0x21, 0, 1_010);
-        let mut invalid_tx: Transaction =
-            bitcoin::consensus::encode::deserialize(&hex::decode(&valid_tx.tx).unwrap()).unwrap();
-        invalid_tx.input[0].sequence = Sequence(1);
-        let invalid_tx_hex = hex::encode(bitcoin::consensus::encode::serialize(&invalid_tx));
-
-        assert!(verify_transaction_sequence(&valid_tx.tx).is_ok());
-        assert!(matches!(
-            verify_transaction_sequence(&invalid_tx_hex),
-            Err(MercuryError::TransactionSequenceDifferentThanZeroError)
-        ));
-    }
-
-    #[test]
-    fn verify_if_locktime_is_reasonable_checks_bounds_and_structure() {
-        let valid_tx = sample_backup_tx(1, 0x31, 0, 1_050);
-        let low_locktime_tx = sample_backup_tx(1, 0x32, 0, 1_000);
-
-        assert!(verify_if_locktime_is_reasonable_tx_version_and_output_size(
-            &valid_tx.tx,
-            1_000,
-            100
-        )
-        .is_ok());
-        assert!(matches!(
-            verify_if_locktime_is_reasonable_tx_version_and_output_size(
-                &low_locktime_tx.tx,
-                1_000,
-                100
-            ),
-            Err(MercuryError::LocktimeTooLow)
-        ));
+        assert_eq!(cloned.index, coin.index);
+        assert_eq!(cloned.user_privkey, coin.user_privkey);
+        assert_eq!(cloned.user_pubkey, coin.user_pubkey);
+        assert_eq!(cloned.auth_privkey, coin.auth_privkey);
+        assert_eq!(cloned.auth_pubkey, coin.auth_pubkey);
+        assert_eq!(cloned.derivation_path, coin.derivation_path);
+        assert_eq!(cloned.fingerprint, coin.fingerprint);
+        assert_eq!(cloned.address, coin.address);
+        assert_eq!(cloned.backup_address, coin.backup_address);
+        assert!(cloned.server_pubkey.is_none());
+        assert!(cloned.aggregated_pubkey.is_none());
+        assert!(cloned.aggregated_address.is_none());
+        assert!(cloned.statechain_protocol.is_none());
+        assert!(cloned.utxo_txid.is_none());
+        assert!(cloned.utxo_vout.is_none());
+        assert!(cloned.amount.is_none());
+        assert!(cloned.statechain_id.is_none());
+        assert!(cloned.signed_statechain_id.is_none());
+        assert!(cloned.locktime.is_none());
+        assert!(cloned.secret_nonce.is_none());
+        assert!(cloned.public_nonce.is_none());
+        assert!(cloned.blinding_factor.is_none());
+        assert!(cloned.server_public_nonce.is_none());
+        assert!(cloned.tx_withdraw.is_none());
+        assert!(cloned.withdrawal_address.is_none());
+        assert_eq!(cloned.status, CoinStatus::INITIALISED);
     }
 }

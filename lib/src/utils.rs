@@ -1,12 +1,8 @@
 use std::str::FromStr;
 
-use bitcoin::Transaction;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    wallet::{BackupTx, Coin},
-    MercuryError,
-};
+use crate::{wallet::Coin, MercuryError};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ServerConfig {
@@ -14,25 +10,6 @@ pub struct ServerConfig {
     pub interval: u32,
     pub batchtimeout: u32,
     pub version: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct InfoConfig {
-    pub initlock: u32,
-    pub interval: u32,
-    pub fee_rate_sats_per_byte: f64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PubKeyInfo {
-    pub server_pubkey: String,
-    pub tx_n: u32,
-    pub created_at: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct KeyListResponsePayload {
-    pub list_keyinfo: Vec<PubKeyInfo>,
 }
 
 pub fn get_network(network: &str) -> Result<bitcoin::Network, MercuryError> {
@@ -43,19 +20,6 @@ pub fn get_network(network: &str) -> Result<bitcoin::Network, MercuryError> {
         "bitcoin" => Ok(bitcoin::Network::Bitcoin),
         _ => Err(MercuryError::NetworkConversionError),
     }
-}
-
-pub fn get_blockheight(bkp_tx: &BackupTx) -> Result<u32, MercuryError> {
-    let tx_bytes = hex::decode(&bkp_tx.tx)?;
-    let tx1 = bitcoin::consensus::deserialize::<Transaction>(&tx_bytes)?;
-
-    let lock_time = tx1.lock_time;
-    if !(lock_time.is_block_height()) {
-        return Err(MercuryError::LocktimeNotBlockHeightError);
-    }
-    let block_height = lock_time.to_consensus_u32();
-
-    Ok(block_height)
 }
 
 pub fn is_enclave_pubkey_part_of_coin(

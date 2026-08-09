@@ -8,9 +8,10 @@ use crate::{
     client_config::ClientConfig,
     sqlite_manager::{get_wallet, update_wallet},
 };
-use anyhow::{Ok, Result};
-use bitcoin::{Address, Txid};
+use anyhow::Result;
+use bitcoin::{Address, Transaction, Txid};
 use mercurylib::{
+    error::MercuryError,
     utils::get_network,
     wallet::{Coin, CoinStatus},
 };
@@ -148,10 +149,11 @@ pub async fn execute(
                     }
                 }
             } else {
-                let new_coin = mercurylib::transfer::receiver::duplicate_coin_to_initialized_state(
-                    &wallet,
-                    &auth_pubkey,
-                );
+                let new_coin =
+                    mercurylib::transfer::receiver::clone_transfer_address_coin_to_initialized_state(
+                        &wallet,
+                        &auth_pubkey,
+                    );
 
                 if new_coin.is_err() {
                     println!("Error: {}", new_coin.err().unwrap().to_string());
@@ -228,11 +230,7 @@ async fn verify_tx0_output_is_unspent_and_confirmed(
     network: &str,
     confirmation_target: u32,
 ) -> Result<(bool, CoinStatus)> {
-    let output_address = mercurylib::transfer::receiver::get_output_address_from_tx0(
-        &tx0_outpoint,
-        &tx0_hex,
-        &network,
-    )?;
+    let output_address = get_output_address_from_tx0(&tx0_outpoint, &tx0_hex, &network)?;
 
     let network = get_network(&network)?;
     let address = Address::from_str(&output_address)?.require_network(network)?;
@@ -252,6 +250,24 @@ async fn verify_tx0_output_is_unspent_and_confirmed(
         true,
         tx0_status_for_confirmations(tx_out.confirmations, confirmation_target),
     ))
+}
+
+fn get_output_address_from_tx0(
+    tx0_outpoint: &mercurylib::transfer::TxOutpoint,
+    tx0_hex: &str,
+    network: &str,
+) -> std::result::Result<String, MercuryError> {
+    let network = get_network(&network)?;
+
+    let tx0: Transaction = bitcoin::consensus::encode::deserialize(&hex::decode(&tx0_hex)?)?;
+
+    let tx0_output = tx0.output[tx0_outpoint.vout as usize].clone();
+
+    let output_script_pubkey = tx0_output.script_pubkey;
+
+    let address = Address::from_script(&output_script_pubkey.as_script(), network)?;
+
+    Ok(address.to_string())
 }
 
 pub(crate) fn tx0_status_for_confirmations(
@@ -443,5 +459,114 @@ mod tests {
     fn tx0_confirmation_status_uses_confirmation_count() {
         assert_eq!(tx0_status_for_confirmations(1, 2), CoinStatus::UNCONFIRMED);
         assert_eq!(tx0_status_for_confirmations(2, 2), CoinStatus::CONFIRMED);
+    }
+
+    #[test]
+    fn tx0_output_address_maps_invalid_hex_to_mercury_error() {
+        let tx0_outpoint = mercurylib::transfer::TxOutpoint {
+            txid: "00".repeat(32),
+            vout: 0,
+        };
+
+        let error = get_output_address_from_tx0(&tx0_outpoint, "not-hex", "regtest").unwrap_err();
+
+        assert!(matches!(error, MercuryError::HexError));
+    }
+
+    #[test]
+    fn tx0_output_address_maps_undecodable_transaction_to_mercury_error() {
+        let tx0_outpoint = mercurylib::transfer::TxOutpoint {
+            txid: "00".repeat(32),
+            vout: 0,
+        };
+
+        let error = get_output_address_from_tx0(&tx0_outpoint, "00", "regtest").unwrap_err();
+
+        assert!(matches!(error, MercuryError::BitcoinConsensusEncodeError));
+    }
+
+    #[test]
+    fn tx0_output_address_maps_unrecognized_script_to_mercury_error() {
+        let tx0 = Transaction {
+            version: 2,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: vec![bitcoin::TxOut {
+                value: 100_000,
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let tx0_outpoint = mercurylib::transfer::TxOutpoint {
+            txid: tx0.txid().to_string(),
+            vout: 0,
+        };
+        let tx0_hex = hex::encode(bitcoin::consensus::encode::serialize(&tx0));
+
+        let error = get_output_address_from_tx0(&tx0_outpoint, &tx0_hex, "regtest").unwrap_err();
+
+        assert!(matches!(error, MercuryError::BitcoinAddressError));
+    }
+
+    #[tokio::test]
+    async fn tx0_output_error_preserves_mercury_error_through_anyhow_boundary() {
+        let chain_client = ChainClient::new(crate::chain::CoreRpcConfig {
+            url: "http://127.0.0.1:1".to_string(),
+            auth: crate::chain::CoreRpcAuth::None,
+        })
+        .unwrap();
+        let tx0_outpoint = mercurylib::transfer::TxOutpoint {
+            txid: "00".repeat(32),
+            vout: 0,
+        };
+
+        let error = verify_tx0_output_is_unspent_and_confirmed(
+            &chain_client,
+            &tx0_outpoint,
+            "not-hex",
+            "regtest",
+            1,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "HexError");
+        assert!(matches!(
+            error.downcast_ref::<MercuryError>(),
+            Some(MercuryError::HexError)
+        ));
+    }
+
+    #[test]
+    fn tx0_output_address_is_derived_from_selected_output() -> Result<()> {
+        let expected_address = Address::from_str(
+            "bcrt1p3qkhfews2uk44qtvauqyr2ttdsw7svhkl9nkm9s9c3x4ax5h60wq5jq7et",
+        )?
+        .require_network(bitcoin::Network::Regtest)?;
+        let tx0 = Transaction {
+            version: 2,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: vec![
+                bitcoin::TxOut {
+                    value: 0,
+                    script_pubkey: bitcoin::ScriptBuf::new(),
+                },
+                bitcoin::TxOut {
+                    value: 100_000,
+                    script_pubkey: expected_address.script_pubkey(),
+                },
+            ],
+        };
+        let tx0_outpoint = mercurylib::transfer::TxOutpoint {
+            txid: tx0.txid().to_string(),
+            vout: 1,
+        };
+        let tx0_hex = hex::encode(bitcoin::consensus::encode::serialize(&tx0));
+
+        assert_eq!(
+            get_output_address_from_tx0(&tx0_outpoint, &tx0_hex, "regtest")?,
+            expected_address.to_string()
+        );
+        Ok(())
     }
 }

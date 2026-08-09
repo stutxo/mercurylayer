@@ -1,14 +1,12 @@
-pub mod cpfp_tx;
 pub mod key_derivation;
 
 use std::{fmt, str::FromStr};
 
 use bip39::{Language, Mnemonic};
-use bitcoin::Transaction;
 use secp256k1::rand::{self, Rng};
 use serde::{Deserialize, Serialize};
 
-use crate::{transfer::TxOutpoint, utils::ServerConfig, MercuryError};
+use crate::MercuryError;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Wallet {
@@ -20,8 +18,6 @@ pub struct Wallet {
     pub chain_endpoint: String,
     pub network: String,
     pub blockheight: u32,
-    pub initlock: u32,
-    pub interval: u32,
     pub activities: Vec<Activity>,
     pub coins: Vec<Coin>,
     pub settings: Settings,
@@ -66,15 +62,16 @@ pub struct Coin {
     /// The coin address is the user_pubkey || auth_pubkey
     /// Used to transfer the coin to another wallet
     pub address: String,
-    /// The backup address is the address used in backup transactions
-    /// The backup address is the p2tr address of the user_pubkey
+    /// The BIP448 recovery address derived from the user public key.
+    /// The serialized field name remains `backup_address` for code stability.
     pub backup_address: String,
     pub server_pubkey: Option<String>,
     // The aggregated_pubkey is the user_pubkey + server_pubkey
     pub aggregated_pubkey: Option<String>,
     /// The aggregated address is the P2TR address from aggregated_pubkey
     pub aggregated_address: Option<String>,
-    /// Explicit protocol marker for non-legacy statechains. Missing means legacy.
+    /// `None` marks a new transfer-address coin before a statechain is assigned.
+    /// An initialized deposit or accepted transfer sets this to `Some("bip448")`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub statechain_protocol: Option<String>,
     pub utxo_txid: Option<String>,
@@ -87,11 +84,9 @@ pub struct Coin {
     pub public_nonce: Option<String>,
     pub blinding_factor: Option<String>,
     pub server_public_nonce: Option<String>,
-    pub tx_cpfp: Option<String>,
     pub tx_withdraw: Option<String>,
     pub withdrawal_address: Option<String>,
     pub status: CoinStatus,
-    pub duplicate_index: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -105,8 +100,6 @@ pub enum CoinStatus {
     WITHDRAWING, // withdrawal tx signed and broadcast but not yet confirmed
     TRANSFERRED, // the coin was transferred
     WITHDRAWN,   // the coin was withdrawn
-    DUPLICATED,  // the coin was duplicated
-    INVALIDATED, // the coin was invalidated (duplicated but not transferred)
 }
 
 impl fmt::Display for CoinStatus {
@@ -124,8 +117,6 @@ impl fmt::Display for CoinStatus {
                 Self::WITHDRAWING => "WITHDRAWING",
                 Self::TRANSFERRED => "TRANSFERRED",
                 Self::WITHDRAWN => "WITHDRAWN",
-                Self::DUPLICATED => "DUPLICATED",
-                Self::INVALIDATED => "INVALIDATED",
             }
         )
     }
@@ -155,53 +146,9 @@ impl FromStr for CoinStatus {
             "WITHDRAWING" => Ok(CoinStatus::WITHDRAWING),
             "TRANSFERRED" => Ok(CoinStatus::TRANSFERRED),
             "WITHDRAWN" => Ok(CoinStatus::WITHDRAWN),
-            "DUPLICATED" => Ok(CoinStatus::DUPLICATED),
-            "INVALIDATED" => Ok(CoinStatus::INVALIDATED),
             _ => Err(CoinStatusParseError {}),
         }
     }
-}
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct StatechainBackupTxs {
-    pub statechain_id: String,
-    pub backup_txs: Vec<BackupTx>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct BackupTx {
-    pub tx_n: u32,
-    pub tx: String,
-    pub client_public_nonce: String,
-    pub server_public_nonce: String,
-    pub client_public_key: String,
-    pub server_public_key: String,
-    pub blinding_factor: String,
-}
-
-pub fn get_previous_outpoint(backup_tx: &BackupTx) -> Result<TxOutpoint, MercuryError> {
-    let tx1: Transaction =
-        bitcoin::consensus::encode::deserialize(&hex::decode(backup_tx.tx.clone())?)?;
-
-    if tx1.input.len() > 1 {
-        return Err(MercuryError::Tx1HasMoreThanOneInput);
-    }
-
-    if tx1.output.len() > 1 {
-        return Err(MercuryError::Tx1HasMoreThanOneInput);
-    }
-
-    let tx0_txid = tx1.input[0].previous_output.txid;
-    let tx0_vout = tx1.input[0].previous_output.vout as u32;
-
-    Ok(TxOutpoint {
-        txid: tx0_txid.to_string(),
-        vout: tx0_vout,
-    })
-}
-
-pub fn set_config(wallet: &mut Wallet, config: &ServerConfig) {
-    wallet.initlock = config.initlock;
-    wallet.interval = config.interval;
 }
 
 pub fn generate_mnemonic() -> core::result::Result<String, MercuryError> {
@@ -213,7 +160,7 @@ pub fn generate_mnemonic() -> core::result::Result<String, MercuryError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Coin, Settings, Wallet};
+    use super::{Settings, Wallet};
 
     #[test]
     fn wallet_deserializes_neutral_chain_metadata() {
@@ -226,8 +173,6 @@ mod tests {
             chain_endpoint: "http://127.0.0.1:18443".to_string(),
             network: "regtest".to_string(),
             blockheight: 42,
-            initlock: 1000,
-            interval: 10,
             activities: Vec::new(),
             coins: Vec::new(),
             settings: Settings {
@@ -260,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_coin_json_deserializes_without_protocol_marker() {
+    fn fresh_coin_has_no_statechain_id_or_protocol_marker() {
         let wallet = Wallet {
             name: "wallet".to_string(),
             mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string(),
@@ -270,8 +215,6 @@ mod tests {
             chain_endpoint: "http://127.0.0.1:18443".to_string(),
             network: "regtest".to_string(),
             blockheight: 42,
-            initlock: 1000,
-            interval: 10,
             activities: Vec::new(),
             coins: Vec::new(),
             settings: Settings {
@@ -290,14 +233,9 @@ mod tests {
                 tutorials: false,
             },
         };
-        let mut coin_json = serde_json::to_value(wallet.get_new_coin().unwrap()).unwrap();
-        coin_json
-            .as_object_mut()
-            .unwrap()
-            .remove("statechain_protocol");
+        let coin = wallet.get_new_coin().unwrap();
 
-        let coin: Coin = serde_json::from_value(coin_json).unwrap();
-
+        assert_eq!(coin.statechain_id, None);
         assert_eq!(coin.statechain_protocol, None);
     }
 }

@@ -170,11 +170,9 @@ impl Wallet {
             public_nonce: None,
             blinding_factor: None,
             server_public_nonce: None,
-            tx_cpfp: None,
             tx_withdraw: None,
             withdrawal_address: None,
             status: CoinStatus::INITIALISED,
-            duplicate_index: 0,
         };
 
         Ok(coin)
@@ -197,8 +195,6 @@ mod tests {
             chain_endpoint: String::new(),
             network: "regtest".to_string(),
             blockheight: 0,
-            initlock: 0,
-            interval: 0,
             activities: Vec::new(),
             coins: Vec::new(),
             settings: Settings {

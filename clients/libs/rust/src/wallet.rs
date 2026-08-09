@@ -1,12 +1,10 @@
 use anyhow::Result;
 use mercurylib::wallet::{generate_mnemonic, Settings, Wallet};
 
-use crate::{client_config::ClientConfig, utils::info_config};
+use crate::client_config::ClientConfig;
 
 pub async fn create_wallet(name: &str, client_config: &ClientConfig) -> Result<Wallet> {
     let mnemonic = generate_mnemonic()?;
-
-    let server_info = info_config(&client_config).await?;
 
     let blockheight = client_config.chain_client.tip_height()?;
 
@@ -44,8 +42,6 @@ pub async fn create_wallet(name: &str, client_config: &ClientConfig) -> Result<W
         chain_endpoint,
         network: client_config.network.to_string(),
         blockheight,
-        initlock: server_info.initlock,
-        interval: server_info.interval,
         activities: Vec::new(),
         coins: Vec::new(),
         settings,

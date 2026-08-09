@@ -77,10 +77,6 @@ async fn wait_for_address_utxo_matching(
     ))
 }
 
-pub async fn get_blockheight(client_config: &ClientConfig) -> Result<u32> {
-    client_config.chain_client.tip_height()
-}
-
 pub fn broadcast_raw_tx(client_config: &ClientConfig, tx_bytes: &[u8]) -> Result<Txid> {
     client_config.chain_client.broadcast_tx(tx_bytes)
 }

@@ -598,7 +598,7 @@ mod tests {
         Wallet {
             name: "wallet".to_string(), mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string(),
             version: "0.1.0".to_string(), state_entity_endpoint: "http://127.0.0.1:1".to_string(), chain_backend: "core".to_string(),
-            chain_endpoint: "http://127.0.0.1:1".to_string(), network: "regtest".to_string(), blockheight: 0, initlock: 1000, interval: 10,
+            chain_endpoint: "http://127.0.0.1:1".to_string(), network: "regtest".to_string(), blockheight: 0,
             activities: Vec::new(), coins,
             settings: Settings { network: "regtest".to_string(), block_explorerURL: None, torProxyHost: None, torProxyPort: None, torProxyControlPassword: None, torProxyControlPort: None, statechainEntityApi: "http://127.0.0.1:1".to_string(), torStatechainEntityApi: None, chainBackend: "core".to_string(), chainUrl: "http://127.0.0.1:1".to_string(), chainType: None, notifications: false, tutorials: false },
         }

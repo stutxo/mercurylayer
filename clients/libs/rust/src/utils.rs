@@ -2,36 +2,13 @@ use crate::client_config::ClientConfig;
 use anyhow::{anyhow, Ok, Result};
 use chrono::Utc;
 use mercurylib::{
-    transfer::receiver::StatechainInfoResponsePayload,
-    utils::{InfoConfig, ServerConfig},
-    wallet::Activity,
+    transfer::receiver::StatechainInfoResponsePayload, wallet::Activity,
     withdraw::WithdrawCompletePayload,
 };
 use reqwest::StatusCode;
 
-pub async fn info_config(client_config: &ClientConfig) -> Result<InfoConfig> {
-    let path = "info/config";
-
-    let client = client_config.get_reqwest_client()?;
-    let request = client.get(&format!("{}/{}", client_config.statechain_entity, path));
-
-    let value = request.send().await?.text().await?;
-
-    let server_config: ServerConfig = serde_json::from_str(value.as_str())?;
-
-    let initlock = server_config.initlock;
-    let interval = server_config.interval;
-
-    let number_blocks = 3;
-    let fee_rate_sats_per_byte = client_config
-        .chain_client
-        .estimate_fee_sat_per_vbyte(number_blocks)?;
-
-    Ok(InfoConfig {
-        initlock,
-        interval,
-        fee_rate_sats_per_byte,
-    })
+pub fn estimate_fee_rate_sats_per_byte(client_config: &ClientConfig) -> Result<f64> {
+    client_config.chain_client.estimate_fee_sat_per_vbyte(3)
 }
 
 pub fn create_activity(utxo: &str, amount: u32, action: &str) -> Activity {

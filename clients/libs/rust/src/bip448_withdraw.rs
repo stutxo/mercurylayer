@@ -22,7 +22,7 @@ use crate::{
     sqlite_manager::{
         get_bip448_pending_transfer_signing, get_bip448_statechain, get_wallet, update_wallet,
     },
-    utils::info_config,
+    utils::estimate_fee_rate_sats_per_byte,
 };
 
 const UNEXPECTED_COMPLETION_RESPONSE: &str =
@@ -85,12 +85,10 @@ pub async fn execute(
         ));
     }
 
-    let server_info = info_config(client_config).await?;
-    let fee_rate = fee_rate.unwrap_or(
-        server_info
-            .fee_rate_sats_per_byte
-            .min(client_config.max_fee_rate),
-    );
+    let fee_rate = match fee_rate {
+        Some(fee_rate) => fee_rate,
+        None => estimate_fee_rate_sats_per_byte(client_config)?.min(client_config.max_fee_rate),
+    };
     let nonce = create_bip448_keypath_nonces(coin)?;
     coin.secret_nonce = Some(nonce.secret_nonce);
     coin.public_nonce = Some(nonce.public_nonce);
@@ -191,7 +189,7 @@ mod tests {
         let mut wallet = Wallet {
             name: "wallet".into(), mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".into(), version: "0.1.0".into(),
             state_entity_endpoint: "http://127.0.0.1:1".into(), chain_backend: "core".into(), chain_endpoint: "http://127.0.0.1:1".into(), network: "regtest".into(),
-            blockheight: 0, initlock: 1_000, interval: 10, activities: Vec::new(), coins: Vec::new(),
+            blockheight: 0, activities: Vec::new(), coins: Vec::new(),
             settings: Settings { network: "regtest".into(), block_explorerURL: None, torProxyHost: None, torProxyPort: None, torProxyControlPassword: None, torProxyControlPort: None, statechainEntityApi: "http://127.0.0.1:1".into(), torStatechainEntityApi: None, chainBackend: "core".into(), chainUrl: "http://127.0.0.1:1".into(), chainType: None, notifications: false, tutorials: false },
         };
         let mut coin = wallet.get_new_coin().unwrap();

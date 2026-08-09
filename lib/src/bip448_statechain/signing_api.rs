@@ -1,14 +1,11 @@
-//! Wire payloads and request validation for the Phase 5 versioned BIP448
-//! signing API.
+//! Wire payloads and request validation for the BIP448 signing API.
 //!
 //! The BIP448 signing routes (`/bip448-statechain/sign/first` and
-//! `/bip448-statechain/sign/second`) are separate from the legacy `/sign/*`
-//! routes and must preserve the legacy blind-server property. The Mercury
-//! server sees only an opaque client-generated `signing_id`, never the state
-//! number, signing role, template hash, transaction contents, outputs, or
-//! settlement hash. The BIP448 lockbox contract is also versioned so the
-//! lockbox can make nonce idempotency authoritative by opaque id without
-//! learning transaction metadata.
+//! `/bip448-statechain/sign/second`) preserve the blind-server property. The
+//! Mercury server sees only an opaque client-generated `signing_id`, never the
+//! state number, signing role, template hash, transaction contents, outputs,
+//! or settlement hash. The BIP448 lockbox contract makes nonce idempotency
+//! authoritative by opaque id without learning transaction metadata.
 
 use std::{error::Error, fmt};
 

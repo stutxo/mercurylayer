@@ -1,7 +1,6 @@
 //! BIP448 CSFS blinded MuSig signing over BIP446 `TemplateHash` messages.
 //!
-//! This adapts Mercury's blinded two-party MuSig flow (see
-//! `crate::transaction::calculate_musig_session` and `docs/blind_musig.md`) to
+//! This module implements the blinded two-party MuSig flow used by BIP448 to
 //! produce the raw BIP340 signatures consumed by the
 //! `OP_TEMPLATEHASH OP_INTERNALKEY OP_CHECKSIGFROMSTACK` update leaves. It
 //! deliberately differs from the legacy Taproot key-path flow in three ways:

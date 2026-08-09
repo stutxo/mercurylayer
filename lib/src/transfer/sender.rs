@@ -1,17 +1,10 @@
 use std::str::FromStr;
 
 use bitcoin::{hashes::sha256, secp256k1, PrivateKey, Txid};
-use secp256k1::{Message, Scalar, Secp256k1};
+use secp256k1::{Message, Secp256k1};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
-use crate::{
-    decode_transfer_address,
-    error::MercuryError,
-    wallet::{BackupTx, Coin},
-};
-
-use super::TransferMsg;
+use crate::{decode_transfer_address, error::MercuryError};
 
 #[derive(Serialize, Deserialize)]
 pub struct PaymentHashRequestPayload {
@@ -85,60 +78,4 @@ pub fn create_transfer_signature(
     let signature = secp.sign_schnorr(msg.as_ref(), &keypair);
 
     Ok(signature.to_string())
-}
-
-pub fn create_transfer_update_msg(
-    x1: &str,
-    recipient_address: &str,
-    coin: &Coin,
-    transfer_signature: &str,
-    backup_transactions: &Vec<BackupTx>,
-) -> Result<TransferUpdateMsgRequestPayload, MercuryError> {
-    let (_, _, recipient_auth_pubkey) = decode_transfer_address(recipient_address)?;
-
-    let client_seckey = PrivateKey::from_wif(&coin.user_privkey)?.inner;
-    let client_public_key = coin.user_pubkey.to_string();
-
-    let x1 = hex::decode(x1)?;
-    let x1: [u8; 32] = x1.try_into().unwrap();
-    let x1 = Scalar::from_be_bytes(x1)?;
-
-    let t1 = client_seckey.add_tweak(&x1)?;
-
-    let statechain_id = coin.statechain_id.as_ref().unwrap();
-    let signed_statechain_id = coin.signed_statechain_id.as_ref().unwrap();
-
-    let transfer_msg = TransferMsg {
-        statechain_id: statechain_id.to_string(),
-        transfer_signature: transfer_signature.to_string(),
-        backup_transactions: backup_transactions.to_owned(),
-        t1: t1.secret_bytes(),
-        user_public_key: client_public_key,
-    };
-
-    let transfer_msg_json = json!(&transfer_msg);
-
-    let transfer_msg_json_str = serde_json::to_string_pretty(&transfer_msg_json)?;
-
-    let msg = transfer_msg_json_str.as_bytes();
-
-    let serialized_new_auth_pubkey = &recipient_auth_pubkey.serialize();
-    let encrypted_msg = ecies::encrypt(serialized_new_auth_pubkey, msg);
-
-    if encrypted_msg.is_err() {
-        return Err(MercuryError::SecpError);
-    }
-
-    let encrypted_msg = encrypted_msg.unwrap();
-
-    let encrypted_msg_string = hex::encode(&encrypted_msg);
-
-    let transfer_update_msg_request_payload = TransferUpdateMsgRequestPayload {
-        statechain_id: statechain_id.to_string(),
-        auth_sig: signed_statechain_id.to_string(),
-        new_user_auth_key: recipient_auth_pubkey.to_string(),
-        enc_transfer_msg: encrypted_msg_string.clone(),
-    };
-
-    Ok(transfer_update_msg_request_payload)
 }

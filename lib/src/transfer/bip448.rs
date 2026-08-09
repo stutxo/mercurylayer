@@ -176,9 +176,8 @@ impl Bip448VerifiedRecoveryState {
     }
 }
 
-/// BIP448 transfer message. This deliberately does not reuse the legacy
-/// `TransferMsg`/`BackupTx` shape, because BIP448 receivers validate signed
-/// update/settlement templates rather than legacy backup transactions.
+/// BIP448 transfer message. Receivers validate signed update/settlement
+/// templates rather than backup-transaction history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bip448TransferMsg {
     pub msg_version: u32,
@@ -199,7 +198,8 @@ pub struct Bip448TransferMsg {
     /// compare it with `/bip448-statechain/signature-count/<statechain_id>`.
     pub server_signature_count: u64,
     /// Sender's tweaked client key share material needed by the receiver's key
-    /// update flow. It is protocol key-share state, not a legacy backup tx.
+    /// update flow. It is protocol key-share state, not backup-transaction
+    /// history.
     pub t1: [u8; 32],
     pub state_history: Vec<Bip448StateHistoryEntry>,
 }
@@ -1288,7 +1288,7 @@ mod tests {
     }
 
     #[test]
-    fn transfer_message_serialization_round_trips_without_legacy_backups() {
+    fn transfer_message_serialization_round_trips_without_backup_transactions() {
         let latest_state = latest_state();
         let msg = Bip448TransferMsg {
             msg_version: 2,

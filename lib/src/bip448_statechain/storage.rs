@@ -915,8 +915,7 @@ fn settlement_template_witness(script: &ScriptBuf, control_block: &ControlBlock)
     witness
 }
 
-/// BIP448 statechain storage record. This is intentionally independent from
-/// legacy `BackupTx` and the `backup_txs` SQLite table.
+/// BIP448 statechain storage record for signed update and settlement state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bip448StatechainRecord {
     pub wallet_name: String,
@@ -1003,7 +1002,7 @@ mod tests {
     }
 
     #[test]
-    fn statechain_record_is_independent_from_legacy_backup_txs() {
+    fn statechain_record_serialization_excludes_backup_transaction_fields() {
         let latest_state = sample_latest_state();
         let record = Bip448StatechainRecord {
             wallet_name: "wallet".to_string(),

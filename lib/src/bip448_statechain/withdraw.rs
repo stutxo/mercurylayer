@@ -412,8 +412,6 @@ mod tests {
             chain_endpoint: "http://127.0.0.1:18443".to_string(),
             network: "regtest".to_string(),
             blockheight: 0,
-            initlock: 1_000,
-            interval: 10,
             activities: Vec::new(),
             coins: Vec::new(),
             settings: Settings {
