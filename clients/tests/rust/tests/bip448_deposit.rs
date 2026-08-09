@@ -16,6 +16,7 @@ use common::bip448_regtest::{
     fund_address_output, fund_p2a_fee_input, FEE_INPUT_AMOUNT_SATS, FUNDING_AMOUNT_SATS,
 };
 use mercurylib::bip448_statechain::{
+    deposit::BIP448_COIN_PROTOCOL,
     package::{
         build_anchor_cpfp_package, build_latest_state_recovery_package, Bip448CpfpFeeInput,
         Bip448RecoveryPackage,
@@ -1360,13 +1361,14 @@ async fn bip448_discovery_cursor_reorg_and_restart_state() -> Result<()> {
 
     let wallet_name = format!("bip448-scan-state-{}", uuid::Uuid::new_v4());
     let mut wallet = mercuryrustlib::wallet::create_wallet(&wallet_name, &client_config).await?;
+    let wallet_birth_height = wallet.blockheight;
     let mut coin = wallet.get_new_coin()?;
     coin.aggregated_address = Some(scan_address.to_string());
-    coin.utxo_txid = Some(first.outpoint.txid.to_string());
-    coin.utxo_vout = Some(first.outpoint.vout);
-    coin.amount = Some(u32::try_from(first.value_sats)?);
-    coin.statechain_id = Some(format!("legacy-scan-{}", uuid::Uuid::new_v4()));
-    coin.status = CoinStatus::CONFIRMED;
+    // Keep this scan-state fixture out of the signing path, which its synthetic
+    // statechain does not configure, while retaining descriptor discovery.
+    coin.amount = Some(u32::try_from(first.value_sats)?.saturating_add(1));
+    coin.statechain_id = Some(format!("bip448-scan-{}", uuid::Uuid::new_v4()));
+    coin.statechain_protocol = Some(BIP448_COIN_PROTOCOL.to_string());
     wallet.coins.push(coin);
     mercuryrustlib::sqlite_manager::insert_wallet(&client_config.pool, &wallet).await?;
 
@@ -1375,7 +1377,7 @@ async fn bip448_discovery_cursor_reorg_and_restart_state() -> Result<()> {
     mercuryrustlib::coin_status::update_coins(&client_config, &wallet_name).await?;
     let first_calls = mercuryrustlib::chain::take_scan_blocks_calls();
     assert_eq!(first_calls.len(), 1);
-    assert_eq!(first_calls[0].0, 0);
+    assert_eq!(first_calls[0].0, wallet_birth_height);
     let (first_cursor_height, _): (i64, String) = sqlx::query_as(
         "SELECT last_scanned_height, last_scanned_block_hash \
          FROM bip448_scan_cursors WHERE wallet_name = $1 AND script_pubkey = $2",
@@ -1493,7 +1495,7 @@ async fn bip448_discovery_cursor_reorg_and_restart_state() -> Result<()> {
     mercuryrustlib::coin_status::update_coins(&restarted_config, &wallet_name).await?;
     assert_eq!(
         mercuryrustlib::chain::take_scan_blocks_calls(),
-        vec![(0, rescan_tip)]
+        vec![(wallet_birth_height, rescan_tip)]
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(

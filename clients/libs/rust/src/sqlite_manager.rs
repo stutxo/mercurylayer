@@ -8,10 +8,9 @@ use mercurylib::{
         storage::{Bip448LatestState, Bip448StatechainRecord},
     },
     transfer::bip448::{Bip448StateHistoryEntry, Bip448TransferMsg},
-    wallet::{BackupTx, Wallet},
+    wallet::Wallet,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use secp256k1::XOnlyPublicKey;
 use sqlx::{Pool, Row, Sqlite};
 
@@ -84,7 +83,7 @@ pub(crate) fn canonical_txid(txid: &str) -> Result<String> {
 fn canonical_wallet_json(wallet: &Wallet) -> Result<String> {
     let mut wallet = wallet.clone();
     for coin in &mut wallet.coins {
-        for txid in [&mut coin.utxo_txid, &mut coin.tx_cpfp, &mut coin.tx_withdraw] {
+        for txid in [&mut coin.utxo_txid, &mut coin.tx_withdraw] {
             if let Some(txid) = txid {
                 *txid = canonical_txid(txid)?;
             }
@@ -501,102 +500,6 @@ pub async fn update_wallet(pool: &Pool<Sqlite>, wallet: &Wallet) -> Result<()> {
         .bind(wallet.name.clone())
         .execute(pool)
         .await?;
-
-    Ok(())
-}
-
-pub async fn insert_backup_txs(
-    pool: &Pool<Sqlite>,
-    wallet_name: &str,
-    statechain_id: &str,
-    backup_txs: &Vec<BackupTx>,
-) -> Result<()> {
-    let backup_txs_json = json!(backup_txs).to_string();
-
-    let query = "INSERT INTO backup_txs (wallet_name, statechain_id, txs) VALUES ($1, $2, $3)";
-
-    let _ = sqlx::query(query)
-        .bind(wallet_name)
-        .bind(statechain_id)
-        .bind(backup_txs_json)
-        .execute(pool)
-        .await?;
-
-    Ok(())
-}
-
-pub async fn update_backup_txs(
-    pool: &Pool<Sqlite>,
-    wallet_name: &str,
-    statechain_id: &str,
-    backup_txs: &Vec<BackupTx>,
-) -> Result<()> {
-    let backup_txs_json = json!(backup_txs).to_string();
-
-    let query = "UPDATE backup_txs SET txs = $1 WHERE statechain_id = $2 AND wallet_name = $3";
-
-    let _ = sqlx::query(query)
-        .bind(backup_txs_json)
-        .bind(statechain_id)
-        .bind(wallet_name)
-        .execute(pool)
-        .await?;
-
-    Ok(())
-}
-
-pub async fn get_backup_txs(
-    pool: &Pool<Sqlite>,
-    wallet_name: &str,
-    statechain_id: &str,
-) -> Result<Vec<BackupTx>> {
-    let query = "SELECT txs FROM backup_txs WHERE statechain_id = $1 AND wallet_name = $2";
-
-    let row = sqlx::query(query)
-        .bind(statechain_id)
-        .bind(wallet_name)
-        .fetch_one(pool)
-        .await?;
-
-    if row.is_empty() {
-        return Err(anyhow!("Statechain id not found"));
-    }
-
-    let backup_txs_json: String = row.get(0);
-
-    let backup_txs: Vec<BackupTx> = serde_json::from_str(&backup_txs_json)?;
-
-    Ok(backup_txs)
-}
-
-pub async fn insert_or_update_backup_txs(
-    pool: &Pool<Sqlite>,
-    wallet_name: &str,
-    statechain_id: &str,
-    backup_txs: &Vec<BackupTx>,
-) -> Result<()> {
-    let mut transaction = pool.begin().await?;
-
-    let backup_txs_json = json!(backup_txs).to_string();
-
-    let query = "DELETE FROM backup_txs WHERE statechain_id = $1 AND wallet_name = $2";
-
-    let _ = sqlx::query(query)
-        .bind(statechain_id)
-        .bind(wallet_name)
-        .execute(&mut *transaction)
-        .await?;
-
-    let query = "INSERT INTO backup_txs (statechain_id, wallet_name, txs) VALUES ($1, $2, $3)";
-
-    let _ = sqlx::query(query)
-        .bind(statechain_id)
-        .bind(wallet_name)
-        .bind(backup_txs_json)
-        .execute(&mut *transaction)
-        .await?;
-
-    transaction.commit().await?;
 
     Ok(())
 }
@@ -1262,16 +1165,6 @@ mod tests {
         Ok(pool)
     }
 
-    async fn table_exists(pool: &Pool<Sqlite>, table_name: &str) -> Result<bool> {
-        let row =
-            sqlx::query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = $1 LIMIT 1")
-                .bind(table_name)
-                .fetch_optional(pool)
-                .await?;
-
-        Ok(row.is_some())
-    }
-
     fn sample_wallet() -> Wallet {
         Wallet {
             name: "wallet".to_string(),
@@ -1381,18 +1274,6 @@ mod tests {
         }
     }
 
-    fn sample_backup_txs() -> Vec<BackupTx> {
-        vec![BackupTx {
-            tx_n: 1,
-            tx: "02000000".to_string(),
-            client_public_nonce: "aa".to_string(),
-            server_public_nonce: "bb".to_string(),
-            client_public_key: "cc".to_string(),
-            server_public_key: "dd".to_string(),
-            blinding_factor: "ee".to_string(),
-        }]
-    }
-
     fn sample_bip448_transfer_msg() -> Bip448TransferMsg {
         let mut latest_state = sample_latest_state(2);
         latest_state
@@ -1455,31 +1336,35 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
-    async fn migration_adds_bip448_tables_without_touching_legacy_wallet_data() -> Result<()> {
+    async fn current_migrations_are_idempotent_and_preserve_bip448_wallet_state() -> Result<()> {
         let pool = migrated_pool().await?;
-
-        assert!(table_exists(&pool, "wallet").await?);
-        assert!(table_exists(&pool, "backup_txs").await?);
-        assert!(table_exists(&pool, "bip448_statechains").await?);
-        assert!(table_exists(&pool, "bip448_transfer_messages").await?);
-        assert!(table_exists(&pool, "bip448_pending_deposit_signings").await?);
-        assert!(table_exists(&pool, "bip448_pending_transfer_signings").await?);
-        assert!(table_exists(&pool, "bip448_scan_cursors").await?);
-        assert!(table_exists(&pool, "bip448_scanned_outpoints").await?);
-        assert!(table_exists(&pool, "bip448_package_attempts").await?);
-        assert!(table_exists(&pool, "bip448_state_history").await?);
-
-        let wallet = sample_wallet();
+        let record = sample_bip448_record(1);
+        let mut wallet = sample_wallet();
+        let mut coin = wallet.get_new_coin()?;
+        coin.statechain_protocol =
+            Some(mercurylib::bip448_statechain::deposit::BIP448_COIN_PROTOCOL.into());
+        coin.statechain_id = Some(record.statechain_id.clone());
+        coin.aggregated_pubkey = Some(record.aggregate_pubkey.clone());
+        coin.utxo_txid = Some(record.funding_outpoint.txid.clone());
+        coin.utxo_vout = Some(record.funding_outpoint.vout);
+        coin.amount = Some(u32::try_from(record.amount_sats)?);
+        coin.locktime = Some(record.latest_state.state_locktime);
+        coin.status = CoinStatus::CONFIRMED;
+        wallet.coins.push(coin);
         insert_wallet(&pool, &wallet).await?;
-        let backup_txs = sample_backup_txs();
-        insert_backup_txs(&pool, &wallet.name, "legacy-statechain", &backup_txs).await?;
+        upsert_bip448_statechain_record(&pool, &record).await?;
+
+        sqlx::migrate!("./migrations").run(&pool).await?;
 
         let roundtrip_wallet = get_wallet(&pool, &wallet.name).await?;
-        let roundtrip_backup_txs = get_backup_txs(&pool, &wallet.name, "legacy-statechain").await?;
-
-        assert_eq!(roundtrip_wallet.name, wallet.name);
-        assert_eq!(roundtrip_backup_txs.len(), 1);
-        assert_eq!(roundtrip_backup_txs[0].tx_n, 1);
+        let roundtrip_record =
+            get_bip448_statechain(&pool, &wallet.name, &record.statechain_id).await?;
+        assert_eq!(
+            roundtrip_wallet.coins[0].statechain_protocol.as_deref(),
+            Some(mercurylib::bip448_statechain::deposit::BIP448_COIN_PROTOCOL)
+        );
+        assert_eq!(roundtrip_wallet.coins[0].statechain_id, Some("statechain".into()));
+        assert_eq!(roundtrip_record, record);
 
         Ok(())
     }
@@ -1528,20 +1413,15 @@ mod tests {
         let mut coin = wallet.get_new_coin()?;
         coin.utxo_txid = Some("AA".repeat(32));
         coin.utxo_vout = Some(1);
-        coin.tx_cpfp = Some("BB".repeat(32));
         coin.tx_withdraw = Some("CC".repeat(32));
         wallet.coins.push(coin);
         insert_wallet(&pool, &wallet).await?;
         let stored_coin = get_wallet(&pool, &wallet.name).await?.coins.remove(0);
         assert_eq!(stored_coin.utxo_txid, Some("aa".repeat(32)));
-        assert_eq!(stored_coin.tx_cpfp, Some("bb".repeat(32)));
         assert_eq!(stored_coin.tx_withdraw, Some("cc".repeat(32)));
         wallet.coins[0].utxo_txid = Some("not-a-txid".into());
         assert!(update_wallet(&pool, &wallet).await.is_err());
         wallet.coins[0].utxo_txid = Some("aa".repeat(32));
-        wallet.coins[0].tx_cpfp = Some("not-a-txid".into());
-        assert!(update_wallet(&pool, &wallet).await.is_err());
-        wallet.coins[0].tx_cpfp = None;
         wallet.coins[0].tx_withdraw = Some("not-a-txid".into());
         assert!(update_wallet(&pool, &wallet).await.is_err());
 
@@ -1816,34 +1696,6 @@ mod tests {
             .await?,
             bip448_reservation_id(&reclaimed.statechain_id, &reclaimed.role)
         );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn reapplying_bip448_migration_does_not_destroy_populated_legacy_data() -> Result<()> {
-        let pool = migrated_pool().await?;
-        let wallet = sample_wallet();
-        insert_wallet(&pool, &wallet).await?;
-        let backup_txs = sample_backup_txs();
-        insert_backup_txs(&pool, &wallet.name, "legacy-statechain", &backup_txs).await?;
-
-        // Re-run the additive 0002 migration statements against the ALREADY
-        // POPULATED legacy database. A destructive DROP/ALTER in 0002 would wipe
-        // the legacy rows asserted below; `CREATE TABLE IF NOT EXISTS` is a no-op.
-        let migration_sql = include_str!("../migrations/0002_bip448_statechain_data.sql");
-        for statement in migration_sql.split(';') {
-            let statement = statement.trim();
-            if !statement.is_empty() {
-                sqlx::query(statement).execute(&pool).await?;
-            }
-        }
-
-        let roundtrip_backup_txs = get_backup_txs(&pool, &wallet.name, "legacy-statechain").await?;
-        assert_eq!(roundtrip_backup_txs.len(), 1);
-        assert_eq!(roundtrip_backup_txs[0].tx_n, backup_txs[0].tx_n);
-        assert_eq!(get_wallet(&pool, &wallet.name).await?.name, wallet.name);
-        assert!(table_exists(&pool, "bip448_statechains").await?);
-
         Ok(())
     }
 
@@ -2193,8 +2045,4 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn legacy_coin_status_import_remains_available_for_existing_callers() {
-        assert_eq!(CoinStatus::CONFIRMED.to_string(), "CONFIRMED");
-    }
 }

@@ -10,25 +10,19 @@ use mercurylib::{
         storage::Bip448StatechainRecord,
     },
     utils::is_enclave_pubkey_part_of_coin,
-    wallet::{Activity, BackupTx, Coin, CoinStatus, Wallet},
+    wallet::{Activity, Coin, CoinStatus, Wallet},
 };
 
 use crate::{
     chain::{ChainUtxo, DescriptorActivity},
     client_config::ClientConfig,
-    deposit::{create_bip448_deposit_state, create_tx1},
+    deposit::create_bip448_deposit_state,
     sqlite_manager::{
         clear_bip448_scan_state, delete_bip448_pending_deposit_signing,
         get_bip448_pending_deposit_signing, get_bip448_statechain_optional, get_wallet,
-        insert_backup_txs, load_bip448_scan_state, persist_bip448_scan_state, update_wallet,
-        Bip448ScanCursor,
+        load_bip448_scan_state, persist_bip448_scan_state, update_wallet, Bip448ScanCursor,
     },
 };
-
-struct DepositResult {
-    activity: Activity,
-    backup_tx: BackupTx,
-}
 
 struct Bip448DepositResult {
     activity: Activity,
@@ -459,134 +453,6 @@ fn validate_bip448_pending_matches_accepted(
     Ok(())
 }
 
-async fn check_deposit(
-    client_config: &ClientConfig,
-    coin: &mut Coin,
-    wallet_netwotk: &str,
-    wallet_blockheight: u32,
-    discovered: &HashMap<ScriptBuf, Vec<ChainUtxo>>,
-) -> Result<Option<DepositResult>> {
-    if funding_outpoint_is_partial(coin) {
-        return Err(anyhow!("Coin has a partial funding outpoint"));
-    }
-
-    if deposit_setup_is_incomplete(coin) {
-        return Ok(None);
-    }
-
-    if coin.statechain_id.is_none() && coin.utxo_txid.is_none() && coin.utxo_vout.is_none() {
-        if coin.status != CoinStatus::INITIALISED {
-            return Err(anyhow!(
-                "Coin does not have a statechain ID, a UTXO and the status is not INITIALISED"
-            ));
-        } else {
-            return Ok(None);
-        }
-    }
-
-    let expected_amount = coin
-        .amount
-        .ok_or_else(|| anyhow!("Coin missing amount after deposit setup"))?;
-    let address = Address::from_str(
-        coin.aggregated_address
-            .as_ref()
-            .ok_or_else(|| anyhow!("Coin missing aggregated_address after deposit setup"))?,
-    )?
-    .require_network(client_config.network)?;
-
-    let (utxo, confirmations) =
-        if let (Some(txid), Some(vout)) = (coin.utxo_txid.as_deref(), coin.utxo_vout) {
-            let Some(utxo) = get_known_utxo(
-                client_config,
-                &address,
-                txid,
-                vout,
-                Some(u64::from(expected_amount)),
-            )?
-            else {
-                return Ok(None);
-            };
-            utxo
-        } else {
-            let utxo_list = discovered
-                .get(&address.script_pubkey())
-                .into_iter()
-                .flatten()
-                .filter(|unspent| {
-                    unspent.height == 0 || unspent.height >= wallet_blockheight
-                })
-                .cloned();
-            let Some(utxo) = utxo_list
-                .filter(|unspent| unspent.value == u64::from(expected_amount))
-                .min_by_key(|unspent| {
-                    if unspent.height == 0 {
-                        u32::MAX
-                    } else {
-                        unspent.height
-                    }
-                })
-            else {
-                return Ok(None);
-            };
-            let blockheight = client_config.chain_client.tip_height()?;
-            let confirmations = if utxo.height == 0 {
-                0
-            } else {
-                blockheight.saturating_sub(utxo.height).saturating_add(1)
-            };
-            (utxo, confirmations)
-        };
-
-    // IN_MEMPOOL. there is nothing to do
-    if confirmations == 0 && coin.status == CoinStatus::IN_MEMPOOL {
-        return Ok(None);
-    }
-
-    let mut deposit_result: Option<DepositResult> = None;
-
-    if coin.status == CoinStatus::INITIALISED {
-        let utxo_txid = utxo.txid.clone();
-        let utxo_vout = utxo.vout;
-
-        if coin.status != CoinStatus::INITIALISED {
-            return Err(anyhow!(
-                "The coin with the public key {} is not in the INITIALISED state",
-                coin.user_pubkey.to_string()
-            ));
-        }
-
-        coin.utxo_txid = Some(utxo_txid.to_string());
-        coin.utxo_vout = Some(utxo_vout);
-
-        coin.status = CoinStatus::IN_MEMPOOL;
-
-        let backup_tx = create_tx1(client_config, coin, wallet_netwotk, 1u32).await?;
-
-        let activity_utxo = format!("{}:{}", utxo.txid, utxo.vout);
-
-        let activity = Some(create_activity(
-            &activity_utxo,
-            utxo.value as u32,
-            "deposit",
-        ));
-
-        deposit_result = Some(DepositResult {
-            activity: activity.unwrap(),
-            backup_tx,
-        });
-    }
-
-    if confirmations > 0 {
-        coin.status = CoinStatus::UNCONFIRMED;
-
-        if confirmations >= client_config.confirmation_target {
-            coin.status = CoinStatus::CONFIRMED;
-        }
-    }
-
-    Ok(deposit_result)
-}
-
 async fn check_bip448_deposit(
     client_config: &ClientConfig,
     wallet_name: &str,
@@ -824,24 +690,11 @@ async fn check_transfer(client_config: &ClientConfig, coin: &Coin) -> Result<boo
 }
 
 async fn check_withdrawal(client_config: &ClientConfig, coin: &mut Coin) -> Result<()> {
-    let mut txid: Option<String> = None;
-
-    if coin.tx_withdraw.is_some() {
-        txid = Some(coin.tx_withdraw.as_ref().unwrap().to_string());
-    }
-
-    if coin.tx_cpfp.is_some() {
-        if txid.is_some() {
-            return Err(anyhow!("Coin has both tx_withdraw and tx_cpfp"));
-        }
-        txid = Some(coin.tx_cpfp.as_ref().unwrap().to_string());
-    }
-
-    if txid.is_none() {
-        return Err(anyhow!("Coin does not have tx_withdraw or tx_cpfp"));
-    }
-
-    let txid = Txid::from_str(&txid.unwrap())?;
+    let txid = coin
+        .tx_withdraw
+        .as_deref()
+        .ok_or_else(|| anyhow!("Coin does not have tx_withdraw"))?;
+    let txid = Txid::from_str(txid)?;
 
     if coin.withdrawal_address.is_none() {
         return Err(anyhow!("Coin does not have withdrawal_address"));
@@ -894,16 +747,6 @@ async fn discover_wallet_unspent(
         };
         let address = Address::from_str(address)?.require_network(client_config.network)?;
 
-        if !bip448_deposit::is_bip448_coin(coin) {
-            // Legacy deposits later enter duplicate detection. Cover its lifetime
-            // floor on the first wallet scan, even while it is still INITIALISED.
-            requests.push(DescriptorDiscoveryRequest {
-                address,
-                coverage_start_height: 0,
-                result_start_height: 0,
-            });
-            continue;
-        }
         if coin.utxo_txid.is_some() {
             continue;
         }
@@ -931,116 +774,11 @@ async fn discover_wallet_unspent(
     discover_unspent_batch(client_config, &wallet.name, &requests).await
 }
 
-async fn check_for_duplicated(
-    client_config: &ClientConfig,
-    existing_coins: &Vec<Coin>,
-    wallet_blockheight: u32,
-    discovered: &HashMap<ScriptBuf, Vec<ChainUtxo>>,
-) -> Result<Vec<Coin>> {
-    let mut duplicated_coin_list: Vec<Coin> = Vec::new();
-    let mut scans = Vec::new();
-    for coin in existing_coins.iter() {
-        if coin.status != CoinStatus::IN_MEMPOOL
-            && coin.status != CoinStatus::UNCONFIRMED
-            && coin.status != CoinStatus::CONFIRMED
-        {
-            continue;
-        }
-
-        if bip448_deposit::is_bip448_coin(coin) {
-            continue;
-        }
-
-        let address = Address::from_str(&coin.aggregated_address.as_ref().unwrap())?
-            .require_network(client_config.network)?;
-
-        let start_height = match (coin.utxo_txid.as_deref(), coin.utxo_vout) {
-            (Some(txid), Some(vout)) => {
-                match client_config
-                    .chain_client
-                    .get_stored_tx_out(txid, vout, true)?
-                {
-                    Some(tx_out) if tx_out.confirmations > 0 => client_config
-                        .chain_client
-                        .tip_height()?
-                        .saturating_sub(tx_out.confirmations)
-                        .saturating_add(1),
-                    // IN_MEMPOOL is assigned only when this wallet created the deposit address,
-                    // so wallet birth is a safe bound until the primary has a block height.
-                    Some(_) if coin.status == CoinStatus::IN_MEMPOOL => wallet_blockheight,
-                    // A received mempool primary can predate this wallet, and a spent primary no
-                    // longer exposes confirmations. Genesis is the only safe bound for either.
-                    Some(_) | None => 0,
-                }
-            }
-            _ => wallet_blockheight,
-        };
-        scans.push((coin, address, start_height));
-    }
-    for (coin, address, start_height) in scans {
-        let mut max_duplicated_index = existing_coins
-            .iter()
-            .filter(|c| c.statechain_id == coin.statechain_id)
-            .map(|coin| coin.duplicate_index)
-            .max()
-            .unwrap();
-
-        for unspent in discovered
-            .get(&address.script_pubkey())
-            .into_iter()
-            .flatten()
-            .filter(|unspent| unspent.height == 0 || unspent.height >= start_height)
-            .cloned()
-        {
-            let utxo_exists = existing_coins.iter().any(|coin| {
-                coin.utxo_txid == Some(unspent.txid.clone()) && coin.utxo_vout == Some(unspent.vout)
-            });
-
-            if utxo_exists {
-                continue;
-            }
-
-            max_duplicated_index = max_duplicated_index + 1;
-
-            let mut duplicated_coin = coin.clone();
-            duplicated_coin.status = CoinStatus::DUPLICATED;
-            duplicated_coin.utxo_txid = Some(unspent.txid);
-            duplicated_coin.utxo_vout = Some(unspent.vout);
-            duplicated_coin.amount = Some(unspent.value as u32);
-            duplicated_coin.duplicate_index = max_duplicated_index;
-            duplicated_coin_list.push(duplicated_coin);
-        }
-    }
-
-    Ok(duplicated_coin_list)
-}
-
 async fn finalize_wallet_update(
     client_config: &ClientConfig,
     wallet: &mut Wallet,
     deferred_errors: Vec<DeferredBip448DepositError>,
-    discovered: &HashMap<ScriptBuf, Vec<ChainUtxo>>,
 ) -> Result<()> {
-    let duplicated_coins =
-        check_for_duplicated(client_config, &wallet.coins, wallet.blockheight, discovered).await?;
-
-    wallet.coins.extend(duplicated_coins);
-
-    // invalidate duplicated coins that were not transferred
-    for i in 0..wallet.coins.len() {
-        if wallet.coins[i].status == CoinStatus::DUPLICATED {
-            let is_transferred = (0..wallet.coins.len()).any(|j| {
-                i != j && // Skip comparing with self
-                wallet.coins[j].statechain_id == wallet.coins[i].statechain_id &&
-                wallet.coins[j].locktime == wallet.coins[i].locktime &&
-                wallet.coins[j].status == CoinStatus::TRANSFERRED
-            });
-            if is_transferred {
-                wallet.coins[i].status = CoinStatus::INVALIDATED;
-            }
-        }
-    }
-
     update_wallet(&client_config.pool, wallet).await?;
 
     if deferred_errors.is_empty() {
@@ -1061,6 +799,17 @@ async fn finalize_wallet_update(
 
 pub async fn update_coins(client_config: &ClientConfig, wallet_name: &str) -> Result<()> {
     let mut wallet = get_wallet(&client_config.pool, &wallet_name).await?;
+    for coin in &wallet.coins {
+        if let Some(statechain_id) = coin.statechain_id.as_deref() {
+            if coin.statechain_protocol.as_deref()
+                != Some(bip448_deposit::BIP448_COIN_PROTOCOL)
+            {
+                return Err(anyhow!(
+                    "statechain {statechain_id}: unsupported non-BIP448 coin"
+                ));
+            }
+        }
+    }
     let discovered = discover_wallet_unspent(client_config, &wallet).await?;
 
     let network = wallet.network.clone();
@@ -1068,62 +817,37 @@ pub async fn update_coins(client_config: &ClientConfig, wallet_name: &str) -> Re
     let mut deferred_bip448_deposit_errors = Vec::new();
 
     for coin in wallet.coins.iter_mut() {
+        if coin.statechain_id.is_none() && deposit_setup_is_incomplete(coin) {
+            continue;
+        }
+
         if coin.status == CoinStatus::INITIALISED
             || coin.status == CoinStatus::IN_MEMPOOL
             || coin.status == CoinStatus::UNCONFIRMED
         {
-            if bip448_deposit::is_bip448_coin(coin) {
-                let deposit_result = match check_bip448_deposit(
-                    client_config,
-                    &wallet.name,
-                    coin,
-                    &network,
-                    wallet_blockheight,
-                    &discovered,
-                )
-                .await
-                {
-                    std::result::Result::Ok(deposit_result) => deposit_result,
-                    std::result::Result::Err(error) => {
-                        defer_bip448_signature_count_error(
-                            coin,
-                            error,
-                            &mut deferred_bip448_deposit_errors,
-                        )?;
-                        continue;
-                    }
-                };
-
-                if let Some(deposit_result) = deposit_result {
-                    wallet.activities.push(deposit_result.activity);
+            let deposit_result = match check_bip448_deposit(
+                client_config,
+                &wallet.name,
+                coin,
+                &network,
+                wallet_blockheight,
+                &discovered,
+            )
+            .await
+            {
+                std::result::Result::Ok(deposit_result) => deposit_result,
+                std::result::Result::Err(error) => {
+                    defer_bip448_signature_count_error(
+                        coin,
+                        error,
+                        &mut deferred_bip448_deposit_errors,
+                    )?;
+                    continue;
                 }
+            };
 
-                continue;
-            }
-
-            let deposit_result =
-                check_deposit(
-                    client_config,
-                    coin,
-                    &network,
-                    wallet_blockheight,
-                    &discovered,
-                )
-                .await?;
-
-            if deposit_result.is_some() {
-                let deposit_result = deposit_result.unwrap();
-                let activity = deposit_result.activity;
-                let backup_tx = deposit_result.backup_tx;
-
-                wallet.activities.push(activity);
-                insert_backup_txs(
-                    &client_config.pool,
-                    &wallet.name,
-                    &coin.statechain_id.as_ref().unwrap(),
-                    &[backup_tx].to_vec(),
-                )
-                .await?;
+            if let Some(deposit_result) = deposit_result {
+                wallet.activities.push(deposit_result.activity);
             }
         } else if coin.status == CoinStatus::IN_TRANSFER {
             let is_transferred = check_transfer(client_config, coin).await?;
@@ -1140,7 +864,6 @@ pub async fn update_coins(client_config: &ClientConfig, wallet_name: &str) -> Re
         client_config,
         &mut wallet,
         deferred_bip448_deposit_errors,
-        &discovered,
     )
     .await
 }
@@ -1195,36 +918,14 @@ mod tests {
     }
 
     fn sample_coin() -> Coin {
-        Coin {
-            index: 0,
-            user_privkey: "user-privkey".to_string(),
-            user_pubkey: "user-pubkey".to_string(),
-            auth_privkey: "auth-privkey".to_string(),
-            auth_pubkey: "auth-pubkey".to_string(),
-            derivation_path: "m/86h/0h/0h/0/0".to_string(),
-            fingerprint: "deadbeef".to_string(),
-            address: "address".to_string(),
-            backup_address: "backup".to_string(),
-            server_pubkey: None,
-            aggregated_pubkey: None,
-            aggregated_address: None,
-            statechain_protocol: Some(bip448_deposit::BIP448_COIN_PROTOCOL.to_string()),
-            utxo_txid: Some("aa".repeat(32)),
-            utxo_vout: Some(1),
-            amount: Some(50_000),
-            statechain_id: Some("statechain".to_string()),
-            signed_statechain_id: None,
-            locktime: None,
-            secret_nonce: None,
-            public_nonce: None,
-            blinding_factor: None,
-            server_public_nonce: None,
-            tx_cpfp: None,
-            tx_withdraw: None,
-            withdrawal_address: None,
-            status: CoinStatus::UNCONFIRMED,
-            duplicate_index: 0,
-        }
+        let mut coin = sample_wallet(Vec::new()).get_new_coin().unwrap();
+        coin.statechain_protocol = Some(bip448_deposit::BIP448_COIN_PROTOCOL.to_string());
+        coin.utxo_txid = Some("aa".repeat(32));
+        coin.utxo_vout = Some(1);
+        coin.amount = Some(50_000);
+        coin.statechain_id = Some("statechain".to_string());
+        coin.status = CoinStatus::UNCONFIRMED;
+        coin
     }
 
     fn incomplete_coin(index: u32, protocol: Option<&str>) -> Coin {
@@ -1349,7 +1050,6 @@ mod tests {
     {
         let client_config = test_client_config().await?;
         let mut bip448_coin = incomplete_coin(0, Some(bip448_deposit::BIP448_COIN_PROTOCOL));
-        let mut legacy_coin = incomplete_coin(1, None);
 
         assert!(
             check_bip448_deposit(
@@ -1363,20 +1063,8 @@ mod tests {
                 .await?
                 .is_none()
         );
-        assert!(
-            check_deposit(
-                &client_config,
-                &mut legacy_coin,
-                "regtest",
-                0,
-                &HashMap::new(),
-            )
-                .await?
-                .is_none()
-        );
 
         bip448_coin.utxo_txid = Some("aa".repeat(32));
-        legacy_coin.utxo_vout = Some(0);
         let bip448_error =
             check_bip448_deposit(
                 &client_config,
@@ -1389,23 +1077,9 @@ mod tests {
                 .await
                 .err()
                 .expect("partial BIP448 outpoint must fail");
-        let legacy_error = check_deposit(
-            &client_config,
-            &mut legacy_coin,
-            "regtest",
-            0,
-            &HashMap::new(),
-        )
-        .await
-        .err()
-        .expect("partial legacy outpoint must fail");
         assert_eq!(
             bip448_error.to_string(),
             "BIP448 coin has a partial funding outpoint"
-        );
-        assert_eq!(
-            legacy_error.to_string(),
-            "Coin has a partial funding outpoint"
         );
 
         Ok(())
@@ -1415,10 +1089,8 @@ mod tests {
     async fn asymmetric_or_advanced_missing_setup_fields_fail_before_chain_access() -> Result<()> {
         let client_config = test_client_config().await?;
         let mut bip448_coin = incomplete_coin(0, Some(bip448_deposit::BIP448_COIN_PROTOCOL));
-        let mut legacy_coin = incomplete_coin(1, None);
 
         bip448_coin.aggregated_address = Some("not-queried".to_string());
-        legacy_coin.aggregated_address = Some("not-queried".to_string());
         let bip448_error =
             check_bip448_deposit(
                 &client_config,
@@ -1431,29 +1103,13 @@ mod tests {
                 .await
                 .err()
                 .expect("address-only BIP448 setup must fail");
-        let legacy_error = check_deposit(
-            &client_config,
-            &mut legacy_coin,
-            "regtest",
-            0,
-            &HashMap::new(),
-        )
-        .await
-        .err()
-        .expect("address-only legacy setup must fail");
         assert_eq!(
             bip448_error.to_string(),
             "BIP448 coin missing amount after deposit setup"
         );
-        assert_eq!(
-            legacy_error.to_string(),
-            "Coin missing amount after deposit setup"
-        );
 
         bip448_coin.aggregated_address = None;
         bip448_coin.amount = Some(50_000);
-        legacy_coin.aggregated_address = None;
-        legacy_coin.amount = Some(50_000);
         let bip448_error =
             check_bip448_deposit(
                 &client_config,
@@ -1466,29 +1122,14 @@ mod tests {
                 .await
                 .err()
                 .expect("amount-only BIP448 setup must fail");
-        let legacy_error = check_deposit(
-            &client_config,
-            &mut legacy_coin,
-            "regtest",
-            0,
-            &HashMap::new(),
-        )
-        .await
-        .err()
-        .expect("amount-only legacy setup must fail");
         assert!(bip448_error
             .to_string()
             .contains("missing aggregated_address"));
-        assert!(legacy_error
-            .to_string()
-            .contains("missing aggregated_address"));
 
-        for coin in [&mut bip448_coin, &mut legacy_coin] {
-            coin.amount = None;
-            coin.utxo_txid = None;
-            coin.utxo_vout = None;
-            coin.status = CoinStatus::IN_MEMPOOL;
-        }
+        bip448_coin.amount = None;
+        bip448_coin.utxo_txid = None;
+        bip448_coin.utxo_vout = None;
+        bip448_coin.status = CoinStatus::IN_MEMPOOL;
         let bip448_error =
             check_bip448_deposit(
                 &client_config,
@@ -1501,18 +1142,7 @@ mod tests {
                 .await
                 .err()
                 .expect("advanced BIP448 setup must fail");
-        let legacy_error = check_deposit(
-            &client_config,
-            &mut legacy_coin,
-            "regtest",
-            0,
-            &HashMap::new(),
-        )
-        .await
-        .err()
-        .expect("advanced legacy setup must fail");
         assert!(bip448_error.to_string().contains("missing amount"));
-        assert!(legacy_error.to_string().contains("missing amount"));
 
         Ok(())
     }
@@ -1553,37 +1183,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_coins_preserves_incomplete_deposits_without_blocking_the_wallet() -> Result<()>
-    {
+    async fn blank_initialized_transfer_address_coin_is_skipped() -> Result<()> {
         let client_config = test_client_config().await?;
-        let bip448_coin = incomplete_coin(0, Some(bip448_deposit::BIP448_COIN_PROTOCOL));
-        let legacy_coin = incomplete_coin(1, None);
-        let mut duplicated_coin = sample_coin();
-        duplicated_coin.index = 2;
-        duplicated_coin.status = CoinStatus::DUPLICATED;
-        duplicated_coin.locktime = Some(42);
-        let mut transferred_coin = sample_coin();
-        transferred_coin.index = 3;
-        transferred_coin.status = CoinStatus::TRANSFERRED;
-        transferred_coin.locktime = Some(42);
-        let wallet = sample_wallet(vec![
-            bip448_coin,
-            legacy_coin,
-            duplicated_coin,
-            transferred_coin,
-        ]);
+        let mut coin = incomplete_coin(0, None);
+        coin.statechain_id = None;
+        let wallet = sample_wallet(vec![coin.clone()]);
         insert_wallet(&client_config.pool, &wallet).await?;
 
         update_coins(&client_config, &wallet.name).await?;
 
         let persisted = get_wallet(&client_config.pool, &wallet.name).await?;
-        assert_eq!(persisted.coins.len(), 4);
-        assert_eq!(persisted.coins[0].status, CoinStatus::INITIALISED);
-        assert_eq!(persisted.coins[1].status, CoinStatus::INITIALISED);
-        assert_eq!(persisted.coins[2].status, CoinStatus::INVALIDATED);
-        assert_eq!(persisted.coins[3].status, CoinStatus::TRANSFERRED);
-        assert!(persisted.coins[0].aggregated_address.is_none());
-        assert!(persisted.coins[1].aggregated_address.is_none());
+        assert_eq!(persisted.coins.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&persisted.coins[0])?,
+            serde_json::to_value(coin)?
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn statechain_without_bip448_marker_fails_closed_before_chain_access() -> Result<()> {
+        let client_config = test_client_config().await?;
+        let coin = incomplete_coin(0, None);
+        let wallet = sample_wallet(vec![coin]);
+        insert_wallet(&client_config.pool, &wallet).await?;
+
+        let error = update_coins(&client_config, &wallet.name)
+            .await
+            .err()
+            .expect("non-BIP448 marker must fail closed");
+
+        assert_eq!(
+            error.to_string(),
+            "statechain statechain: unsupported non-BIP448 coin"
+        );
 
         Ok(())
     }
@@ -1609,15 +1243,10 @@ mod tests {
         let client_config = test_client_config().await?;
         let mut failed_coin = sample_coin();
         failed_coin.statechain_id = Some("failed-statechain".to_string());
-        let mut duplicated_coin = sample_coin();
-        duplicated_coin.index = 1;
-        duplicated_coin.statechain_id = Some("duplicate-statechain".to_string());
-        duplicated_coin.status = CoinStatus::DUPLICATED;
-        duplicated_coin.locktime = Some(42);
-        let mut transferred_coin = duplicated_coin.clone();
-        transferred_coin.index = 2;
-        transferred_coin.status = CoinStatus::TRANSFERRED;
-        let wallet = sample_wallet(vec![failed_coin, duplicated_coin, transferred_coin]);
+        let mut successful_coin = sample_coin();
+        successful_coin.index = 1;
+        successful_coin.statechain_id = Some("successful-statechain".to_string());
+        let wallet = sample_wallet(vec![failed_coin, successful_coin]);
         insert_wallet(&client_config.pool, &wallet).await?;
 
         let pending = Bip448PendingDepositSigning {
@@ -1638,6 +1267,12 @@ mod tests {
         insert_bip448_pending_deposit_signing_if_absent(&client_config.pool, &pending).await?;
 
         let mut wallet = get_wallet(&client_config.pool, &wallet.name).await?;
+        wallet.coins[1].status = CoinStatus::CONFIRMED;
+        wallet.activities.push(create_activity(
+            "successful-funding:0",
+            50_000,
+            "bip448_deposit",
+        ));
         let mut deferred_errors = Vec::new();
         defer_bip448_signature_count_error(
             &wallet.coins[0],
@@ -1652,7 +1287,6 @@ mod tests {
             &client_config,
             &mut wallet,
             deferred_errors,
-            &HashMap::new(),
         )
             .await
             .err()
@@ -1671,8 +1305,9 @@ mod tests {
             .contains("other wallet updates were persisted"));
 
         let persisted = get_wallet(&client_config.pool, &wallet.name).await?;
-        assert_eq!(persisted.coins[1].status, CoinStatus::INVALIDATED);
-        assert_eq!(persisted.coins[2].status, CoinStatus::TRANSFERRED);
+        assert_eq!(persisted.coins[1].status, CoinStatus::CONFIRMED);
+        assert_eq!(persisted.activities.len(), 1);
+        assert_eq!(persisted.activities[0].action, "bip448_deposit");
         assert!(get_bip448_pending_deposit_signing(
             &client_config.pool,
             &wallet.name,

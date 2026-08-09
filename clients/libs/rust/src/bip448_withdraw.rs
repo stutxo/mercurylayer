@@ -52,7 +52,7 @@ pub async fn execute(
         .ok_or_else(|| anyhow!("No coins associated with this statechain ID were found"))?;
     if !is_bip448_coin(&wallet.coins[coin_index]) {
         return Err(anyhow!(
-            "statechain {statechain_id} is not a BIP448 coin; use the legacy withdraw"
+            "statechain {statechain_id} is not a BIP448 coin; BIP448 withdrawal requires an accepted BIP448 coin"
         ));
     }
     if get_bip448_pending_transfer_signing(&client_config.pool, wallet_name, statechain_id)
@@ -237,12 +237,10 @@ mod tests {
         let mut wallet = wallet(None);
         insert_wallet(&config.pool, &wallet).await?;
         let error = execute(&config, "wallet", "statechain", "unused", None).await.unwrap_err();
-        assert_eq!(error.to_string(), "statechain statechain is not a BIP448 coin; use the legacy withdraw");
+        assert_eq!(error.to_string(), "statechain statechain is not a BIP448 coin; BIP448 withdrawal requires an accepted BIP448 coin");
 
         wallet.coins[0].statechain_protocol = Some("bip448".into());
         update_wallet(&config.pool, &wallet).await?;
-        let error = crate::withdraw::execute(&config, "wallet", "statechain", "unused", None, None).await.unwrap_err();
-        assert_eq!(error.to_string(), "statechain statechain is a BIP448 coin; use the BIP448 recovery flow, not the legacy withdraw");
 
         sqlx::query("INSERT INTO bip448_pending_transfer_signings (wallet_name,statechain_id,funding_txid,funding_vout,funding_value_sats,update_template_hash,settlement_template_hash,state_locktime,signing_id,client_secret_nonce,client_public_nonce,blinding_factor) VALUES ('wallet','statechain','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',0,50000,'aa','bb',700000000,'cc','dd','ee','ff')").execute(&config.pool).await?;
         let error = execute(&config, "wallet", "statechain", "unused", None).await.unwrap_err();

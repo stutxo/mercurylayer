@@ -36,7 +36,7 @@ use crate::{
     utils,
 };
 
-use super::{Bip448ReceiveOutcome, MessageResult};
+use super::Bip448ReceiveOutcome;
 
 const ALREADY_UPDATED_ERROR: &str = "key update already completed; manual completion required";
 
@@ -139,9 +139,7 @@ pub(super) async fn try_transfer_bip448_receiver(
     wallet_name: &str,
     activities: &mut Vec<Activity>,
 ) -> Result<Bip448ReceiveOutcome> {
-    let Some(msg) = decrypt_transfer_message(enc_message, &coin.auth_privkey)? else {
-        return Ok(Bip448ReceiveOutcome::Legacy);
-    };
+    let msg = decrypt_transfer_message(enc_message, &coin.auth_privkey)?;
     transfer_bip448_receiver(
         client_config,
         coin,
@@ -156,8 +154,8 @@ pub(super) async fn try_transfer_bip448_receiver(
 fn decrypt_transfer_message(
     enc_message: &str,
     auth_privkey: &str,
-) -> Result<Option<Bip448TransferMsg>> {
-    Ok(decrypt_bip448_transfer_msg(enc_message, auth_privkey).ok())
+) -> Result<Bip448TransferMsg> {
+    Ok(decrypt_bip448_transfer_msg(enc_message, auth_privkey)?)
 }
 
 async fn transfer_bip448_receiver(
@@ -339,11 +337,7 @@ async fn persist_accepted_transfer(
     *coin = updated_coin;
     activities.push(activity);
 
-    Ok(Bip448ReceiveOutcome::Processed(MessageResult {
-        is_batch_locked: false,
-        statechain_id: Some(verified.msg.statechain_id),
-        duplicated_coins: Vec::new(),
-    }))
+    Ok(Bip448ReceiveOutcome::Processed(verified.msg.statechain_id))
 }
 
 pub(crate) async fn transfer_chain_facts(
@@ -572,7 +566,6 @@ mod tests {
     use mercurylib::{
         bip448_statechain::script,
         encode_sc_address,
-        transfer::sender::create_transfer_update_msg,
         wallet::{Settings, Wallet},
     };
     use secp256k1::SecretKey;
@@ -583,8 +576,6 @@ mod tests {
     const INFO: &str = r#"{"enclave_public_key":"03462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b","num_sigs":2,"statechain_info":[{"statechain_id":"statechain","server_pubnonce":"039f31d027e17b6be6aace5fd20d1119f131f226777884bc423fb262dc037b38e302b2890303451ceffd050fcb0ee9db960c4b05755f5b533ef9535cbe25b6a4b533","challenge":"c92315f66e51c7fe79055243762996a9e250782ddd53adf6c6c958dc928a6d7b","tx_n":1},{"statechain_id":"statechain","server_pubnonce":"035f10ef76a0174cdb766a68b3439e22bcf24dc277497b37205bab3766e32a6899038f6a8fc25318cc9887a6e8cadbe7cac425174b884599058ce8b2f78c6e8fbd70","challenge":"ac31ec275e2e9d4e9fc62ed0f9d9f558800def734bd267fb2e260a283d606b93","tx_n":2}],"x1_pub":"03f006a18d5653c4edf5391ff23a61f03ff83d237e880ee61187fa9f379a028e0a"}"#;
     // ECIES plaintext is {"msg_version":1,"statechain_id":"statechain"} under auth key [8; 32].
     const MISSING_SIGNATURE: &str = "0450bfa93d1d7eccf21e821b47555b35717c7581539a802dbce4e2681e947f9ed1265b32fb0f3168723723f59ac9acda6a5e3aa93ae3da95b2f6c466abac1f9c02d4a0b843668195f2fc903b94f884316ecbe86fd73a02a26c8202c2f98e3189b6a065c5444ba47420e7c54e8f68986f32ca7a456ba17f5ba14ce0ded13d738e391ba33a2afe2ad28f8f61c0e9c96f";
-    const EMPTY_COIN: &str = r#"{"index":0,"user_privkey":"","user_pubkey":"","auth_privkey":"","auth_pubkey":"","derivation_path":"","fingerprint":"","address":"","backup_address":"","server_pubkey":null,"aggregated_pubkey":null,"aggregated_address":null,"statechain_protocol":null,"utxo_txid":null,"utxo_vout":null,"amount":null,"statechain_id":null,"signed_statechain_id":null,"locktime":null,"secret_nonce":null,"public_nonce":null,"blinding_factor":null,"server_public_nonce":null,"tx_cpfp":null,"tx_withdraw":null,"withdrawal_address":null,"status":"INITIALISED","duplicate_index":0}"#;
-
     #[rustfmt::skip]
     struct Fixture { msg: Bip448TransferMsg, mailbox: String, facts: Bip448TransferChainFacts, coin: Coin }
     #[rustfmt::skip]
@@ -592,7 +583,7 @@ mod tests {
         let secp = Secp256k1::new();
         let user = SecretKey::from_secret_bytes([user_seed; 32]).unwrap();
         let auth = SecretKey::from_secret_bytes([auth_seed; 32]).unwrap();
-        let mut coin: Coin = serde_json::from_str(EMPTY_COIN).unwrap();
+        let mut coin = test_wallet(Vec::new()).get_new_coin().unwrap();
         coin.user_privkey = PrivateKey::new(user, Network::Regtest).to_wif();
         coin.user_pubkey = user.public_key(&secp).to_string();
         coin.auth_privkey = PrivateKey::new(auth, Network::Regtest).to_wif();
@@ -603,12 +594,12 @@ mod tests {
     }
 
     #[rustfmt::skip]
-    fn test_wallet(coin: Coin) -> Wallet {
+    fn test_wallet(coins: Vec<Coin>) -> Wallet {
         Wallet {
             name: "wallet".to_string(), mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string(),
             version: "0.1.0".to_string(), state_entity_endpoint: "http://127.0.0.1:1".to_string(), chain_backend: "core".to_string(),
             chain_endpoint: "http://127.0.0.1:1".to_string(), network: "regtest".to_string(), blockheight: 0, initlock: 1000, interval: 10,
-            activities: Vec::new(), coins: vec![coin],
+            activities: Vec::new(), coins,
             settings: Settings { network: "regtest".to_string(), block_explorerURL: None, torProxyHost: None, torProxyPort: None, torProxyControlPassword: None, torProxyControlPort: None, statechainEntityApi: "http://127.0.0.1:1".to_string(), torStatechainEntityApi: None, chainBackend: "core".to_string(), chainUrl: "http://127.0.0.1:1".to_string(), chainType: None, notifications: false, tutorials: false },
         }
     }
@@ -671,7 +662,7 @@ mod tests {
         fixture: &Fixture, pool: &sqlx::Pool<sqlx::Sqlite>, coin: &mut Coin,
         activities: &mut Vec<Activity>, transport: Rc<RefCell<Transport>>,
     ) -> Result<Bip448ReceiveOutcome> {
-        let msg = decrypt_transfer_message(&fixture.mailbox, &coin.auth_privkey)?.ok_or_else(|| anyhow!("unexpected legacy message"))?;
+        let msg = decrypt_transfer_message(&fixture.mailbox, &coin.auth_privkey)?;
         let mut info: StatechainInfoResponsePayload = serde_json::from_str(INFO)?;
         info.enclave_public_key = transport.borrow().server.clone();
         if info.enclave_public_key != serde_json::from_str::<StatechainInfoResponsePayload>(INFO)?.enclave_public_key { info.statechain_info.clear(); }
@@ -720,7 +711,7 @@ mod tests {
         let result = match outcome { Bip448ReceiveOutcome::Processed(result) => result, _ => panic!("happy path did not process the transfer") };
         let record = crate::sqlite_manager::get_bip448_statechain(&pool, "wallet", "statechain").await.unwrap();
         let history = crate::sqlite_manager::get_bip448_state_history(&pool, "wallet", "statechain").await.unwrap();
-        assert_eq!(result.statechain_id.as_deref(), Some("statechain"));
+        assert_eq!(result, "statechain");
         assert_eq!(record.latest_state_number, 2);
         assert_eq!(history, fixture.msg.state_history);
         assert_eq!(coin.statechain_protocol.as_deref(), Some("bip448"));
@@ -760,7 +751,7 @@ mod tests {
         let fixture = fixture(); let mut coin = fixture.coin.clone(); let mut activities = Vec::new();
         let pool = pool().await; let transport = transport();
         attempt(&fixture, &pool, &mut coin, &mut activities, Rc::clone(&transport)).await.unwrap();
-        crate::sqlite_manager::insert_wallet(&pool, &test_wallet(coin.clone())).await.unwrap();
+        crate::sqlite_manager::insert_wallet(&pool, &test_wallet(vec![coin.clone()])).await.unwrap();
         let current_server = PublicKey::from_str(coin.server_pubkey.as_deref().unwrap()).unwrap();
         let mut replay = fixture.msg.clone();
         replay.funding_outpoint.txid.make_ascii_uppercase();
@@ -789,7 +780,7 @@ mod tests {
         let fixture = fixture(); let original_coin = fixture.coin.clone(); let mut accepted_coin = original_coin.clone(); let mut activities = Vec::new();
         let pool = pool().await; let transport = transport();
         attempt(&fixture, &pool, &mut accepted_coin, &mut activities, Rc::clone(&transport)).await.unwrap();
-        crate::sqlite_manager::insert_wallet(&pool, &test_wallet(original_coin.clone())).await.unwrap();
+        crate::sqlite_manager::insert_wallet(&pool, &test_wallet(vec![original_coin.clone()])).await.unwrap();
         let current_server = PublicKey::from_str(accepted_coin.server_pubkey.as_deref().unwrap()).unwrap();
         let result = resolve_already_updated(&pool, "wallet", &original_coin, &fixture.msg, &current_server).await;
         let error = match result { Err(error) => error, Ok(_) => panic!("incomplete receipt was accepted as a replay") };
@@ -804,7 +795,7 @@ mod tests {
         let fixture = fixture(); let mut coin = fixture.coin.clone(); let mut activities = Vec::new();
         let pool = pool().await; let transport = transport();
         attempt(&fixture, &pool, &mut coin, &mut activities, Rc::clone(&transport)).await.unwrap();
-        let mut wallet = test_wallet(coin.clone()); wallet.activities = activities;
+        let mut wallet = test_wallet(vec![coin.clone()]); wallet.activities = activities;
         crate::sqlite_manager::insert_wallet(&pool, &wallet).await.unwrap();
         let mut statechain_info: StatechainInfoResponsePayload = serde_json::from_str(INFO).unwrap();
         statechain_info.enclave_public_key = coin.server_pubkey.clone().unwrap();
@@ -860,11 +851,11 @@ mod tests {
 
     #[test]
     #[rustfmt::skip]
-    fn version_one_plaintext_missing_transfer_signature_falls_through_without_panic() {
+    fn version_one_plaintext_missing_transfer_signature_is_rejected_without_panic() {
         let coin = test_coin(5, 8);
         let result = std::panic::catch_unwind(|| decrypt_transfer_message(MISSING_SIGNATURE, &coin.auth_privkey));
         assert!(result.is_ok());
-        assert!(result.unwrap().unwrap().is_none());
+        assert!(result.unwrap().is_err());
     }
 
     #[rustfmt::skip]
@@ -880,8 +871,7 @@ mod tests {
                 let mut bytes = [0u8; 8192];
                 let size = socket.read(&mut bytes).await.unwrap();
                 let request = String::from_utf8_lossy(&bytes[..size]);
-                let body = if request.starts_with("GET /info/config ") { r#"{"initlock":1000,"interval":10,"batchtimeout":60,"version":"test"}"#.to_string() }
-                else if request.starts_with("GET /transfer/get_msg_addr/") { mailbox.clone() } else {
+                let body = if request.starts_with("GET /transfer/get_msg_addr/") { mailbox.clone() } else {
                     if request.starts_with("GET /info/statechain/") && statechain_info.is_some() { statechain_info.clone().unwrap() } else {
                     rpc_calls += 1;
                     if rpc_calls % 2 == 1 { r#"{"result":{"feerate":0.00001},"error":null,"id":"mercury-client"}"#.to_string() }
@@ -897,33 +887,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     #[rustfmt::skip]
-    async fn legacy_message_and_later_bip448_error_complete_receive_loop() {
-        use crate::sqlite_manager::insert_wallet;
-        let mut sender = test_coin(7, 8); sender.statechain_id = Some("legacy-statechain".to_string()); sender.signed_statechain_id = Some("legacy-auth-signature".to_string()); sender.status = CoinStatus::CONFIRMED;
-        let receiver = test_coin(9, 10);
-        let payload = create_transfer_update_msg(&hex::encode([11u8; 32]), &receiver.address, &sender, "legacy-transfer-signature", &Vec::new()).unwrap();
-        let (endpoint, server) = mock_execute_endpoints(vec![payload.enc_transfer_msg, "invalid later message".to_string()], None).await;
-        let pool = pool().await;
-        let config = test_client_config(endpoint, pool.clone());
-        let mut wallet = crate::wallet::create_wallet("wallet", &config).await.unwrap();
-        wallet.coins.push(receiver);
-        insert_wallet(&pool, &wallet).await.unwrap();
-        let result = super::super::execute(&config, "wallet").await;
-        server.abort();
-        assert!(result.is_ok());
-        assert_eq!(crate::sqlite_manager::get_wallet(&pool, "wallet").await.unwrap().coins[0].status, CoinStatus::INITIALISED);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    #[rustfmt::skip]
     async fn bip448_error_does_not_append_reused_address_coin_or_abort_receive_loop() {
         use crate::sqlite_manager::insert_wallet;
         let mut receiver = test_coin(9, 10); receiver.status = CoinStatus::CONFIRMED;
         let (endpoint, server) = mock_execute_endpoints(vec!["invalid transfer message".to_string()], None).await;
         let pool = pool().await;
         let config = test_client_config(endpoint, pool.clone());
-        let mut wallet = crate::wallet::create_wallet("wallet", &config).await.unwrap();
-        wallet.coins.push(receiver);
+        let wallet = test_wallet(vec![receiver]);
         insert_wallet(&pool, &wallet).await.unwrap();
         let result = super::super::execute(&config, "wallet").await;
         server.abort();

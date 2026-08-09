@@ -12,10 +12,8 @@ use mercurylib::{
         },
         storage::{Bip448FundingOutpoint, Bip448StatechainRecord},
     },
-    deposit::{create_aggregated_address, create_deposit_msg1},
-    transaction::get_user_backup_address,
-    utils::get_blockheight,
-    wallet::{BackupTx, Coin, Wallet},
+    deposit::create_deposit_msg1,
+    wallet::{Coin, Wallet},
 };
 use reqwest::StatusCode;
 use secp256k1::{
@@ -38,8 +36,6 @@ use crate::{
         update_bip448_pending_deposit_server_public_nonce, update_wallet,
         Bip448PendingDepositSigning,
     },
-    transaction::new_transaction,
-    utils::info_config,
 };
 
 #[cfg(feature = "test-hooks")]
@@ -145,30 +141,6 @@ fn populate_bip448_deposit_locktime(coin: &mut Coin, accepted: &Bip448AcceptedDe
     coin.locktime = Some(accepted.record().latest_state.state_locktime);
 }
 
-pub async fn get_deposit_bitcoin_address(
-    client_config: &ClientConfig,
-    wallet_name: &str,
-    token_id: &str,
-    amount: u32,
-) -> Result<String> {
-    let token_id = uuid::Uuid::parse_str(&token_id)?;
-    // println!("Deposit: {} {} {}", wallet_name, token_id, amount);
-    let wallet = get_wallet(&client_config.pool, &wallet_name).await?;
-    let mut wallet = init(&client_config, &wallet, token_id).await?;
-
-    let coin = wallet.coins.last_mut().unwrap();
-
-    let aggregated_public_key = create_aggregated_address(&coin, wallet.network.clone())?;
-
-    coin.amount = Some(amount);
-    coin.aggregated_address = Some(aggregated_public_key.aggregate_address.clone());
-    coin.aggregated_pubkey = Some(aggregated_public_key.aggregate_pubkey);
-
-    update_wallet(&client_config.pool, &wallet).await?;
-
-    Ok(aggregated_public_key.aggregate_address)
-}
-
 pub async fn get_bip448_deposit_bitcoin_address(
     client_config: &ClientConfig,
     wallet_name: &str,
@@ -177,13 +149,7 @@ pub async fn get_bip448_deposit_bitcoin_address(
 ) -> Result<Bip448DepositAddressResult> {
     let token_id = uuid::Uuid::parse_str(&token_id)?;
     let wallet = get_wallet(&client_config.pool, &wallet_name).await?;
-    let mut wallet = init_with_protocol(
-        &client_config,
-        &wallet,
-        token_id,
-        Some(BIP448_COIN_PROTOCOL),
-    )
-    .await?;
+    let mut wallet = init_bip448(&client_config, &wallet, token_id).await?;
 
     let coin = wallet.coins.last_mut().unwrap();
 
@@ -205,66 +171,6 @@ pub async fn get_bip448_deposit_bitcoin_address(
         statechain_id,
         aggregate_pubkey: deposit_address.aggregate_pubkey,
     })
-}
-
-// When sending duplicated coins, the tx_n of the backup_tx must be different
-pub async fn create_tx1(
-    client_config: &ClientConfig,
-    coin: &mut Coin,
-    wallet_netwotk: &str,
-    tx_n: u32,
-) -> Result<BackupTx> {
-    let to_address = get_user_backup_address(&coin, wallet_netwotk.to_string())?;
-
-    let server_info = info_config(&client_config).await?;
-
-    let fee_rate_sats_per_byte = if server_info.fee_rate_sats_per_byte > client_config.max_fee_rate
-    {
-        client_config.max_fee_rate
-    } else {
-        server_info.fee_rate_sats_per_byte
-    };
-
-    let signed_tx = new_transaction(
-        &client_config,
-        coin,
-        &to_address,
-        0,
-        false,
-        None,
-        wallet_netwotk,
-        fee_rate_sats_per_byte,
-        server_info.initlock,
-        server_info.interval,
-    )
-    .await?;
-
-    if coin.public_nonce.is_none() {
-        return Err(anyhow::anyhow!("coin.public_nonce is None"));
-    }
-
-    if coin.blinding_factor.is_none() {
-        return Err(anyhow::anyhow!("coin.blinding_factor is None"));
-    }
-
-    if coin.statechain_id.is_none() {
-        return Err(anyhow::anyhow!("coin.statechain_id is None"));
-    }
-
-    let backup_tx = BackupTx {
-        tx_n,
-        tx: signed_tx,
-        client_public_nonce: coin.public_nonce.as_ref().unwrap().to_string(),
-        server_public_nonce: coin.server_public_nonce.as_ref().unwrap().to_string(),
-        client_public_key: coin.user_pubkey.clone(),
-        server_public_key: coin.server_pubkey.as_ref().unwrap().to_string(),
-        blinding_factor: coin.blinding_factor.as_ref().unwrap().to_string(),
-    };
-
-    let block_height = Some(get_blockheight(&backup_tx)?);
-    coin.locktime = block_height;
-
-    Ok(backup_tx)
 }
 
 pub async fn create_bip448_deposit_state(
@@ -682,24 +588,15 @@ fn response_error(context: &str, body: &str) -> anyhow::Error {
     anyhow!("{}: {}", context, body)
 }
 
-pub async fn init(
+async fn init_bip448(
     client_config: &ClientConfig,
     wallet: &Wallet,
     token_id: uuid::Uuid,
-) -> Result<Wallet> {
-    init_with_protocol(client_config, wallet, token_id, None).await
-}
-
-async fn init_with_protocol(
-    client_config: &ClientConfig,
-    wallet: &Wallet,
-    token_id: uuid::Uuid,
-    statechain_protocol: Option<&str>,
 ) -> Result<Wallet> {
     let mut wallet = wallet.clone();
 
     let mut coin = wallet.get_new_coin()?;
-    coin.statechain_protocol = statechain_protocol.map(str::to_owned);
+    coin.statechain_protocol = Some(BIP448_COIN_PROTOCOL.to_string());
 
     wallet.coins.push(coin.clone());
 

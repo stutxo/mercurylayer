@@ -28,7 +28,6 @@ use crate::{
     deposit::{bip448_sign_first, bip448_sign_second, bip448_signature_count},
     sqlite_manager::*,
     transfer_receiver::bip448_transfer_receiver::expected_server_pubkey,
-    transfer_sender::get_new_x1,
     utils,
 };
 const ELIGIBILITY_ERROR: &str =
@@ -38,6 +37,59 @@ const SIGNATURE_COUNT_ERROR: &str =
     "BIP448 signature count does not match any supported transfer state";
 const BATCHED_PENDING_ERROR: &str =
     "BIP448 batched pending transfers cannot be cancelled or retargeted";
+
+async fn get_new_x1(
+    client_config: &ClientConfig,
+    statechain_id: &str,
+    signed_statechain_id: &str,
+    recipient_auth_pubkey: &str,
+    batch_id: Option<String>,
+) -> Result<String> {
+    let endpoint = client_config.statechain_entity.clone();
+    let path = "transfer/sender";
+
+    let client = client_config.get_reqwest_client()?;
+    let request = client.post(&format!("{}/{}", endpoint, path));
+
+    let transfer_sender_request_payload = TransferSenderRequestPayload {
+        statechain_id: statechain_id.to_string(),
+        auth_sig: signed_statechain_id.to_string(),
+        new_user_auth_key: recipient_auth_pubkey.to_string(),
+        batch_id,
+    };
+
+    let value = match request.json(&transfer_sender_request_payload).send().await {
+        Ok(response) => {
+            let status = response.status();
+            let text = response
+                .text()
+                .await
+                .unwrap_or("Unexpected error".to_string());
+
+            if status.is_success() {
+                text
+            } else {
+                return Err(anyhow::anyhow!(format!(
+                    "status: {}, error: {}",
+                    status, text
+                )));
+            }
+        }
+        Err(err) => {
+            return Err(anyhow::anyhow!(format!(
+                "status: {}, error: {}",
+                err.status().unwrap(),
+                err.to_string()
+            )));
+        }
+    };
+
+    let response: TransferSenderResponsePayload = serde_json::from_str(value.as_str())
+        .expect(&format!("failed to parse: {}", value.as_str()));
+
+    Ok(response.x1)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TransferStatePlan {
     state_number: u32,
