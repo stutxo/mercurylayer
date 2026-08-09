@@ -9,7 +9,6 @@ const MUSIG_SESSION_MAGIC: [u8; 4] = [0x9d, 0xed, 0xe9, 0x17];
 pub mod bip448_sign;
 pub mod deposit;
 pub mod lightning_latch;
-pub mod sign;
 pub mod transfer_receiver;
 pub mod transfer_sender;
 pub mod utils;
@@ -21,19 +20,6 @@ pub(crate) fn outbound_request_timeout() -> std::time::Duration {
 
 pub(crate) fn error_response(status: Status, message: String) -> status::Custom<Json<Value>> {
     status::Custom(status, Json(json!({ "message": message })))
-}
-
-pub(crate) fn protocol_mixing_response(
-    existing_protocol: &str,
-    requested_protocol: &str,
-) -> status::Custom<Json<Value>> {
-    error_response(
-        Status::Conflict,
-        format!(
-            "statechain already uses {} signing; {} signing is disabled for this coin",
-            existing_protocol, requested_protocol
-        ),
-    )
 }
 
 /// Extracts the blinded challenge committed by a valid 133-byte hex MuSig session.

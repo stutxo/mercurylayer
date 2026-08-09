@@ -10,10 +10,6 @@ use mercurylib::{
         Bip448SignFirstRequestPayload, Bip448SignFirstResponsePayload,
     },
     deposit::{self, DepositMsg1, DepositMsg1Response, TokenResponse},
-    transaction::{
-        PartialSignatureRequestPayload, PartialSignatureResponsePayload, SignFirstRequestPayload,
-        SignFirstResponsePayload,
-    },
     transfer::receiver::{
         StatechainInfoResponsePayload, TransferReceiverPostResponsePayload,
         TransferReceiverRequestPayload,
@@ -80,60 +76,6 @@ pub async fn deposit_init(client: &Client, payload: &DepositMsg1) -> Result<Depo
         .context("failed to call mercury deposit/init/pod")?;
 
     ensure_success(response, "deposit/init/pod").await
-}
-
-pub async fn sign_first(
-    client: &Client,
-    payload: &SignFirstRequestPayload,
-) -> Result<SignFirstResponsePayload> {
-    let response = client
-        .post(format!("{}/sign/first", MERCURY_URL))
-        .json(payload)
-        .send()
-        .await
-        .context("failed to call mercury sign/first")?;
-
-    let mut result: SignFirstResponsePayload = ensure_success(response, "sign/first").await?;
-    result.server_pubnonce = lockbox::normalize_hex(&result.server_pubnonce);
-
-    Ok(result)
-}
-
-pub async fn sign_first_raw(
-    client: &Client,
-    payload: &SignFirstRequestPayload,
-) -> Result<Response> {
-    client
-        .post(format!("{}/sign/first", MERCURY_URL))
-        .json(payload)
-        .send()
-        .await
-        .context("failed to call mercury sign/first")
-}
-
-pub async fn sign_second(
-    client: &Client,
-    payload: &PartialSignatureRequestPayload,
-) -> Result<PartialSignatureResponsePayload> {
-    let response = sign_second_raw(client, payload).await?;
-
-    let mut result: PartialSignatureResponsePayload =
-        ensure_success(response, "sign/second").await?;
-    result.partial_sig = lockbox::normalize_hex(&result.partial_sig);
-
-    Ok(result)
-}
-
-pub async fn sign_second_raw(
-    client: &Client,
-    payload: &PartialSignatureRequestPayload,
-) -> Result<Response> {
-    client
-        .post(format!("{}/sign/second", MERCURY_URL))
-        .json(payload)
-        .send()
-        .await
-        .context("failed to call mercury sign/second")
 }
 
 pub async fn bip448_sign_first(
@@ -318,105 +260,6 @@ pub async fn clear_bip448_server_partial_signature(
             "expected to clear one BIP448 partial signature for {} / {}, cleared {}",
             statechain_id,
             signing_id,
-            result.rows_affected()
-        ));
-    }
-
-    Ok(())
-}
-
-pub async fn clear_legacy_server_partial_signature(
-    statechain_id: &str,
-    server_pubnonce: &str,
-) -> Result<()> {
-    let pool = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(MERCURY_DATABASE_URL)
-        .await
-        .context("failed to connect to mercury postgres")?;
-
-    let normalized_server_pubnonce = lockbox::normalize_hex(server_pubnonce);
-    let result = sqlx::query(
-        "UPDATE statechain_signature_data \
-         SET server_partial_sig = NULL, updated_at = NOW() \
-         WHERE statechain_id = $1 \
-           AND server_pubnonce IS NOT NULL \
-           AND LOWER(REGEXP_REPLACE(server_pubnonce, '^0[xX]', '')) = $2 \
-           AND challenge IS NOT NULL \
-           AND server_partial_sig IS NOT NULL",
-    )
-    .bind(statechain_id)
-    .bind(&normalized_server_pubnonce)
-    .execute(&pool)
-    .await
-    .with_context(|| {
-        format!(
-            "failed to clear legacy partial signature for {} / {}",
-            statechain_id, normalized_server_pubnonce
-        )
-    })?;
-
-    if result.rows_affected() != 1 {
-        return Err(anyhow!(
-            "expected to clear one legacy partial signature for {} / {}, cleared {}",
-            statechain_id,
-            normalized_server_pubnonce,
-            result.rows_affected()
-        ));
-    }
-
-    Ok(())
-}
-
-pub async fn delete_legacy_signing_nonce_lease(statechain_id: &str) -> Result<()> {
-    let pool = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(MERCURY_DATABASE_URL)
-        .await
-        .context("failed to connect to mercury postgres")?;
-
-    let result = sqlx::query(
-        "DELETE FROM signing_nonce_leases \
-         WHERE statechain_id = $1 AND protocol = 'legacy'",
-    )
-    .bind(statechain_id)
-    .execute(&pool)
-    .await
-    .with_context(|| format!("failed to delete legacy nonce lease for {}", statechain_id))?;
-
-    if result.rows_affected() != 1 {
-        return Err(anyhow!(
-            "expected to delete one legacy nonce lease for {}, deleted {}",
-            statechain_id,
-            result.rows_affected()
-        ));
-    }
-
-    Ok(())
-}
-
-pub async fn insert_legacy_signing_nonce_lease(statechain_id: &str) -> Result<()> {
-    let pool = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(MERCURY_DATABASE_URL)
-        .await
-        .context("failed to connect to mercury postgres")?;
-
-    let result = sqlx::query(
-        "INSERT INTO signing_nonce_leases \
-         (statechain_id, protocol, lease_token) \
-         VALUES ($1, 'legacy', md5(random()::text || clock_timestamp()::text || $1)) \
-         ON CONFLICT DO NOTHING",
-    )
-    .bind(statechain_id)
-    .execute(&pool)
-    .await
-    .with_context(|| format!("failed to insert legacy nonce lease for {}", statechain_id))?;
-
-    if result.rows_affected() != 1 {
-        return Err(anyhow!(
-            "expected to insert one legacy nonce lease for {}, inserted {}",
-            statechain_id,
             result.rows_affected()
         ));
     }

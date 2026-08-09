@@ -1,10 +1,9 @@
-//! Versioned BIP448 signing routes (Phase 5).
+//! BIP448 signing routes.
 //!
-//! `/bip448-statechain/sign/first` and `/bip448-statechain/sign/second` run
-//! in parallel with the legacy `/sign/first` and `/sign/second`, which stay
-//! unchanged. BIP448 uses versioned lockbox endpoints that include the opaque
-//! signing id, letting the lockbox make nonce idempotency authoritative without
-//! seeing transaction metadata.
+//! `/bip448-statechain/sign/first` and `/bip448-statechain/sign/second` use
+//! versioned lockbox endpoints that include the opaque signing id, letting the
+//! lockbox make nonce idempotency authoritative without seeing transaction
+//! metadata.
 //!
 //! What is new is the opaque retry/idempotency identifier and the rules around
 //! it:
@@ -16,13 +15,9 @@
 //!   is replayed idempotently from the stored record without re-invoking the
 //!   enclave. Reuse of the same signing_id with a different server nonce,
 //!   blinded challenge, or negation flag is rejected as a conflict.
-//! - The CSFS share-negation flag is recorded with the BIP448 record,
-//!   distinct from any legacy Taproot tweak metadata.
-//! - A statechain is single-protocol for its lifetime. BIP448 and legacy
-//!   signing metadata cannot be mixed because the unchanged lockbox exposes one
-//!   shared per-statechain signature counter for legacy transfer fraud checks.
-//! - `/bip448-statechain/signature-count/<statechain_id>` exposes the shared
-//!   lockbox signature counter so a receiver can verify it independently.
+//! - The CSFS share-negation flag is recorded with the BIP448 record.
+//! - `/bip448-statechain/signature-count/<statechain_id>` exposes the lockbox
+//!   signature counter so a receiver can verify it independently.
 
 use mercurylib::bip448_statechain::signing_api::{
     validate_negate_seckey_flag, validate_signing_id, Bip448PartialSignatureRequestPayload,
@@ -33,11 +28,8 @@ use rocket::{http::Status, response::status, serde::json::Json, State};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::{
-    challenge_from_session_hex, error_response, outbound_request_timeout, protocol_mixing_response,
-};
+use super::{challenge_from_session_hex, error_response, outbound_request_timeout};
 use crate::database::bip448_sign::{Bip448IncompleteSignatureRecord, Bip448SignatureRecord};
-use crate::database::sign::{SigningProtocolClaim, BIP448_SIGNING_PROTOCOL};
 use crate::endpoints::utils::SignatureValidationError;
 use crate::server::StateChainEntity;
 
@@ -193,16 +185,6 @@ fn pending_nonce_response() -> status::Custom<Json<Value>> {
     )
 }
 
-fn cross_protocol_nonce_response(protocol: &str) -> status::Custom<Json<Value>> {
-    error_response(
-        Status::Conflict,
-        format!(
-            "{} signing round is still incomplete for this statechain; complete sign/second before requesting another nonce",
-            protocol
-        ),
-    )
-}
-
 async fn recover_bip448_sign_second_pre_lockbox_claim(
     pool: &sqlx::PgPool,
     statechain_id: &str,
@@ -216,7 +198,12 @@ async fn recover_bip448_sign_second_pre_lockbox_claim(
         challenge,
     )
     .await;
-    crate::database::sign::delete_bip448_signing_nonce_lease(pool, statechain_id, signing_id).await;
+    crate::database::signing_nonce::delete_bip448_signing_nonce_lease(
+        pool,
+        statechain_id,
+        signing_id,
+    )
+    .await;
 }
 
 async fn cleanup_bip448_sign_first_reservation(
@@ -231,7 +218,7 @@ async fn cleanup_bip448_sign_first_reservation(
         signing_id,
     )
     .await;
-    crate::database::sign::delete_bip448_signing_nonce_lease_by_token(
+    crate::database::signing_nonce::delete_bip448_signing_nonce_lease_by_token(
         pool,
         statechain_id,
         signing_id,
@@ -246,7 +233,12 @@ async fn replay_bip448_partial_signature(
     signing_id: &str,
     server_partial_sig: String,
 ) -> status::Custom<Json<Value>> {
-    crate::database::sign::delete_bip448_signing_nonce_lease(pool, statechain_id, signing_id).await;
+    crate::database::signing_nonce::delete_bip448_signing_nonce_lease(
+        pool,
+        statechain_id,
+        signing_id,
+    )
+    .await;
 
     status::Custom(
         Status::Ok,
@@ -310,24 +302,11 @@ pub async fn bip448_sign_first(
         return response;
     }
 
-    crate::database::sign::reclaim_stale_signing_nonce_lease(
+    crate::database::signing_nonce::reclaim_stale_signing_nonce_lease(
         &statechain_entity.pool,
         &payload.statechain_id,
     )
     .await;
-
-    match crate::database::sign::claim_statechain_signing_protocol(
-        &statechain_entity.pool,
-        &payload.statechain_id,
-        BIP448_SIGNING_PROTOCOL,
-    )
-    .await
-    {
-        SigningProtocolClaim::Claimed | SigningProtocolClaim::AlreadyMatches => {}
-        SigningProtocolClaim::Conflict { existing_protocol } => {
-            return protocol_mixing_response(&existing_protocol, BIP448_SIGNING_PROTOCOL);
-        }
-    }
 
     let existing = crate::database::bip448_sign::get_bip448_signature_record(
         &statechain_entity.pool,
@@ -343,7 +322,7 @@ pub async fn bip448_sign_first(
     match classify_sign_first(existing.as_ref()) {
         SignFirstDecision::Replay { server_pubnonce } => {
             if existing_bip448_round_is_incomplete {
-                let _ = crate::database::sign::insert_bip448_signing_nonce_lease(
+                let _ = crate::database::signing_nonce::insert_bip448_signing_nonce_lease(
                     &statechain_entity.pool,
                     &payload.statechain_id,
                     &signing_id,
@@ -354,7 +333,7 @@ pub async fn bip448_sign_first(
             return status::Custom(Status::Ok, Json(json!(response)));
         }
         SignFirstDecision::Pending => {
-            let _ = crate::database::sign::insert_bip448_signing_nonce_lease(
+            let _ = crate::database::signing_nonce::insert_bip448_signing_nonce_lease(
                 &statechain_entity.pool,
                 &payload.statechain_id,
                 &signing_id,
@@ -371,7 +350,7 @@ pub async fn bip448_sign_first(
     )
     .await
     {
-        let _ = crate::database::sign::insert_bip448_signing_nonce_lease(
+        let _ = crate::database::signing_nonce::insert_bip448_signing_nonce_lease(
             &statechain_entity.pool,
             &payload.statechain_id,
             &incomplete.signing_id,
@@ -380,20 +359,17 @@ pub async fn bip448_sign_first(
         return incomplete_round_response(incomplete);
     }
 
-    if let Some(protocol) = crate::database::sign::get_signing_nonce_lease(
+    if crate::database::signing_nonce::get_bip448_signing_nonce_lease(
         &statechain_entity.pool,
         &payload.statechain_id,
     )
     .await
+    .is_some()
     {
-        if protocol == BIP448_SIGNING_PROTOCOL {
-            return pending_nonce_response();
-        }
-
-        return cross_protocol_nonce_response(&protocol);
+        return pending_nonce_response();
     }
 
-    let lease_token = crate::database::sign::insert_bip448_signing_nonce_lease(
+    let lease_token = crate::database::signing_nonce::insert_bip448_signing_nonce_lease(
         &statechain_entity.pool,
         &payload.statechain_id,
         &signing_id,
@@ -401,18 +377,7 @@ pub async fn bip448_sign_first(
     .await;
 
     let Some(lease_token) = lease_token else {
-        let protocol = crate::database::sign::get_signing_nonce_lease(
-            &statechain_entity.pool,
-            &payload.statechain_id,
-        )
-        .await
-        .unwrap_or_else(|| "unknown".to_string());
-
-        if protocol == BIP448_SIGNING_PROTOCOL {
-            return pending_nonce_response();
-        }
-
-        return cross_protocol_nonce_response(&protocol);
+        return pending_nonce_response();
     };
 
     let reserved = crate::database::bip448_sign::insert_bip448_signature_reservation(
@@ -433,7 +398,7 @@ pub async fn bip448_sign_first(
         if let SignFirstDecision::Replay { server_pubnonce } =
             classify_sign_first(existing.as_ref())
         {
-            crate::database::sign::delete_bip448_signing_nonce_lease_by_token(
+            crate::database::signing_nonce::delete_bip448_signing_nonce_lease_by_token(
                 &statechain_entity.pool,
                 &payload.statechain_id,
                 &signing_id,
@@ -445,7 +410,7 @@ pub async fn bip448_sign_first(
         }
 
         if let SignFirstDecision::Pending = classify_sign_first(existing.as_ref()) {
-            crate::database::sign::delete_bip448_signing_nonce_lease_by_token(
+            crate::database::signing_nonce::delete_bip448_signing_nonce_lease_by_token(
                 &statechain_entity.pool,
                 &payload.statechain_id,
                 &signing_id,
@@ -462,14 +427,14 @@ pub async fn bip448_sign_first(
             )
             .await
         {
-            crate::database::sign::delete_bip448_signing_nonce_lease_by_token(
+            crate::database::signing_nonce::delete_bip448_signing_nonce_lease_by_token(
                 &statechain_entity.pool,
                 &payload.statechain_id,
                 &signing_id,
                 &lease_token,
             )
             .await;
-            let _ = crate::database::sign::insert_bip448_signing_nonce_lease(
+            let _ = crate::database::signing_nonce::insert_bip448_signing_nonce_lease(
                 &statechain_entity.pool,
                 &payload.statechain_id,
                 &incomplete.signing_id,
@@ -478,7 +443,7 @@ pub async fn bip448_sign_first(
             return incomplete_round_response(incomplete);
         }
 
-        crate::database::sign::delete_bip448_signing_nonce_lease_by_token(
+        crate::database::signing_nonce::delete_bip448_signing_nonce_lease_by_token(
             &statechain_entity.pool,
             &payload.statechain_id,
             &signing_id,
@@ -541,7 +506,7 @@ pub async fn bip448_sign_first(
         .post(&format!("{}/{}", lockbox_endpoint, path))
         .timeout(outbound_request_timeout());
 
-    if !crate::database::sign::bip448_signing_nonce_lease_matches(
+    if !crate::database::signing_nonce::bip448_signing_nonce_lease_matches(
         &statechain_entity.pool,
         &payload.statechain_id,
         &signing_id,
@@ -585,20 +550,19 @@ pub async fn bip448_sign_first(
         }
     };
 
-    let response: mercurylib::transaction::SignFirstResponsePayload =
-        match serde_json::from_str(value.as_str()) {
-            Ok(response) => response,
-            Err(err) => {
-                cleanup_bip448_sign_first_reservation(
-                    &statechain_entity.pool,
-                    &payload.statechain_id,
-                    &signing_id,
-                    &lease_token,
-                )
-                .await;
-                return error_response(Status::InternalServerError, err.to_string());
-            }
-        };
+    let response: Bip448SignFirstResponsePayload = match serde_json::from_str(value.as_str()) {
+        Ok(response) => response,
+        Err(err) => {
+            cleanup_bip448_sign_first_reservation(
+                &statechain_entity.pool,
+                &payload.statechain_id,
+                &signing_id,
+                &lease_token,
+            )
+            .await;
+            return error_response(Status::InternalServerError, err.to_string());
+        }
+    };
 
     let server_pubnonce_hex = normalize_hex_wire_value(&response.server_pubnonce);
 
@@ -705,19 +669,6 @@ pub async fn bip448_sign_second(
         | SignSecondDecision::Replay { .. } => {}
     }
 
-    match crate::database::sign::claim_statechain_signing_protocol(
-        &statechain_entity.pool,
-        &payload.statechain_id,
-        BIP448_SIGNING_PROTOCOL,
-    )
-    .await
-    {
-        SigningProtocolClaim::Claimed | SigningProtocolClaim::AlreadyMatches => {}
-        SigningProtocolClaim::Conflict { existing_protocol } => {
-            return protocol_mixing_response(&existing_protocol, BIP448_SIGNING_PROTOCOL);
-        }
-    }
-
     let retry_claimed_challenge = matches!(&sign_second_decision, SignSecondDecision::RetryClaimed);
 
     match sign_second_decision {
@@ -735,27 +686,17 @@ pub async fn bip448_sign_second(
         SignSecondDecision::NotFound | SignSecondDecision::Conflict { .. } => unreachable!(),
     };
 
-    if let Some(protocol) = crate::database::sign::get_signing_nonce_lease(
+    if let Some(lease_signing_id) = crate::database::signing_nonce::get_bip448_signing_nonce_lease(
         &statechain_entity.pool,
         &payload.statechain_id,
     )
     .await
     {
-        if protocol != BIP448_SIGNING_PROTOCOL {
-            return cross_protocol_nonce_response(&protocol);
-        }
-
-        match crate::database::sign::get_bip448_signing_nonce_lease(
-            &statechain_entity.pool,
-            &payload.statechain_id,
-        )
-        .await
-        {
-            Some(lease_signing_id) if lease_signing_id == signing_id => {}
-            _ => return pending_nonce_response(),
+        if lease_signing_id != signing_id {
+            return pending_nonce_response();
         }
     } else {
-        let lease_token = crate::database::sign::insert_bip448_signing_nonce_lease(
+        let lease_token = crate::database::signing_nonce::insert_bip448_signing_nonce_lease(
             &statechain_entity.pool,
             &payload.statechain_id,
             &signing_id,
@@ -763,17 +704,6 @@ pub async fn bip448_sign_second(
         .await;
 
         if lease_token.is_none() {
-            let protocol = crate::database::sign::get_signing_nonce_lease(
-                &statechain_entity.pool,
-                &payload.statechain_id,
-            )
-            .await
-            .unwrap_or_else(|| "unknown".to_string());
-
-            if protocol != BIP448_SIGNING_PROTOCOL {
-                return cross_protocol_nonce_response(&protocol);
-            }
-
             return pending_nonce_response();
         }
     }
@@ -958,7 +888,7 @@ pub async fn bip448_sign_second(
         };
     }
 
-    crate::database::sign::delete_bip448_signing_nonce_lease(
+    crate::database::signing_nonce::delete_bip448_signing_nonce_lease(
         &statechain_entity.pool,
         &payload.statechain_id,
         &signing_id,
@@ -1220,18 +1150,5 @@ mod tests {
             lockbox_status_to_rocket(reqwest::StatusCode::NOT_FOUND),
             Status::NotFound
         );
-    }
-
-    #[test]
-    fn protocol_mixing_response_rejects_bip448_after_legacy() {
-        let response = protocol_mixing_response(
-            crate::database::sign::LEGACY_SIGNING_PROTOCOL,
-            BIP448_SIGNING_PROTOCOL,
-        );
-
-        assert_eq!(response.0, Status::Conflict);
-        let message = response.1 .0["message"].as_str().unwrap();
-        assert!(message.contains("statechain already uses legacy signing"));
-        assert!(message.contains("bip448 signing is disabled"));
     }
 }

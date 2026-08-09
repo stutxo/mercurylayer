@@ -9,7 +9,7 @@ use mercurylib::{
         signing::{CsfsSigningRole, CsfsSigningSession},
         signing_api::{Bip448PartialSignatureRequestPayload, Bip448SignFirstRequestPayload},
     },
-    deposit, transaction,
+    transaction,
     transfer::receiver::TransferReceiverRequestPayload,
 };
 use reqwest::StatusCode;
@@ -83,45 +83,6 @@ fn deterministic_partial_signature_payload() -> transaction::PartialSignatureReq
         signed_statechain_id: "469b4d8151ba9fbc78d178a7bbe30b80539b52df385647539ab3bfb0d1fade376ccb6e6909d298b31615cd38a8435bf3c92692389ffbadf4b33688976d2bb4ea".to_string(),
         server_pub_nonce: "032f7d30ca4641d314418be9e8e11ef28e079ce684f7271bceab6e9f835adea05303b1b76528c43918e991aa847abb7b6df753dc116de95a9d811bc9b35a7f020dfb".to_string(),
     }
-}
-
-async fn legacy_partial_signature_payload(
-    mercury_client: &reqwest::Client,
-) -> Result<(String, transaction::PartialSignatureRequestPayload)> {
-    let (wallet, mut coin) = mercury::create_deposited_coin(mercury_client).await?;
-    let statechain_id = coin.statechain_id.clone().unwrap();
-    let aggregated = deposit::create_aggregated_address(&coin, wallet.network.clone())?;
-    coin.aggregated_pubkey = Some(aggregated.aggregate_pubkey);
-    coin.aggregated_address = Some(aggregated.aggregate_address);
-    coin.utxo_txid = Some(hex::encode([0x22u8; 32]));
-    coin.utxo_vout = Some(0);
-    coin.amount = Some(100_000);
-
-    let coin_nonce = transaction::create_and_commit_nonces(&coin)?;
-    let first_response =
-        mercury::sign_first(mercury_client, &coin_nonce.sign_first_request_payload).await?;
-
-    coin.secret_nonce = Some(coin_nonce.secret_nonce);
-    coin.public_nonce = Some(coin_nonce.public_nonce);
-    coin.blinding_factor = Some(coin_nonce.blinding_factor);
-    coin.server_public_nonce = Some(first_response.server_pubnonce);
-
-    let partial_signature_request = transaction::get_partial_sig_request(
-        &coin,
-        1_500,
-        wallet.initlock,
-        wallet.interval,
-        1.5,
-        0,
-        coin.backup_address.clone(),
-        wallet.network.clone(),
-        false,
-    )?;
-
-    Ok((
-        statechain_id,
-        partial_signature_request.partial_signature_request_payload,
-    ))
 }
 
 fn bip448_partial_signature_payload(
@@ -215,27 +176,6 @@ async fn complete_bip448_signing_round(
     Ok((first.server_pubnonce, challenge))
 }
 
-async fn insert_completed_legacy_signature_row(statechain_id: &str) -> Result<()> {
-    let pool = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(MERCURY_DATABASE_URL)
-        .await
-        .context("failed to connect to mercury postgres")?;
-    sqlx::query(
-        "INSERT INTO statechain_signature_data \
-         (statechain_id, server_pubnonce, challenge, tx_n, negate_seckey, server_partial_sig) \
-         VALUES ($1, $2, $3, 1, 0, $4)",
-    )
-    .bind(statechain_id)
-    .bind("mixed-legacy-server-pubnonce")
-    .bind("mixed-legacy-challenge")
-    .bind("mixed-legacy-partial-signature")
-    .execute(&pool)
-    .await?;
-
-    Ok(())
-}
-
 async fn insert_completed_bip448_signature_row(statechain_id: &str) -> Result<()> {
     let pool = PgPoolOptions::new()
         .max_connections(1)
@@ -254,48 +194,6 @@ async fn insert_completed_bip448_signature_row(statechain_id: &str) -> Result<()
     .bind("mixed-bip448-partial-signature")
     .execute(&pool)
     .await?;
-
-    Ok(())
-}
-
-async fn statechain_info_response_bytes(
-    mercury_client: &reqwest::Client,
-    statechain_id: &str,
-) -> Result<Vec<u8>> {
-    let response = mercury_client
-        .get(format!(
-            "{}/info/statechain/{}",
-            mercury::MERCURY_URL,
-            statechain_id
-        ))
-        .send()
-        .await
-        .context("failed to call mercury info/statechain")?;
-    assert_eq!(response.status(), StatusCode::OK);
-
-    Ok(response
-        .bytes()
-        .await
-        .context("failed to read mercury info/statechain body")?
-        .to_vec())
-}
-
-async fn assert_response_status_contains(
-    response: reqwest::Response,
-    expected_status: StatusCode,
-    expected_body: &str,
-) -> Result<()> {
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .context("failed to read response body")?;
-
-    assert_eq!(status, expected_status);
-    assert!(
-        body.contains(expected_body),
-        "response body did not contain {expected_body:?}: {body}"
-    );
 
     Ok(())
 }
@@ -1045,49 +943,33 @@ async fn mercury_signing_routes_nonce_and_partial_signature_through_lockbox() ->
     mercury::wait_until_ready(&mercury_client).await?;
     lockbox::wait_until_ready(&lockbox_client).await?;
 
-    let (wallet, mut coin) = mercury::create_deposited_coin(&mercury_client).await?;
+    let (_wallet, coin) = mercury::create_deposited_coin(&mercury_client).await?;
     let statechain_id = coin.statechain_id.clone().unwrap();
-    let aggregated = deposit::create_aggregated_address(&coin, wallet.network.clone())?;
-    coin.aggregated_pubkey = Some(aggregated.aggregate_pubkey);
-    coin.aggregated_address = Some(aggregated.aggregate_address);
-    coin.utxo_txid = Some(hex::encode([0x22u8; 32]));
-    coin.utxo_vout = Some(0);
-    coin.amount = Some(100_000);
-
-    let coin_nonce = transaction::create_and_commit_nonces(&coin)?;
-    let first_response =
-        mercury::sign_first(&mercury_client, &coin_nonce.sign_first_request_payload).await?;
+    let signing_id = hex::encode([0x44u8; 32]);
+    let sign_first_payload = Bip448SignFirstRequestPayload {
+        statechain_id: statechain_id.clone(),
+        signed_statechain_id: coin.signed_statechain_id.clone().unwrap(),
+        signing_id: signing_id.clone(),
+    };
+    let first_response = mercury::bip448_sign_first(&mercury_client, &sign_first_payload).await?;
     let repeated_first_response =
-        mercury::sign_first(&mercury_client, &coin_nonce.sign_first_request_payload).await?;
+        mercury::bip448_sign_first(&mercury_client, &sign_first_payload).await?;
 
     assert_eq!(
         first_response.server_pubnonce,
         repeated_first_response.server_pubnonce
     );
 
-    coin.secret_nonce = Some(coin_nonce.secret_nonce);
-    coin.public_nonce = Some(coin_nonce.public_nonce);
-    coin.blinding_factor = Some(coin_nonce.blinding_factor);
-    coin.server_public_nonce = Some(first_response.server_pubnonce.clone());
-
-    let partial_signature_request = transaction::get_partial_sig_request(
-        &coin,
-        1_500,
-        wallet.initlock,
-        wallet.interval,
-        1.5,
-        0,
-        coin.backup_address.clone(),
-        wallet.network.clone(),
-        false,
-    )?;
-    let partial_signature_response = mercury::sign_second(
-        &mercury_client,
-        &partial_signature_request.partial_signature_request_payload,
-    )
-    .await?;
+    let (partial_signature_request, expected_challenge) =
+        bip448_partial_signature_payload(&coin, &signing_id, &first_response.server_pubnonce)?;
+    let partial_signature_response =
+        mercury::bip448_sign_second(&mercury_client, &partial_signature_request).await?;
 
     assert_eq!(partial_signature_response.partial_sig.len(), 64);
+    assert_eq!(
+        hex::decode(&partial_signature_response.partial_sig)?.len(),
+        32
+    );
     assert_eq!(
         lockbox::get_signature_count(&lockbox_client, &statechain_id).await?,
         1
@@ -1100,7 +982,10 @@ async fn mercury_signing_routes_nonce_and_partial_signature_through_lockbox() ->
         lockbox::normalize_hex(&statechain_info.statechain_info[0].server_pubnonce),
         first_response.server_pubnonce
     );
-    assert!(!statechain_info.statechain_info[0].challenge.is_empty());
+    assert_eq!(
+        statechain_info.statechain_info[0].challenge,
+        expected_challenge
+    );
 
     lockbox::delete_statechain(&lockbox_client, &statechain_id).await?;
 
@@ -1132,7 +1017,6 @@ async fn mercury_statechain_info_returns_ordered_bip448_rows_and_transfer_clears
         complete_bip448_signing_round(&mercury_client, &coin, second_signing_id.clone()).await?;
     let second_nonce = second_row.0.clone();
     let second_challenge = second_row.1.clone();
-    insert_completed_legacy_signature_row(&statechain_id).await?;
     insert_completed_bip448_signature_row(&format!("foreign-{statechain_id}")).await?;
 
     let secp = Secp256k1::new();
@@ -1199,288 +1083,6 @@ async fn mercury_statechain_info_returns_ordered_bip448_rows_and_transfer_clears
         post_transfer_info.statechain_info[0].challenge,
         second_challenge
     );
-
-    lockbox::delete_statechain(&lockbox_client, &statechain_id).await?;
-
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore = "requires lockbox docker stack"]
-async fn mercury_statechain_info_preserves_legacy_response_bytes() -> Result<()> {
-    let _guard = common::test_guard();
-    let mercury_client = mercury::http_client();
-    let lockbox_client = lockbox::http_client();
-    mercury::wait_until_ready(&mercury_client).await?;
-    lockbox::wait_until_ready(&lockbox_client).await?;
-    common::bitcoin_core::ensure_wallet_ready()?;
-
-    let (statechain_id, payload) = legacy_partial_signature_payload(&mercury_client).await?;
-    mercury::sign_second(&mercury_client, &payload).await?;
-    let before_body = statechain_info_response_bytes(&mercury_client, &statechain_id).await?;
-    insert_completed_bip448_signature_row(&statechain_id).await?;
-    let after_body = statechain_info_response_bytes(&mercury_client, &statechain_id).await?;
-    assert_eq!(after_body, before_body);
-
-    lockbox::delete_statechain(&lockbox_client, &statechain_id).await?;
-
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore = "requires lockbox docker stack"]
-async fn mercury_legacy_sign_second_exact_retry_replays_without_lockbox_call() -> Result<()> {
-    let _guard = common::test_guard();
-    let mercury_client = mercury::http_client();
-    let lockbox_client = lockbox::http_client();
-    mercury::wait_until_ready(&mercury_client).await?;
-    lockbox::wait_until_ready(&lockbox_client).await?;
-
-    let (statechain_id, payload) = legacy_partial_signature_payload(&mercury_client).await?;
-
-    let first = mercury::sign_second(&mercury_client, &payload).await?;
-    assert_eq!(
-        lockbox::get_signature_count(&lockbox_client, &statechain_id).await?,
-        1
-    );
-
-    let replay = mercury::sign_second(&mercury_client, &payload).await?;
-    assert_eq!(first.partial_sig, replay.partial_sig);
-    assert_eq!(
-        lockbox::get_signature_count(&lockbox_client, &statechain_id).await?,
-        1
-    );
-
-    lockbox::delete_statechain(&lockbox_client, &statechain_id).await?;
-
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore = "requires lockbox docker stack"]
-async fn mercury_legacy_sign_second_conflict_is_rejected_before_lockbox_call() -> Result<()> {
-    let _guard = common::test_guard();
-    let mercury_client = mercury::http_client();
-    let lockbox_client = lockbox::http_client();
-    mercury::wait_until_ready(&mercury_client).await?;
-    lockbox::wait_until_ready(&lockbox_client).await?;
-
-    let (statechain_id, payload) = legacy_partial_signature_payload(&mercury_client).await?;
-    mercury::sign_second(&mercury_client, &payload).await?;
-    assert_eq!(
-        lockbox::get_signature_count(&lockbox_client, &statechain_id).await?,
-        1
-    );
-
-    let mut conflicting_payload = payload.clone();
-    conflicting_payload.negate_seckey = if conflicting_payload.negate_seckey == 0 {
-        1
-    } else {
-        0
-    };
-    let response = mercury::sign_second_raw(&mercury_client, &conflicting_payload).await?;
-    assert_response_status_contains(response, StatusCode::CONFLICT, "negate_seckey").await?;
-    assert_eq!(
-        lockbox::get_signature_count(&lockbox_client, &statechain_id).await?,
-        1
-    );
-
-    lockbox::delete_statechain(&lockbox_client, &statechain_id).await?;
-
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore = "requires lockbox docker stack"]
-async fn mercury_legacy_sign_second_requires_active_lease_before_lockbox_call() -> Result<()> {
-    let _guard = common::test_guard();
-    let mercury_client = mercury::http_client();
-    let lockbox_client = lockbox::http_client();
-    mercury::wait_until_ready(&mercury_client).await?;
-    lockbox::wait_until_ready(&lockbox_client).await?;
-
-    let (statechain_id, payload) = legacy_partial_signature_payload(&mercury_client).await?;
-    mercury::delete_legacy_signing_nonce_lease(&statechain_id).await?;
-
-    let response = mercury::sign_second_raw(&mercury_client, &payload).await?;
-    assert_response_status_contains(response, StatusCode::CONFLICT, "lease is not active").await?;
-    assert_eq!(
-        lockbox::get_signature_count(&lockbox_client, &statechain_id).await?,
-        0
-    );
-
-    lockbox::delete_statechain(&lockbox_client, &statechain_id).await?;
-
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore = "requires lockbox docker stack"]
-async fn mercury_legacy_claimed_retry_fails_closed_before_lockbox_call() -> Result<()> {
-    let _guard = common::test_guard();
-    let mercury_client = mercury::http_client();
-    let lockbox_client = lockbox::http_client();
-    mercury::wait_until_ready(&mercury_client).await?;
-    lockbox::wait_until_ready(&lockbox_client).await?;
-
-    let (statechain_id, payload) = legacy_partial_signature_payload(&mercury_client).await?;
-    mercury::sign_second(&mercury_client, &payload).await?;
-    assert_eq!(
-        lockbox::get_signature_count(&lockbox_client, &statechain_id).await?,
-        1
-    );
-
-    mercury::clear_legacy_server_partial_signature(&statechain_id, &payload.server_pub_nonce)
-        .await?;
-    mercury::insert_legacy_signing_nonce_lease(&statechain_id).await?;
-
-    let response = mercury::sign_second_raw(&mercury_client, &payload).await?;
-    assert_response_status_contains(
-        response,
-        StatusCode::CONFLICT,
-        "retry cannot safely re-drive the legacy lockbox",
-    )
-    .await?;
-    assert_eq!(
-        lockbox::get_signature_count(&lockbox_client, &statechain_id).await?,
-        1
-    );
-
-    lockbox::delete_statechain(&lockbox_client, &statechain_id).await?;
-
-    Ok(())
-}
-
-fn flip_last_hex_char(value: &str) -> String {
-    let mut chars: Vec<char> = value.chars().collect();
-    if let Some(last) = chars.last_mut() {
-        *last = if *last == '0' { '1' } else { '0' };
-    }
-    chars.into_iter().collect()
-}
-
-#[tokio::test]
-#[ignore = "requires lockbox docker stack"]
-async fn mercury_legacy_sign_second_rejects_non_matching_server_pub_nonce() -> Result<()> {
-    let _guard = common::test_guard();
-    let mercury_client = mercury::http_client();
-    let lockbox_client = lockbox::http_client();
-    mercury::wait_until_ready(&mercury_client).await?;
-    lockbox::wait_until_ready(&lockbox_client).await?;
-
-    let (statechain_id, payload) = legacy_partial_signature_payload(&mercury_client).await?;
-
-    // A server_pub_nonce that does not match the current legacy nonce row must
-    // be rejected before the lockbox is ever called.
-    let mut mismatched_payload = payload.clone();
-    mismatched_payload.server_pub_nonce = flip_last_hex_char(&payload.server_pub_nonce);
-
-    let response = mercury::sign_second_raw(&mercury_client, &mismatched_payload).await?;
-    assert_response_status_contains(response, StatusCode::CONFLICT, "server public nonce").await?;
-    assert_eq!(
-        lockbox::get_signature_count(&lockbox_client, &statechain_id).await?,
-        0
-    );
-
-    lockbox::delete_statechain(&lockbox_client, &statechain_id).await?;
-
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore = "requires lockbox docker stack"]
-async fn mercury_legacy_stale_sign_second_replays_after_newer_sign_first() -> Result<()> {
-    // Window A: a successful sign/second whose response is lost, then a newer
-    // sign/first overwrites the lockbox secnonce. The old sign/second retry must
-    // replay the stored partial signature instead of re-signing against the
-    // newer nonce, and must not increment the shared sig_count.
-    let _guard = common::test_guard();
-    let mercury_client = mercury::http_client();
-    let lockbox_client = lockbox::http_client();
-    mercury::wait_until_ready(&mercury_client).await?;
-    lockbox::wait_until_ready(&lockbox_client).await?;
-
-    let (statechain_id, payload) = legacy_partial_signature_payload(&mercury_client).await?;
-
-    let first = mercury::sign_second(&mercury_client, &payload).await?;
-    assert_eq!(
-        lockbox::get_signature_count(&lockbox_client, &statechain_id).await?,
-        1
-    );
-
-    // A newer sign/first for the same statechain overwrites the lockbox secnonce.
-    let sign_first_payload = transaction::SignFirstRequestPayload {
-        statechain_id: payload.statechain_id.clone(),
-        signed_statechain_id: payload.signed_statechain_id.clone(),
-    };
-    let newer = mercury::sign_first(&mercury_client, &sign_first_payload).await?;
-    assert_ne!(newer.server_pubnonce, payload.server_pub_nonce);
-
-    // The old sign/second retry replays the stored partial, does not re-sign
-    // with the newer secnonce, and does not increment sig_count.
-    let replay = mercury::sign_second(&mercury_client, &payload).await?;
-    assert_eq!(first.partial_sig, replay.partial_sig);
-    assert_eq!(
-        lockbox::get_signature_count(&lockbox_client, &statechain_id).await?,
-        1
-    );
-
-    lockbox::delete_statechain(&lockbox_client, &statechain_id).await?;
-
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore = "requires lockbox docker stack"]
-async fn mercury_legacy_claimed_round_blocks_fresh_sign_first() -> Result<()> {
-    // Window B: after a challenge is claimed but no partial is durably stored
-    // (indeterminate lockbox failure), the lease is kept and a fresh sign/first
-    // must be blocked from obtaining a new nonce that would overwrite the
-    // still-needed lockbox secnonce.
-    let _guard = common::test_guard();
-    let mercury_client = mercury::http_client();
-    let lockbox_client = lockbox::http_client();
-    mercury::wait_until_ready(&mercury_client).await?;
-    lockbox::wait_until_ready(&lockbox_client).await?;
-
-    let (statechain_id, payload) = legacy_partial_signature_payload(&mercury_client).await?;
-    mercury::sign_second(&mercury_client, &payload).await?;
-
-    // Reproduce the claimed-but-no-stored-partial state with the lease held.
-    mercury::clear_legacy_server_partial_signature(&statechain_id, &payload.server_pub_nonce)
-        .await?;
-    mercury::insert_legacy_signing_nonce_lease(&statechain_id).await?;
-
-    let sign_first_payload = transaction::SignFirstRequestPayload {
-        statechain_id: payload.statechain_id.clone(),
-        signed_statechain_id: payload.signed_statechain_id.clone(),
-    };
-    let response = mercury::sign_first_raw(&mercury_client, &sign_first_payload).await?;
-    assert_response_status_contains(response, StatusCode::CONFLICT, "incomplete").await?;
-    assert_eq!(
-        lockbox::get_signature_count(&lockbox_client, &statechain_id).await?,
-        1
-    );
-
-    lockbox::delete_statechain(&lockbox_client, &statechain_id).await?;
-
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore = "requires lockbox docker stack"]
-async fn mercury_statechain_info_ignores_incomplete_legacy_signature_rows() -> Result<()> {
-    let _guard = common::test_guard();
-    let mercury_client = mercury::http_client();
-    let lockbox_client = lockbox::http_client();
-    mercury::wait_until_ready(&mercury_client).await?;
-    lockbox::wait_until_ready(&lockbox_client).await?;
-
-    let (statechain_id, _payload) = legacy_partial_signature_payload(&mercury_client).await?;
-
-    let statechain_info = mercury::statechain_info(&mercury_client, &statechain_id).await?;
-    assert_eq!(statechain_info.num_sigs, 0);
-    assert!(statechain_info.statechain_info.is_empty());
 
     lockbox::delete_statechain(&lockbox_client, &statechain_id).await?;
 

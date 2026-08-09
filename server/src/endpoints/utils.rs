@@ -1,13 +1,11 @@
 use std::{error::Error, fmt, str::FromStr};
 
 use bitcoin::hashes::sha256;
-use rocket::{http::Status, response::status, serde::json::Json, State};
+use rocket::{http::Status, response::status, serde::json::Json};
 use secp256k1::PublicKey;
 use secp256k1::{schnorr::Signature, Message, Secp256k1, XOnlyPublicKey};
 use serde_json::{json, Value};
 use sqlx::Row;
-
-use crate::server::StateChainEntity;
 
 #[derive(Debug)]
 pub enum SignatureValidationError {
@@ -132,63 +130,6 @@ pub async fn info_config() -> status::Custom<Json<Value>> {
     };
 
     let response_body = json!(server_config);
-
-    return status::Custom(Status::Ok, Json(response_body));
-}
-
-#[get("/info/keylist")]
-pub async fn info_keylist(
-    statechain_entity: &State<StateChainEntity>,
-) -> status::Custom<Json<Value>> {
-    let query = "\
-    SELECT server_public_key, statechain_id \
-    FROM statechain_data";
-
-    let rows = sqlx::query(query)
-        .fetch_all(&statechain_entity.pool)
-        .await
-        .unwrap();
-
-    let query_sigs = "\
-    SELECT tx_n, statechain_id, created_at::TEXT \
-    FROM statechain_signature_data";
-
-    let rows_sigs = sqlx::query(query_sigs)
-        .fetch_all(&statechain_entity.pool)
-        .await
-        .unwrap();
-
-    let mut result = Vec::<mercurylib::utils::PubKeyInfo>::new();
-
-    for row in rows {
-        let server_public_key_bytes = row.get::<Vec<u8>, _>(0);
-        let server_pubkey = PublicKey::from_slice(&server_public_key_bytes).unwrap();
-        let statechain_id: String = row.get(1);
-
-        let mut keyinfo: mercurylib::utils::PubKeyInfo = mercurylib::utils::PubKeyInfo {
-            server_pubkey: server_pubkey.to_string(),
-            tx_n: 0,
-            created_at: "".to_string(),
-        };
-
-        for row_sig in &rows_sigs {
-            let tx_n_i: i32 = row_sig.get(0);
-            let statechain_id_sig: String = row_sig.get(1);
-            let updated_at: String = row_sig.get(2);
-
-            if statechain_id == statechain_id_sig {
-                keyinfo.tx_n = tx_n_i as u32;
-                keyinfo.created_at = updated_at;
-            }
-        }
-        result.push(keyinfo);
-    }
-
-    let key_list_response_payload = mercurylib::utils::KeyListResponsePayload {
-        list_keyinfo: result,
-    };
-
-    let response_body = json!(key_list_response_payload);
 
     return status::Custom(Status::Ok, Json(response_body));
 }

@@ -1,9 +1,8 @@
-//! Database access for BIP448 CSFS signing metadata (Phase 5).
+//! Database access for BIP448 CSFS signing metadata.
 //!
-//! Parallel to `sign.rs`, which serves the legacy flow unchanged. One record
-//! exists per opaque (statechain_id, signing_id); exact retries replay the
-//! stored nonce/partial signature and conflicting blinded challenges are
-//! rejected at the endpoint layer without storing transaction metadata.
+//! One record exists per opaque (statechain_id, signing_id); exact retries
+//! replay the stored nonce/partial signature and conflicting blinded challenges
+//! are rejected at the endpoint layer without storing transaction metadata.
 
 use sqlx::Row;
 
@@ -126,7 +125,7 @@ pub async fn update_bip448_signature_data_server_pubnonce_if_lease_matches(
         .bind(server_pubnonce)
         .bind(statechain_id)
         .bind(signing_id)
-        .bind(crate::database::sign::BIP448_SIGNING_PROTOCOL)
+        .bind(crate::database::signing_nonce::BIP448_SIGNING_PROTOCOL)
         .bind(lease_token)
         .execute(pool)
         .await

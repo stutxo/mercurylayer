@@ -5,76 +5,32 @@ use sqlx::Row;
 
 const DELETE_SIGNING_GUARDS_AFTER_TRANSFER_QUERY: &str = "\
     WITH deleted_leases AS (\
-        DELETE FROM signing_nonce_leases WHERE statechain_id = $1 RETURNING protocol, created_at\
+        DELETE FROM signing_nonce_leases WHERE statechain_id = $1 RETURNING 1\
     ), \
-    deleted_legacy_incomplete AS (\
-        DELETE FROM statechain_signature_data AS signature \
-        WHERE signature.statechain_id = $1 \
-          AND signature.server_pubnonce IS NOT NULL \
-          AND signature.server_partial_sig IS NULL \
-          AND (\
-              signature.challenge IS NULL \
-              OR signature.negate_seckey IS NOT NULL\
-          ) \
-        RETURNING 1\
-    ), \
-    deleted_bip448 AS (\
+    deleted_bip448_incomplete AS (\
         DELETE FROM bip448_signature_data WHERE statechain_id = $1 \
           AND server_partial_sig IS NULL RETURNING 1\
     ) \
     SELECT 1";
 
 const GET_STATECHAIN_INFO_QUERY: &str = "\
-        WITH signing_protocol AS (\
-            SELECT COALESCE((\
-                SELECT protocol \
-                FROM statechain_signing_protocol \
-                WHERE statechain_id = $1\
-            ), $2) AS protocol\
-        ), \
-        statechain_rows AS (\
-            SELECT signature.statechain_id, signature.server_pubnonce, \
-                   signature.challenge, signature.tx_n, \
-                   signature.created_at AS insertion_order \
-            FROM statechain_signature_data AS signature \
-            CROSS JOIN signing_protocol AS owner \
-            WHERE signature.statechain_id = $1 \
-              AND signature.server_pubnonce IS NOT NULL \
-              AND signature.challenge IS NOT NULL \
-              AND NOT (\
-                  signature.negate_seckey IS NOT NULL \
-                  AND signature.server_partial_sig IS NULL\
-              ) \
-              AND owner.protocol <> $3 \
-            UNION ALL \
-            SELECT signature.statechain_id, signature.server_pubnonce, \
-                   signature.challenge, \
-                   signature.tx_n, \
-                   signature.created_at AS insertion_order \
-            FROM (\
-                SELECT statechain_id, server_pubnonce, challenge, negate_seckey, \
-                       server_partial_sig, created_at, \
-                       ROW_NUMBER() OVER (ORDER BY id ASC)::INTEGER AS tx_n \
-                FROM bip448_signature_data \
-                WHERE statechain_id = $1 \
-                  AND server_pubnonce IS NOT NULL \
-                  AND challenge IS NOT NULL \
-                  AND server_partial_sig IS NOT NULL\
-            ) AS signature \
-            CROSS JOIN signing_protocol AS owner \
-            WHERE owner.protocol = $3\
-        ) \
         SELECT statechain_id, server_pubnonce, challenge, tx_n \
-        FROM statechain_rows \
-        ORDER BY tx_n ASC, insertion_order ASC";
+        FROM (\
+            SELECT statechain_id, server_pubnonce, challenge, \
+                   ROW_NUMBER() OVER (ORDER BY id ASC)::INTEGER AS tx_n \
+            FROM bip448_signature_data \
+            WHERE statechain_id = $1 \
+              AND server_pubnonce IS NOT NULL \
+              AND challenge IS NOT NULL \
+              AND server_partial_sig IS NOT NULL\
+        ) AS completed_signatures \
+        ORDER BY tx_n ASC";
 
 pub async fn get_statechain_info(pool: &sqlx::PgPool, statechain_id: &str) -> Vec<StatechainInfo> {
     let mut result = Vec::<StatechainInfo>::new();
 
     let rows = sqlx::query(GET_STATECHAIN_INFO_QUERY)
         .bind(statechain_id)
-        .bind(crate::database::sign::LEGACY_SIGNING_PROTOCOL)
-        .bind(crate::database::sign::BIP448_SIGNING_PROTOCOL)
         .fetch_all(pool)
         .await
         .unwrap();
@@ -274,9 +230,8 @@ pub async fn update_statechain(
 
     // Ownership has moved to a new key share. Any incomplete signing guard
     // state from the previous owner must not block the new owner. Preserve
-    // completed legacy signature rows for receiver fraud-proof validation, and
-    // preserve the protocol claim because transfer does not reset the shared
-    // signature count.
+    // completed BIP448 signature rows because transfer does not reset the
+    // shared signature count.
     let _ = sqlx::query(DELETE_SIGNING_GUARDS_AFTER_TRANSFER_QUERY)
         .bind(statechain_id)
         .execute(&mut *transaction)

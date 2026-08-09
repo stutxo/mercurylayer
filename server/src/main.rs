@@ -159,8 +159,6 @@ async fn main() {
             routes![
                 endpoints::deposit::post_deposit,
                 endpoints::deposit::get_token,
-                endpoints::sign::sign_first,
-                endpoints::sign::sign_second,
                 endpoints::bip448_sign::bip448_sign_first,
                 endpoints::bip448_sign::bip448_sign_second,
                 endpoints::bip448_sign::bip448_signature_count,
@@ -175,7 +173,6 @@ async fn main() {
                 endpoints::transfer_receiver::transfer_receiver,
                 endpoints::withdraw::withdraw_complete,
                 utils::info_config,
-                utils::info_keylist,
                 all_options,
             ],
         )
