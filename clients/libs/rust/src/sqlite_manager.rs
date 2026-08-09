@@ -10,8 +10,8 @@ use mercurylib::{
     transfer::bip448::{Bip448StateHistoryEntry, Bip448TransferMsg},
     wallet::Wallet,
 };
-use serde::{Deserialize, Serialize};
 use secp256k1::XOnlyPublicKey;
+use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Row, Sqlite};
 
 use crate::chain::ChainUtxo;
@@ -44,25 +44,36 @@ pub(crate) struct Bip448ScanCursor {
 pub const BIP448_FEE_RESERVATION_TTL_SECONDS: i64 = 60 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Bip448FeeInputRecord { pub txid: String, pub vout: u32, pub value_sats: u64 }
+pub struct Bip448FeeInputRecord {
+    pub txid: String,
+    pub vout: u32,
+    pub value_sats: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bip448PackageAttemptStatus {
-    Pending, Submitted, Confirmed, Abandoned,
+    Pending,
+    Submitted,
+    Confirmed,
+    Abandoned,
 }
 
 impl Bip448PackageAttemptStatus {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Pending => "Pending", Self::Submitted => "Submitted",
-            Self::Confirmed => "Confirmed", Self::Abandoned => "Abandoned",
+            Self::Pending => "Pending",
+            Self::Submitted => "Submitted",
+            Self::Confirmed => "Confirmed",
+            Self::Abandoned => "Abandoned",
         }
     }
 
     fn parse(value: &str) -> Result<Self> {
         match value {
-            "Pending" => Ok(Self::Pending), "Submitted" => Ok(Self::Submitted),
-            "Confirmed" => Ok(Self::Confirmed), "Abandoned" => Ok(Self::Abandoned),
+            "Pending" => Ok(Self::Pending),
+            "Submitted" => Ok(Self::Submitted),
+            "Confirmed" => Ok(Self::Confirmed),
+            "Abandoned" => Ok(Self::Abandoned),
             _ => Err(anyhow!("invalid BIP448 package-attempt status")),
         }
     }
@@ -70,10 +81,15 @@ impl Bip448PackageAttemptStatus {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Bip448PackageAttempt {
-    pub wallet_name: String, pub statechain_id: String, pub role: String,
-    pub parent_txid: String, pub child_txid: String, pub child_tx_hex: String,
+    pub wallet_name: String,
+    pub statechain_id: String,
+    pub role: String,
+    pub parent_txid: String,
+    pub child_txid: String,
+    pub child_tx_hex: String,
     pub fee_inputs: Vec<Bip448FeeInputRecord>,
-    pub target_feerate_sat_per_vbyte: f64, pub status: Bip448PackageAttemptStatus,
+    pub target_feerate_sat_per_vbyte: f64,
+    pub status: Bip448PackageAttemptStatus,
 }
 
 pub(crate) fn canonical_txid(txid: &str) -> Result<String> {
@@ -94,17 +110,23 @@ fn canonical_wallet_json(wallet: &Wallet) -> Result<String> {
 
 fn canonical_block_hash(block_hash: &str) -> Result<String> {
     Ok(BlockHash::from_str(block_hash)
-        .context("invalid block hash")?.to_string())
+        .context("invalid block hash")?
+        .to_string())
 }
 
 pub(crate) async fn load_bip448_scan_state(
-    pool: &Pool<Sqlite>, wallet_name: &str, script_pubkey: &str,
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    script_pubkey: &str,
 ) -> Result<(Option<Bip448ScanCursor>, Vec<ChainUtxo>)> {
     let cursor = sqlx::query(
         "SELECT last_scanned_height, last_scanned_block_hash \
          FROM bip448_scan_cursors WHERE wallet_name = $1 AND script_pubkey = $2",
     )
-    .bind(wallet_name).bind(script_pubkey).fetch_optional(pool).await?
+    .bind(wallet_name)
+    .bind(script_pubkey)
+    .fetch_optional(pool)
+    .await?
     .map(|row| -> Result<_> {
         Ok(Bip448ScanCursor {
             last_scanned_height: u32::try_from(row.try_get::<i64, _>(0)?)?,
@@ -116,35 +138,52 @@ pub(crate) async fn load_bip448_scan_state(
         "SELECT txid, vout, value_sats, height FROM bip448_scanned_outpoints \
          WHERE wallet_name = $1 AND script_pubkey = $2",
     )
-    .bind(wallet_name).bind(script_pubkey).fetch_all(pool).await?;
+    .bind(wallet_name)
+    .bind(script_pubkey)
+    .fetch_all(pool)
+    .await?;
     let outpoints = rows
         .into_iter()
-        .map(|row| Ok(ChainUtxo {
-            txid: canonical_txid(row.try_get(0)?)?,
-            vout: u32::try_from(row.try_get::<i64, _>(1)?)?,
-            value: u64::try_from(row.try_get::<i64, _>(2)?)?,
-            height: u32::try_from(row.try_get::<i64, _>(3)?)?,
-        }))
+        .map(|row| {
+            Ok(ChainUtxo {
+                txid: canonical_txid(row.try_get(0)?)?,
+                vout: u32::try_from(row.try_get::<i64, _>(1)?)?,
+                value: u64::try_from(row.try_get::<i64, _>(2)?)?,
+                height: u32::try_from(row.try_get::<i64, _>(3)?)?,
+            })
+        })
         .collect::<Result<Vec<_>>>()?;
     Ok((cursor, outpoints))
 }
 
 pub(crate) async fn persist_bip448_scan_state(
-    pool: &Pool<Sqlite>, wallet_name: &str, script_pubkey: &str,
-    cursor: &Bip448ScanCursor, outpoints: &[ChainUtxo],
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    script_pubkey: &str,
+    cursor: &Bip448ScanCursor,
+    outpoints: &[ChainUtxo],
 ) -> Result<()> {
     let block_hash = canonical_block_hash(&cursor.last_scanned_block_hash)?;
     let outpoints = outpoints
         .iter()
-        .map(|outpoint| Ok((canonical_txid(&outpoint.txid)?, outpoint.vout,
-            outpoint.value, outpoint.height)))
+        .map(|outpoint| {
+            Ok((
+                canonical_txid(&outpoint.txid)?,
+                outpoint.vout,
+                outpoint.value,
+                outpoint.height,
+            ))
+        })
         .collect::<Result<Vec<_>>>()?;
     let mut transaction = pool.begin().await?;
     sqlx::query(
         "UPDATE bip448_scanned_outpoints SET height = -1 \
          WHERE wallet_name = $1 AND script_pubkey = $2",
     )
-    .bind(wallet_name).bind(script_pubkey).execute(&mut *transaction).await?;
+    .bind(wallet_name)
+    .bind(script_pubkey)
+    .execute(&mut *transaction)
+    .await?;
     for (txid, vout, value, height) in outpoints {
         sqlx::query(
             "INSERT INTO bip448_scanned_outpoints \
@@ -154,15 +193,23 @@ pub(crate) async fn persist_bip448_scan_state(
                 script_pubkey = excluded.script_pubkey, value_sats = excluded.value_sats, \
                 height = excluded.height",
         )
-        .bind(wallet_name).bind(txid).bind(i64::from(vout)).bind(script_pubkey)
-        .bind(i64::try_from(value)?).bind(i64::from(height))
-        .execute(&mut *transaction).await?;
+        .bind(wallet_name)
+        .bind(txid)
+        .bind(i64::from(vout))
+        .bind(script_pubkey)
+        .bind(i64::try_from(value)?)
+        .bind(i64::from(height))
+        .execute(&mut *transaction)
+        .await?;
     }
     sqlx::query(
         "DELETE FROM bip448_scanned_outpoints \
          WHERE wallet_name = $1 AND script_pubkey = $2 AND height = -1",
     )
-    .bind(wallet_name).bind(script_pubkey).execute(&mut *transaction).await?;
+    .bind(wallet_name)
+    .bind(script_pubkey)
+    .execute(&mut *transaction)
+    .await?;
     sqlx::query(
         "WITH active_reservations AS (\
             SELECT json_extract(fee.value, '$.txid') AS txid, \
@@ -200,7 +247,10 @@ pub(crate) async fn persist_bip448_scan_state(
                 value_sats = outpoint.value_sats\
          )",
     )
-    .bind(wallet_name).bind(script_pubkey).execute(&mut *transaction).await?;
+    .bind(wallet_name)
+    .bind(script_pubkey)
+    .execute(&mut *transaction)
+    .await?;
     sqlx::query(
         "INSERT INTO bip448_scan_cursors \
             (wallet_name, script_pubkey, last_scanned_height, last_scanned_block_hash) \
@@ -210,25 +260,35 @@ pub(crate) async fn persist_bip448_scan_state(
             last_scanned_block_hash = excluded.last_scanned_block_hash, \
             updated_at = CURRENT_TIMESTAMP",
     )
-    .bind(wallet_name).bind(script_pubkey).bind(i64::from(cursor.last_scanned_height))
-    .bind(block_hash).execute(&mut *transaction).await?;
+    .bind(wallet_name)
+    .bind(script_pubkey)
+    .bind(i64::from(cursor.last_scanned_height))
+    .bind(block_hash)
+    .execute(&mut *transaction)
+    .await?;
     transaction.commit().await?;
     Ok(())
 }
 
 pub(crate) async fn clear_bip448_scan_state(
-    pool: &Pool<Sqlite>, wallet_name: &str, script_pubkey: &str,
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    script_pubkey: &str,
 ) -> Result<()> {
     let mut transaction = pool.begin().await?;
     sqlx::query(
         "DELETE FROM bip448_scanned_outpoints \
          WHERE wallet_name = $1 AND script_pubkey = $2",
     )
-    .bind(wallet_name).bind(script_pubkey).execute(&mut *transaction).await?;
-    sqlx::query(
-        "DELETE FROM bip448_scan_cursors WHERE wallet_name = $1 AND script_pubkey = $2",
-    )
-    .bind(wallet_name).bind(script_pubkey).execute(&mut *transaction).await?;
+    .bind(wallet_name)
+    .bind(script_pubkey)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query("DELETE FROM bip448_scan_cursors WHERE wallet_name = $1 AND script_pubkey = $2")
+        .bind(wallet_name)
+        .bind(script_pubkey)
+        .execute(&mut *transaction)
+        .await?;
     transaction.commit().await?;
     Ok(())
 }
@@ -238,7 +298,10 @@ pub(crate) fn bip448_reservation_id(statechain_id: &str, role: &str) -> String {
 }
 
 pub(crate) async fn upsert_bip448_scanned_outpoint(
-    pool: &Pool<Sqlite>, wallet_name: &str, script_pubkey: &str, outpoint: &ChainUtxo,
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    script_pubkey: &str,
+    outpoint: &ChainUtxo,
 ) -> Result<()> {
     sqlx::query(
         "INSERT INTO bip448_scanned_outpoints \
@@ -248,15 +311,22 @@ pub(crate) async fn upsert_bip448_scanned_outpoint(
             script_pubkey = excluded.script_pubkey, value_sats = excluded.value_sats, \
             height = excluded.height",
     )
-    .bind(wallet_name).bind(canonical_txid(&outpoint.txid)?)
-    .bind(i64::from(outpoint.vout)).bind(script_pubkey)
-    .bind(i64::try_from(outpoint.value)?).bind(i64::from(outpoint.height))
-    .execute(pool).await?;
+    .bind(wallet_name)
+    .bind(canonical_txid(&outpoint.txid)?)
+    .bind(i64::from(outpoint.vout))
+    .bind(script_pubkey)
+    .bind(i64::try_from(outpoint.value)?)
+    .bind(i64::from(outpoint.height))
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
 pub(crate) async fn available_bip448_scanned_outpoints(
-    pool: &Pool<Sqlite>, wallet_name: &str, script_pubkey: &str, reservation_id: &str,
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    script_pubkey: &str,
+    reservation_id: &str,
 ) -> Result<Vec<ChainUtxo>> {
     let rows = sqlx::query(
         "SELECT txid, vout, value_sats, height FROM bip448_scanned_outpoints \
@@ -264,18 +334,29 @@ pub(crate) async fn available_bip448_scanned_outpoints(
             (reserved_by IS NULL OR \
              (reserved_by <> $3 AND reserved_at <= unixepoch() - $4))",
     )
-    .bind(wallet_name).bind(script_pubkey).bind(reservation_id)
-    .bind(BIP448_FEE_RESERVATION_TTL_SECONDS).fetch_all(pool).await?;
-    rows.into_iter().map(|row| Ok(ChainUtxo {
-        txid: canonical_txid(row.try_get(0)?)?,
-        vout: u32::try_from(row.try_get::<i64, _>(1)?)?,
-        value: u64::try_from(row.try_get::<i64, _>(2)?)?,
-        height: u32::try_from(row.try_get::<i64, _>(3)?)?,
-    })).collect()
+    .bind(wallet_name)
+    .bind(script_pubkey)
+    .bind(reservation_id)
+    .bind(BIP448_FEE_RESERVATION_TTL_SECONDS)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(ChainUtxo {
+                txid: canonical_txid(row.try_get(0)?)?,
+                vout: u32::try_from(row.try_get::<i64, _>(1)?)?,
+                value: u64::try_from(row.try_get::<i64, _>(2)?)?,
+                height: u32::try_from(row.try_get::<i64, _>(3)?)?,
+            })
+        })
+        .collect()
 }
 
 pub(crate) async fn ensure_no_orphaned_bip448_reservation(
-    pool: &Pool<Sqlite>, wallet_name: &str, statechain_id: &str, role: &str,
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    role: &str,
 ) -> Result<()> {
     let reservation_id = bip448_reservation_id(statechain_id, role);
     let exists = sqlx::query_scalar::<_, i64>(
@@ -284,7 +365,10 @@ pub(crate) async fn ensure_no_orphaned_bip448_reservation(
             WHERE wallet_name = $1 AND reserved_by = $2\
          )",
     )
-    .bind(wallet_name).bind(reservation_id).fetch_one(pool).await?;
+    .bind(wallet_name)
+    .bind(reservation_id)
+    .fetch_one(pool)
+    .await?;
     if exists != 0 {
         return Err(anyhow!(
             "BIP448 fee reservation exists without its package attempt"
@@ -294,7 +378,10 @@ pub(crate) async fn ensure_no_orphaned_bip448_reservation(
 }
 
 pub async fn get_bip448_package_attempt(
-    pool: &Pool<Sqlite>, wallet_name: &str, statechain_id: &str, role: &str,
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    role: &str,
 ) -> Result<Option<Bip448PackageAttempt>> {
     let row = sqlx::query(
         "SELECT parent_txid, child_txid, child_tx_hex, fee_inputs_json, \
@@ -302,7 +389,11 @@ pub async fn get_bip448_package_attempt(
          FROM bip448_package_attempts \
          WHERE wallet_name = $1 AND statechain_id = $2 AND role = $3",
     )
-    .bind(wallet_name).bind(statechain_id).bind(role).fetch_optional(pool).await?;
+    .bind(wallet_name)
+    .bind(statechain_id)
+    .bind(role)
+    .fetch_optional(pool)
+    .await?;
     row.map(|row| -> Result<_> {
         let parent_txid: String = row.try_get(0)?;
         let child_txid: String = row.try_get(1)?;
@@ -310,23 +401,30 @@ pub async fn get_bip448_package_attempt(
             .map_err(|_| anyhow!("invalid BIP448 package-attempt fee inputs"))?;
         if canonical_txid(&parent_txid)? != parent_txid
             || canonical_txid(&child_txid)? != child_txid
-            || fee_inputs.iter().any(|input| {
-                canonical_txid(&input.txid).map_or(true, |txid| txid != input.txid)
-            })
+            || fee_inputs
+                .iter()
+                .any(|input| canonical_txid(&input.txid).map_or(true, |txid| txid != input.txid))
         {
             return Err(anyhow!("non-canonical BIP448 package-attempt txid"));
         }
         Ok(Bip448PackageAttempt {
-            wallet_name: wallet_name.to_owned(), statechain_id: statechain_id.to_owned(),
-            role: role.to_owned(), parent_txid, child_txid, child_tx_hex: row.try_get(2)?,
-            fee_inputs, target_feerate_sat_per_vbyte: row.try_get(4)?,
+            wallet_name: wallet_name.to_owned(),
+            statechain_id: statechain_id.to_owned(),
+            role: role.to_owned(),
+            parent_txid,
+            child_txid,
+            child_tx_hex: row.try_get(2)?,
+            fee_inputs,
+            target_feerate_sat_per_vbyte: row.try_get(4)?,
             status: Bip448PackageAttemptStatus::parse(row.try_get(5)?)?,
         })
-    }).transpose()
+    })
+    .transpose()
 }
 
 pub(crate) async fn insert_bip448_package_attempt(
-    pool: &Pool<Sqlite>, attempt: &Bip448PackageAttempt,
+    pool: &Pool<Sqlite>,
+    attempt: &Bip448PackageAttempt,
 ) -> Result<()> {
     if attempt.status != Bip448PackageAttemptStatus::Pending
         || !attempt.target_feerate_sat_per_vbyte.is_finite()
@@ -348,11 +446,17 @@ pub(crate) async fn insert_bip448_package_attempt(
              fee_inputs_json, target_feerate_sat_per_vbyte, status) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
-    .bind(&attempt.wallet_name).bind(&attempt.statechain_id).bind(&attempt.role)
-    .bind(parent_txid).bind(child_txid).bind(&attempt.child_tx_hex)
+    .bind(&attempt.wallet_name)
+    .bind(&attempt.statechain_id)
+    .bind(&attempt.role)
+    .bind(parent_txid)
+    .bind(child_txid)
+    .bind(&attempt.child_tx_hex)
     .bind(serde_json::to_string(&fee_inputs)?)
-    .bind(attempt.target_feerate_sat_per_vbyte).bind(attempt.status.as_str())
-    .execute(&mut *transaction).await?;
+    .bind(attempt.target_feerate_sat_per_vbyte)
+    .bind(attempt.status.as_str())
+    .execute(&mut *transaction)
+    .await?;
     for input in &fee_inputs {
         let result = sqlx::query(
             "UPDATE bip448_scanned_outpoints SET reserved_by = $1, reserved_at = unixepoch() \
@@ -360,9 +464,13 @@ pub(crate) async fn insert_bip448_package_attempt(
                 (reserved_by IS NULL OR \
                  (reserved_by <> $1 AND reserved_at <= unixepoch() - $5))",
         )
-        .bind(&reservation_id).bind(&attempt.wallet_name).bind(canonical_txid(&input.txid)?)
-        .bind(i64::from(input.vout)).bind(BIP448_FEE_RESERVATION_TTL_SECONDS)
-        .execute(&mut *transaction).await?;
+        .bind(&reservation_id)
+        .bind(&attempt.wallet_name)
+        .bind(canonical_txid(&input.txid)?)
+        .bind(i64::from(input.vout))
+        .bind(BIP448_FEE_RESERVATION_TTL_SECONDS)
+        .execute(&mut *transaction)
+        .await?;
         if result.rows_affected() != 1 {
             return Err(anyhow!("BIP448 fee input is unavailable"));
         }
@@ -435,7 +543,10 @@ pub(crate) async fn reacquire_bip448_package_attempt_reservations(
 }
 
 pub async fn set_bip448_package_attempt_status(
-    pool: &Pool<Sqlite>, wallet_name: &str, statechain_id: &str, role: &str,
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    role: &str,
     status: Bip448PackageAttemptStatus,
 ) -> Result<()> {
     let mut transaction = pool.begin().await?;
@@ -443,18 +554,27 @@ pub async fn set_bip448_package_attempt_status(
         "UPDATE bip448_package_attempts SET status = $1, updated_at = CURRENT_TIMESTAMP \
          WHERE wallet_name = $2 AND statechain_id = $3 AND role = $4",
     )
-    .bind(status.as_str()).bind(wallet_name).bind(statechain_id).bind(role)
-    .execute(&mut *transaction).await?;
+    .bind(status.as_str())
+    .bind(wallet_name)
+    .bind(statechain_id)
+    .bind(role)
+    .execute(&mut *transaction)
+    .await?;
     if result.rows_affected() != 1 {
         return Err(anyhow!("BIP448 package attempt is missing"));
     }
-    if matches!(status, Bip448PackageAttemptStatus::Confirmed | Bip448PackageAttemptStatus::Abandoned) {
+    if matches!(
+        status,
+        Bip448PackageAttemptStatus::Confirmed | Bip448PackageAttemptStatus::Abandoned
+    ) {
         sqlx::query(
             "UPDATE bip448_scanned_outpoints SET reserved_by = NULL, reserved_at = NULL \
              WHERE wallet_name = $1 AND reserved_by = $2",
         )
-        .bind(wallet_name).bind(bip448_reservation_id(statechain_id, role))
-        .execute(&mut *transaction).await?;
+        .bind(wallet_name)
+        .bind(bip448_reservation_id(statechain_id, role))
+        .execute(&mut *transaction)
+        .await?;
     }
     transaction.commit().await?;
     Ok(())
@@ -952,7 +1072,11 @@ pub async fn insert_bip448_pending_transfer_signing_if_absent(
     ))?;
     let accepted =
         get_bip448_statechain_optional(pool, &signing.wallet_name, &signing.statechain_id).await?;
-    if !accepted.as_ref().is_some_and(|record| record.funding_outpoint.txid == signing.funding_txid && record.funding_outpoint.vout == signing.funding_vout && record.funding_outpoint.value_sats == signing.funding_value_sats) {
+    if !accepted.as_ref().is_some_and(|record| {
+        record.funding_outpoint.txid == signing.funding_txid
+            && record.funding_outpoint.vout == signing.funding_vout
+            && record.funding_outpoint.value_sats == signing.funding_value_sats
+    }) {
         return Err(anyhow!(
             "BIP448 pending transfer signing requires a matching accepted record at the coin's latest state"
         ));
@@ -1133,17 +1257,35 @@ pub async fn get_bip448_transfer_msg(
     Ok(transfer_msg)
 }
 
-pub async fn has_bip448_transfer_msg_for_statechain(pool: &Pool<Sqlite>, wallet_name: &str, statechain_id: &str) -> Result<bool> { Ok(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM bip448_transfer_messages WHERE wallet_name = $1 AND statechain_id = $2").bind(wallet_name).bind(statechain_id).fetch_one(pool).await? != 0) }
-pub async fn delete_bip448_transfer_msgs(pool: &Pool<Sqlite>, wallet_name: &str, statechain_id: &str) -> Result<()> {
-    sqlx::query("DELETE FROM bip448_transfer_messages WHERE wallet_name = $1 AND statechain_id = $2")
-        .bind(wallet_name).bind(statechain_id).execute(pool).await?;
+pub async fn has_bip448_transfer_msg_for_statechain(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM bip448_transfer_messages WHERE wallet_name = $1 AND statechain_id = $2").bind(wallet_name).bind(statechain_id).fetch_one(pool).await? != 0)
+}
+pub async fn delete_bip448_transfer_msgs(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM bip448_transfer_messages WHERE wallet_name = $1 AND statechain_id = $2",
+    )
+    .bind(wallet_name)
+    .bind(statechain_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{bip448_transfer_sender::transfer_bip448_sender,
-        chain::{ChainClient, CoreRpcAuth, CoreRpcConfig}, client_config::ClientConfig};
+    use crate::{
+        bip448_transfer_sender::transfer_bip448_sender,
+        chain::{ChainClient, CoreRpcAuth, CoreRpcConfig},
+        client_config::ClientConfig,
+    };
     use bitcoin::Network;
     use mercurylib::bip448_statechain::storage::{
         Bip448AnchorOutput, Bip448CpfpChildTemplate, Bip448CsfsKeyMetadata, Bip448FeeBumpPolicy,
@@ -1304,32 +1446,55 @@ mod tests {
 
     fn sender_test_config(pool: Pool<Sqlite>) -> Result<ClientConfig> {
         let url = "http://127.0.0.1:1";
-        Ok(ClientConfig { statechain_entity: url.into(), chain_backend: "core".into(),
-            chain_client: ChainClient::new(CoreRpcConfig { url: url.into(), auth: CoreRpcAuth::None })?,
-            core_rpc_url: Some(url.into()), core_rpc_auth: Some("none".into()), core_rpc_user: None,
-            core_rpc_password: None, core_rpc_cookie_file: None, network: Network::Regtest,
-            fee_rate_tolerance: 0.0, confirmation_target: 1,
-            pool, tor_proxy: None, max_fee_rate: 10.0 })
+        Ok(ClientConfig {
+            statechain_entity: url.into(),
+            chain_backend: "core".into(),
+            chain_client: ChainClient::new(CoreRpcConfig {
+                url: url.into(),
+                auth: CoreRpcAuth::None,
+            })?,
+            core_rpc_url: Some(url.into()),
+            core_rpc_auth: Some("none".into()),
+            core_rpc_user: None,
+            core_rpc_password: None,
+            core_rpc_cookie_file: None,
+            network: Network::Regtest,
+            fee_rate_tolerance: 0.0,
+            confirmation_target: 1,
+            pool,
+            tor_proxy: None,
+            max_fee_rate: 10.0,
+        })
     }
     async fn assert_sender_ineligible(config: &ClientConfig) {
         let error = transfer_bip448_sender(config, "unused", "wallet", "statechain", None)
-            .await.unwrap_err();
-        assert_eq!(error.to_string(), "only transfer of a CONFIRMED BIP448 coin at its accepted latest state is supported");
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "only transfer of a CONFIRMED BIP448 coin at its accepted latest state is supported"
+        );
     }
     #[tokio::test]
     async fn bip448_sender_exercises_record_coin_state_and_status_guards() -> Result<()> {
         let config = sender_test_config(migrated_pool().await?)?;
         let mut wallet = sample_wallet();
-        insert_wallet(&config.pool, &wallet).await?; assert_sender_ineligible(&config).await;
-        upsert_bip448_statechain_record(&config.pool, &sample_bip448_record(1)).await?; assert_sender_ineligible(&config).await;
+        insert_wallet(&config.pool, &wallet).await?;
+        assert_sender_ineligible(&config).await;
+        upsert_bip448_statechain_record(&config.pool, &sample_bip448_record(1)).await?;
+        assert_sender_ineligible(&config).await;
         let mut coin = wallet.get_new_coin()?;
-        coin.statechain_protocol = Some(mercurylib::bip448_statechain::deposit::BIP448_COIN_PROTOCOL.into());
-        coin.statechain_id = Some("statechain".into()); coin.status = CoinStatus::TRANSFERRED;
-        wallet.coins.push(coin); update_wallet(&config.pool, &wallet).await?;
+        coin.statechain_protocol =
+            Some(mercurylib::bip448_statechain::deposit::BIP448_COIN_PROTOCOL.into());
+        coin.statechain_id = Some("statechain".into());
+        coin.status = CoinStatus::TRANSFERRED;
+        wallet.coins.push(coin);
+        update_wallet(&config.pool, &wallet).await?;
         assert_sender_ineligible(&config).await;
         wallet.coins[0].status = CoinStatus::CONFIRMED;
         let config = sender_test_config(migrated_pool().await?)?;
-        insert_wallet(&config.pool, &wallet).await?; upsert_bip448_statechain_record(&config.pool, &sample_bip448_record(0)).await?;
+        insert_wallet(&config.pool, &wallet).await?;
+        upsert_bip448_statechain_record(&config.pool, &sample_bip448_record(0)).await?;
         assert_sender_ineligible(&config).await;
         Ok(())
     }
@@ -1361,7 +1526,10 @@ mod tests {
             roundtrip_wallet.coins[0].statechain_protocol.as_deref(),
             Some(mercurylib::bip448_statechain::deposit::BIP448_COIN_PROTOCOL)
         );
-        assert_eq!(roundtrip_wallet.coins[0].statechain_id, Some("statechain".into()));
+        assert_eq!(
+            roundtrip_wallet.coins[0].statechain_id,
+            Some("statechain".into())
+        );
         assert_eq!(roundtrip_record, record);
 
         Ok(())
@@ -1393,16 +1561,10 @@ mod tests {
             ]
         );
 
-        let pending_deposit_columns: Vec<(
-            i64,
-            String,
-            String,
-            i64,
-            Option<String>,
-            i64,
-        )> = sqlx::query_as("PRAGMA table_info('bip448_pending_deposit_signings')")
-            .fetch_all(&pool)
-            .await?;
+        let pending_deposit_columns: Vec<(i64, String, String, i64, Option<String>, i64)> =
+            sqlx::query_as("PRAGMA table_info('bip448_pending_deposit_signings')")
+                .fetch_all(&pool)
+                .await?;
         assert_eq!(
             pending_deposit_columns,
             vec![
@@ -1417,10 +1579,38 @@ mod tests {
                 (8, "state_locktime".into(), "INTEGER".into(), 0, None, 0),
                 (9, "funding_txid".into(), "TEXT".into(), 0, None, 0),
                 (10, "funding_vout".into(), "INTEGER".into(), 0, None, 0),
-                (11, "funding_value_sats".into(), "INTEGER".into(), 0, None, 0),
-                (12, "settlement_template_hash".into(), "TEXT".into(), 0, None, 0),
-                (13, "created_at".into(), "TEXT".into(), 1, Some("CURRENT_TIMESTAMP".into()), 0),
-                (14, "updated_at".into(), "TEXT".into(), 1, Some("CURRENT_TIMESTAMP".into()), 0),
+                (
+                    11,
+                    "funding_value_sats".into(),
+                    "INTEGER".into(),
+                    0,
+                    None,
+                    0
+                ),
+                (
+                    12,
+                    "settlement_template_hash".into(),
+                    "TEXT".into(),
+                    0,
+                    None,
+                    0
+                ),
+                (
+                    13,
+                    "created_at".into(),
+                    "TEXT".into(),
+                    1,
+                    Some("CURRENT_TIMESTAMP".into()),
+                    0
+                ),
+                (
+                    14,
+                    "updated_at".into(),
+                    "TEXT".into(),
+                    1,
+                    Some("CURRENT_TIMESTAMP".into()),
+                    0
+                ),
             ]
         );
 
@@ -1458,9 +1648,11 @@ mod tests {
             error.to_string(),
             "BIP448 state history is incomplete for this coin"
         );
-        assert!(get_bip448_pending_transfer_signing(&config.pool, "wallet", "statechain")
-            .await?
-            .is_none());
+        assert!(
+            get_bip448_pending_transfer_signing(&config.pool, "wallet", "statechain")
+                .await?
+                .is_none()
+        );
         assert_eq!(
             get_bip448_statechain(&config.pool, "wallet", "statechain")
                 .await?
@@ -1494,8 +1686,13 @@ mod tests {
         let mut record = sample_bip448_record(1);
         record.funding_outpoint.txid = "AA".repeat(32);
         upsert_bip448_statechain_record(&pool, &record).await?;
-        assert_eq!(get_bip448_statechain(&pool, &record.wallet_name, &record.statechain_id)
-            .await?.funding_outpoint.txid, "aa".repeat(32));
+        assert_eq!(
+            get_bip448_statechain(&pool, &record.wallet_name, &record.statechain_id)
+                .await?
+                .funding_outpoint
+                .txid,
+            "aa".repeat(32)
+        );
         Ok(())
     }
 
@@ -1520,8 +1717,7 @@ mod tests {
         )
         .await?;
 
-        let (stored_cursor, outpoints) =
-            load_bip448_scan_state(&pool, "wallet", "51").await?;
+        let (stored_cursor, outpoints) = load_bip448_scan_state(&pool, "wallet", "51").await?;
         assert_eq!(stored_cursor, Some(cursor));
         assert_eq!(outpoints[0].txid, "aa".repeat(32));
 
@@ -1536,27 +1732,74 @@ mod tests {
     #[tokio::test]
     async fn package_attempt_reserves_expires_releases_and_fails_closed() -> Result<()> {
         let pool = migrated_pool().await?;
-        let fee = ChainUtxo { txid: "aa".repeat(32), vout: 1, value: 50_000, height: 2 };
+        let fee = ChainUtxo {
+            txid: "aa".repeat(32),
+            vout: 1,
+            value: 50_000,
+            height: 2,
+        };
         upsert_bip448_scanned_outpoint(&pool, "wallet", "51", &fee).await?;
         let attempt = Bip448PackageAttempt {
-            wallet_name: "wallet".into(), statechain_id: "statechain".into(),
-            role: "funding_update".into(), parent_txid: "bb".repeat(32),
-            child_txid: "cc".repeat(32), child_tx_hex: "deadbeef".into(),
+            wallet_name: "wallet".into(),
+            statechain_id: "statechain".into(),
+            role: "funding_update".into(),
+            parent_txid: "bb".repeat(32),
+            child_txid: "cc".repeat(32),
+            child_tx_hex: "deadbeef".into(),
             fee_inputs: vec![Bip448FeeInputRecord {
-                txid: fee.txid.clone(), vout: fee.vout, value_sats: fee.value }],
-            target_feerate_sat_per_vbyte: 2.0, status: Bip448PackageAttemptStatus::Pending,
+                txid: fee.txid.clone(),
+                vout: fee.vout,
+                value_sats: fee.value,
+            }],
+            target_feerate_sat_per_vbyte: 2.0,
+            status: Bip448PackageAttemptStatus::Pending,
         };
         insert_bip448_package_attempt(&pool, &attempt).await?;
-        assert_eq!(get_bip448_package_attempt(&pool, "wallet", "statechain", "funding_update").await?.unwrap(), attempt);
-        assert!(available_bip448_scanned_outpoints(&pool, "wallet", "51", "other").await?.is_empty());
-        sqlx::query("UPDATE bip448_scanned_outpoints SET reserved_at = unixepoch() - $1").bind(BIP448_FEE_RESERVATION_TTL_SECONDS + 1).execute(&pool).await?;
-        assert_eq!(available_bip448_scanned_outpoints(&pool, "wallet", "51", "other").await?.len(), 1);
-        set_bip448_package_attempt_status(&pool, "wallet", "statechain", "funding_update", Bip448PackageAttemptStatus::Abandoned).await?;
-        assert_eq!(sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM bip448_scanned_outpoints WHERE reserved_by IS NOT NULL")
-            .fetch_one(&pool).await?, 0);
-        sqlx::query("UPDATE bip448_package_attempts SET fee_inputs_json = '{'").execute(&pool).await?;
-        assert!(get_bip448_package_attempt(&pool, "wallet", "statechain", "funding_update").await.is_err());
+        assert_eq!(
+            get_bip448_package_attempt(&pool, "wallet", "statechain", "funding_update")
+                .await?
+                .unwrap(),
+            attempt
+        );
+        assert!(
+            available_bip448_scanned_outpoints(&pool, "wallet", "51", "other")
+                .await?
+                .is_empty()
+        );
+        sqlx::query("UPDATE bip448_scanned_outpoints SET reserved_at = unixepoch() - $1")
+            .bind(BIP448_FEE_RESERVATION_TTL_SECONDS + 1)
+            .execute(&pool)
+            .await?;
+        assert_eq!(
+            available_bip448_scanned_outpoints(&pool, "wallet", "51", "other")
+                .await?
+                .len(),
+            1
+        );
+        set_bip448_package_attempt_status(
+            &pool,
+            "wallet",
+            "statechain",
+            "funding_update",
+            Bip448PackageAttemptStatus::Abandoned,
+        )
+        .await?;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM bip448_scanned_outpoints WHERE reserved_by IS NOT NULL"
+            )
+            .fetch_one(&pool)
+            .await?,
+            0
+        );
+        sqlx::query("UPDATE bip448_package_attempts SET fee_inputs_json = '{'")
+            .execute(&pool)
+            .await?;
+        assert!(
+            get_bip448_package_attempt(&pool, "wallet", "statechain", "funding_update")
+                .await
+                .is_err()
+        );
         Ok(())
     }
 
@@ -1666,12 +1909,10 @@ mod tests {
         )
         .execute(&pool)
         .await?;
-        sqlx::query(
-            "UPDATE bip448_scanned_outpoints SET reserved_at = unixepoch() - $1",
-        )
-        .bind(BIP448_FEE_RESERVATION_TTL_SECONDS + 1)
-        .execute(&pool)
-        .await?;
+        sqlx::query("UPDATE bip448_scanned_outpoints SET reserved_at = unixepoch() - $1")
+            .bind(BIP448_FEE_RESERVATION_TTL_SECONDS + 1)
+            .execute(&pool)
+            .await?;
 
         assert!(ensure_no_orphaned_bip448_reservation(
             &pool,
@@ -1689,15 +1930,14 @@ mod tests {
         )
         .await?
         .is_empty());
-        assert!(insert_bip448_package_attempt(&pool, &attempt).await.is_err());
-        assert!(get_bip448_package_attempt(
-            &pool,
-            "wallet",
-            "statechain",
-            "funding_update",
-        )
-        .await?
-        .is_none());
+        assert!(insert_bip448_package_attempt(&pool, &attempt)
+            .await
+            .is_err());
+        assert!(
+            get_bip448_package_attempt(&pool, "wallet", "statechain", "funding_update",)
+                .await?
+                .is_none()
+        );
         Ok(())
     }
 
@@ -1727,31 +1967,31 @@ mod tests {
             status: Bip448PackageAttemptStatus::Pending,
         };
         insert_bip448_package_attempt(&pool, &attempt).await?;
-        sqlx::query(
-            "UPDATE bip448_scanned_outpoints SET reserved_at = unixepoch() - $1",
-        )
-        .bind(BIP448_FEE_RESERVATION_TTL_SECONDS + 1)
-        .execute(&pool)
-        .await?;
+        sqlx::query("UPDATE bip448_scanned_outpoints SET reserved_at = unixepoch() - $1")
+            .bind(BIP448_FEE_RESERVATION_TTL_SECONDS + 1)
+            .execute(&pool)
+            .await?;
         reacquire_bip448_package_attempt_reservations(&pool, &attempt).await?;
-        assert!(available_bip448_scanned_outpoints(&pool, "wallet", "51", "other")
-            .await?
-            .is_empty());
+        assert!(
+            available_bip448_scanned_outpoints(&pool, "wallet", "51", "other")
+                .await?
+                .is_empty()
+        );
 
-        sqlx::query(
-            "UPDATE bip448_scanned_outpoints SET reserved_at = unixepoch() - $1",
-        )
-        .bind(BIP448_FEE_RESERVATION_TTL_SECONDS + 1)
-        .execute(&pool)
-        .await?;
+        sqlx::query("UPDATE bip448_scanned_outpoints SET reserved_at = unixepoch() - $1")
+            .bind(BIP448_FEE_RESERVATION_TTL_SECONDS + 1)
+            .execute(&pool)
+            .await?;
         let mut reclaimed = attempt.clone();
         reclaimed.statechain_id = "statechain-b".into();
         reclaimed.parent_txid = "dd".repeat(32);
         reclaimed.child_txid = "ee".repeat(32);
         insert_bip448_package_attempt(&pool, &reclaimed).await?;
-        assert!(reacquire_bip448_package_attempt_reservations(&pool, &attempt)
-            .await
-            .is_err());
+        assert!(
+            reacquire_bip448_package_attempt_reservations(&pool, &attempt)
+                .await
+                .is_err()
+        );
         assert_eq!(
             sqlx::query_scalar::<_, String>(
                 "SELECT reserved_by FROM bip448_scanned_outpoints \
@@ -1784,7 +2024,8 @@ mod tests {
 
         upsert_bip448_statechain_record(&pool, &state_three).await?;
         let roundtrip =
-            get_bip448_statechain(&pool, &state_three.wallet_name, &state_three.statechain_id).await?;
+            get_bip448_statechain(&pool, &state_three.wallet_name, &state_three.statechain_id)
+                .await?;
         assert_eq!(roundtrip, state_three);
 
         upsert_bip448_statechain_record(&pool, &state_three).await?;
@@ -1853,7 +2094,8 @@ mod tests {
             );
         }
         let persisted =
-            get_bip448_statechain(&pool, &state_three.wallet_name, &state_three.statechain_id).await?;
+            get_bip448_statechain(&pool, &state_three.wallet_name, &state_three.statechain_id)
+                .await?;
         assert_eq!(persisted, state_three);
 
         let skip_pool = migrated_pool().await?;
@@ -2002,7 +2244,11 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("coin's latest state"));
-        let accepted = sample_bip448_record(3); pending.funding_txid = accepted.funding_outpoint.txid.clone(); pending.funding_vout = accepted.funding_outpoint.vout; pending.funding_value_sats = accepted.funding_outpoint.value_sats; upsert_bip448_statechain_record(&pool, &accepted).await?;
+        let accepted = sample_bip448_record(3);
+        pending.funding_txid = accepted.funding_outpoint.txid.clone();
+        pending.funding_vout = accepted.funding_outpoint.vout;
+        pending.funding_value_sats = accepted.funding_outpoint.value_sats;
+        upsert_bip448_statechain_record(&pool, &accepted).await?;
         let persisted = insert_bip448_pending_transfer_signing_if_absent(&pool, &pending).await?;
         assert_eq!(persisted.state_locktime, 1_000_000_001);
 
@@ -2110,5 +2356,4 @@ mod tests {
 
         Ok(())
     }
-
 }

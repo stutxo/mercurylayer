@@ -564,13 +564,9 @@ pub fn verify_bip448_transfer_msg(
         }
         let owner_public_key = XOnlyPublicKey::from_str(&entry.owner_public_key)
             .map_err(|_| Bip448TransferVerifyError::InvalidStateHistory)?;
-        let recovery_script = Address::p2tr(
-            &secp,
-            owner_public_key,
-            None,
-            chain_facts.expected_network,
-        )
-        .script_pubkey();
+        let recovery_script =
+            Address::p2tr(&secp, owner_public_key, None, chain_facts.expected_network)
+                .script_pubkey();
         verify_history_entry(
             &secp,
             entry,

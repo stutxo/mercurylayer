@@ -231,7 +231,9 @@ pub async fn create_bip448_deposit_state(
         &statechain_id,
         &history_entry(
             &accepted.record().latest_state,
-            PublicKey::from_str(&coin.user_pubkey)?.x_only_public_key().0,
+            PublicKey::from_str(&coin.user_pubkey)?
+                .x_only_public_key()
+                .0,
         ),
     )
     .await?;

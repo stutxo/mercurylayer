@@ -177,15 +177,15 @@ pub fn spend_wallet_outpoint(outpoint: OutPoint, value_sats: u64) -> Result<Txid
     ))?;
     let signed: Value = serde_json::from_str(&signed)?;
     if signed.get("complete").and_then(Value::as_bool) != Some(true) {
-        return Err(anyhow!("Bitcoin Core wallet did not fully sign the test spend"));
+        return Err(anyhow!(
+            "Bitcoin Core wallet did not fully sign the test spend"
+        ));
     }
     let signed_hex = signed
         .get("hex")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("signed test spend did not include transaction hex"))?;
-    let txid = execute_bitcoin_command(&format!(
-        "{BITCOIN_CLI} sendrawtransaction {signed_hex}"
-    ))?;
+    let txid = execute_bitcoin_command(&format!("{BITCOIN_CLI} sendrawtransaction {signed_hex}"))?;
 
     Ok(Txid::from_str(&txid)?)
 }

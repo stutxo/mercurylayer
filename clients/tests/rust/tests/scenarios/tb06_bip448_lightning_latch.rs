@@ -172,11 +172,9 @@ async fn tb06_bip448_batch_expiry_recovery() -> Result<()> {
     let statechain_id = create_confirmed_deposit(&config, &sender).await?;
     let lockbox = common::lockbox::http_client();
 
-    let expired_recipient = mercuryrustlib::transfer_receiver::new_transfer_address(
-        &config,
-        &expired_receiver.name,
-    )
-    .await?;
+    let expired_recipient =
+        mercuryrustlib::transfer_receiver::new_transfer_address(&config, &expired_receiver.name)
+            .await?;
     mercuryrustlib::bip448_transfer_sender::transfer_bip448_sender(
         &config,
         &expired_recipient,
@@ -189,7 +187,8 @@ async fn tb06_bip448_batch_expiry_recovery() -> Result<()> {
         common::lockbox::get_signature_count(&lockbox, &statechain_id).await?,
         2
     );
-    let sent_wallet = mercuryrustlib::sqlite_manager::get_wallet(&config.pool, &sender.name).await?;
+    let sent_wallet =
+        mercuryrustlib::sqlite_manager::get_wallet(&config.pool, &sender.name).await?;
     assert!(sent_wallet.coins.iter().any(|coin| {
         coin.statechain_id.as_deref() == Some(&statechain_id)
             && coin.status == CoinStatus::IN_TRANSFER
@@ -202,7 +201,10 @@ async fn tb06_bip448_batch_expiry_recovery() -> Result<()> {
         .error_for_status()?
         .json::<ServerConfig>()
         .await?;
-    sleep(Duration::from_secs(u64::from(server_config.batchtimeout) + 1)).await;
+    sleep(Duration::from_secs(
+        u64::from(server_config.batchtimeout) + 1,
+    ))
+    .await;
 
     let expired = mercuryrustlib::transfer_receiver::execute(&config, &expired_receiver.name)
         .await
@@ -237,11 +239,9 @@ async fn tb06_bip448_batch_expiry_recovery() -> Result<()> {
             && coin.status == CoinStatus::CONFIRMED
     }));
 
-    let final_recipient = mercuryrustlib::transfer_receiver::new_transfer_address(
-        &config,
-        &final_receiver.name,
-    )
-    .await?;
+    let final_recipient =
+        mercuryrustlib::transfer_receiver::new_transfer_address(&config, &final_receiver.name)
+            .await?;
     mercuryrustlib::bip448_transfer_sender::transfer_bip448_sender(
         &config,
         &final_recipient,

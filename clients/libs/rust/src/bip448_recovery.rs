@@ -18,11 +18,10 @@ use crate::{
     coin_status::discover_unspent,
     sqlite_manager::{
         available_bip448_scanned_outpoints, bip448_reservation_id,
-        ensure_no_orphaned_bip448_reservation, get_bip448_package_attempt,
-        get_bip448_statechain, get_wallet, insert_bip448_package_attempt,
-        reacquire_bip448_package_attempt_reservations, set_bip448_package_attempt_status,
-        upsert_bip448_scanned_outpoint, Bip448FeeInputRecord, Bip448PackageAttempt,
-        Bip448PackageAttemptStatus,
+        ensure_no_orphaned_bip448_reservation, get_bip448_package_attempt, get_bip448_statechain,
+        get_wallet, insert_bip448_package_attempt, reacquire_bip448_package_attempt_reservations,
+        set_bip448_package_attempt_status, upsert_bip448_scanned_outpoint, Bip448FeeInputRecord,
+        Bip448PackageAttempt, Bip448PackageAttemptStatus,
     },
 };
 
@@ -31,7 +30,8 @@ const FEE_INPUT_SIZING_VALUE_SATS: u64 = 21_000_000u64 * 100_000_000;
 #[cfg(feature = "test-hooks")]
 fn bip448_recovery_checkpoint(checkpoint: &str) {
     if std::env::var("ML_BIP448_RESTART_CHILD").as_deref() == Ok("1")
-        && std::env::var("ML_BIP448_TEST_CHECKPOINT").as_deref() == Ok(checkpoint) {
+        && std::env::var("ML_BIP448_TEST_CHECKPOINT").as_deref() == Ok(checkpoint)
+    {
         std::process::exit(86);
     }
 }
@@ -69,37 +69,63 @@ impl fmt::Display for Bip448InsufficientRecoveryFeeFunds {
 impl Error for Bip448InsufficientRecoveryFeeFunds {}
 
 fn fee_input_records(inputs: &[Bip448CpfpFeeInput]) -> Vec<Bip448FeeInputRecord> {
-    inputs.iter().map(|input| Bip448FeeInputRecord { txid: input.previous_output.txid.to_string(),
-        vout: input.previous_output.vout, value_sats: input.value_sats }).collect()
+    inputs
+        .iter()
+        .map(|input| Bip448FeeInputRecord {
+            txid: input.previous_output.txid.to_string(),
+            vout: input.previous_output.vout,
+            value_sats: input.value_sats,
+        })
+        .collect()
 }
 
-async fn persist_fee_inputs(client_config: &ClientConfig, wallet_name: &str,
-    inputs: &[Bip448CpfpFeeInput]) -> Result<()> {
+async fn persist_fee_inputs(
+    client_config: &ClientConfig,
+    wallet_name: &str,
+    inputs: &[Bip448CpfpFeeInput],
+) -> Result<()> {
     let tip = client_config.chain_client.tip_height()?;
     for input in inputs {
-        let tx_out = client_config.chain_client.get_tx_out(
-            &input.previous_output.txid, input.previous_output.vout, true)?
+        let tx_out = client_config
+            .chain_client
+            .get_tx_out(
+                &input.previous_output.txid,
+                input.previous_output.vout,
+                true,
+            )?
             .ok_or_else(|| anyhow!("BIP448 fee input is unavailable"))?;
         if tx_out.value != input.value_sats {
             return Err(anyhow!("BIP448 fee input value is inconsistent"));
         }
         let outpoint = ChainUtxo {
-            txid: input.previous_output.txid.to_string(), vout: input.previous_output.vout,
-            value: tx_out.value, height: if tx_out.confirmations == 0 { 0 } else {
+            txid: input.previous_output.txid.to_string(),
+            vout: input.previous_output.vout,
+            value: tx_out.value,
+            height: if tx_out.confirmations == 0 {
+                0
+            } else {
                 tip.saturating_sub(tx_out.confirmations).saturating_add(1)
             },
         };
-        upsert_bip448_scanned_outpoint(&client_config.pool, wallet_name,
-            &hex::encode(tx_out.script_pubkey.as_bytes()), &outpoint).await?;
+        upsert_bip448_scanned_outpoint(
+            &client_config.pool,
+            wallet_name,
+            &hex::encode(tx_out.script_pubkey.as_bytes()),
+            &outpoint,
+        )
+        .await?;
     }
     Ok(())
 }
 
-fn validate_stored_attempt(record: &Bip448StatechainRecord, attempt: &Bip448PackageAttempt)
-    -> Result<(Vec<u8>, Vec<u8>, u64, usize, f64)> {
-    if !matches!(attempt.status,
-        Bip448PackageAttemptStatus::Pending | Bip448PackageAttemptStatus::Submitted)
-        || attempt.wallet_name != record.wallet_name
+fn validate_stored_attempt(
+    record: &Bip448StatechainRecord,
+    attempt: &Bip448PackageAttempt,
+) -> Result<(Vec<u8>, Vec<u8>, u64, usize, f64)> {
+    if !matches!(
+        attempt.status,
+        Bip448PackageAttemptStatus::Pending | Bip448PackageAttemptStatus::Submitted
+    ) || attempt.wallet_name != record.wallet_name
         || attempt.statechain_id != record.statechain_id
         || !attempt.target_feerate_sat_per_vbyte.is_finite()
         || attempt.target_feerate_sat_per_vbyte <= 0.0
@@ -111,53 +137,88 @@ fn validate_stored_attempt(record: &Bip448StatechainRecord, attempt: &Bip448Pack
         Bip448RecoveryTemplateRole::FundingUpdate => &record.latest_state.update_tx,
         Bip448RecoveryTemplateRole::Settlement => &record.latest_state.settlement_tx,
         Bip448RecoveryTemplateRole::StateUpdate => {
-            return Err(anyhow!("stored BIP448 package attempt has an unsupported role"))
+            return Err(anyhow!(
+                "stored BIP448 package attempt has an unsupported role"
+            ))
         }
     };
-    let parent_bytes = hex::decode(parent_hex).context("invalid accepted BIP448 recovery parent")?;
-    let parent: Transaction = encode::deserialize(&parent_bytes).context("invalid accepted BIP448 recovery parent")?;
-    let child_bytes = hex::decode(&attempt.child_tx_hex).context("invalid stored BIP448 recovery child")?;
-    let child: Transaction = encode::deserialize(&child_bytes).context("invalid stored BIP448 recovery child")?;
-    let anchor_vout = record.latest_state.anchors.iter()
-        .find(|anchor| anchor.tx_role == role).map(|anchor| anchor.output_index)
+    let parent_bytes =
+        hex::decode(parent_hex).context("invalid accepted BIP448 recovery parent")?;
+    let parent: Transaction =
+        encode::deserialize(&parent_bytes).context("invalid accepted BIP448 recovery parent")?;
+    let child_bytes =
+        hex::decode(&attempt.child_tx_hex).context("invalid stored BIP448 recovery child")?;
+    let child: Transaction =
+        encode::deserialize(&child_bytes).context("invalid stored BIP448 recovery child")?;
+    let anchor_vout = record
+        .latest_state
+        .anchors
+        .iter()
+        .find(|anchor| anchor.tx_role == role)
+        .map(|anchor| anchor.output_index)
         .ok_or_else(|| anyhow!("accepted BIP448 state is missing recovery anchor metadata"))?;
     if parent.txid().to_string() != attempt.parent_txid
         || child.txid().to_string() != attempt.child_txid
         || child.input.first().map(|input| input.previous_output)
-            != Some(OutPoint { txid: parent.txid(), vout: anchor_vout })
+            != Some(OutPoint {
+                txid: parent.txid(),
+                vout: anchor_vout,
+            })
         || child.input.len() != attempt.fee_inputs.len() + 1
-        || child.input.iter().skip(1).zip(&attempt.fee_inputs).any(|(txin, fee)| {
-            txin.previous_output.txid.to_string() != fee.txid
-                || txin.previous_output.vout != fee.vout
-        })
+        || child
+            .input
+            .iter()
+            .skip(1)
+            .zip(&attempt.fee_inputs)
+            .any(|(txin, fee)| {
+                txin.previous_output.txid.to_string() != fee.txid
+                    || txin.previous_output.vout != fee.vout
+            })
     {
         return Err(anyhow!("stored BIP448 package attempt is inconsistent"));
     }
-    let input_sats = attempt.fee_inputs.iter().try_fold(0u64, |sum, input|
-        sum.checked_add(input.value_sats).ok_or_else(|| anyhow!("stored BIP448 package attempt is inconsistent")))?;
-    let output_sats = child.output.iter().try_fold(0u64, |sum, output|
-        sum.checked_add(output.value).ok_or_else(|| anyhow!("stored BIP448 package attempt is inconsistent")))?;
-    let fee_sats = input_sats.checked_sub(output_sats)
+    let input_sats = attempt.fee_inputs.iter().try_fold(0u64, |sum, input| {
+        sum.checked_add(input.value_sats)
+            .ok_or_else(|| anyhow!("stored BIP448 package attempt is inconsistent"))
+    })?;
+    let output_sats = child.output.iter().try_fold(0u64, |sum, output| {
+        sum.checked_add(output.value)
+            .ok_or_else(|| anyhow!("stored BIP448 package attempt is inconsistent"))
+    })?;
+    let fee_sats = input_sats
+        .checked_sub(output_sats)
         .ok_or_else(|| anyhow!("stored BIP448 package attempt is inconsistent"))?;
     let vbytes = parent.vsize() + child.vsize();
-    let expected_fee_sats =
-        (attempt.target_feerate_sat_per_vbyte * vbytes as f64).ceil() as u64;
+    let expected_fee_sats = (attempt.target_feerate_sat_per_vbyte * vbytes as f64).ceil() as u64;
     if fee_sats != expected_fee_sats {
         return Err(anyhow!("stored BIP448 package attempt is inconsistent"));
     }
-    Ok((parent_bytes, child_bytes, fee_sats, vbytes, fee_sats as f64 / vbytes as f64))
+    Ok((
+        parent_bytes,
+        child_bytes,
+        fee_sats,
+        vbytes,
+        fee_sats as f64 / vbytes as f64,
+    ))
 }
 
 async fn submit_stored_attempt(
-    client_config: &ClientConfig, record: &Bip448StatechainRecord,
+    client_config: &ClientConfig,
+    record: &Bip448StatechainRecord,
     attempt: Bip448PackageAttempt,
 ) -> Result<Bip448RecoveryPackageSubmission> {
     let (parent, child, fee_sats, vbytes, feerate) = validate_stored_attempt(record, &attempt)?;
-    let child_txid = Txid::from_str(&attempt.child_txid)
-        .context("stored BIP448 child txid is invalid")?;
+    let child_txid =
+        Txid::from_str(&attempt.child_txid).context("stored BIP448 child txid is invalid")?;
     if recovery_child_is_confirmed(client_config, &child_txid)? {
-        set_bip448_package_attempt_status(&client_config.pool, &attempt.wallet_name,
-            &attempt.statechain_id, &attempt.role, Bip448PackageAttemptStatus::Confirmed).await?;
+        set_bip448_package_attempt_status(
+            &client_config.pool,
+            &attempt.wallet_name,
+            &attempt.statechain_id,
+            &attempt.role,
+            Bip448PackageAttemptStatus::Confirmed,
+        )
+        .await?;
         return Ok(stored_attempt_submission(
             attempt,
             fee_sats,
@@ -167,23 +228,39 @@ async fn submit_stored_attempt(
         ));
     }
     reacquire_bip448_package_attempt_reservations(&client_config.pool, &attempt).await?;
-    let response = client_config.chain_client.submit_package(&[parent, child])?;
+    let response = client_config
+        .chain_client
+        .submit_package(&[parent, child])?;
     let submitted = package_response_is_success(&response, 2);
     if submitted {
         bip448_recovery_checkpoint("recovery_submitted");
     }
     if recovery_child_is_confirmed(client_config, &child_txid)? {
-        set_bip448_package_attempt_status(&client_config.pool, &attempt.wallet_name,
-            &attempt.statechain_id, &attempt.role, Bip448PackageAttemptStatus::Confirmed).await?;
+        set_bip448_package_attempt_status(
+            &client_config.pool,
+            &attempt.wallet_name,
+            &attempt.statechain_id,
+            &attempt.role,
+            Bip448PackageAttemptStatus::Confirmed,
+        )
+        .await?;
         return Ok(stored_attempt_submission(
             attempt, fee_sats, vbytes, feerate, response,
         ));
     }
     if !submitted {
-        return Err(anyhow!("Bitcoin Core submitpackage did not accept BIP448 package: {response}"));
+        return Err(anyhow!(
+            "Bitcoin Core submitpackage did not accept BIP448 package: {response}"
+        ));
     }
-    set_bip448_package_attempt_status(&client_config.pool, &attempt.wallet_name,
-        &attempt.statechain_id, &attempt.role, Bip448PackageAttemptStatus::Submitted).await?;
+    set_bip448_package_attempt_status(
+        &client_config.pool,
+        &attempt.wallet_name,
+        &attempt.statechain_id,
+        &attempt.role,
+        Bip448PackageAttemptStatus::Submitted,
+    )
+    .await?;
     Ok(stored_attempt_submission(
         attempt, fee_sats, vbytes, feerate, response,
     ))
@@ -204,22 +281,32 @@ fn stored_attempt_submission(
     submitpackage_response: Value,
 ) -> Bip448RecoveryPackageSubmission {
     Bip448RecoveryPackageSubmission {
-        statechain_id: attempt.statechain_id, role: attempt.role,
-        parent_txid: attempt.parent_txid, cpfp_child_txid: attempt.child_txid,
-        package_fee_sats, package_vbytes, package_feerate_sat_per_vbyte,
+        statechain_id: attempt.statechain_id,
+        role: attempt.role,
+        parent_txid: attempt.parent_txid,
+        cpfp_child_txid: attempt.child_txid,
+        package_fee_sats,
+        package_vbytes,
+        package_feerate_sat_per_vbyte,
         submitpackage_response,
     }
 }
 
 async fn persist_and_submit_package(
-    client_config: &ClientConfig, wallet_name: &str, record: &Bip448StatechainRecord,
-    role: Bip448RecoveryTemplateRole, fee_inputs: &[Bip448CpfpFeeInput],
-    target_feerate: f64, package: Bip448RecoveryPackage,
+    client_config: &ClientConfig,
+    wallet_name: &str,
+    record: &Bip448StatechainRecord,
+    role: Bip448RecoveryTemplateRole,
+    fee_inputs: &[Bip448CpfpFeeInput],
+    target_feerate: f64,
+    package: Bip448RecoveryPackage,
 ) -> Result<Bip448RecoveryPackageSubmission> {
     persist_fee_inputs(client_config, wallet_name, fee_inputs).await?;
     let attempt = Bip448PackageAttempt {
-        wallet_name: wallet_name.to_owned(), statechain_id: record.statechain_id.clone(),
-        role: role.as_str().to_owned(), parent_txid: package.parent_tx.txid().to_string(),
+        wallet_name: wallet_name.to_owned(),
+        statechain_id: record.statechain_id.clone(),
+        role: role.as_str().to_owned(),
+        parent_txid: package.parent_tx.txid().to_string(),
         child_txid: package.cpfp_child_tx.txid().to_string(),
         child_tx_hex: hex::encode(encode::serialize(&package.cpfp_child_tx)),
         fee_inputs: fee_input_records(fee_inputs),
@@ -300,12 +387,22 @@ pub async fn submit_wallet_funded_latest_state_recovery_package(
 ) -> Result<Bip448RecoveryPackageSubmission> {
     let record = get_bip448_statechain(&client_config.pool, wallet_name, statechain_id).await?;
     if let Some(attempt) = get_bip448_package_attempt(
-        &client_config.pool, wallet_name, statechain_id, role.as_str()).await?
+        &client_config.pool,
+        wallet_name,
+        statechain_id,
+        role.as_str(),
+    )
+    .await?
     {
         return submit_stored_attempt(client_config, &record, attempt).await;
     }
     ensure_no_orphaned_bip448_reservation(
-        &client_config.pool, wallet_name, statechain_id, role.as_str()).await?;
+        &client_config.pool,
+        wallet_name,
+        statechain_id,
+        role.as_str(),
+    )
+    .await?;
     let wallet = get_wallet(&client_config.pool, wallet_name).await?;
     let fee_key = wallet.bip448_recovery_fee_key()?;
     let change_address = change_address
@@ -341,11 +438,21 @@ pub async fn submit_wallet_funded_latest_state_recovery_package(
         .saturating_sub(sizing_package.cpfp_child_tx.output[0].value)
         .saturating_add(change_dust_sats);
 
-    discover_unspent(client_config, wallet_name, &fee_key.address, wallet.blockheight).await?;
+    discover_unspent(
+        client_config,
+        wallet_name,
+        &fee_key.address,
+        wallet.blockheight,
+    )
+    .await?;
     let reservation_id = bip448_reservation_id(statechain_id, role.as_str());
     let candidates = available_bip448_scanned_outpoints(
-        &client_config.pool, wallet_name,
-        &hex::encode(fee_key.address.script_pubkey().as_bytes()), &reservation_id).await?;
+        &client_config.pool,
+        wallet_name,
+        &hex::encode(fee_key.address.script_pubkey().as_bytes()),
+        &reservation_id,
+    )
+    .await?;
     let (mut fee_inputs, mut package) = select_confirmed_fee_inputs(
         candidates,
         minimum_required_sats,
@@ -374,7 +481,15 @@ pub async fn submit_wallet_funded_latest_state_recovery_package(
     }
 
     persist_and_submit_package(
-        client_config, wallet_name, &record, role, &fee_inputs, fee_rate, package).await
+        client_config,
+        wallet_name,
+        &record,
+        role,
+        &fee_inputs,
+        fee_rate,
+        package,
+    )
+    .await
 }
 
 pub async fn submit_latest_state_recovery_package(
@@ -388,12 +503,22 @@ pub async fn submit_latest_state_recovery_package(
 ) -> Result<Bip448RecoveryPackageSubmission> {
     let record = get_bip448_statechain(&client_config.pool, wallet_name, statechain_id).await?;
     if let Some(attempt) = get_bip448_package_attempt(
-        &client_config.pool, wallet_name, statechain_id, role.as_str()).await?
+        &client_config.pool,
+        wallet_name,
+        statechain_id,
+        role.as_str(),
+    )
+    .await?
     {
         return submit_stored_attempt(client_config, &record, attempt).await;
     }
     ensure_no_orphaned_bip448_reservation(
-        &client_config.pool, wallet_name, statechain_id, role.as_str()).await?;
+        &client_config.pool,
+        wallet_name,
+        statechain_id,
+        role.as_str(),
+    )
+    .await?;
     let change_script_pubkey = Address::from_str(change_address)
         .with_context(|| format!("invalid BIP448 CPFP change address {change_address}"))?
         .require_network(client_config.network)
@@ -423,44 +548,80 @@ pub async fn submit_latest_state_recovery_package(
         fee_rate,
     )?;
     persist_and_submit_package(
-        client_config, wallet_name, &record, role, fee_inputs, fee_rate, package).await
+        client_config,
+        wallet_name,
+        &record,
+        role,
+        fee_inputs,
+        fee_rate,
+        package,
+    )
+    .await
 }
 
 pub async fn resume_latest_state_recovery_package(
-    client_config: &ClientConfig, wallet_name: &str, statechain_id: &str,
+    client_config: &ClientConfig,
+    wallet_name: &str,
+    statechain_id: &str,
     role: Bip448RecoveryTemplateRole,
 ) -> Result<Bip448RecoveryPackageSubmission> {
     let record = get_bip448_statechain(&client_config.pool, wallet_name, statechain_id).await?;
     let attempt = get_bip448_package_attempt(
-        &client_config.pool, wallet_name, statechain_id, role.as_str()).await?
-        .ok_or_else(|| anyhow!("BIP448 package attempt is missing"))?;
+        &client_config.pool,
+        wallet_name,
+        statechain_id,
+        role.as_str(),
+    )
+    .await?
+    .ok_or_else(|| anyhow!("BIP448 package attempt is missing"))?;
     submit_stored_attempt(client_config, &record, attempt).await
 }
 
 pub async fn confirm_latest_state_recovery_package(
-    client_config: &ClientConfig, wallet_name: &str, statechain_id: &str,
+    client_config: &ClientConfig,
+    wallet_name: &str,
+    statechain_id: &str,
     role: Bip448RecoveryTemplateRole,
 ) -> Result<()> {
     let record = get_bip448_statechain(&client_config.pool, wallet_name, statechain_id).await?;
     let attempt = get_bip448_package_attempt(
-        &client_config.pool, wallet_name, statechain_id, role.as_str()).await?
-        .ok_or_else(|| anyhow!("BIP448 package attempt is missing"))?;
+        &client_config.pool,
+        wallet_name,
+        statechain_id,
+        role.as_str(),
+    )
+    .await?
+    .ok_or_else(|| anyhow!("BIP448 package attempt is missing"))?;
     validate_stored_attempt(&record, &attempt)?;
-    let child_txid = Txid::from_str(&attempt.child_txid)
-        .context("stored BIP448 child txid is invalid")?;
+    let child_txid =
+        Txid::from_str(&attempt.child_txid).context("stored BIP448 child txid is invalid")?;
     if !recovery_child_is_confirmed(client_config, &child_txid)? {
         return Err(anyhow!("BIP448 package child is not confirmed"));
     }
-    set_bip448_package_attempt_status(&client_config.pool, wallet_name, statechain_id,
-        role.as_str(), Bip448PackageAttemptStatus::Confirmed).await
+    set_bip448_package_attempt_status(
+        &client_config.pool,
+        wallet_name,
+        statechain_id,
+        role.as_str(),
+        Bip448PackageAttemptStatus::Confirmed,
+    )
+    .await
 }
 
 pub async fn abandon_latest_state_recovery_package(
-    client_config: &ClientConfig, wallet_name: &str, statechain_id: &str,
+    client_config: &ClientConfig,
+    wallet_name: &str,
+    statechain_id: &str,
     role: Bip448RecoveryTemplateRole,
 ) -> Result<()> {
-    set_bip448_package_attempt_status(&client_config.pool, wallet_name, statechain_id,
-        role.as_str(), Bip448PackageAttemptStatus::Abandoned).await
+    set_bip448_package_attempt_status(
+        &client_config.pool,
+        wallet_name,
+        statechain_id,
+        role.as_str(),
+        Bip448PackageAttemptStatus::Abandoned,
+    )
+    .await
 }
 
 pub fn parse_recovery_template_role(role: &str) -> Result<Bip448RecoveryTemplateRole> {

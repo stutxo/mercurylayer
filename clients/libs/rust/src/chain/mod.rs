@@ -11,8 +11,7 @@ pub use self::core::{ChainTxOut, DescriptorActivity, ScanBlocksResult};
 pub(crate) use self::core::{CoreRpcAuth, CoreRpcConfig};
 
 #[cfg(feature = "test-hooks")]
-static SCAN_BLOCKS_CALLS: std::sync::Mutex<Vec<(u32, u32)>> =
-    std::sync::Mutex::new(Vec::new());
+static SCAN_BLOCKS_CALLS: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
 
 #[cfg(feature = "test-hooks")]
 pub fn take_scan_blocks_calls() -> Vec<(u32, u32)> {

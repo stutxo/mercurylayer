@@ -72,9 +72,7 @@ fn handle_bip448_message_result(
         std::result::Result::Ok(Bip448ReceiveOutcome::AlreadyProcessed) => {
             Ok(Bip448MessageDisposition::AlreadyProcessed)
         }
-        std::result::Result::Err(error)
-            if error.to_string() == EXPIRED_BATCH_TIME_ERROR =>
-        {
+        std::result::Result::Err(error) if error.to_string() == EXPIRED_BATCH_TIME_ERROR => {
             Err(error)
         }
         std::result::Result::Err(error) => {
@@ -134,10 +132,7 @@ pub async fn execute(
                     &mut temp_activities,
                 )
                 .await;
-                match handle_bip448_message_result(
-                    bip448_result,
-                    &mut received_statechain_ids,
-                )? {
+                match handle_bip448_message_result(bip448_result, &mut received_statechain_ids)? {
                     Bip448MessageDisposition::BatchLocked => {
                         is_there_batch_locked = true;
                         continue;
@@ -171,10 +166,7 @@ pub async fn execute(
                     &mut temp_activities,
                 )
                 .await;
-                match handle_bip448_message_result(
-                    bip448_result,
-                    &mut received_statechain_ids,
-                )? {
+                match handle_bip448_message_result(bip448_result, &mut received_statechain_ids)? {
                     Bip448MessageDisposition::BatchLocked => {
                         is_there_batch_locked = true;
                         continue;
@@ -538,10 +530,9 @@ mod tests {
 
     #[test]
     fn tx0_output_address_is_derived_from_selected_output() -> Result<()> {
-        let expected_address = Address::from_str(
-            "bcrt1p3qkhfews2uk44qtvauqyr2ttdsw7svhkl9nkm9s9c3x4ax5h60wq5jq7et",
-        )?
-        .require_network(bitcoin::Network::Regtest)?;
+        let expected_address =
+            Address::from_str("bcrt1p3qkhfews2uk44qtvauqyr2ttdsw7svhkl9nkm9s9c3x4ax5h60wq5jq7et")?
+                .require_network(bitcoin::Network::Regtest)?;
         let tx0 = Transaction {
             version: 2,
             lock_time: bitcoin::absolute::LockTime::ZERO,

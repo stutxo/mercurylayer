@@ -151,10 +151,7 @@ pub(super) async fn try_transfer_bip448_receiver(
     .await
 }
 
-fn decrypt_transfer_message(
-    enc_message: &str,
-    auth_privkey: &str,
-) -> Result<Bip448TransferMsg> {
+fn decrypt_transfer_message(enc_message: &str, auth_privkey: &str) -> Result<Bip448TransferMsg> {
     Ok(decrypt_bip448_transfer_msg(enc_message, auth_privkey)?)
 }
 
@@ -380,7 +377,10 @@ pub(crate) async fn transfer_chain_facts(
     })
 }
 
-pub(crate) fn expected_server_pubkey(msg: &Bip448TransferMsg, receiver: &PublicKey) -> Result<PublicKey> {
+pub(crate) fn expected_server_pubkey(
+    msg: &Bip448TransferMsg,
+    receiver: &PublicKey,
+) -> Result<PublicKey> {
     Ok(PublicKey::from_str(&msg.aggregate_pubkey)?.combine(&receiver.negate())?)
 }
 

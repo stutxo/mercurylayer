@@ -49,18 +49,17 @@ async fn bip448_client_restart_child() -> Result<()> {
             &std::env::var("ML_BIP448_RECOVERY_FEE_INPUT")?,
         )?;
         let change_address = std::env::var("ML_BIP448_RECOVERY_CHANGE_ADDRESS")?;
-        let result =
-            mercuryrustlib::bip448_recovery::submit_latest_state_recovery_package(
-                &client_config,
-                &wallet_name,
-                &statechain_id,
-                Bip448RecoveryTemplateRole::FundingUpdate,
-                &[fee_input],
-                &change_address,
-                Some(PACKAGE_FEERATE_SAT_PER_VBYTE),
-            )
-            .await
-            .map(|_| ());
+        let result = mercuryrustlib::bip448_recovery::submit_latest_state_recovery_package(
+            &client_config,
+            &wallet_name,
+            &statechain_id,
+            Bip448RecoveryTemplateRole::FundingUpdate,
+            &[fee_input],
+            &change_address,
+            Some(PACKAGE_FEERATE_SAT_PER_VBYTE),
+        )
+        .await
+        .map(|_| ());
         client_config.pool.close().await;
         return result;
     }
@@ -1792,9 +1791,7 @@ async fn bip448_owner_recovery_survives_restart_mid_broadcast() -> Result<()> {
             .context("fee input funding returned no input")?;
         let fee_input_descriptor = format!(
             "{}:{}:{}",
-            fee_input.previous_output.txid,
-            fee_input.previous_output.vout,
-            fee_input.value_sats
+            fee_input.previous_output.txid, fee_input.previous_output.vout, fee_input.value_sats
         );
         let change_address = common::bitcoin_core::getnewaddress()?;
         let missing = mercuryrustlib::bip448_recovery::resume_latest_state_recovery_package(
@@ -1815,11 +1812,7 @@ async fn bip448_owner_recovery_survives_restart_mid_broadcast() -> Result<()> {
             &change_address,
             Some(checkpoint),
         )?;
-        assert_child_status(
-            &interrupted,
-            Some(RESTART_CHECKPOINT_EXIT_CODE),
-            checkpoint,
-        )?;
+        assert_child_status(&interrupted, Some(RESTART_CHECKPOINT_EXIT_CODE), checkpoint)?;
 
         let interrupted_config = mercuryrustlib::client_config::load().await;
         let attempt = mercuryrustlib::sqlite_manager::get_bip448_package_attempt(
@@ -2278,10 +2271,7 @@ async fn assert_server_persistence_excludes_locktime(
             std::env::var("MERCURY_TEST_DATABASE_URL").unwrap_or_else(|_| {
                 "postgres://postgres:postgres@127.0.0.1:5432/mercury".to_string()
             }),
-            &[
-                "bip448_signature_data",
-                "signing_nonce_leases",
-            ][..],
+            &["bip448_signature_data", "signing_nonce_leases"][..],
         ),
         (
             std::env::var("LOCKBOX_TEST_DATABASE_URL").unwrap_or_else(|_| {

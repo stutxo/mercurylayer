@@ -131,18 +131,17 @@ impl CoreChainClient {
     }
 
     pub fn transaction_confirmations(&self, txid: &Txid) -> Result<Option<u32>> {
-        match self.call::<RawTransactionStatus>(
-            "getrawtransaction",
-            &[json!(txid), json!(true)],
-        ) {
+        match self.call::<RawTransactionStatus>("getrawtransaction", &[json!(txid), json!(true)]) {
             Ok(status) => status
                 .confirmations
                 .map(u32::try_from)
                 .transpose()
                 .context("Bitcoin Core returned negative transaction confirmations"),
-            Err(error) if error
-                .downcast_ref::<CoreRpcError>()
-                .is_some_and(|error| error.code == -5) => {
+            Err(error)
+                if error
+                    .downcast_ref::<CoreRpcError>()
+                    .is_some_and(|error| error.code == -5) =>
+            {
                 Ok(None)
             }
             Err(error) => Err(error),

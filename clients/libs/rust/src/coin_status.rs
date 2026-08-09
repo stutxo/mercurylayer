@@ -124,11 +124,17 @@ async fn discover_unspent_batch_attempt(
     let mut states = HashMap::new();
     for (script, (descriptor, coverage_start_height, result_start_height)) in bounds {
         let script_hex = hex::encode(script.as_bytes());
-        let (mut cursor, mut stored) = load_bip448_scan_state(&client_config.pool, wallet_name, &script_hex).await?;
+        let (mut cursor, mut stored) =
+            load_bip448_scan_state(&client_config.pool, wallet_name, &script_hex).await?;
         let cursor_matches = match &cursor {
             Some(cursor) if cursor.last_scanned_height > stop_height => false,
-            Some(cursor) => client_config.chain_client.get_block_hash(cursor.last_scanned_height)?
-                .to_string() == cursor.last_scanned_block_hash,
+            Some(cursor) => {
+                client_config
+                    .chain_client
+                    .get_block_hash(cursor.last_scanned_height)?
+                    .to_string()
+                    == cursor.last_scanned_block_hash
+            }
             None => true,
         };
         if !cursor_matches {
@@ -136,44 +142,72 @@ async fn discover_unspent_batch_attempt(
             cursor = None;
             stored.clear();
         }
-        let start_height = cursor.as_ref().map_or(coverage_start_height.min(stop_height),
-            |cursor| cursor.last_scanned_height.saturating_add(1));
+        let start_height = cursor
+            .as_ref()
+            .map_or(coverage_start_height.min(stop_height), |cursor| {
+                cursor.last_scanned_height.saturating_add(1)
+            });
         let mut outpoints = HashMap::new();
         for mut outpoint in stored {
-            if let Some(tx_out) = client_config.chain_client.get_stored_tx_out(&outpoint.txid, outpoint.vout, true)? {
+            if let Some(tx_out) =
+                client_config
+                    .chain_client
+                    .get_stored_tx_out(&outpoint.txid, outpoint.vout, true)?
+            {
                 if tx_out.script_pubkey == script {
                     outpoint.value = tx_out.value;
                     outpoint.height = if tx_out.confirmations == 0 {
                         0
                     } else {
-                        stop_height.saturating_sub(tx_out.confirmations).saturating_add(1)
+                        stop_height
+                            .saturating_sub(tx_out.confirmations)
+                            .saturating_add(1)
                     };
                     outpoints.insert((outpoint.txid.clone(), outpoint.vout), outpoint);
                 }
             }
         }
-        states.insert(script, DescriptorScanState {
-            descriptor,
-            start_height,
-            result_start_height,
-            cursor,
-            outpoints,
-        });
+        states.insert(
+            script,
+            DescriptorScanState {
+                descriptor,
+                start_height,
+                result_start_height,
+                cursor,
+                outpoints,
+            },
+        );
     }
     if states.is_empty() {
         return Ok(HashMap::new());
     }
-    let descriptors = states.values().map(|state| state.descriptor.clone()).collect::<Vec<_>>();
-    let scan_start = states.values().map(|state| state.start_height).min().unwrap();
+    let descriptors = states
+        .values()
+        .map(|state| state.descriptor.clone())
+        .collect::<Vec<_>>();
+    let scan_start = states
+        .values()
+        .map(|state| state.start_height)
+        .min()
+        .unwrap();
     let (scanned, activity) = retry_discovery_once(|| {
         let scan = (scan_start <= stop_height)
-            .then(|| client_config.chain_client.scan_blocks(&descriptors, scan_start, stop_height))
+            .then(|| {
+                client_config
+                    .chain_client
+                    .scan_blocks(&descriptors, scan_start, stop_height)
+            })
             .transpose()?;
         if scan.as_ref().is_some_and(|scan| !scan.completed) {
             return Err(anyhow!("Bitcoin Core scanblocks did not complete"));
         }
-        let blocks = scan.as_ref().map_or(&[][..], |scan| scan.relevant_blocks.as_slice());
-        let activity = client_config.chain_client.descriptor_activity(blocks, &descriptors, true)?;
+        let blocks = scan
+            .as_ref()
+            .map_or(&[][..], |scan| scan.relevant_blocks.as_slice());
+        let activity =
+            client_config
+                .chain_client
+                .descriptor_activity(blocks, &descriptors, true)?;
         Ok((scan.is_some(), activity))
     })?;
     let post_scan_tip = client_config.chain_client.tip_height()?;
@@ -232,9 +266,17 @@ async fn discover_unspent_batch_attempt(
                 output_spk,
             } => {
                 let txid = txid.to_string();
-                (output_spk, height, (txid.clone(), vout), Some(ChainUtxo {
-                    txid, vout, value: amount, height: height.unwrap_or(0),
-                }))
+                (
+                    output_spk,
+                    height,
+                    (txid.clone(), vout),
+                    Some(ChainUtxo {
+                        txid,
+                        vout,
+                        value: amount,
+                        height: height.unwrap_or(0),
+                    }),
+                )
             }
             DescriptorActivity::Spend {
                 height,
@@ -242,7 +284,12 @@ async fn discover_unspent_batch_attempt(
                 prevout_vout,
                 prevout_spk,
                 ..
-            } => (prevout_spk, height, (prevout_txid.to_string(), prevout_vout), None),
+            } => (
+                prevout_spk,
+                height,
+                (prevout_txid.to_string(), prevout_vout),
+                None,
+            ),
         };
         if let Some(state) = states.get_mut(&script) {
             if height.map_or(true, |height| height >= state.start_height) {
@@ -255,8 +302,8 @@ async fn discover_unspent_batch_attempt(
     }
     let scanned_cursor = if scanned {
         Some(Bip448ScanCursor {
-                last_scanned_height: stop_height,
-                last_scanned_block_hash: stop_block_hash,
+            last_scanned_height: stop_height,
+            last_scanned_block_hash: stop_block_hash,
         })
     } else {
         None
@@ -265,8 +312,14 @@ async fn discover_unspent_batch_attempt(
     for (script, state) in states {
         let cursor = scanned_cursor.as_ref().or(state.cursor.as_ref()).unwrap();
         let outpoints = state.outpoints.into_values().collect::<Vec<_>>();
-        persist_bip448_scan_state(&client_config.pool, wallet_name,
-            &hex::encode(script.as_bytes()), cursor, &outpoints).await?;
+        persist_bip448_scan_state(
+            &client_config.pool,
+            wallet_name,
+            &hex::encode(script.as_bytes()),
+            cursor,
+            &outpoints,
+        )
+        .await?;
         result.insert(
             script,
             outpoints
@@ -292,7 +345,9 @@ pub(crate) async fn discover_unspent(
         result_start_height: start_height,
     };
     let mut discovered = discover_unspent_batch(client_config, wallet_name, &[request]).await?;
-    Ok(discovered.remove(&address.script_pubkey()).unwrap_or_default())
+    Ok(discovered
+        .remove(&address.script_pubkey())
+        .unwrap_or_default())
 }
 
 fn retry_discovery_once<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
@@ -540,9 +595,7 @@ async fn check_bip448_deposit(
             .get(&address.script_pubkey())
             .into_iter()
             .flatten()
-            .filter(|unspent| {
-                unspent.height == 0 || unspent.height >= wallet_blockheight
-            })
+            .filter(|unspent| unspent.height == 0 || unspent.height >= wallet_blockheight)
             .cloned()
             .collect();
         let Some(utxo) = select_bip448_funding_utxo(
@@ -755,13 +808,9 @@ async fn discover_wallet_unspent(
             get_bip448_pending_deposit_signing(&client_config.pool, &wallet.name, statechain_id)
                 .await?
                 .is_some()
-                || get_bip448_statechain_optional(
-                    &client_config.pool,
-                    &wallet.name,
-                    statechain_id,
-                )
-                .await?
-                .is_some();
+                || get_bip448_statechain_optional(&client_config.pool, &wallet.name, statechain_id)
+                    .await?
+                    .is_some();
         if !has_persisted_outpoint {
             requests.push(DescriptorDiscoveryRequest {
                 address,
@@ -801,9 +850,7 @@ pub async fn update_coins(client_config: &ClientConfig, wallet_name: &str) -> Re
     let mut wallet = get_wallet(&client_config.pool, &wallet_name).await?;
     for coin in &wallet.coins {
         if let Some(statechain_id) = coin.statechain_id.as_deref() {
-            if coin.statechain_protocol.as_deref()
-                != Some(bip448_deposit::BIP448_COIN_PROTOCOL)
-            {
+            if coin.statechain_protocol.as_deref() != Some(bip448_deposit::BIP448_COIN_PROTOCOL) {
                 return Err(anyhow!(
                     "statechain {statechain_id}: unsupported non-BIP448 coin"
                 ));
@@ -860,12 +907,7 @@ pub async fn update_coins(client_config: &ClientConfig, wallet_name: &str) -> Re
         }
     }
 
-    finalize_wallet_update(
-        client_config,
-        &mut wallet,
-        deferred_bip448_deposit_errors,
-    )
-    .await
+    finalize_wallet_update(client_config, &mut wallet, deferred_bip448_deposit_errors).await
 }
 
 #[cfg(test)]
@@ -1049,32 +1091,29 @@ mod tests {
         let client_config = test_client_config().await?;
         let mut bip448_coin = incomplete_coin(0, Some(bip448_deposit::BIP448_COIN_PROTOCOL));
 
-        assert!(
-            check_bip448_deposit(
-                &client_config,
-                "wallet",
-                &mut bip448_coin,
-                "regtest",
-                0,
-                &HashMap::new(),
-            )
-                .await?
-                .is_none()
-        );
+        assert!(check_bip448_deposit(
+            &client_config,
+            "wallet",
+            &mut bip448_coin,
+            "regtest",
+            0,
+            &HashMap::new(),
+        )
+        .await?
+        .is_none());
 
         bip448_coin.utxo_txid = Some("aa".repeat(32));
-        let bip448_error =
-            check_bip448_deposit(
-                &client_config,
-                "wallet",
-                &mut bip448_coin,
-                "regtest",
-                0,
-                &HashMap::new(),
-            )
-                .await
-                .err()
-                .expect("partial BIP448 outpoint must fail");
+        let bip448_error = check_bip448_deposit(
+            &client_config,
+            "wallet",
+            &mut bip448_coin,
+            "regtest",
+            0,
+            &HashMap::new(),
+        )
+        .await
+        .err()
+        .expect("partial BIP448 outpoint must fail");
         assert_eq!(
             bip448_error.to_string(),
             "BIP448 coin has a partial funding outpoint"
@@ -1089,18 +1128,17 @@ mod tests {
         let mut bip448_coin = incomplete_coin(0, Some(bip448_deposit::BIP448_COIN_PROTOCOL));
 
         bip448_coin.aggregated_address = Some("not-queried".to_string());
-        let bip448_error =
-            check_bip448_deposit(
-                &client_config,
-                "wallet",
-                &mut bip448_coin,
-                "regtest",
-                0,
-                &HashMap::new(),
-            )
-                .await
-                .err()
-                .expect("address-only BIP448 setup must fail");
+        let bip448_error = check_bip448_deposit(
+            &client_config,
+            "wallet",
+            &mut bip448_coin,
+            "regtest",
+            0,
+            &HashMap::new(),
+        )
+        .await
+        .err()
+        .expect("address-only BIP448 setup must fail");
         assert_eq!(
             bip448_error.to_string(),
             "BIP448 coin missing amount after deposit setup"
@@ -1108,18 +1146,17 @@ mod tests {
 
         bip448_coin.aggregated_address = None;
         bip448_coin.amount = Some(50_000);
-        let bip448_error =
-            check_bip448_deposit(
-                &client_config,
-                "wallet",
-                &mut bip448_coin,
-                "regtest",
-                0,
-                &HashMap::new(),
-            )
-                .await
-                .err()
-                .expect("amount-only BIP448 setup must fail");
+        let bip448_error = check_bip448_deposit(
+            &client_config,
+            "wallet",
+            &mut bip448_coin,
+            "regtest",
+            0,
+            &HashMap::new(),
+        )
+        .await
+        .err()
+        .expect("amount-only BIP448 setup must fail");
         assert!(bip448_error
             .to_string()
             .contains("missing aggregated_address"));
@@ -1128,18 +1165,17 @@ mod tests {
         bip448_coin.utxo_txid = None;
         bip448_coin.utxo_vout = None;
         bip448_coin.status = CoinStatus::IN_MEMPOOL;
-        let bip448_error =
-            check_bip448_deposit(
-                &client_config,
-                "wallet",
-                &mut bip448_coin,
-                "regtest",
-                0,
-                &HashMap::new(),
-            )
-                .await
-                .err()
-                .expect("advanced BIP448 setup must fail");
+        let bip448_error = check_bip448_deposit(
+            &client_config,
+            "wallet",
+            &mut bip448_coin,
+            "regtest",
+            0,
+            &HashMap::new(),
+        )
+        .await
+        .err()
+        .expect("advanced BIP448 setup must fail");
         assert!(bip448_error.to_string().contains("missing amount"));
 
         Ok(())
@@ -1160,9 +1196,9 @@ mod tests {
             0,
             &HashMap::new(),
         )
-            .await
-            .err()
-            .expect("missing address must fail before chain access");
+        .await
+        .err()
+        .expect("missing address must fail before chain access");
         assert!(error.to_string().contains("missing aggregated_address"));
         assert!(!error.to_string().contains("missing amount"));
 
@@ -1281,11 +1317,7 @@ mod tests {
             &mut deferred_errors,
         )?;
 
-        let error = finalize_wallet_update(
-            &client_config,
-            &mut wallet,
-            deferred_errors,
-        )
+        let error = finalize_wallet_update(&client_config, &mut wallet, deferred_errors)
             .await
             .err()
             .expect("signature-count mismatch must be reported after persistence");

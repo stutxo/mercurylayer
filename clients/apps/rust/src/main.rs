@@ -77,7 +77,10 @@ enum Commands {
         batch_id: Option<String>,
     },
     /// Cancel an in-flight BIP448 transfer by transferring back to this wallet
-    Bip448TransferCancel { wallet_name: String, statechain_id: String },
+    Bip448TransferCancel {
+        wallet_name: String,
+        statechain_id: String,
+    },
     /// Send a statechain coin to a transfer address
     TransferReceive { wallet_name: String },
     /// Create a payment hash for a lightning latch
@@ -267,16 +270,33 @@ async fn main() -> Result<()> {
         } => {
             mercuryrustlib::coin_status::update_coins(&client_config, &wallet_name).await?;
             mercuryrustlib::bip448_transfer_sender::transfer_bip448_sender(
-                &client_config, &to_address, &wallet_name, &statechain_id, batch_id,
-            ).await?;
-            println!("{}", serde_json::to_string_pretty(&json!({"Transfer": "sent"})).unwrap());
+                &client_config,
+                &to_address,
+                &wallet_name,
+                &statechain_id,
+                batch_id,
+            )
+            .await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({"Transfer": "sent"})).unwrap()
+            );
         }
-        Commands::Bip448TransferCancel { wallet_name, statechain_id } => {
+        Commands::Bip448TransferCancel {
+            wallet_name,
+            statechain_id,
+        } => {
             mercuryrustlib::coin_status::update_coins(&client_config, &wallet_name).await?;
             let state_number = mercuryrustlib::bip448_transfer_sender::cancel_bip448_transfer(
-                &client_config, &wallet_name, &statechain_id,
-            ).await?;
-            println!("{}", serde_json::to_string_pretty(&json!({"state_number": state_number})).unwrap());
+                &client_config,
+                &wallet_name,
+                &statechain_id,
+            )
+            .await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({"state_number": state_number})).unwrap()
+            );
         }
         Commands::TransferReceive { wallet_name } => {
             mercuryrustlib::coin_status::update_coins(&client_config, &wallet_name).await?;

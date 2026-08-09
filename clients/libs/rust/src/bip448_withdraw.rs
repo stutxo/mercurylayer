@@ -29,8 +29,8 @@ const UNEXPECTED_COMPLETION_RESPONSE: &str =
     "BIP448 withdraw completion returned an unexpected response";
 
 fn require_statechain_deleted(body: &str) -> Result<()> {
-    let value: serde_json::Value = serde_json::from_str(body)
-        .map_err(|_| anyhow!("{UNEXPECTED_COMPLETION_RESPONSE}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| anyhow!("{UNEXPECTED_COMPLETION_RESPONSE}"))?;
     if value.get("message").and_then(serde_json::Value::as_str) != Some("Statechain deleted.") {
         return Err(anyhow!("{UNEXPECTED_COMPLETION_RESPONSE}"));
     }
@@ -144,8 +144,7 @@ pub async fn execute(
         msg1.encoded_session,
         msg1.output_pubkey,
     )?;
-    let signed_tx =
-        finalize_bip448_keypath_transaction(msg1.encoded_unsigned_tx, signature)?;
+    let signed_tx = finalize_bip448_keypath_transaction(msg1.encoded_unsigned_tx, signature)?;
     #[cfg(feature = "test-hooks")]
     if std::env::var("ML_BIP448_WITHDRAW_STOP_AFTER_SIGNATURE").as_deref() == Ok("1") {
         return Err(anyhow!("BIP448 withdraw stopped after signature for test"));
@@ -165,7 +164,8 @@ pub async fn execute(
     });
     update_wallet(&client_config.pool, &wallet).await?;
     let completion =
-        crate::utils::complete_withdraw(statechain_id, &signed_statechain_id, client_config).await?;
+        crate::utils::complete_withdraw(statechain_id, &signed_statechain_id, client_config)
+            .await?;
     // Diagnostic only: the transaction is broadcast and the statechain is already deleted;
     // confirmation still promotes the persisted coin from WITHDRAWING to WITHDRAWN.
     require_statechain_deleted(&completion)?;
@@ -201,10 +201,31 @@ mod tests {
     }
 
     async fn config() -> Result<ClientConfig> {
-        let pool = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await?;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
         let url = "http://127.0.0.1:1";
-        Ok(ClientConfig { statechain_entity: url.into(), chain_backend: "core".into(), chain_client: ChainClient::new(CoreRpcConfig { url: url.into(), auth: CoreRpcAuth::None })?, core_rpc_url: Some(url.into()), core_rpc_auth: Some("none".into()), core_rpc_user: None, core_rpc_password: None, core_rpc_cookie_file: None, network: Network::Regtest, fee_rate_tolerance: 0.0, confirmation_target: 1, pool, tor_proxy: None, max_fee_rate: 10.0 })
+        Ok(ClientConfig {
+            statechain_entity: url.into(),
+            chain_backend: "core".into(),
+            chain_client: ChainClient::new(CoreRpcConfig {
+                url: url.into(),
+                auth: CoreRpcAuth::None,
+            })?,
+            core_rpc_url: Some(url.into()),
+            core_rpc_auth: Some("none".into()),
+            core_rpc_user: None,
+            core_rpc_password: None,
+            core_rpc_cookie_file: None,
+            network: Network::Regtest,
+            fee_rate_tolerance: 0.0,
+            confirmation_target: 1,
+            pool,
+            tor_proxy: None,
+            max_fee_rate: 10.0,
+        })
     }
 
     #[test]
@@ -226,7 +247,8 @@ mod tests {
 
     #[test]
     fn require_statechain_deleted_rejects_different_message() {
-        let error = require_statechain_deleted(r#"{"message":"Statechain retained."}"#).unwrap_err();
+        let error =
+            require_statechain_deleted(r#"{"message":"Statechain retained."}"#).unwrap_err();
         assert_eq!(error.to_string(), UNEXPECTED_COMPLETION_RESPONSE);
     }
 
@@ -235,15 +257,22 @@ mod tests {
         let config = config().await?;
         let mut wallet = wallet(None);
         insert_wallet(&config.pool, &wallet).await?;
-        let error = execute(&config, "wallet", "statechain", "unused", None).await.unwrap_err();
+        let error = execute(&config, "wallet", "statechain", "unused", None)
+            .await
+            .unwrap_err();
         assert_eq!(error.to_string(), "statechain statechain is not a BIP448 coin; BIP448 withdrawal requires an accepted BIP448 coin");
 
         wallet.coins[0].statechain_protocol = Some("bip448".into());
         update_wallet(&config.pool, &wallet).await?;
 
         sqlx::query("INSERT INTO bip448_pending_transfer_signings (wallet_name,statechain_id,funding_txid,funding_vout,funding_value_sats,update_template_hash,settlement_template_hash,state_locktime,signing_id,client_secret_nonce,client_public_nonce,blinding_factor) VALUES ('wallet','statechain','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',0,50000,'aa','bb',700000000,'cc','dd','ee','ff')").execute(&config.pool).await?;
-        let error = execute(&config, "wallet", "statechain", "unused", None).await.unwrap_err();
-        assert_eq!(error.to_string(), "cancel or complete the in-flight transfer before withdrawing");
+        let error = execute(&config, "wallet", "statechain", "unused", None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "cancel or complete the in-flight transfer before withdrawing"
+        );
         Ok(())
     }
 }
