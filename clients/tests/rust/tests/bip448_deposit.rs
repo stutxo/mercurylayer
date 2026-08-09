@@ -2281,7 +2281,6 @@ async fn assert_server_persistence_excludes_locktime(
             &[
                 "bip448_signature_data",
                 "signing_nonce_leases",
-                "statechain_signing_protocol",
             ][..],
         ),
         (

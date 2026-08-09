@@ -1368,6 +1368,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_bip448_client_schema_has_exact_application_tables() -> Result<()> {
+        let pool = migrated_pool().await?;
+        let tables = sqlx::query_scalar::<_, String>(
+            "SELECT name FROM sqlite_schema \
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+               AND name <> '_sqlx_migrations' \
+             ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(
+            tables,
+            vec![
+                "bip448_package_attempts",
+                "bip448_pending_deposit_signings",
+                "bip448_pending_transfer_signings",
+                "bip448_scan_cursors",
+                "bip448_scanned_outpoints",
+                "bip448_state_history",
+                "bip448_statechains",
+                "bip448_transfer_messages",
+                "wallet",
+            ]
+        );
+
+        let pending_deposit_columns: Vec<(
+            i64,
+            String,
+            String,
+            i64,
+            Option<String>,
+            i64,
+        )> = sqlx::query_as("PRAGMA table_info('bip448_pending_deposit_signings')")
+            .fetch_all(&pool)
+            .await?;
+        assert_eq!(
+            pending_deposit_columns,
+            vec![
+                (0, "wallet_name".into(), "TEXT".into(), 1, None, 1),
+                (1, "statechain_id".into(), "TEXT".into(), 1, None, 2),
+                (2, "update_template_hash".into(), "TEXT".into(), 1, None, 0),
+                (3, "signing_id".into(), "TEXT".into(), 1, None, 0),
+                (4, "client_secret_nonce".into(), "TEXT".into(), 1, None, 0),
+                (5, "client_public_nonce".into(), "TEXT".into(), 1, None, 0),
+                (6, "blinding_factor".into(), "TEXT".into(), 1, None, 0),
+                (7, "server_public_nonce".into(), "TEXT".into(), 0, None, 0),
+                (8, "state_locktime".into(), "INTEGER".into(), 0, None, 0),
+                (9, "funding_txid".into(), "TEXT".into(), 0, None, 0),
+                (10, "funding_vout".into(), "INTEGER".into(), 0, None, 0),
+                (11, "funding_value_sats".into(), "INTEGER".into(), 0, None, 0),
+                (12, "settlement_template_hash".into(), "TEXT".into(), 0, None, 0),
+                (13, "created_at".into(), "TEXT".into(), 1, Some("CURRENT_TIMESTAMP".into()), 0),
+                (14, "updated_at".into(), "TEXT".into(), 1, Some("CURRENT_TIMESTAMP".into()), 0),
+            ]
+        );
+
+        let backup_txs_exists = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema \
+             WHERE type = 'table' AND name = 'backup_txs')",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(backup_txs_exists, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn bip448_sender_fails_before_signing_when_history_is_incomplete() -> Result<()> {
         let config = sender_test_config(migrated_pool().await?)?;
         let mut wallet = sample_wallet();

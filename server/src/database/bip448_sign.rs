@@ -116,16 +116,14 @@ pub async fn update_bip448_signature_data_server_pubnonce_if_lease_matches(
               SELECT 1 \
               FROM signing_nonce_leases AS lease \
               WHERE lease.statechain_id = signature.statechain_id \
-                AND lease.protocol = $4 \
                 AND lease.signing_id = signature.signing_id \
-                AND lease.lease_token = $5\
+                AND lease.lease_token = $4\
           )";
 
     let result = sqlx::query(query)
         .bind(server_pubnonce)
         .bind(statechain_id)
         .bind(signing_id)
-        .bind(crate::database::signing_nonce::BIP448_SIGNING_PROTOCOL)
         .bind(lease_token)
         .execute(pool)
         .await
