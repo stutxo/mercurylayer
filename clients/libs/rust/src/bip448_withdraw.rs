@@ -7,10 +7,10 @@ use mercurylib::{
     bip448_statechain::{
         deposit::is_bip448_coin,
         signing_api::{Bip448PartialSignatureRequestPayload, Bip448SignFirstRequestPayload},
-    },
-    transaction::{
-        create_and_commit_nonces, create_signature, get_bip448_withdrawal_partial_sig_request,
-        new_backup_transaction,
+        withdraw::{
+            aggregate_bip448_keypath_signature, build_bip448_withdrawal_signing_data,
+            create_bip448_keypath_nonces, finalize_bip448_keypath_transaction,
+        },
     },
     wallet::{Activity, CoinStatus},
 };
@@ -91,7 +91,7 @@ pub async fn execute(
             .fee_rate_sats_per_byte
             .min(client_config.max_fee_rate),
     );
-    let nonce = create_and_commit_nonces(coin)?;
+    let nonce = create_bip448_keypath_nonces(coin)?;
     coin.secret_nonce = Some(nonce.secret_nonce);
     coin.public_nonce = Some(nonce.public_nonce);
     coin.blinding_factor = Some(nonce.blinding_factor);
@@ -115,7 +115,7 @@ pub async fn execute(
         txid: Txid::from_str(&record.funding_outpoint.txid)?,
         vout: record.funding_outpoint.vout,
     };
-    let msg1 = get_bip448_withdrawal_partial_sig_request(
+    let msg1 = build_bip448_withdrawal_signing_data(
         coin,
         funding_outpoint,
         record.funding_outpoint.value_sats,
@@ -139,14 +139,15 @@ pub async fn execute(
     .await?;
     // This signature permanently commits the coin to exit: it advances the shared count,
     // making every later transfer ineligible. Retries re-sign; there is no count compensation.
-    let signature = create_signature(
+    let signature = aggregate_bip448_keypath_signature(
         msg1.msg,
         msg1.client_partial_sig,
         hex::encode(server_partial.serialize()),
         msg1.encoded_session,
         msg1.output_pubkey,
     )?;
-    let signed_tx = new_backup_transaction(msg1.encoded_unsigned_tx, signature)?;
+    let signed_tx =
+        finalize_bip448_keypath_transaction(msg1.encoded_unsigned_tx, signature)?;
     #[cfg(feature = "test-hooks")]
     if std::env::var("ML_BIP448_WITHDRAW_STOP_AFTER_SIGNATURE").as_deref() == Ok("1") {
         return Err(anyhow!("BIP448 withdraw stopped after signature for test"));
