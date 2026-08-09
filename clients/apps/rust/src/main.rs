@@ -21,12 +21,6 @@ enum Commands {
     },
     /// Get new token.
     NewToken {},
-    /// Get new deposit address. Used to fund a new statecoin.
-    NewDepositAddress {
-        wallet_name: String,
-        token_id: String,
-        amount: u32,
-    },
     /// Get a BIP448 deposit address. Used to fund a prototype BIP448 statecoin.
     NewBip448DepositAddress {
         wallet_name: String,
@@ -35,14 +29,6 @@ enum Commands {
     },
     /// Print the wallet-derived BIP448 recovery fee address
     Bip448RecoveryFeeAddress { wallet_name: String },
-    /// Broadcast the backup transaction to the network
-    BroadcastBackupTransaction {
-        wallet_name: String,
-        statechain_id: String,
-        to_address: Option<String>,
-        /// Transaction fee rate in sats per byte
-        fee_rate: Option<f64>,
-    },
     /// Submit a BIP448 recovery parent and anchor CPFP child via Bitcoin Core submitpackage
     BroadcastBip448RecoveryPackage {
         wallet_name: String,
@@ -65,17 +51,8 @@ enum Commands {
         #[arg(long)]
         fee_rate: Option<f64>,
     },
-    /// Broadcast the backup transaction to the network
+    /// List wallet statecoins
     ListStatecoins { wallet_name: String },
-    /// Withdraw funds from a statechain coin to a bitcoin address
-    Withdraw {
-        wallet_name: String,
-        statechain_id: String,
-        to_address: String,
-        /// Transaction fee rate in sats per byte
-        fee_rate: Option<f64>,
-        duplicated_index: Option<u32>,
-    },
     /// Withdraw a BIP448 statechain coin cooperatively to a bitcoin address
     Bip448Withdraw {
         wallet_name: String,
@@ -90,17 +67,6 @@ enum Commands {
         /// Generate batch id for atomic transfers
         #[arg(short = 'b', long)]
         generate_batch_id: bool,
-    },
-    /// Send a statechain coin to a transfer address
-    TransferSend {
-        wallet_name: String,
-        statechain_id: String,
-        to_address: String,
-        // Force send (required when the coin is duplicated)
-        force_send: Option<bool>,
-        /// Batch id for atomic transfers
-        batch_id: Option<String>,
-        duplicated_indexes: Option<Vec<u32>>,
     },
     /// Send a BIP448 statechain coin to a transfer address
     Bip448TransferSend {
@@ -154,23 +120,6 @@ async fn main() -> Result<()> {
 
             println!("{}", serde_json::to_string_pretty(&obj).unwrap());
         }
-        Commands::NewDepositAddress {
-            wallet_name,
-            token_id,
-            amount,
-        } => {
-            let address = mercuryrustlib::deposit::get_deposit_bitcoin_address(
-                &client_config,
-                &wallet_name,
-                &token_id,
-                amount,
-            )
-            .await?;
-
-            let obj = json!({"address": address});
-
-            println!("{}", serde_json::to_string_pretty(&obj).unwrap());
-        }
         Commands::NewBip448DepositAddress {
             wallet_name,
             token_id,
@@ -194,22 +143,6 @@ async fn main() -> Result<()> {
                     .await?;
             let obj = json!({"address": wallet.bip448_recovery_fee_key()?.address});
             println!("{}", serde_json::to_string_pretty(&obj).unwrap());
-        }
-        Commands::BroadcastBackupTransaction {
-            wallet_name,
-            statechain_id,
-            to_address,
-            fee_rate,
-        } => {
-            mercuryrustlib::coin_status::update_coins(&client_config, &wallet_name).await?;
-            mercuryrustlib::broadcast_backup_tx::execute(
-                &client_config,
-                &wallet_name,
-                &statechain_id,
-                to_address,
-                fee_rate,
-            )
-            .await?;
         }
         Commands::BroadcastBip448RecoveryPackage {
             wallet_name,
@@ -289,24 +222,6 @@ async fn main() -> Result<()> {
             let coins_json_string = serde_json::to_string_pretty(&coins_json).unwrap();
             println!("{}", coins_json_string);
         }
-        Commands::Withdraw {
-            wallet_name,
-            statechain_id,
-            to_address,
-            fee_rate,
-            duplicated_index,
-        } => {
-            mercuryrustlib::coin_status::update_coins(&client_config, &wallet_name).await?;
-            mercuryrustlib::withdraw::execute(
-                &client_config,
-                &wallet_name,
-                &statechain_id,
-                &to_address,
-                fee_rate,
-                duplicated_index,
-            )
-            .await?;
-        }
         Commands::Bip448Withdraw {
             wallet_name,
             statechain_id,
@@ -341,33 +256,6 @@ async fn main() -> Result<()> {
 
                 obj["batch_id"] = json!(batch_id);
             }
-
-            println!("{}", serde_json::to_string_pretty(&obj).unwrap());
-        }
-        Commands::TransferSend {
-            wallet_name,
-            statechain_id,
-            to_address,
-            force_send,
-            batch_id,
-            duplicated_indexes,
-        } => {
-            mercuryrustlib::coin_status::update_coins(&client_config, &wallet_name).await?;
-
-            let force_send = force_send.unwrap_or(false);
-
-            mercuryrustlib::transfer_sender::execute(
-                &client_config,
-                &to_address,
-                &wallet_name,
-                &statechain_id,
-                duplicated_indexes,
-                force_send,
-                batch_id,
-            )
-            .await?;
-
-            let obj = json!({"Transfer": "sent"});
 
             println!("{}", serde_json::to_string_pretty(&obj).unwrap());
         }
@@ -498,5 +386,74 @@ mod tests {
             &format!("{}:0:20000", "11".repeat(32)),
         ]))
         .is_err());
+    }
+
+    #[test]
+    fn legacy_commands_are_rejected_and_bip448_commands_remain_valid() {
+        for invocation in [
+            vec![
+                "client-rust",
+                "new-deposit-address",
+                "wallet",
+                "token",
+                "1000",
+            ],
+            vec![
+                "client-rust",
+                "broadcast-backup-transaction",
+                "wallet",
+                "statechain",
+            ],
+            vec![
+                "client-rust",
+                "withdraw",
+                "wallet",
+                "statechain",
+                "bcrt1qdestination",
+            ],
+            vec![
+                "client-rust",
+                "transfer-send",
+                "wallet",
+                "statechain",
+                "transfer-address",
+            ],
+        ] {
+            let error = Cli::try_parse_from(invocation.clone())
+                .err()
+                .unwrap_or_else(|| panic!("removed command parsed successfully: {invocation:?}"));
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::InvalidSubcommand,
+                "unexpected parse error for removed command {invocation:?}: {error}"
+            );
+        }
+
+        for invocation in [
+            vec![
+                "client-rust",
+                "new-bip448-deposit-address",
+                "wallet",
+                "token",
+                "1000",
+            ],
+            vec![
+                "client-rust",
+                "bip448-withdraw",
+                "wallet",
+                "statechain",
+                "bcrt1qdestination",
+            ],
+            vec![
+                "client-rust",
+                "bip448-transfer-send",
+                "wallet",
+                "statechain",
+                "transfer-address",
+            ],
+            vec!["client-rust", "transfer-receive", "wallet"],
+        ] {
+            assert!(Cli::try_parse_from(invocation).is_ok());
+        }
     }
 }
