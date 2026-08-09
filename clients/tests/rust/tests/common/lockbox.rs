@@ -1,14 +1,21 @@
 use std::{path::PathBuf, process::Command, str::FromStr, time::Duration};
 
 use anyhow::{anyhow, Context, Result};
-use bitcoin::Transaction;
+use bitcoin::{hashes::Hash, sighash::TemplateHash};
 use mercurylib::{
-    deposit::{self, DepositMsg1Response},
-    transaction::{self, PartialSignatureMsg1},
+    bip448_statechain::{
+        signing::{CsfsSigningParticipant, CsfsSigningRole, CsfsSigningSession},
+        signing_api::{
+            Bip448LockboxPartialSignatureRequestPayload, Bip448LockboxSignFirstRequestPayload,
+        },
+    },
     wallet::{Settings, Wallet},
 };
 use reqwest::{Client, Response, StatusCode};
-use secp256k1::{PublicKey, Secp256k1, SecretKey};
+use secp256k1::{
+    musig::{new_musig_nonce_pair, BlindingFactor, MusigSessionId, PartialSignature, PublicNonce},
+    rand, Message, PublicKey, Secp256k1, SecretKey,
+};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -36,6 +43,29 @@ pub struct PartialSignatureResponse {
 #[derive(Debug, Deserialize)]
 pub struct SignatureCountResponse {
     pub sig_count: u32,
+}
+
+pub struct Bip448PartialSignatureFixture {
+    pub payload: Bip448LockboxPartialSignatureRequestPayload,
+    session: CsfsSigningSession,
+    server_public_nonce: PublicNonce,
+    server_public_key: PublicKey,
+}
+
+impl Bip448PartialSignatureFixture {
+    pub fn verify_server_partial_signature(&self, partial_sig: &str) -> Result<()> {
+        let secp = Secp256k1::new();
+        let partial_sig = PartialSignature::from_slice(&hex::decode(partial_sig)?)?;
+        self.session.verify_partial(
+            &secp,
+            CsfsSigningParticipant::Server,
+            &partial_sig,
+            &self.server_public_nonce,
+            &self.server_public_key,
+        )?;
+
+        Ok(())
+    }
 }
 
 pub fn http_client() -> Client {
@@ -118,34 +148,14 @@ pub async fn create_statechain(
     Ok(result)
 }
 
-pub async fn get_public_nonce(
-    client: &Client,
-    statechain_id: &str,
-) -> Result<ServerPubnonceResponse> {
-    let response = post_json(
-        client,
-        "get_public_nonce",
-        json!({ "statechain_id": statechain_id }),
-    )
-    .await?;
-
-    let mut result: ServerPubnonceResponse = ensure_success(response, "get_public_nonce").await?;
-    result.server_pubnonce = normalize_hex(&result.server_pubnonce);
-    Ok(result)
-}
-
 pub async fn bip448_get_public_nonce(
     client: &Client,
-    statechain_id: &str,
-    signing_id: &str,
+    payload: &Bip448LockboxSignFirstRequestPayload,
 ) -> Result<ServerPubnonceResponse> {
     let response = post_json(
         client,
         "bip448/get_public_nonce",
-        json!({
-            "statechain_id": statechain_id,
-            "signing_id": signing_id,
-        }),
+        serde_json::to_value(payload)?,
     )
     .await?;
 
@@ -290,38 +300,14 @@ pub async fn keyupdate(
     Ok(result)
 }
 
-pub async fn request_partial_signature(
-    client: &Client,
-    payload: &transaction::PartialSignatureRequestPayload,
-) -> Result<String> {
-    let response = post_json(
-        client,
-        "get_partial_signature",
-        serde_json::to_value(payload)?,
-    )
-    .await?;
-    let mut result: PartialSignatureResponse =
-        ensure_success(response, "get_partial_signature").await?;
-    result.partial_sig = normalize_hex(&result.partial_sig);
-
-    Ok(result.partial_sig)
-}
-
 pub async fn bip448_request_partial_signature(
     client: &Client,
-    signing_id: &str,
-    payload: &transaction::PartialSignatureRequestPayload,
+    payload: &Bip448LockboxPartialSignatureRequestPayload,
 ) -> Result<String> {
     let response = post_json(
         client,
         "bip448/get_partial_signature",
-        json!({
-            "statechain_id": payload.statechain_id,
-            "signing_id": signing_id,
-            "negate_seckey": payload.negate_seckey,
-            "session": payload.session,
-            "server_pub_nonce": payload.server_pub_nonce,
-        }),
+        serde_json::to_value(payload)?,
     )
     .await?;
     let mut result: PartialSignatureResponse =
@@ -331,6 +317,25 @@ pub async fn bip448_request_partial_signature(
     Ok(result.partial_sig)
 }
 
+pub async fn complete_bip448_signing_roundtrip(
+    client: &Client,
+    statechain_id: &str,
+    signing_id: &str,
+    server_pubkey: &str,
+    server_pubnonce: &str,
+) -> Result<String> {
+    let fixture = build_bip448_partial_signature_fixture(
+        statechain_id,
+        signing_id,
+        server_pubkey,
+        server_pubnonce,
+    )?;
+    let partial_sig = bip448_request_partial_signature(client, &fixture.payload).await?;
+    fixture.verify_server_partial_signature(&partial_sig)?;
+
+    Ok(partial_sig)
+}
+
 pub async fn get_signature_count(client: &Client, statechain_id: &str) -> Result<u32> {
     let response = get(client, &format!("signature_count/{}", statechain_id)).await?;
     let result: SignatureCountResponse = ensure_success(response, "signature_count").await?;
@@ -338,75 +343,55 @@ pub async fn get_signature_count(client: &Client, statechain_id: &str) -> Result
     Ok(result.sig_count)
 }
 
-pub async fn complete_signing_roundtrip(
-    client: &Client,
+pub fn build_bip448_partial_signature_fixture(
     statechain_id: &str,
+    signing_id: &str,
     server_pubkey: &str,
     server_pubnonce: &str,
-) -> Result<Transaction> {
-    let msg1 = build_partial_signature_fixture(statechain_id, server_pubkey, server_pubnonce)?;
-    let server_partial_signature =
-        request_partial_signature(client, &msg1.partial_signature_request_payload).await?;
-
-    let aggregated_signature = transaction::create_signature(
-        msg1.msg,
-        msg1.client_partial_sig,
-        server_partial_signature,
-        msg1.encoded_session,
-        msg1.output_pubkey,
+) -> Result<Bip448PartialSignatureFixture> {
+    let secp = Secp256k1::new();
+    let client_secret_key = SecretKey::from_secret_bytes([0x21u8; 32])?;
+    let client_public_key = client_secret_key.public_key(&secp);
+    let server_public_key = PublicKey::from_str(&normalize_hex(server_pubkey))?;
+    let aggregate_public_key = client_public_key.combine(&server_public_key)?;
+    let template_hash = TemplateHash::from_slice(&[0x51u8; 32])?;
+    let signing_message: Message = template_hash.into();
+    let mut rng = rand::rng();
+    let (_client_secret_nonce, client_public_nonce) = new_musig_nonce_pair(
+        &secp,
+        MusigSessionId::new(&mut rng),
+        None,
+        Some(client_secret_key),
+        client_public_key,
+        Some(signing_message),
+        None,
     )?;
-    let signed_tx_hex =
-        transaction::new_backup_transaction(msg1.encoded_unsigned_tx, aggregated_signature)?;
-    let signed_tx = bitcoin::consensus::deserialize(&hex::decode(&signed_tx_hex)?)
-        .context("failed to decode signed tx")?;
+    let server_public_nonce = PublicNonce::from_slice(&hex::decode(server_pubnonce)?)?;
+    let blinding_factor = BlindingFactor::from_slice(&[0x22u8; 32])?;
+    let session = CsfsSigningSession::new(
+        &secp,
+        CsfsSigningRole::FundingUpdate,
+        aggregate_public_key,
+        &client_public_nonce,
+        &server_public_nonce,
+        template_hash,
+        &blinding_factor,
+    )?;
+    let serialized_session = session.blinded_server_session().serialize();
+    assert_eq!(serialized_session.len(), 133);
 
-    Ok(signed_tx)
-}
-
-pub fn build_partial_signature_fixture(
-    statechain_id: &str,
-    server_pubkey: &str,
-    server_pubnonce: &str,
-) -> Result<PartialSignatureMsg1> {
-    let wallet = sample_wallet();
-    let mut coin = wallet.get_new_coin()?;
-
-    let deposit_init = deposit::handle_deposit_msg_1_response(
-        &coin,
-        &DepositMsg1Response {
-            server_pubkey: normalize_hex(server_pubkey),
+    Ok(Bip448PartialSignatureFixture {
+        payload: Bip448LockboxPartialSignatureRequestPayload {
             statechain_id: statechain_id.to_string(),
+            signing_id: signing_id.to_string(),
+            negate_seckey: u8::from(session.negate_seckey()),
+            session: hex::encode(serialized_session),
+            server_pub_nonce: normalize_hex(server_pubnonce),
         },
-    )?;
-
-    coin.server_pubkey = Some(deposit_init.server_pubkey);
-    coin.statechain_id = Some(deposit_init.statechain_id);
-    coin.signed_statechain_id = Some(deposit_init.signed_statechain_id);
-
-    let aggregated = deposit::create_aggregated_address(&coin, wallet.network.clone())?;
-    coin.aggregated_pubkey = Some(aggregated.aggregate_pubkey);
-    coin.aggregated_address = Some(aggregated.aggregate_address);
-    coin.utxo_txid = Some(hex::encode([0x11u8; 32]));
-    coin.utxo_vout = Some(0);
-    coin.amount = Some(100_000);
-
-    let nonce = transaction::create_and_commit_nonces(&coin)?;
-    coin.secret_nonce = Some(nonce.secret_nonce);
-    coin.public_nonce = Some(nonce.public_nonce);
-    coin.blinding_factor = Some(nonce.blinding_factor);
-    coin.server_public_nonce = Some(normalize_hex(server_pubnonce));
-
-    Ok(transaction::get_partial_sig_request(
-        &coin,
-        1_500,
-        wallet.initlock,
-        wallet.interval,
-        1.5,
-        0,
-        coin.backup_address.clone(),
-        wallet.network,
-        false,
-    )?)
+        session,
+        server_public_nonce,
+        server_public_key,
+    })
 }
 
 pub fn expected_keyupdate_server_pubkey(

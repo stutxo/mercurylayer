@@ -22,8 +22,6 @@ namespace db_manager {
                 "id SERIAL PRIMARY KEY, "
                 "statechain_id varchar(50), "
                 "sealed_keypair BYTEA, "
-                "sealed_secnonce BYTEA, "
-                "public_nonce BYTEA, "
                 "public_key BYTEA UNIQUE, "
                 "sig_count INTEGER DEFAULT 0);"
             );
@@ -230,11 +228,9 @@ namespace db_manager {
         return true;
     }
 
-    bool load_generated_key_data(
+    bool load_generated_keypair(
         const std::string& statechain_id, 
         std::unique_ptr<utils::chacha20_poly1305_encrypted_data>& encrypted_keypair,
-        std::unique_ptr<utils::chacha20_poly1305_encrypted_data>& encrypted_secnonce,
-        unsigned char* public_nonce, const size_t public_nonce_size, 
         std::string& error_message)
     {
         auto database_connection_string = getDatabaseConnectionString();
@@ -245,18 +241,16 @@ namespace db_manager {
             if (conn.is_open()) {
 
                 std::string sealed_keypair_query =
-                    "SELECT sealed_keypair, sealed_secnonce, public_nonce FROM generated_public_key WHERE statechain_id = $1;";
+                    "SELECT sealed_keypair FROM generated_public_key WHERE statechain_id = $1;";
 
                 pqxx::nontransaction ntxn(conn);
 
-                conn.prepare("load_generated_key_data_query", sealed_keypair_query);
+                conn.prepare("load_generated_keypair_query", sealed_keypair_query);
 
-                pqxx::result result = ntxn.exec_prepared("load_generated_key_data_query", statechain_id);
+                pqxx::result result = ntxn.exec_prepared("load_generated_keypair_query", statechain_id);
 
                 if (!result.empty()) {
                     auto sealed_keypair_field = result[0]["sealed_keypair"];
-                    auto sealed_secnonce_field = result[0]["sealed_secnonce"];
-                    auto public_nonce_field = result[0]["public_nonce"];
 
                     if (sealed_keypair_field.is_null()) {
                         encrypted_keypair.reset();
@@ -271,86 +265,11 @@ namespace db_manager {
                             return false;
                         }
                     }
-
-                    if (sealed_secnonce_field.is_null()) {
-                        encrypted_secnonce.reset();
-                    } else if (encrypted_secnonce != nullptr) {
-                        auto sealed_secnonce_view = sealed_secnonce_field.as<std::basic_string<std::byte>>();
-
-                        std::vector<unsigned char> sealed_secnonce(sealed_secnonce_view.size());
-                        memcpy(sealed_secnonce.data(), sealed_secnonce_view.data(), sealed_secnonce_view.size());
-
-                        if (!deserialize(sealed_secnonce.data(), encrypted_secnonce.get())) {
-                            error_message = "Failed to deserialize keypair!";
-                            return false;
-                        }
-                    } 
-
-                    if (!public_nonce_field.is_null() && public_nonce != nullptr) {
-                        auto public_nonce_view = public_nonce_field.as<std::basic_string<std::byte>>();
-
-                        if (public_nonce_view.size() != public_nonce_size) {
-                            error_message = "Failed to retrieve public nonce. Different size than expected !";
-                            return false;
-                        }
-
-                        memcpy(public_nonce, public_nonce_view.data(), public_nonce_size);
-                    }
                 }
                 else {
                     error_message = "Failed to retrieve keypair. No data found !";
                     return false;
                 }
-
-                conn.close();
-                return true;
-            } else {
-                error_message = "Failed to connect to the database!";
-                return false;
-            }
-        }
-        catch (std::exception const &e)
-        {
-            error_message = e.what();
-            return false;
-        }
-    }
-
-    bool update_sealed_secnonce(
-        const std::string& statechain_id, 
-        unsigned char* serialized_server_pubnonce, const size_t serialized_server_pubnonce_size, 
-        const utils::chacha20_poly1305_encrypted_data& encrypted_secnonce, 
-        std::string& error_message) 
-    {
-        auto database_connection_string = getDatabaseConnectionString();
-
-        try
-        {
-            pqxx::connection conn(database_connection_string);
-            if (conn.is_open()) {
-
-                size_t serialized_len = 0;
-
-                size_t bufferSize = sizeof(encrypted_secnonce.data_len) + sizeof(encrypted_secnonce.nonce) + sizeof(encrypted_secnonce.mac) + encrypted_secnonce.data_len;
-                unsigned char* buffer = (unsigned char*) malloc(bufferSize);
-
-                if (!buffer) {
-                    error_message = "Failed to allocate memory for serialization!";
-                    return false;
-                }
-
-                serialize(&encrypted_secnonce, buffer, &serialized_len);
-                assert(serialized_len == bufferSize);
-
-                std::basic_string_view<std::byte> sealed_secnonce_view(reinterpret_cast<std::byte*>(buffer), bufferSize);
-                std::basic_string_view<std::byte> serialized_server_pubnonce_view(reinterpret_cast<std::byte*>(serialized_server_pubnonce), serialized_server_pubnonce_size);
-
-                std::string updated_query =
-                    "UPDATE generated_public_key SET public_nonce = $1, sealed_secnonce = $2 WHERE statechain_id = $3";
-                pqxx::work txn(conn);
-
-                txn.exec_params(updated_query, serialized_server_pubnonce_view, sealed_secnonce_view, statechain_id);
-                txn.commit();
 
                 conn.close();
                 return true;
@@ -700,7 +619,7 @@ namespace db_manager {
 
                 std::string insert_query =
                     "UPDATE generated_public_key "
-                    "SET sealed_keypair = $1, public_key = $2, sealed_secnonce = NULL, public_nonce = NULL "
+                    "SET sealed_keypair = $1, public_key = $2 "
                     "WHERE statechain_id = $3;";
                 pqxx::work txn2(conn);
 

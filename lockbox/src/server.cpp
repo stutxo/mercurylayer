@@ -105,51 +105,6 @@ namespace lockbox {
         return crow::response{result};
     }
 
-    crow::response generate_public_nonce(const std::string& statechain_id,  unsigned char *seed) {
-
-        auto encrypted_keypair = std::make_unique<utils::chacha20_poly1305_encrypted_data>();
-
-        // the secret nonce is not defined yet
-        auto encrypted_secnonce = std::make_unique<utils::chacha20_poly1305_encrypted_data>();
-        encrypted_secnonce.reset();
-
-        std::string error_message;
-        bool data_loaded = db_manager::load_generated_key_data(
-            statechain_id,
-            encrypted_keypair,
-            encrypted_secnonce,
-            nullptr,
-            0,
-            error_message
-        );
-
-        assert(encrypted_secnonce == nullptr);
-
-        if (!data_loaded) {
-            error_message = "Failed to load aggregated key data: " + error_message;
-            return crow::response(500, error_message);
-        }
-
-        auto response = enclave::generate_nonce(seed, encrypted_keypair.get());
-
-        bool data_saved = db_manager::update_sealed_secnonce(
-            statechain_id,
-            response.server_pubnonce, sizeof(response.server_pubnonce),
-            response.encrypted_secnonce,
-            error_message
-        );
-
-        if (!data_saved) {
-            error_message = "Failed to save sealed secret nonce: " + error_message;
-            return crow::response(500, error_message);
-        }
-
-        auto serialized_server_pubnonce_hex = utils::key_to_string(response.server_pubnonce, sizeof(response.server_pubnonce));
-
-        crow::json::wvalue result({{"server_pubnonce", serialized_server_pubnonce_hex}});
-        return crow::response{result};
-    }
-
     crow::response generate_bip448_public_nonce(
         const std::string& statechain_id,
         const std::string& signing_id,
@@ -172,15 +127,9 @@ namespace lockbox {
         }
 
         auto encrypted_keypair = std::make_unique<utils::chacha20_poly1305_encrypted_data>();
-        auto encrypted_secnonce = std::make_unique<utils::chacha20_poly1305_encrypted_data>();
-        encrypted_secnonce.reset();
-
-        bool data_loaded = db_manager::load_generated_key_data(
+        bool data_loaded = db_manager::load_generated_keypair(
             statechain_id,
             encrypted_keypair,
-            encrypted_secnonce,
-            nullptr,
-            0,
             error_message
         );
 
@@ -321,15 +270,9 @@ namespace lockbox {
             }
 
             auto encrypted_keypair = std::make_unique<utils::chacha20_poly1305_encrypted_data>();
-            auto unused_secnonce = std::make_unique<utils::chacha20_poly1305_encrypted_data>();
-            unused_secnonce.reset();
-
-            bool data_loaded = db_manager::load_generated_key_data(
+            bool data_loaded = db_manager::load_generated_keypair(
                 statechain_id,
                 encrypted_keypair,
-                unused_secnonce,
-                nullptr,
-                0,
                 error_message
             );
 
@@ -389,59 +332,6 @@ namespace lockbox {
             return crow::response(500, "BIP448 partial signature was not saved or replayable");
     }
 
-    crow::response generate_partial_signature(
-        const std::string& statechain_id, 
-        int64_t negate_seckey, 
-        std::vector<unsigned char>& serialized_session,
-        unsigned char *seed) {
-
-            auto encrypted_keypair = std::make_unique<utils::chacha20_poly1305_encrypted_data>();
-            auto encrypted_secnonce = std::make_unique<utils::chacha20_poly1305_encrypted_data>();
-
-            unsigned char serialized_server_pubnonce[66];
-            memset(serialized_server_pubnonce, 0, sizeof(serialized_server_pubnonce));
-
-            std::string error_message;
-            bool data_loaded = db_manager::load_generated_key_data(
-                statechain_id,
-                encrypted_keypair,
-                encrypted_secnonce,
-                serialized_server_pubnonce,
-                sizeof(serialized_server_pubnonce),
-                error_message
-            );
-
-            if (!data_loaded) {
-                error_message = "Failed to load aggregated key data: " + error_message;
-                return crow::response(500, error_message);
-            }
-
-            bool is_sealed_keypair_empty = encrypted_keypair == nullptr;
-            bool is_sealed_secnonce_empty = encrypted_secnonce == nullptr;
-
-            if (is_sealed_keypair_empty || is_sealed_secnonce_empty) {
-                return crow::response(400, "Empty sealed keypair or sealed secnonce!");
-            }
-
-            auto response = enclave::partial_signature(
-                seed, 
-                encrypted_keypair.get(),
-                encrypted_secnonce.get(),
-                (int) negate_seckey,
-                serialized_session.data(), serialized_session.size(),
-                serialized_server_pubnonce);
-
-            bool sig_count_updated = db_manager::update_sig_count(statechain_id);
-            if (!sig_count_updated) {
-                return crow::response(500, "Failed to update signature count!");
-            }
-
-            auto partial_sig_hex = utils::key_to_string(response.partial_sig_data, sizeof(response.partial_sig_data));
-
-            crow::json::wvalue result({{"partial_sig", partial_sig_hex}});
-            return crow::response{result};
-    }
-
     crow::response keyupdate(
         const std::string& statechain_id, 
         std::vector<unsigned char>& serialized_t2,
@@ -450,17 +340,10 @@ namespace lockbox {
 
             auto old_encrypted_keypair = std::make_unique<utils::chacha20_poly1305_encrypted_data>();
         
-            // the secret nonce is not used here
-            auto encrypted_secnonce = std::make_unique<utils::chacha20_poly1305_encrypted_data>();
-            encrypted_secnonce.reset();
-
             std::string error_message;
-            bool data_loaded = db_manager::load_generated_key_data(
+            bool data_loaded = db_manager::load_generated_keypair(
                 statechain_id,
                 old_encrypted_keypair,
-                encrypted_secnonce,
-                nullptr,
-                0,
                 error_message
             );
 
@@ -602,22 +485,6 @@ namespace lockbox {
             return generate_new_keypair(statechain_id, seed.data());
         });
 
-        CROW_ROUTE(app, "/get_public_nonce")
-        .methods("POST"_method)([&seed](const crow::request& req) {
-
-            auto req_body = crow::json::load(req.body);
-            if (!req_body)
-                return crow::response(400);
-
-            if (req_body.count("statechain_id") == 0) {
-                return crow::response(400, "Invalid parameters. They must be 'statechain_id'.");
-            }
-
-            std::string statechain_id = req_body["statechain_id"].s();
-
-            return generate_public_nonce(statechain_id, seed.data());
-        });
-
         CROW_ROUTE(app, "/bip448/get_public_nonce")
         .methods("POST"_method)([&seed](const crow::request& req) {
 
@@ -637,38 +504,6 @@ namespace lockbox {
             }
 
             return generate_bip448_public_nonce(statechain_id, signing_id, seed.data());
-        });
-
-        CROW_ROUTE(app, "/get_partial_signature")
-            .methods("POST"_method)([&seed](const crow::request& req) {
-
-                auto req_body = crow::json::load(req.body);
-                if (!req_body)
-                    return crow::response(400);
-
-                if (req_body.count("statechain_id") == 0 || 
-                    req_body.count("negate_seckey") == 0 ||
-                    req_body.count("session") == 0) {
-                    return crow::response(400, "Invalid parameters. They must be 'statechain_id', 'negate_seckey' and 'session'.");
-                }
-
-                std::string statechain_id = req_body["statechain_id"].s();
-                int64_t negate_seckey = req_body["negate_seckey"].i();
-                std::string session_hex = req_body["session"].s();
-
-
-                if (session_hex.substr(0, 2) == "0x") {
-                    session_hex = session_hex.substr(2);
-                }
-
-                std::vector<unsigned char> serialized_session = utils::ParseHex(session_hex);
-
-                if (serialized_session.size() != 133) {
-                    return crow::response(400, "Invalid session length. Must be 133 bytes!");
-                }
-
-                return generate_partial_signature(statechain_id, negate_seckey, serialized_session, seed.data());
-        
         });
 
         CROW_ROUTE(app, "/bip448/get_partial_signature")

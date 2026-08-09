@@ -7,9 +7,11 @@ use bitcoin::{hashes::Hash, sighash::TemplateHash, PrivateKey};
 use mercurylib::{
     bip448_statechain::{
         signing::{CsfsSigningRole, CsfsSigningSession},
-        signing_api::{Bip448PartialSignatureRequestPayload, Bip448SignFirstRequestPayload},
+        signing_api::{
+            Bip448LockboxPartialSignatureRequestPayload, Bip448LockboxSignFirstRequestPayload,
+            Bip448PartialSignatureRequestPayload, Bip448SignFirstRequestPayload,
+        },
     },
-    transaction,
     transfer::receiver::TransferReceiverRequestPayload,
 };
 use reqwest::StatusCode;
@@ -26,7 +28,10 @@ use crate::common::{lockbox, mercury};
 const DETERMINISTIC_RNG_SEED: &str =
     "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 const DETERMINISTIC_STATECHAIN_ID: &str = "deterministic-vector";
+const DETERMINISTIC_SIGNING_ID: &str =
+    "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1";
 const MERCURY_DATABASE_URL: &str = "postgres://postgres:postgres@127.0.0.1:5432/mercury";
+const LOCKBOX_DATABASE_URL: &str = "postgres://postgres:postgres@127.0.0.1:5433/enclave";
 
 #[derive(Debug, PartialEq, Eq)]
 struct DeterministicVector {
@@ -34,6 +39,14 @@ struct DeterministicVector {
     server_pubnonce: String,
     partial_sig: String,
     updated_server_pubkey: String,
+}
+
+#[derive(Debug)]
+struct Bip448SignatureDataRow {
+    server_pubnonce: Option<String>,
+    challenge: Option<String>,
+    negate_seckey: Option<bool>,
+    server_partial_sig: Option<String>,
 }
 
 struct ProductionRngRestoreGuard {
@@ -64,10 +77,6 @@ impl Drop for ProductionRngRestoreGuard {
     }
 }
 
-fn dummy_session_hex() -> String {
-    "00".repeat(133)
-}
-
 fn mutate_bip448_session_challenge(session_hex: &str) -> Result<String> {
     const CHALLENGE_OFFSET: usize = 4 + 1 + 32 + 32;
     let mut session = hex::decode(session_hex)?;
@@ -75,12 +84,12 @@ fn mutate_bip448_session_challenge(session_hex: &str) -> Result<String> {
     Ok(hex::encode(session))
 }
 
-fn deterministic_partial_signature_payload() -> transaction::PartialSignatureRequestPayload {
-    transaction::PartialSignatureRequestPayload {
+fn deterministic_partial_signature_payload() -> Bip448LockboxPartialSignatureRequestPayload {
+    Bip448LockboxPartialSignatureRequestPayload {
         statechain_id: DETERMINISTIC_STATECHAIN_ID.to_string(),
+        signing_id: DETERMINISTIC_SIGNING_ID.to_string(),
         negate_seckey: 0,
         session: "9dede917000000000000000000000000000000000000000000000000000000000000000000b59faf7e0a44057b41d273e70cc0a59194347b286c8108fef3519bb52fe64b0729641b33afc4d71464ccde0ca4b0471ed2fda81a39056745ed7b1f4f90790dfd3ee2e8c6c5937a7f4dd30e9e78ec2096433ff32ea89ffca29a40b02b03b4e7eb".to_string(),
-        signed_statechain_id: "469b4d8151ba9fbc78d178a7bbe30b80539b52df385647539ab3bfb0d1fade376ccb6e6909d298b31615cd38a8435bf3c92692389ffbadf4b33688976d2bb4ea".to_string(),
         server_pub_nonce: "032f7d30ca4641d314418be9e8e11ef28e079ce684f7271bceab6e9f835adea05303b1b76528c43918e991aa847abb7b6df753dc116de95a9d811bc9b35a7f020dfb".to_string(),
     }
 }
@@ -176,7 +185,10 @@ async fn complete_bip448_signing_round(
     Ok((first.server_pubnonce, challenge))
 }
 
-async fn insert_completed_bip448_signature_row(statechain_id: &str) -> Result<()> {
+async fn insert_completed_bip448_signature_row(
+    statechain_id: &str,
+    signing_id: &str,
+) -> Result<()> {
     let pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(MERCURY_DATABASE_URL)
@@ -188,7 +200,7 @@ async fn insert_completed_bip448_signature_row(statechain_id: &str) -> Result<()
          VALUES ($1, $2, $3, $4, false, $5)",
     )
     .bind(statechain_id)
-    .bind(hex::encode([0xb2u8; 32]))
+    .bind(signing_id)
     .bind("mixed-bip448-server-pubnonce")
     .bind("mixed-bip448-challenge")
     .bind("mixed-bip448-partial-signature")
@@ -196,6 +208,32 @@ async fn insert_completed_bip448_signature_row(statechain_id: &str) -> Result<()
     .await?;
 
     Ok(())
+}
+
+async fn load_bip448_signature_data_row(
+    pool: &sqlx::PgPool,
+    statechain_id: &str,
+    signing_id: &str,
+) -> Result<Option<Bip448SignatureDataRow>> {
+    let row: Option<(Option<String>, Option<String>, Option<bool>, Option<String>)> =
+        sqlx::query_as(
+            "SELECT server_pubnonce, challenge, negate_seckey, server_partial_sig \
+         FROM bip448_signature_data \
+         WHERE statechain_id = $1 AND signing_id = $2",
+        )
+        .bind(statechain_id)
+        .bind(signing_id)
+        .fetch_optional(pool)
+        .await?;
+
+    Ok(row.map(
+        |(server_pubnonce, challenge, negate_seckey, server_partial_sig)| Bip448SignatureDataRow {
+            server_pubnonce,
+            challenge,
+            negate_seckey,
+            server_partial_sig,
+        },
+    ))
 }
 
 async fn assert_missing_statechain_error(response: reqwest::Response, context: &str) -> Result<()> {
@@ -233,22 +271,25 @@ async fn get_public_key_requires_statechain_id() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires lockbox docker stack"]
-async fn get_public_nonce_requires_existing_statechain() -> Result<()> {
+async fn bip448_get_public_nonce_requires_existing_statechain() -> Result<()> {
     let _guard = common::test_guard();
     let client = lockbox::http_client();
     lockbox::wait_until_ready(&client).await?;
 
     let response = lockbox::post_json(
         &client,
-        "get_public_nonce",
-        json!({ "statechain_id": lockbox::new_statechain_id("missing-nonce") }),
+        "bip448/get_public_nonce",
+        serde_json::to_value(Bip448LockboxSignFirstRequestPayload {
+            statechain_id: lockbox::new_statechain_id("missing-nonce"),
+            signing_id: hex::encode([0x11u8; 32]),
+        })?,
     )
     .await?;
     let status = response.status();
     let body = response
         .text()
         .await
-        .context("failed to read get_public_nonce body")?;
+        .context("failed to read bip448/get_public_nonce body")?;
 
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert!(body.contains("Failed to load aggregated key data"));
@@ -258,26 +299,28 @@ async fn get_public_nonce_requires_existing_statechain() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires lockbox docker stack"]
-async fn get_partial_signature_validates_session_length() -> Result<()> {
+async fn bip448_get_partial_signature_validates_session_length() -> Result<()> {
     let _guard = common::test_guard();
     let client = lockbox::http_client();
     lockbox::wait_until_ready(&client).await?;
 
     let response = lockbox::post_json(
         &client,
-        "get_partial_signature",
-        json!({
-            "statechain_id": lockbox::new_statechain_id("bad-session"),
-            "negate_seckey": 0,
-            "session": "00",
-        }),
+        "bip448/get_partial_signature",
+        serde_json::to_value(Bip448LockboxPartialSignatureRequestPayload {
+            statechain_id: lockbox::new_statechain_id("bad-session"),
+            signing_id: hex::encode([0x12u8; 32]),
+            negate_seckey: 0,
+            session: "00".to_string(),
+            server_pub_nonce: "00".repeat(66),
+        })?,
     )
     .await?;
     let status = response.status();
     let body = response
         .text()
         .await
-        .context("failed to read get_partial_signature body")?;
+        .context("failed to read bip448/get_partial_signature body")?;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body, "Invalid session length. Must be 133 bytes!");
@@ -287,23 +330,47 @@ async fn get_partial_signature_validates_session_length() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires lockbox docker stack"]
-async fn get_partial_signature_requires_existing_statechain() -> Result<()> {
+async fn bip448_get_partial_signature_requires_existing_nonce_state() -> Result<()> {
     let _guard = common::test_guard();
     let client = lockbox::http_client();
     lockbox::wait_until_ready(&client).await?;
 
-    let response = lockbox::post_json(
+    let statechain_id = lockbox::new_statechain_id("missing-sign");
+    let existing_signing_id = hex::encode([0x13u8; 32]);
+    let missing_signing_id = hex::encode([0x14u8; 32]);
+    let created = lockbox::create_statechain(&client, &statechain_id).await?;
+    let server_pubnonce = lockbox::bip448_get_public_nonce(
         &client,
-        "get_partial_signature",
-        json!({
-            "statechain_id": lockbox::new_statechain_id("missing-sign"),
-            "negate_seckey": 0,
-            "session": dummy_session_hex(),
-        }),
+        &Bip448LockboxSignFirstRequestPayload {
+            statechain_id: statechain_id.clone(),
+            signing_id: existing_signing_id,
+        },
     )
     .await?;
+    let fixture = lockbox::build_bip448_partial_signature_fixture(
+        &statechain_id,
+        &missing_signing_id,
+        &created.server_pubkey,
+        &server_pubnonce.server_pubnonce,
+    )?;
+    let response = lockbox::post_json(
+        &client,
+        "bip448/get_partial_signature",
+        serde_json::to_value(&fixture.payload)?,
+    )
+    .await?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .context("failed to read missing BIP448 nonce-state body")?;
 
-    assert_missing_statechain_error(response, "missing partial signature").await
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body, "BIP448 nonce state not found for signing_id");
+
+    lockbox::delete_statechain(&client, &statechain_id).await?;
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -398,26 +465,33 @@ async fn signature_count_for_missing_statechain_returns_not_found() -> Result<()
 
 #[tokio::test]
 #[ignore = "requires lockbox docker stack"]
-async fn signing_lifecycle_returns_a_valid_partial_signature_and_increments_signature_count(
+async fn bip448_signing_lifecycle_returns_a_valid_partial_signature_and_increments_signature_count(
 ) -> Result<()> {
     let _guard = common::test_guard();
     let client = lockbox::http_client();
     lockbox::wait_until_ready(&client).await?;
 
     let statechain_id = lockbox::new_statechain_id("signing-lifecycle");
+    let signing_id = hex::encode([0x21u8; 32]);
     let created = lockbox::create_statechain(&client, &statechain_id).await?;
-    let server_pubnonce = lockbox::get_public_nonce(&client, &statechain_id).await?;
-    let signed_tx = lockbox::complete_signing_roundtrip(
+    let server_pubnonce = lockbox::bip448_get_public_nonce(
+        &client,
+        &Bip448LockboxSignFirstRequestPayload {
+            statechain_id: statechain_id.clone(),
+            signing_id: signing_id.clone(),
+        },
+    )
+    .await?;
+    let partial_sig = lockbox::complete_bip448_signing_roundtrip(
         &client,
         &statechain_id,
+        &signing_id,
         &created.server_pubkey,
         &server_pubnonce.server_pubnonce,
     )
     .await?;
 
-    assert_eq!(signed_tx.input.len(), 1);
-    assert_eq!(signed_tx.output.len(), 1);
-    assert_eq!(signed_tx.input[0].witness.len(), 1);
+    assert_eq!(hex::decode(&partial_sig)?.len(), 32);
 
     let sig_count = lockbox::get_signature_count(&client, &statechain_id).await?;
     assert_eq!(sig_count, 1);
@@ -437,6 +511,27 @@ async fn keyupdate_returns_the_expected_server_pubkey_and_statechain_remains_usa
 
     let statechain_id = lockbox::new_statechain_id("keyupdate");
     let created = lockbox::create_statechain(&client, &statechain_id).await?;
+    let old_signing_id = hex::encode([0x22u8; 32]);
+    let old_server_pubnonce = lockbox::bip448_get_public_nonce(
+        &client,
+        &Bip448LockboxSignFirstRequestPayload {
+            statechain_id: statechain_id.clone(),
+            signing_id: old_signing_id.clone(),
+        },
+    )
+    .await?;
+    let old_partial_signature_fixture = lockbox::build_bip448_partial_signature_fixture(
+        &statechain_id,
+        &old_signing_id,
+        &created.server_pubkey,
+        &old_server_pubnonce.server_pubnonce,
+    )?;
+    assert_eq!(old_server_pubnonce.server_pubnonce.len(), 132);
+    assert_eq!(
+        lockbox::get_signature_count(&client, &statechain_id).await?,
+        0
+    );
+
     let t2 = [1u8; 32];
     let x1 = [2u8; 32];
     let expected_server_pubkey =
@@ -447,38 +542,51 @@ async fn keyupdate_returns_the_expected_server_pubkey_and_statechain_remains_usa
     assert_ne!(new_key.server_pubkey, created.server_pubkey);
     assert_eq!(new_key.server_pubkey, expected_server_pubkey);
 
-    let new_server_pubnonce = lockbox::get_public_nonce(&client, &statechain_id).await?;
-    assert_eq!(new_server_pubnonce.server_pubnonce.len(), 132);
-
-    lockbox::delete_statechain(&client, &statechain_id).await?;
-
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore = "requires lockbox docker stack"]
-async fn nonce_generated_signing_state_survives_lockbox_restart() -> Result<()> {
-    let _guard = common::test_guard();
-    let client = lockbox::http_client();
-    lockbox::wait_until_ready(&client).await?;
-
-    let statechain_id = lockbox::new_statechain_id("restart-sign");
-    let created = lockbox::create_statechain(&client, &statechain_id).await?;
-    let server_pubnonce = lockbox::get_public_nonce(&client, &statechain_id).await?;
-
-    lockbox::restart_lockbox_service(&client).await?;
-
-    let signed_tx = lockbox::complete_signing_roundtrip(
+    let old_partial_signature_response = lockbox::post_json(
         &client,
-        &statechain_id,
-        &created.server_pubkey,
-        &server_pubnonce.server_pubnonce,
+        "bip448/get_partial_signature",
+        serde_json::to_value(&old_partial_signature_fixture.payload)?,
     )
     .await?;
+    let old_partial_signature_status = old_partial_signature_response.status();
+    let old_partial_signature_body = old_partial_signature_response
+        .text()
+        .await
+        .context("failed to read post-keyupdate old BIP448 nonce-state body")?;
+    assert_eq!(old_partial_signature_status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        old_partial_signature_body,
+        "BIP448 nonce state not found for signing_id"
+    );
+    assert_eq!(
+        lockbox::get_signature_count(&client, &statechain_id).await?,
+        0
+    );
 
-    assert_eq!(signed_tx.input.len(), 1);
-    assert_eq!(signed_tx.output.len(), 1);
-    assert_eq!(signed_tx.input[0].witness.len(), 1);
+    let updated_signing_id = hex::encode([0x23u8; 32]);
+    assert_ne!(updated_signing_id, old_signing_id);
+    let new_server_pubnonce = lockbox::bip448_get_public_nonce(
+        &client,
+        &Bip448LockboxSignFirstRequestPayload {
+            statechain_id: statechain_id.clone(),
+            signing_id: updated_signing_id.clone(),
+        },
+    )
+    .await?;
+    assert_eq!(new_server_pubnonce.server_pubnonce.len(), 132);
+    let updated_partial_signature_fixture = lockbox::build_bip448_partial_signature_fixture(
+        &statechain_id,
+        &updated_signing_id,
+        &expected_server_pubkey,
+        &new_server_pubnonce.server_pubnonce,
+    )?;
+    let partial_sig = lockbox::bip448_request_partial_signature(
+        &client,
+        &updated_partial_signature_fixture.payload,
+    )
+    .await?;
+    updated_partial_signature_fixture.verify_server_partial_signature(&partial_sig)?;
+    assert_eq!(hex::decode(&partial_sig)?.len(), 32);
     assert_eq!(
         lockbox::get_signature_count(&client, &statechain_id).await?,
         1
@@ -500,23 +608,27 @@ async fn bip448_nonce_state_replays_after_restart_and_rejects_conflicting_challe
     let statechain_id = lockbox::new_statechain_id("bip448-lockbox");
     let signing_id = hex::encode([0x55u8; 32]);
     let created = lockbox::create_statechain(&client, &statechain_id).await?;
-    let server_pubnonce =
-        lockbox::bip448_get_public_nonce(&client, &statechain_id, &signing_id).await?;
+    let nonce_payload = Bip448LockboxSignFirstRequestPayload {
+        statechain_id: statechain_id.clone(),
+        signing_id: signing_id.clone(),
+    };
+    let server_pubnonce = lockbox::bip448_get_public_nonce(&client, &nonce_payload).await?;
     let repeated_server_pubnonce =
-        lockbox::bip448_get_public_nonce(&client, &statechain_id, &signing_id).await?;
+        lockbox::bip448_get_public_nonce(&client, &nonce_payload).await?;
     assert_eq!(
         repeated_server_pubnonce.server_pubnonce,
         server_pubnonce.server_pubnonce
     );
 
-    let payload = lockbox::build_partial_signature_fixture(
+    let fixture = lockbox::build_bip448_partial_signature_fixture(
         &statechain_id,
+        &signing_id,
         &created.server_pubkey,
         &server_pubnonce.server_pubnonce,
-    )?
-    .partial_signature_request_payload;
+    )?;
+    let payload = fixture.payload;
 
-    let partial = lockbox::bip448_request_partial_signature(&client, &signing_id, &payload).await?;
+    let partial = lockbox::bip448_request_partial_signature(&client, &payload).await?;
     assert_eq!(partial.len(), 64);
     assert_eq!(
         lockbox::get_signature_count(&client, &statechain_id).await?,
@@ -525,7 +637,7 @@ async fn bip448_nonce_state_replays_after_restart_and_rejects_conflicting_challe
 
     lockbox::restart_lockbox_service(&client).await?;
 
-    let replay = lockbox::bip448_request_partial_signature(&client, &signing_id, &payload).await?;
+    let replay = lockbox::bip448_request_partial_signature(&client, &payload).await?;
     assert_eq!(replay, partial);
     assert_eq!(
         lockbox::get_signature_count(&client, &statechain_id).await?,
@@ -582,18 +694,25 @@ async fn keyupdate_state_survives_lockbox_restart() -> Result<()> {
 
     lockbox::restart_lockbox_service(&client).await?;
 
-    let server_pubnonce = lockbox::get_public_nonce(&client, &statechain_id).await?;
-    let signed_tx = lockbox::complete_signing_roundtrip(
+    let signing_id = hex::encode([0x23u8; 32]);
+    let server_pubnonce = lockbox::bip448_get_public_nonce(
+        &client,
+        &Bip448LockboxSignFirstRequestPayload {
+            statechain_id: statechain_id.clone(),
+            signing_id: signing_id.clone(),
+        },
+    )
+    .await?;
+    let partial_sig = lockbox::complete_bip448_signing_roundtrip(
         &client,
         &statechain_id,
+        &signing_id,
         &updated_key.server_pubkey,
         &server_pubnonce.server_pubnonce,
     )
     .await?;
 
-    assert_eq!(signed_tx.input.len(), 1);
-    assert_eq!(signed_tx.output.len(), 1);
-    assert_eq!(signed_tx.input[0].witness.len(), 1);
+    assert_eq!(hex::decode(&partial_sig)?.len(), 32);
     assert_eq!(
         lockbox::get_signature_count(&client, &statechain_id).await?,
         1
@@ -612,7 +731,19 @@ async fn delete_statechain_is_idempotent_and_deleted_statechain_cannot_be_used()
     lockbox::wait_until_ready(&client).await?;
 
     let statechain_id = lockbox::new_statechain_id("delete-state");
-    let _created = lockbox::create_statechain(&client, &statechain_id).await?;
+    let signing_id = hex::encode([0x24u8; 32]);
+    let created = lockbox::create_statechain(&client, &statechain_id).await?;
+    let nonce_payload = Bip448LockboxSignFirstRequestPayload {
+        statechain_id: statechain_id.clone(),
+        signing_id: signing_id.clone(),
+    };
+    let server_pubnonce = lockbox::bip448_get_public_nonce(&client, &nonce_payload).await?;
+    let partial_signature_fixture = lockbox::build_bip448_partial_signature_fixture(
+        &statechain_id,
+        &signing_id,
+        &created.server_pubkey,
+        &server_pubnonce.server_pubnonce,
+    )?;
 
     let delete_response =
         lockbox::delete(&client, &format!("delete_statechain/{}", statechain_id)).await?;
@@ -638,27 +769,28 @@ async fn delete_statechain_is_idempotent_and_deleted_statechain_cannot_be_used()
 
     let nonce_response = lockbox::post_json(
         &client,
-        "get_public_nonce",
-        json!({ "statechain_id": statechain_id }),
+        "bip448/get_public_nonce",
+        serde_json::to_value(&nonce_payload)?,
     )
     .await?;
-    assert_missing_statechain_error(nonce_response, "post-delete get_public_nonce").await?;
+    assert_missing_statechain_error(nonce_response, "post-delete bip448/get_public_nonce").await?;
 
     let partial_signature_response = lockbox::post_json(
         &client,
-        "get_partial_signature",
-        json!({
-            "statechain_id": statechain_id,
-            "negate_seckey": 0,
-            "session": dummy_session_hex(),
-        }),
+        "bip448/get_partial_signature",
+        serde_json::to_value(&partial_signature_fixture.payload)?,
     )
     .await?;
-    assert_missing_statechain_error(
-        partial_signature_response,
-        "post-delete get_partial_signature",
-    )
-    .await?;
+    let partial_signature_status = partial_signature_response.status();
+    let partial_signature_body = partial_signature_response
+        .text()
+        .await
+        .context("failed to read post-delete bip448/get_partial_signature body")?;
+    assert_eq!(partial_signature_status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        partial_signature_body,
+        "BIP448 nonce state not found for signing_id"
+    );
 
     let keyupdate_response = lockbox::post_json(
         &client,
@@ -698,13 +830,17 @@ async fn deterministic_lockbox_vectors_match_golden_outputs() -> Result<()> {
     lockbox::recreate_lockbox_service_with_rng_seed(&client, Some(DETERMINISTIC_RNG_SEED)).await?;
 
     let first_created = lockbox::create_statechain(&client, statechain_id).await?;
-    let first_server_pubnonce = lockbox::get_public_nonce(&client, statechain_id).await?;
+    let nonce_payload = Bip448LockboxSignFirstRequestPayload {
+        statechain_id: statechain_id.to_string(),
+        signing_id: DETERMINISTIC_SIGNING_ID.to_string(),
+    };
+    let first_server_pubnonce = lockbox::bip448_get_public_nonce(&client, &nonce_payload).await?;
     assert_eq!(
         first_server_pubnonce.server_pubnonce,
         partial_signature_payload.server_pub_nonce
     );
     let first_partial_sig =
-        lockbox::request_partial_signature(&client, &partial_signature_payload).await?;
+        lockbox::bip448_request_partial_signature(&client, &partial_signature_payload).await?;
     let first_updated_server_pubkey =
         lockbox::keyupdate(&client, statechain_id, [9u8; 32], [10u8; 32])
             .await?
@@ -721,13 +857,13 @@ async fn deterministic_lockbox_vectors_match_golden_outputs() -> Result<()> {
     lockbox::recreate_lockbox_service_with_rng_seed(&client, Some(DETERMINISTIC_RNG_SEED)).await?;
 
     let second_created = lockbox::create_statechain(&client, statechain_id).await?;
-    let second_server_pubnonce = lockbox::get_public_nonce(&client, statechain_id).await?;
+    let second_server_pubnonce = lockbox::bip448_get_public_nonce(&client, &nonce_payload).await?;
     assert_eq!(
         second_server_pubnonce.server_pubnonce,
         partial_signature_payload.server_pub_nonce
     );
     let second_partial_sig =
-        lockbox::request_partial_signature(&client, &partial_signature_payload).await?;
+        lockbox::bip448_request_partial_signature(&client, &partial_signature_payload).await?;
     let second_updated_server_pubkey =
         lockbox::keyupdate(&client, statechain_id, [9u8; 32], [10u8; 32])
             .await?
@@ -780,11 +916,20 @@ async fn parallel_statechains_can_sign_independently() -> Result<()> {
     for statechain_id in statechain_ids {
         join_set.spawn(async move {
             let client = lockbox::http_client();
+            let signing_id = hex::encode([0x61u8; 32]);
             let created = lockbox::create_statechain(&client, &statechain_id).await?;
-            let server_pubnonce = lockbox::get_public_nonce(&client, &statechain_id).await?;
-            let signed_tx = lockbox::complete_signing_roundtrip(
+            let server_pubnonce = lockbox::bip448_get_public_nonce(
+                &client,
+                &Bip448LockboxSignFirstRequestPayload {
+                    statechain_id: statechain_id.clone(),
+                    signing_id: signing_id.clone(),
+                },
+            )
+            .await?;
+            let partial_sig = lockbox::complete_bip448_signing_roundtrip(
                 &client,
                 &statechain_id,
+                &signing_id,
                 &created.server_pubkey,
                 &server_pubnonce.server_pubnonce,
             )
@@ -792,15 +937,13 @@ async fn parallel_statechains_can_sign_independently() -> Result<()> {
             let sig_count = lockbox::get_signature_count(&client, &statechain_id).await?;
             lockbox::delete_statechain(&client, &statechain_id).await?;
 
-            Ok::<_, anyhow::Error>((signed_tx, sig_count))
+            Ok::<_, anyhow::Error>((partial_sig, sig_count))
         });
     }
 
     while let Some(result) = join_set.join_next().await {
-        let (signed_tx, sig_count) = result??;
-        assert_eq!(signed_tx.input.len(), 1);
-        assert_eq!(signed_tx.output.len(), 1);
-        assert_eq!(signed_tx.input[0].witness.len(), 1);
+        let (partial_sig, sig_count) = result??;
+        assert_eq!(hex::decode(&partial_sig)?.len(), 32);
         assert_eq!(sig_count, 1);
     }
 
@@ -809,21 +952,30 @@ async fn parallel_statechains_can_sign_independently() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires lockbox docker stack"]
-async fn concurrent_partial_signature_replays_increment_signature_count() -> Result<()> {
+async fn concurrent_exact_bip448_partial_replays_increment_signature_count_once() -> Result<()> {
     let _guard = common::test_guard();
     let client = lockbox::http_client();
     lockbox::wait_until_ready(&client).await?;
 
     let statechain_id = lockbox::new_statechain_id("concurrent-sign");
+    let signing_id = hex::encode([0x62u8; 32]);
     let created = lockbox::create_statechain(&client, &statechain_id).await?;
-    let server_pubnonce = lockbox::get_public_nonce(&client, &statechain_id).await?;
+    let server_pubnonce = lockbox::bip448_get_public_nonce(
+        &client,
+        &Bip448LockboxSignFirstRequestPayload {
+            statechain_id: statechain_id.clone(),
+            signing_id: signing_id.clone(),
+        },
+    )
+    .await?;
     let payload = Arc::new(
-        lockbox::build_partial_signature_fixture(
+        lockbox::build_bip448_partial_signature_fixture(
             &statechain_id,
+            &signing_id,
             &created.server_pubkey,
             &server_pubnonce.server_pubnonce,
         )?
-        .partial_signature_request_payload,
+        .payload,
     );
     let barrier = Arc::new(Barrier::new(3));
     let mut join_set = JoinSet::new();
@@ -835,7 +987,7 @@ async fn concurrent_partial_signature_replays_increment_signature_count() -> Res
 
         join_set.spawn(async move {
             barrier.wait().await;
-            lockbox::request_partial_signature(&client, &payload).await
+            lockbox::bip448_request_partial_signature(&client, &payload).await
         });
     }
 
@@ -850,7 +1002,7 @@ async fn concurrent_partial_signature_replays_increment_signature_count() -> Res
     assert_eq!(partial_sigs[0], partial_sigs[1]);
     assert_eq!(
         lockbox::get_signature_count(&client, &statechain_id).await?,
-        2
+        1
     );
 
     lockbox::delete_statechain(&client, &statechain_id).await?;
@@ -896,18 +1048,29 @@ async fn concurrent_keyupdate_replays_return_the_same_server_pubkey() -> Result<
     assert_eq!(returned_pubkeys[0], expected_server_pubkey);
     assert_eq!(returned_pubkeys[1], expected_server_pubkey);
 
-    let server_pubnonce = lockbox::get_public_nonce(&client, &statechain_id).await?;
-    let signed_tx = lockbox::complete_signing_roundtrip(
+    let signing_id = hex::encode([0x63u8; 32]);
+    let server_pubnonce = lockbox::bip448_get_public_nonce(
+        &client,
+        &Bip448LockboxSignFirstRequestPayload {
+            statechain_id: statechain_id.clone(),
+            signing_id: signing_id.clone(),
+        },
+    )
+    .await?;
+    let partial_sig = lockbox::complete_bip448_signing_roundtrip(
         &client,
         &statechain_id,
+        &signing_id,
         &expected_server_pubkey,
         &server_pubnonce.server_pubnonce,
     )
     .await?;
 
-    assert_eq!(signed_tx.input.len(), 1);
-    assert_eq!(signed_tx.output.len(), 1);
-    assert_eq!(signed_tx.input[0].witness.len(), 1);
+    assert_eq!(hex::decode(&partial_sig)?.len(), 32);
+    assert_eq!(
+        lockbox::get_signature_count(&client, &statechain_id).await?,
+        1
+    );
 
     lockbox::delete_statechain(&client, &statechain_id).await?;
 
@@ -925,11 +1088,102 @@ async fn mercury_deposit_init_creates_a_lockbox_backed_statechain() -> Result<()
 
     let (_wallet, coin) = mercury::create_deposited_coin(&mercury_client).await?;
     let statechain_id = coin.statechain_id.clone().unwrap();
-    let server_pubnonce = lockbox::get_public_nonce(&lockbox_client, &statechain_id).await?;
+    assert_eq!(
+        lockbox::get_signature_count(&lockbox_client, &statechain_id).await?,
+        0
+    );
+    let server_pubnonce = lockbox::bip448_get_public_nonce(
+        &lockbox_client,
+        &Bip448LockboxSignFirstRequestPayload {
+            statechain_id: statechain_id.clone(),
+            signing_id: hex::encode([0x64u8; 32]),
+        },
+    )
+    .await?;
 
     assert_eq!(server_pubnonce.server_pubnonce.len(), 132);
+    assert_eq!(
+        lockbox::get_signature_count(&lockbox_client, &statechain_id).await?,
+        0
+    );
 
     lockbox::delete_statechain(&lockbox_client, &statechain_id).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires lockbox docker stack"]
+async fn fresh_lockbox_schema_has_only_bip448_nonce_state_columns() -> Result<()> {
+    let _guard = common::test_guard();
+    let client = lockbox::http_client();
+    lockbox::wait_until_ready(&client).await?;
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(LOCKBOX_DATABASE_URL)
+        .await
+        .context("failed to connect to lockbox postgres")?;
+    let tables: Vec<(String,)> = sqlx::query_as(
+        "SELECT table_name FROM information_schema.tables \
+         WHERE table_schema = 'public' AND table_type = 'BASE TABLE' ORDER BY table_name",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        tables,
+        vec![
+            ("bip448_nonce_state".to_string(),),
+            ("generated_public_key".to_string(),),
+        ]
+    );
+
+    let columns: Vec<(String, String)> = sqlx::query_as(
+        "SELECT table_name, column_name FROM information_schema.columns \
+         WHERE table_schema = 'public' \
+         AND table_name IN ('generated_public_key', 'bip448_nonce_state') \
+         ORDER BY table_name, ordinal_position",
+    )
+    .fetch_all(&pool)
+    .await?;
+    let bip448_nonce_state_columns = columns
+        .iter()
+        .filter(|(table, _)| table == "bip448_nonce_state")
+        .map(|(_, column)| column.as_str())
+        .collect::<Vec<_>>();
+    let generated_public_key_columns = columns
+        .iter()
+        .filter(|(table, _)| table == "generated_public_key")
+        .map(|(_, column)| column.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        bip448_nonce_state_columns,
+        vec![
+            "id",
+            "statechain_id",
+            "signing_id",
+            "public_nonce",
+            "sealed_secnonce",
+            "challenge",
+            "negate_seckey",
+            "partial_sig",
+            "created_at",
+            "updated_at",
+        ]
+    );
+    assert_eq!(
+        generated_public_key_columns,
+        vec![
+            "id",
+            "statechain_id",
+            "sealed_keypair",
+            "public_key",
+            "sig_count",
+        ]
+    );
+    assert!(!generated_public_key_columns.contains(&"sealed_secnonce"));
+    assert!(!generated_public_key_columns.contains(&"public_nonce"));
 
     Ok(())
 }
@@ -1017,7 +1271,9 @@ async fn mercury_statechain_info_returns_ordered_bip448_rows_and_transfer_clears
         complete_bip448_signing_round(&mercury_client, &coin, second_signing_id.clone()).await?;
     let second_nonce = second_row.0.clone();
     let second_challenge = second_row.1.clone();
-    insert_completed_bip448_signature_row(&format!("foreign-{statechain_id}")).await?;
+    let foreign_statechain_id = format!("foreign-{statechain_id}");
+    let foreign_signing_id = hex::encode([0xb2u8; 32]);
+    insert_completed_bip448_signature_row(&foreign_statechain_id, &foreign_signing_id).await?;
 
     let secp = Secp256k1::new();
     let new_user_auth_secret = SecretKey::from_secret_bytes([13u8; 32])?;
@@ -1084,6 +1340,65 @@ async fn mercury_statechain_info_returns_ordered_bip448_rows_and_transfer_clears
         second_challenge
     );
 
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(MERCURY_DATABASE_URL)
+        .await
+        .context("failed to connect to mercury postgres")?;
+    assert!(
+        load_bip448_signature_data_row(&pool, &statechain_id, &first_signing_id)
+            .await?
+            .is_none(),
+        "the transferred statechain's exact incomplete signing row must be deleted"
+    );
+
+    let persisted_second_row =
+        load_bip448_signature_data_row(&pool, &statechain_id, &second_signing_id)
+            .await?
+            .context("the transferred statechain's completed signing row was deleted")?;
+    assert_eq!(
+        lockbox::normalize_hex(
+            persisted_second_row
+                .server_pubnonce
+                .as_deref()
+                .context("completed signing row lost server_pubnonce")?
+        ),
+        second_nonce
+    );
+    assert_eq!(
+        persisted_second_row.challenge.as_deref(),
+        Some(second_challenge.as_str())
+    );
+    assert!(persisted_second_row.negate_seckey.is_some());
+    assert_eq!(
+        hex::decode(lockbox::normalize_hex(
+            persisted_second_row
+                .server_partial_sig
+                .as_deref()
+                .context("completed signing row lost server_partial_sig")?,
+        ))?
+        .len(),
+        32
+    );
+
+    let persisted_foreign_row =
+        load_bip448_signature_data_row(&pool, &foreign_statechain_id, &foreign_signing_id)
+            .await?
+            .context("foreign statechain's completed signing row was deleted")?;
+    assert_eq!(
+        persisted_foreign_row.server_pubnonce.as_deref(),
+        Some("mixed-bip448-server-pubnonce")
+    );
+    assert_eq!(
+        persisted_foreign_row.challenge.as_deref(),
+        Some("mixed-bip448-challenge")
+    );
+    assert_eq!(persisted_foreign_row.negate_seckey, Some(false));
+    assert_eq!(
+        persisted_foreign_row.server_partial_sig.as_deref(),
+        Some("mixed-bip448-partial-signature")
+    );
+
     lockbox::delete_statechain(&lockbox_client, &statechain_id).await?;
 
     Ok(())
@@ -1141,8 +1456,33 @@ async fn mercury_transfer_receiver_routes_keyupdate_to_lockbox() -> Result<()> {
         )
     );
 
-    let server_pubnonce = lockbox::get_public_nonce(&lockbox_client, &statechain_id).await?;
+    let updated_signing_id = hex::encode([0x65u8; 32]);
+    let server_pubnonce = lockbox::bip448_get_public_nonce(
+        &lockbox_client,
+        &Bip448LockboxSignFirstRequestPayload {
+            statechain_id: statechain_id.clone(),
+            signing_id: updated_signing_id.clone(),
+        },
+    )
+    .await?;
     assert_eq!(server_pubnonce.server_pubnonce.len(), 132);
+    let updated_partial_signature_fixture = lockbox::build_bip448_partial_signature_fixture(
+        &statechain_id,
+        &updated_signing_id,
+        &expected_server_pubkey,
+        &server_pubnonce.server_pubnonce,
+    )?;
+    let partial_sig = lockbox::bip448_request_partial_signature(
+        &lockbox_client,
+        &updated_partial_signature_fixture.payload,
+    )
+    .await?;
+    updated_partial_signature_fixture.verify_server_partial_signature(&partial_sig)?;
+    assert_eq!(hex::decode(&partial_sig)?.len(), 32);
+    assert_eq!(
+        lockbox::get_signature_count(&lockbox_client, &statechain_id).await?,
+        1
+    );
 
     lockbox::delete_statechain(&lockbox_client, &statechain_id).await?;
 

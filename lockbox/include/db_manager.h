@@ -32,17 +32,9 @@ namespace db_manager {
         const std::string& statechain_id,
         std::string& error_message);
 
-    bool load_generated_key_data(
+    bool load_generated_keypair(
         const std::string& statechain_id, 
         std::unique_ptr<utils::chacha20_poly1305_encrypted_data>& encrypted_keypair,
-        std::unique_ptr<utils::chacha20_poly1305_encrypted_data>& encrypted_secnonce,
-        unsigned char* public_nonce, const size_t public_nonce_size, 
-        std::string& error_message);
-
-    bool update_sealed_secnonce(
-        const std::string& statechain_id, 
-        unsigned char* serialized_server_pubnonce, const size_t serialized_server_pubnonce_size, 
-        const utils::chacha20_poly1305_encrypted_data& encrypted_secnonce, 
         std::string& error_message);
 
     bool get_bip448_public_nonce(
