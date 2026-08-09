@@ -59,27 +59,37 @@ jobs:
       - name: Run retained integration suite
         run: |
           cd clients/tests/rust
-          cargo test --test functional -- --ignored --test-threads=1
+          cargo test --locked --test functional -- --ignored --test-threads=1
 
       - name: Run BIP448 primitive integration suite
         run: |
           cd clients/tests/rust
-          cargo test --test bip448_primitive_spike -- --ignored --test-threads=1
+          cargo test --locked --test bip448_primitive_spike -- --ignored --test-threads=1
 
       - name: Run BIP448 CSFS signing integration suite
         run: |
           cd clients/tests/rust
-          cargo test --test bip448_csfs_signing -- --ignored --test-threads=1
+          cargo test --locked --test bip448_csfs_signing -- --ignored --test-threads=1
 
       - name: Run BIP448 deposit and recovery integration suite
         run: |
           cd clients/tests/rust
-          cargo test --test bip448_deposit -- --ignored --test-threads=1
+          cargo test --locked --test bip448_deposit -- --ignored --test-threads=1
+
+      - name: Run BIP448 transfer-sender integration suite
+        run: |
+          cd clients/tests/rust
+          cargo test --locked --test bip448_transfer_sender -- --ignored --test-threads=1
+
+      - name: Run BIP448 withdrawal integration suite
+        run: |
+          cd clients/tests/rust
+          cargo test --locked --test bip448_withdraw -- --ignored --test-threads=1
 
       - name: Run lockbox compatibility suite
         run: |
           cd clients/tests/rust
-          cargo test --test lockbox_compatibility -- --ignored --test-threads=1
+          cargo test --locked --test lockbox_compatibility -- --ignored --test-threads=1
 
       - name: Tear down
         if: always()
