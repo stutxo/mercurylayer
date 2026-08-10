@@ -24,16 +24,19 @@ fn internal_server_error_response(message: String) -> status::Custom<Json<Value>
     )
 }
 
+fn statechain_data_not_found_response() -> status::Custom<Json<Value>> {
+    status::Custom(
+        Status::NotFound,
+        Json(json!({
+            "message": "Statechain Id key not found."
+        })),
+    )
+}
+
 fn lockbox_signature_count_error_response(
     status_code: reqwest::StatusCode,
     body: String,
 ) -> status::Custom<Json<Value>> {
-    let response_status = if status_code == reqwest::StatusCode::NOT_FOUND {
-        Status::NotFound
-    } else {
-        Status::InternalServerError
-    };
-
     let message = if body.is_empty() {
         format!("lockbox signature_count returned {}", status_code.as_u16())
     } else {
@@ -45,7 +48,7 @@ fn lockbox_signature_count_error_response(
     };
 
     status::Custom(
-        response_status,
+        Status::InternalServerError,
         Json(json!({
             "error": "Lockbox Error",
             "message": message,
@@ -81,11 +84,7 @@ pub async fn statechain_info(
     .await;
 
     if enclave_public_key.is_none() {
-        let response_body = json!({
-            "message": "Statechain Id key not found."
-        });
-
-        return status::Custom(Status::NotFound, Json(response_body));
+        return statechain_data_not_found_response();
     }
 
     let enclave_public_key = enclave_public_key.unwrap();
@@ -420,19 +419,36 @@ mod tests {
     }
 
     #[test]
-    fn lockbox_signature_count_error_maps_missing_count_to_not_found() {
+    fn lockbox_signature_count_not_found_after_mercury_lookup_maps_to_internal_error() {
         let response = lockbox_signature_count_error_response(
             reqwest::StatusCode::NOT_FOUND,
             "Signature count not found.".to_string(),
         );
 
-        assert_eq!(response.0, Status::NotFound);
+        assert_eq!(response.0, Status::InternalServerError);
         assert_eq!(response.1 .0["error"], "Lockbox Error");
         assert!(response.1 .0["message"].as_str().unwrap().contains("404"));
         assert!(response.1 .0["message"]
             .as_str()
             .unwrap()
             .contains("Signature count not found."));
+    }
+
+    #[test]
+    fn only_initial_missing_mercury_row_returns_exact_not_found_envelope() {
+        let initial_lookup_response = statechain_data_not_found_response();
+        let lockbox_missing_response = lockbox_signature_count_error_response(
+            reqwest::StatusCode::NOT_FOUND,
+            "Signature count not found.".to_string(),
+        );
+
+        assert_eq!(initial_lookup_response.0, Status::NotFound);
+        assert_eq!(
+            initial_lookup_response.1 .0,
+            json!({"message": "Statechain Id key not found."})
+        );
+        assert_eq!(lockbox_missing_response.0, Status::InternalServerError);
+        assert_ne!(lockbox_missing_response.1 .0, initial_lookup_response.1 .0);
     }
 
     #[test]

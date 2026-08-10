@@ -212,6 +212,24 @@ pub async fn start_token_stack_lockbox_service(client: &Client) -> Result<()> {
     wait_until_ready(client).await
 }
 
+pub async fn stop_token_stack_lockbox_database() -> Result<()> {
+    run_docker_compose(
+        "docker-compose-token-servers.yml",
+        &["stop", "db_lockbox"],
+        "stop token-stack lockbox database",
+    )
+}
+
+pub async fn start_token_stack_lockbox_database(client: &Client) -> Result<()> {
+    run_docker_compose(
+        "docker-compose-token-servers.yml",
+        &["up", "-d", "--no-deps", "db_lockbox"],
+        "start token-stack lockbox database",
+    )?;
+
+    wait_until_ready(client).await
+}
+
 fn run_docker_compose(compose_file: &str, args: &[&str], context: &str) -> Result<()> {
     let command = docker_compose_command(compose_file, args);
     run_docker_command(command, context)
