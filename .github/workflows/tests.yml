@@ -21,6 +21,7 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: 1.92.0
       ML_SETTINGS_FILE: ${{ matrix.settings_file }}
+      COMPOSE_PROJECT_NAME: bip448ci
 
     steps:
       - name: Checkout code
@@ -35,7 +36,7 @@ jobs:
 
       - name: Start regtest stack
         run: |
-          docker compose -f docker-compose-token-servers.yml up --build -d
+          docker compose -p "$COMPOSE_PROJECT_NAME" -f docker-compose-token-servers.yml up --build -d
 
       - name: Wait for Mercury server
         run: |
@@ -43,12 +44,32 @@ jobs:
 
       - name: Wait for Inquisition node
         run: |
-          container_id=$(docker ps -qf "name=mercurylayer-inquisition-1")
+          container_ids=$(docker ps \
+            --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" \
+            --filter "label=com.docker.compose.service=inquisition" \
+            --filter "status=running" \
+            --format '{{.ID}}')
+          container_count=$(printf '%s\n' "$container_ids" | sed '/^$/d' | wc -l)
+          if [ "$container_count" -ne 1 ]; then
+            echo "Expected exactly one running Inquisition container for project $COMPOSE_PROJECT_NAME, found $container_count"
+            exit 1
+          fi
+          container_id="$container_ids"
           timeout 180 bash -c 'until docker exec "'"$container_id"'" bitcoin-cli -regtest -rpcuser=mercury -rpcpassword=mercury getblockchaininfo >/dev/null; do sleep 2; done'
 
       - name: Initialize regtest wallet
         run: |
-          container_id=$(docker ps -qf "name=mercurylayer-inquisition-1")
+          container_ids=$(docker ps \
+            --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" \
+            --filter "label=com.docker.compose.service=inquisition" \
+            --filter "status=running" \
+            --format '{{.ID}}')
+          container_count=$(printf '%s\n' "$container_ids" | sed '/^$/d' | wc -l)
+          if [ "$container_count" -ne 1 ]; then
+            echo "Expected exactly one running Inquisition container for project $COMPOSE_PROJECT_NAME, found $container_count"
+            exit 1
+          fi
+          container_id="$container_ids"
           echo "Container ID: $container_id"
           wallet_name="mercury_test"
           docker exec "$container_id" bitcoin-cli -regtest -rpcuser=mercury -rpcpassword=mercury createwallet "$wallet_name" || docker exec "$container_id" bitcoin-cli -regtest -rpcuser=mercury -rpcpassword=mercury loadwallet "$wallet_name"
@@ -76,6 +97,11 @@ jobs:
           cd clients/tests/rust
           cargo test --locked --test bip448_deposit -- --ignored --test-threads=1
 
+      - name: Run BIP448 duplicate funding integration suite
+        run: |
+          cd clients/tests/rust
+          cargo test --locked --test bip448_duplicates -- --ignored --test-threads=1
+
       - name: Run BIP448 transfer-sender integration suite
         run: |
           cd clients/tests/rust
@@ -94,4 +120,4 @@ jobs:
       - name: Tear down
         if: always()
         run: |
-          docker compose -f docker-compose-token-servers.yml down -v
+          docker compose -p "$COMPOSE_PROJECT_NAME" -f docker-compose-token-servers.yml down -v
