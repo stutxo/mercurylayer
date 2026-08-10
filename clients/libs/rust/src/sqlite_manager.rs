@@ -1,19 +1,45 @@
-use std::str::FromStr;
+use std::{
+    collections::{HashMap, HashSet},
+    str::FromStr,
+};
 
 use anyhow::{anyhow, Context, Result};
-use bitcoin::{BlockHash, Txid};
+use bitcoin::{
+    absolute,
+    hashes::{sha256, Hash},
+    Address, BlockHash, OutPoint, PrivateKey, Txid,
+};
 use mercurylib::{
     bip448_statechain::{
+        deposit::{
+            self as bip448_deposit, BIP448_COIN_PROTOCOL, DEFAULT_BIP448_CHALLENGE_DELAY,
+            INITIAL_BIP448_STATE_NUMBER,
+        },
         script,
-        storage::{Bip448LatestState, Bip448StatechainRecord},
+        signing::{CsfsSigningRole, CsfsSigningSession},
+        storage::{
+            build_funding_latest_state, build_funding_recovery_artifacts, Bip448FeeBumpPolicy,
+            Bip448LatestState, Bip448RecoveryTemplateRole, Bip448StatechainRecord,
+        },
     },
     transfer::bip448::{Bip448StateHistoryEntry, Bip448TransferMsg},
-    wallet::Wallet,
+    wallet::{Coin, CoinStatus, Wallet},
 };
-use secp256k1::XOnlyPublicKey;
+use secp256k1::{
+    musig::{BlindingFactor, PublicNonce},
+    schnorr, PublicKey, Secp256k1, XOnlyPublicKey,
+};
 use serde::{Deserialize, Serialize};
-use sqlx::{Pool, Row, Sqlite};
+use sqlx::{Pool, Row, Sqlite, SqliteConnection, Transaction};
 
+use crate::bip448_funding::{
+    self, Bip448AppliedScanRevision, Bip448BindingObservation, Bip448BindingRole,
+    Bip448BroadcastStatus, Bip448CloseBlockReason, Bip448CloseGate, Bip448CompletionStatus,
+    Bip448FundingBinding, Bip448ObservationStatus, Bip448OwnershipStatus, Bip448SyncBase,
+    Bip448TransferIntent, Bip448TransferIntentActivityStatus, Bip448TransferIntentKind,
+    Bip448TransferIntentPhase, Bip448TransferStateSigningPhase, Bip448WithdrawalAttempt,
+    Bip448WithdrawalAttemptKind, Bip448WithdrawalPhase,
+};
 use crate::chain::ChainUtxo;
 use crate::deposit::Bip448AcceptedDepositState;
 use crate::transfer_receiver::bip448_transfer_receiver::Bip448AcceptedTransferState;
@@ -36,7 +62,9 @@ pub struct Bip448PendingDepositSigning {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Bip448ScanCursor {
+pub struct Bip448ScanCursor {
+    pub coverage_start_height: u32,
+    pub scan_revision: u64,
     pub last_scanned_height: u32,
     pub last_scanned_block_hash: String,
 }
@@ -120,7 +148,7 @@ pub(crate) async fn load_bip448_scan_state(
     script_pubkey: &str,
 ) -> Result<(Option<Bip448ScanCursor>, Vec<ChainUtxo>)> {
     let cursor = sqlx::query(
-        "SELECT last_scanned_height, last_scanned_block_hash \
+        "SELECT coverage_start_height, scan_revision, last_scanned_height, last_scanned_block_hash \
          FROM bip448_scan_cursors WHERE wallet_name = $1 AND script_pubkey = $2",
     )
     .bind(wallet_name)
@@ -129,8 +157,10 @@ pub(crate) async fn load_bip448_scan_state(
     .await?
     .map(|row| -> Result<_> {
         Ok(Bip448ScanCursor {
-            last_scanned_height: u32::try_from(row.try_get::<i64, _>(0)?)?,
-            last_scanned_block_hash: canonical_block_hash(row.try_get(1)?)?,
+            coverage_start_height: u32::try_from(row.try_get::<i64, _>(0)?)?,
+            scan_revision: u64::try_from(row.try_get::<i64, _>(1)?)?,
+            last_scanned_height: u32::try_from(row.try_get::<i64, _>(2)?)?,
+            last_scanned_block_hash: canonical_block_hash(row.try_get(3)?)?,
         })
     })
     .transpose()?;
@@ -156,13 +186,156 @@ pub(crate) async fn load_bip448_scan_state(
     Ok((cursor, outpoints))
 }
 
+async fn replace_bip448_scan_cache_on(
+    connection: &mut SqliteConnection,
+    wallet_name: &str,
+    script_pubkey: &str,
+    outpoints: &[(String, u32, u64, u32)],
+) -> Result<()> {
+    let mut desired = outpoints.to_vec();
+    desired.sort_by(|left, right| (left.0.as_str(), left.1).cmp(&(right.0.as_str(), right.1)));
+    if desired
+        .windows(2)
+        .any(|rows| rows[0].0 == rows[1].0 && rows[0].1 == rows[1].1)
+    {
+        return Err(anyhow!("duplicate BIP448 scan-cache outpoint"));
+    }
+    let desired_keys = desired
+        .iter()
+        .map(|(txid, vout, _, _)| (txid.clone(), *vout))
+        .collect::<HashSet<_>>();
+    let existing = sqlx::query(
+        "SELECT txid,vout FROM bip448_scanned_outpoints \
+         WHERE wallet_name=$1 AND script_pubkey=$2 ORDER BY txid,vout",
+    )
+    .bind(wallet_name)
+    .bind(script_pubkey)
+    .fetch_all(&mut *connection)
+    .await?;
+    for row in existing {
+        let txid = canonical_txid(row.try_get(0)?)?;
+        let vout = checked_u32(&row, 1, "BIP448 scan-cache vout")?;
+        if !desired_keys.contains(&(txid.clone(), vout)) {
+            let deleted = sqlx::query(
+                "DELETE FROM bip448_scanned_outpoints WHERE wallet_name=$1 \
+                 AND script_pubkey=$2 AND txid=$3 AND vout=$4",
+            )
+            .bind(wallet_name)
+            .bind(script_pubkey)
+            .bind(txid)
+            .bind(i64::from(vout))
+            .execute(&mut *connection)
+            .await?;
+            if deleted.rows_affected() != 1 {
+                return Err(anyhow!("BIP448 stale scan-cache compare-delete lost"));
+            }
+        }
+    }
+    for (txid, vout, value, height) in &desired {
+        let written = sqlx::query(
+            "INSERT INTO bip448_scanned_outpoints \
+                (wallet_name,txid,vout,script_pubkey,value_sats,height) \
+             VALUES ($1,$2,$3,$4,$5,$6) \
+             ON CONFLICT(wallet_name,txid,vout) DO UPDATE SET \
+                script_pubkey=excluded.script_pubkey,value_sats=excluded.value_sats, \
+                height=excluded.height",
+        )
+        .bind(wallet_name)
+        .bind(txid)
+        .bind(i64::from(*vout))
+        .bind(script_pubkey)
+        .bind(i64::try_from(*value)?)
+        .bind(i64::from(*height))
+        .execute(&mut *connection)
+        .await?;
+        if written.rows_affected() != 1 {
+            return Err(anyhow!(
+                "BIP448 scan-cache upsert affected an unexpected row count"
+            ));
+        }
+    }
+
+    let reservation_rows = sqlx::query(
+        "SELECT json_extract(fee.value,'$.txid'), \
+            CAST(json_extract(fee.value,'$.vout') AS INTEGER), \
+            CAST(json_extract(fee.value,'$.value_sats') AS INTEGER), \
+            statechain_id || ':' || role,unixepoch(updated_at) \
+         FROM bip448_package_attempts,json_each(fee_inputs_json) AS fee \
+         WHERE wallet_name=$1 AND status IN ('Pending','Submitted') \
+         ORDER BY 1,2,5 DESC,4 DESC",
+    )
+    .bind(wallet_name)
+    .fetch_all(&mut *connection)
+    .await?;
+    let mut reservations = HashMap::new();
+    for row in reservation_rows {
+        let txid = canonical_txid(row.try_get(0)?)?;
+        let vout = checked_u32(&row, 1, "BIP448 reservation vout")?;
+        let value = checked_u64(&row, 2, "BIP448 reservation value")?;
+        let reservation_id: String = row.try_get(3)?;
+        let reservation_time: i64 = row.try_get(4)?;
+        if reservation_time < 0 {
+            return Err(anyhow!("BIP448 reservation timestamp is negative"));
+        }
+        reservations
+            .entry((txid, vout))
+            .or_insert((value, reservation_id, reservation_time));
+    }
+    for (txid, vout, value, _) in &desired {
+        let Some((reserved_value, reservation_id, reservation_time)) =
+            reservations.get(&(txid.clone(), *vout))
+        else {
+            continue;
+        };
+        if reserved_value != value {
+            continue;
+        }
+        let live = sqlx::query(
+            "SELECT reserved_by,reserved_at FROM bip448_scanned_outpoints \
+             WHERE wallet_name=$1 AND script_pubkey=$2 AND txid=$3 AND vout=$4 \
+             AND value_sats=$5",
+        )
+        .bind(wallet_name)
+        .bind(script_pubkey)
+        .bind(txid)
+        .bind(i64::from(*vout))
+        .bind(i64::try_from(*value)?)
+        .fetch_optional(&mut *connection)
+        .await?
+        .ok_or_else(|| anyhow!("BIP448 reservation target disappeared from scan cache"))?;
+        let live_id: Option<String> = live.try_get(0)?;
+        let live_time: Option<i64> = live.try_get(1)?;
+        if live_id.as_deref() == Some(reservation_id.as_str()) && live_time.is_some() {
+            continue;
+        }
+        let updated = sqlx::query(
+            "UPDATE bip448_scanned_outpoints SET reserved_by=$1,reserved_at=$2 \
+             WHERE wallet_name=$3 AND script_pubkey=$4 AND txid=$5 AND vout=$6 \
+             AND value_sats=$7",
+        )
+        .bind(reservation_id)
+        .bind(*reservation_time)
+        .bind(wallet_name)
+        .bind(script_pubkey)
+        .bind(txid)
+        .bind(i64::from(*vout))
+        .bind(i64::try_from(*value)?)
+        .execute(&mut *connection)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(anyhow!("BIP448 reservation restoration CAS lost"));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn persist_bip448_scan_state(
     pool: &Pool<Sqlite>,
     wallet_name: &str,
     script_pubkey: &str,
     cursor: &Bip448ScanCursor,
     outpoints: &[ChainUtxo],
-) -> Result<()> {
+) -> Result<Bip448AppliedScanRevision> {
     let block_hash = canonical_block_hash(&cursor.last_scanned_block_hash)?;
     let outpoints = outpoints
         .iter()
@@ -175,102 +348,89 @@ pub(crate) async fn persist_bip448_scan_state(
             ))
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut transaction = pool.begin().await?;
-    sqlx::query(
-        "UPDATE bip448_scanned_outpoints SET height = -1 \
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let live_cursor = sqlx::query(
+        "SELECT coverage_start_height, scan_revision FROM bip448_scan_cursors \
          WHERE wallet_name = $1 AND script_pubkey = $2",
     )
     .bind(wallet_name)
     .bind(script_pubkey)
-    .execute(&mut *transaction)
+    .fetch_optional(&mut *transaction)
     .await?;
-    for (txid, vout, value, height) in outpoints {
-        sqlx::query(
-            "INSERT INTO bip448_scanned_outpoints \
-                (wallet_name, txid, vout, script_pubkey, value_sats, height) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
-             ON CONFLICT(wallet_name, txid, vout) DO UPDATE SET \
-                script_pubkey = excluded.script_pubkey, value_sats = excluded.value_sats, \
-                height = excluded.height",
+    let (coverage_start_height, live_revision) = match live_cursor {
+        Some(row) => {
+            let coverage = u32::try_from(row.try_get::<i64, _>(0)?)?;
+            let revision = u64::try_from(row.try_get::<i64, _>(1)?)?;
+            (coverage.min(cursor.coverage_start_height), revision)
+        }
+        None => (cursor.coverage_start_height, 0),
+    };
+    if live_revision != cursor.scan_revision {
+        return Err(anyhow!(
+            "BIP448 scan cursor changed while the candidate scan was running"
+        ));
+    }
+    let scan_revision = live_revision
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("BIP448 scan revision overflow"))?;
+    let scan_revision_i64 = i64::try_from(scan_revision)
+        .map_err(|_| anyhow!("BIP448 scan revision exceeds the SQLite integer domain"))?;
+    replace_bip448_scan_cache_on(&mut transaction, wallet_name, script_pubkey, &outpoints).await?;
+    let cursor_write = if live_revision == 0
+        && sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM bip448_scan_cursors \
+             WHERE wallet_name = $1 AND script_pubkey = $2",
         )
         .bind(wallet_name)
-        .bind(txid)
-        .bind(i64::from(vout))
         .bind(script_pubkey)
-        .bind(i64::try_from(value)?)
-        .bind(i64::from(height))
+        .fetch_one(&mut *transaction)
+        .await?
+            == 0
+    {
+        sqlx::query(
+            "INSERT INTO bip448_scan_cursors \
+                (wallet_name, script_pubkey, coverage_start_height, scan_revision, \
+                 last_scanned_height, last_scanned_block_hash) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(wallet_name)
+        .bind(script_pubkey)
+        .bind(i64::from(coverage_start_height))
+        .bind(scan_revision_i64)
+        .bind(i64::from(cursor.last_scanned_height))
+        .bind(block_hash)
         .execute(&mut *transaction)
-        .await?;
+        .await?
+    } else {
+        sqlx::query(
+            "UPDATE bip448_scan_cursors SET \
+                coverage_start_height = $1, scan_revision = $2, \
+                last_scanned_height = $3, last_scanned_block_hash = $4, \
+                updated_at = CURRENT_TIMESTAMP \
+             WHERE wallet_name = $5 AND script_pubkey = $6 AND scan_revision = $7",
+        )
+        .bind(i64::from(coverage_start_height))
+        .bind(scan_revision_i64)
+        .bind(i64::from(cursor.last_scanned_height))
+        .bind(block_hash)
+        .bind(wallet_name)
+        .bind(script_pubkey)
+        .bind(i64::try_from(live_revision)?)
+        .execute(&mut *transaction)
+        .await?
+    };
+    if cursor_write.rows_affected() != 1 {
+        return Err(anyhow!("BIP448 scan cursor compare-and-set lost"));
     }
-    sqlx::query(
-        "DELETE FROM bip448_scanned_outpoints \
-         WHERE wallet_name = $1 AND script_pubkey = $2 AND height = -1",
-    )
-    .bind(wallet_name)
-    .bind(script_pubkey)
-    .execute(&mut *transaction)
-    .await?;
-    sqlx::query(
-        "WITH active_reservations AS (\
-            SELECT json_extract(fee.value, '$.txid') AS txid, \
-                CAST(json_extract(fee.value, '$.vout') AS INTEGER) AS vout, \
-                CAST(json_extract(fee.value, '$.value_sats') AS INTEGER) AS value_sats, \
-                statechain_id || ':' || role AS reservation_id, \
-                unixepoch(updated_at) AS reservation_time \
-            FROM bip448_package_attempts, json_each(fee_inputs_json) AS fee \
-            WHERE wallet_name = $1 AND status IN ('Pending', 'Submitted')\
-         ) \
-         UPDATE bip448_scanned_outpoints AS outpoint SET \
-            reserved_at = CASE \
-                WHEN reserved_by = (\
-                    SELECT reservation_id FROM active_reservations \
-                    WHERE txid = outpoint.txid AND vout = outpoint.vout AND \
-                        value_sats = outpoint.value_sats \
-                    ORDER BY reservation_time DESC, reservation_id DESC LIMIT 1\
-                ) AND reserved_at IS NOT NULL THEN reserved_at \
-                ELSE (\
-                    SELECT reservation_time FROM active_reservations \
-                    WHERE txid = outpoint.txid AND vout = outpoint.vout AND \
-                        value_sats = outpoint.value_sats \
-                    ORDER BY reservation_time DESC, reservation_id DESC LIMIT 1\
-                ) \
-            END, \
-            reserved_by = (\
-                SELECT reservation_id FROM active_reservations \
-                WHERE txid = outpoint.txid AND vout = outpoint.vout AND \
-                    value_sats = outpoint.value_sats \
-                ORDER BY reservation_time DESC, reservation_id DESC LIMIT 1\
-            ) \
-         WHERE wallet_name = $1 AND script_pubkey = $2 AND EXISTS (\
-            SELECT 1 FROM active_reservations \
-            WHERE txid = outpoint.txid AND vout = outpoint.vout AND \
-                value_sats = outpoint.value_sats\
-         )",
-    )
-    .bind(wallet_name)
-    .bind(script_pubkey)
-    .execute(&mut *transaction)
-    .await?;
-    sqlx::query(
-        "INSERT INTO bip448_scan_cursors \
-            (wallet_name, script_pubkey, last_scanned_height, last_scanned_block_hash) \
-         VALUES ($1, $2, $3, $4) \
-         ON CONFLICT(wallet_name, script_pubkey) DO UPDATE SET \
-            last_scanned_height = excluded.last_scanned_height, \
-            last_scanned_block_hash = excluded.last_scanned_block_hash, \
-            updated_at = CURRENT_TIMESTAMP",
-    )
-    .bind(wallet_name)
-    .bind(script_pubkey)
-    .bind(i64::from(cursor.last_scanned_height))
-    .bind(block_hash)
-    .execute(&mut *transaction)
-    .await?;
     transaction.commit().await?;
-    Ok(())
+    Ok(Bip448AppliedScanRevision {
+        script_pubkey: script_pubkey.to_owned(),
+        scan_revision,
+    })
 }
 
-pub(crate) async fn clear_bip448_scan_state(
+#[cfg(test)]
+async fn clear_bip448_scan_state(
     pool: &Pool<Sqlite>,
     wallet_name: &str,
     script_pubkey: &str,
@@ -284,11 +444,6 @@ pub(crate) async fn clear_bip448_scan_state(
     .bind(script_pubkey)
     .execute(&mut *transaction)
     .await?;
-    sqlx::query("DELETE FROM bip448_scan_cursors WHERE wallet_name = $1 AND script_pubkey = $2")
-        .bind(wallet_name)
-        .bind(script_pubkey)
-        .execute(&mut *transaction)
-        .await?;
     transaction.commit().await?;
     Ok(())
 }
@@ -749,10 +904,10 @@ async fn upsert_bip448_statechain_record_with_policy(
         .bind(&record.aggregate_pubkey)
         .bind(&record.funding_outpoint.txid)
         .bind(i64::from(record.funding_outpoint.vout))
-        .bind(record.funding_outpoint.value_sats as i64)
+        .bind(i64::try_from(record.funding_outpoint.value_sats)?)
         .bind(i64::from(record.latest_state_number))
         .bind(i64::from(record.challenge_delay))
-        .bind(record.amount_sats as i64)
+        .bind(i64::try_from(record.amount_sats)?)
         .bind(&record.network)
         .bind(record_json)
         .execute(&mut *transaction)
@@ -906,7 +1061,7 @@ pub async fn insert_bip448_pending_deposit_signing_if_absent(
         .bind(&signing.statechain_id)
         .bind(&signing.funding_txid)
         .bind(i64::from(signing.funding_vout))
-        .bind(signing.funding_value_sats as i64)
+        .bind(i64::try_from(signing.funding_value_sats)?)
         .bind(&signing.update_template_hash)
         .bind(&signing.settlement_template_hash)
         .bind(i64::from(signing.state_locktime))
@@ -1099,7 +1254,7 @@ pub async fn insert_bip448_pending_transfer_signing_if_absent(
         .bind(&signing.statechain_id)
         .bind(&signing.funding_txid)
         .bind(i64::from(signing.funding_vout))
-        .bind(signing.funding_value_sats as i64)
+        .bind(i64::try_from(signing.funding_value_sats)?)
         .bind(&signing.update_template_hash)
         .bind(&signing.settlement_template_hash)
         .bind(i64::from(signing.state_locktime))
@@ -1222,13 +1377,18 @@ pub async fn insert_or_update_bip448_transfer_msg(
             transfer_msg_json = excluded.transfer_msg_json, \
             updated_at = CURRENT_TIMESTAMP";
 
-    let _ = sqlx::query(query)
+    let result = sqlx::query(query)
         .bind(wallet_name)
         .bind(&transfer_msg.statechain_id)
         .bind(recipient_auth_pubkey)
         .bind(transfer_msg_json)
         .execute(pool)
         .await?;
+    if result.rows_affected() != 1 {
+        return Err(anyhow!(
+            "BIP448 transfer-message upsert affected an unexpected row count"
+        ));
+    }
 
     Ok(())
 }
@@ -1278,6 +1438,5372 @@ pub async fn delete_bip448_transfer_msgs(
     .await?;
     Ok(())
 }
+
+const BIP448_BINDING_COLUMNS: &str = "wallet_name, statechain_id, binding_index, txid, vout, \
+    value_sats, script_pubkey, role, observation_status, funding_height, spend_txid, \
+    spend_height, last_scanned_height, owner_user_pubkey, owner_state_number, \
+    ownership_status, first_seen_at, last_seen_at";
+
+const BIP448_ATTEMPT_COLUMNS: &str = "wallet_name, statechain_id, binding_index, attempt_kind, \
+    owner_user_pubkey, owner_state_number, source_txid, source_vout, source_value_sats, \
+    source_script_pubkey, destination_address, destination_script_pubkey, \
+    fee_rate_sat_per_vbyte, fee_sats, lock_time, unsigned_tx_hex, signing_id, \
+    signed_statechain_id, sign_first_payload_json, client_secret_nonce, client_public_nonce, \
+    blinding_factor, server_public_nonce, message_hex, output_pubkey, client_partial_sig, \
+    encoded_session, sign_second_payload_json, server_partial_sig, aggregate_signature, \
+    signed_tx_hex, txid, phase, broadcast_status, completion_status, closing_tip_height, \
+    closing_tip_hash, closing_bindings_json, created_at, updated_at";
+
+const BIP448_INTENT_COLUMNS: &str = "wallet_name, statechain_id, intent_id, \
+    predecessor_intent_id, activity_status, intent_kind, acknowledge_cooperative_duplicates, \
+    recipient_address, receiver_user_pubkey, recipient_auth_pubkey, batch_id, \
+    sender_signed_statechain_id, planned_state_number, expected_signature_count, \
+    previous_locktime, prior_pending_signing_id, prior_transfer_recipient_auth_pubkey, \
+    prior_transfer_msg_hash, reuse_pending, reuse_signed_state, clear_local_attempt, \
+    generated_coin_user_pubkey, generated_coin_auth_pubkey, generated_coin_address, phase, \
+    server_x1, current_pending_signing_id, state_signing_phase, server_partial_sig, \
+    update_signature, created_at, updated_at";
+
+fn checked_u32(row: &sqlx::sqlite::SqliteRow, index: usize, description: &str) -> Result<u32> {
+    u32::try_from(row.try_get::<i64, _>(index)?)
+        .with_context(|| format!("{description} is outside the u32 range"))
+}
+
+fn checked_optional_u32(
+    row: &sqlx::sqlite::SqliteRow,
+    index: usize,
+    description: &str,
+) -> Result<Option<u32>> {
+    row.try_get::<Option<i64>, _>(index)?
+        .map(|value| {
+            u32::try_from(value).with_context(|| format!("{description} is outside the u32 range"))
+        })
+        .transpose()
+}
+
+fn checked_u64(row: &sqlx::sqlite::SqliteRow, index: usize, description: &str) -> Result<u64> {
+    u64::try_from(row.try_get::<i64, _>(index)?)
+        .with_context(|| format!("{description} is negative"))
+}
+
+fn checked_bool(row: &sqlx::sqlite::SqliteRow, index: usize, description: &str) -> Result<bool> {
+    match row.try_get::<i64, _>(index)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(anyhow!("{description} is not a checked SQLite boolean")),
+    }
+}
+
+fn row_to_bip448_binding(row: sqlx::sqlite::SqliteRow) -> Result<Bip448FundingBinding> {
+    let binding = Bip448FundingBinding {
+        wallet_name: row.try_get(0)?,
+        statechain_id: row.try_get(1)?,
+        binding_index: checked_u32(&row, 2, "BIP448 binding index")?,
+        txid: row.try_get(3)?,
+        vout: checked_u32(&row, 4, "BIP448 binding vout")?,
+        value_sats: checked_u64(&row, 5, "BIP448 binding value")?,
+        script_pubkey: row.try_get(6)?,
+        role: Bip448BindingRole::parse(row.try_get(7)?)?,
+        observation_status: Bip448ObservationStatus::parse(row.try_get(8)?)?,
+        funding_height: checked_optional_u32(&row, 9, "BIP448 funding height")?,
+        spend_txid: row.try_get(10)?,
+        spend_height: checked_optional_u32(&row, 11, "BIP448 spend height")?,
+        last_scanned_height: checked_u32(&row, 12, "BIP448 last scanned height")?,
+        owner_user_pubkey: row.try_get(13)?,
+        owner_state_number: checked_u32(&row, 14, "BIP448 owner state number")?,
+        ownership_status: Bip448OwnershipStatus::parse(row.try_get(15)?)?,
+        first_seen_at: row.try_get(16)?,
+        last_seen_at: row.try_get(17)?,
+    };
+    bip448_funding::validate_binding(&binding)?;
+    Ok(binding)
+}
+
+fn row_to_bip448_attempt(row: sqlx::sqlite::SqliteRow) -> Result<Bip448WithdrawalAttempt> {
+    let attempt = Bip448WithdrawalAttempt {
+        wallet_name: row.try_get(0)?,
+        statechain_id: row.try_get(1)?,
+        binding_index: checked_u32(&row, 2, "BIP448 attempt binding index")?,
+        attempt_kind: Bip448WithdrawalAttemptKind::parse(row.try_get(3)?)?,
+        owner_user_pubkey: row.try_get(4)?,
+        owner_state_number: checked_u32(&row, 5, "BIP448 attempt owner state number")?,
+        source_txid: row.try_get(6)?,
+        source_vout: checked_u32(&row, 7, "BIP448 attempt source vout")?,
+        source_value_sats: checked_u64(&row, 8, "BIP448 attempt source value")?,
+        source_script_pubkey: row.try_get(9)?,
+        destination_address: row.try_get(10)?,
+        destination_script_pubkey: row.try_get(11)?,
+        fee_rate_sat_per_vbyte: row.try_get(12)?,
+        fee_sats: checked_u64(&row, 13, "BIP448 attempt fee")?,
+        lock_time: checked_u32(&row, 14, "BIP448 attempt lock time")?,
+        unsigned_tx_hex: row.try_get(15)?,
+        signing_id: row.try_get(16)?,
+        signed_statechain_id: row.try_get(17)?,
+        sign_first_payload_json: row.try_get(18)?,
+        client_secret_nonce: row.try_get(19)?,
+        client_public_nonce: row.try_get(20)?,
+        blinding_factor: row.try_get(21)?,
+        server_public_nonce: row.try_get(22)?,
+        message_hex: row.try_get(23)?,
+        output_pubkey: row.try_get(24)?,
+        client_partial_sig: row.try_get(25)?,
+        encoded_session: row.try_get(26)?,
+        sign_second_payload_json: row.try_get(27)?,
+        server_partial_sig: row.try_get(28)?,
+        aggregate_signature: row.try_get(29)?,
+        signed_tx_hex: row.try_get(30)?,
+        txid: row.try_get(31)?,
+        phase: Bip448WithdrawalPhase::parse(row.try_get(32)?)?,
+        broadcast_status: Bip448BroadcastStatus::parse(row.try_get(33)?)?,
+        completion_status: Bip448CompletionStatus::parse(row.try_get(34)?)?,
+        closing_tip_height: checked_optional_u32(&row, 35, "BIP448 closing tip height")?,
+        closing_tip_hash: row.try_get(36)?,
+        closing_bindings_json: row.try_get(37)?,
+        created_at: row.try_get(38)?,
+        updated_at: row.try_get(39)?,
+    };
+    bip448_funding::validate_withdrawal_attempt(&attempt)?;
+    Ok(attempt)
+}
+
+fn row_to_bip448_intent(row: sqlx::sqlite::SqliteRow) -> Result<Bip448TransferIntent> {
+    let intent = Bip448TransferIntent {
+        wallet_name: row.try_get(0)?,
+        statechain_id: row.try_get(1)?,
+        intent_id: row.try_get(2)?,
+        predecessor_intent_id: row.try_get(3)?,
+        activity_status: Bip448TransferIntentActivityStatus::parse(row.try_get(4)?)?,
+        intent_kind: Bip448TransferIntentKind::parse(row.try_get(5)?)?,
+        acknowledge_cooperative_duplicates: checked_bool(
+            &row,
+            6,
+            "BIP448 cooperative-duplicate acknowledgement",
+        )?,
+        recipient_address: row.try_get(7)?,
+        receiver_user_pubkey: row.try_get(8)?,
+        recipient_auth_pubkey: row.try_get(9)?,
+        batch_id: row.try_get(10)?,
+        sender_signed_statechain_id: row.try_get(11)?,
+        planned_state_number: checked_u32(&row, 12, "BIP448 planned state number")?,
+        expected_signature_count: checked_u32(&row, 13, "BIP448 expected signature count")?,
+        previous_locktime: checked_u32(&row, 14, "BIP448 previous locktime")?,
+        prior_pending_signing_id: row.try_get(15)?,
+        prior_transfer_recipient_auth_pubkey: row.try_get(16)?,
+        prior_transfer_msg_hash: row.try_get(17)?,
+        reuse_pending: checked_bool(&row, 18, "BIP448 reuse_pending")?,
+        reuse_signed_state: checked_bool(&row, 19, "BIP448 reuse_signed_state")?,
+        clear_local_attempt: checked_bool(&row, 20, "BIP448 clear_local_attempt")?,
+        generated_coin_user_pubkey: row.try_get(21)?,
+        generated_coin_auth_pubkey: row.try_get(22)?,
+        generated_coin_address: row.try_get(23)?,
+        phase: Bip448TransferIntentPhase::parse(row.try_get(24)?)?,
+        server_x1: row.try_get(25)?,
+        current_pending_signing_id: row.try_get(26)?,
+        state_signing_phase: Bip448TransferStateSigningPhase::parse(row.try_get(27)?)?,
+        server_partial_sig: row.try_get(28)?,
+        update_signature: row.try_get(29)?,
+        created_at: row.try_get(30)?,
+        updated_at: row.try_get(31)?,
+    };
+    bip448_funding::validate_transfer_intent(&intent)?;
+    Ok(intent)
+}
+
+async fn list_bip448_funding_bindings_on(
+    connection: &mut SqliteConnection,
+    wallet_name: &str,
+    statechain_id: &str,
+) -> Result<Vec<Bip448FundingBinding>> {
+    let query = format!(
+        "SELECT {BIP448_BINDING_COLUMNS} FROM bip448_funding_bindings \
+         WHERE wallet_name = $1 AND statechain_id = $2 ORDER BY binding_index"
+    );
+    sqlx::query(&query)
+        .bind(wallet_name)
+        .bind(statechain_id)
+        .fetch_all(connection)
+        .await?
+        .into_iter()
+        .map(row_to_bip448_binding)
+        .collect()
+}
+
+pub async fn list_bip448_funding_bindings(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+) -> Result<Vec<Bip448FundingBinding>> {
+    let mut connection = pool.acquire().await?;
+    list_bip448_funding_bindings_on(&mut connection, wallet_name, statechain_id).await
+}
+
+pub async fn get_bip448_funding_binding(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    binding_index: u32,
+) -> Result<Option<Bip448FundingBinding>> {
+    let query = format!(
+        "SELECT {BIP448_BINDING_COLUMNS} FROM bip448_funding_bindings \
+         WHERE wallet_name = $1 AND statechain_id = $2 AND binding_index = $3"
+    );
+    sqlx::query(&query)
+        .bind(wallet_name)
+        .bind(statechain_id)
+        .bind(i64::from(binding_index))
+        .fetch_optional(pool)
+        .await?
+        .map(row_to_bip448_binding)
+        .transpose()
+}
+
+async fn list_bip448_withdrawal_attempts_on(
+    connection: &mut SqliteConnection,
+    wallet_name: &str,
+    statechain_id: &str,
+) -> Result<Vec<Bip448WithdrawalAttempt>> {
+    let query = format!(
+        "SELECT {BIP448_ATTEMPT_COLUMNS} FROM bip448_withdrawal_attempts \
+         WHERE wallet_name = $1 AND statechain_id = $2 ORDER BY binding_index"
+    );
+    sqlx::query(&query)
+        .bind(wallet_name)
+        .bind(statechain_id)
+        .fetch_all(connection)
+        .await?
+        .into_iter()
+        .map(row_to_bip448_attempt)
+        .collect()
+}
+
+pub async fn list_bip448_withdrawal_attempts(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+) -> Result<Vec<Bip448WithdrawalAttempt>> {
+    let mut connection = pool.acquire().await?;
+    list_bip448_withdrawal_attempts_on(&mut connection, wallet_name, statechain_id).await
+}
+
+pub async fn get_bip448_withdrawal_attempt(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    binding_index: u32,
+) -> Result<Option<Bip448WithdrawalAttempt>> {
+    let query = format!(
+        "SELECT {BIP448_ATTEMPT_COLUMNS} FROM bip448_withdrawal_attempts \
+         WHERE wallet_name = $1 AND statechain_id = $2 AND binding_index = $3"
+    );
+    sqlx::query(&query)
+        .bind(wallet_name)
+        .bind(statechain_id)
+        .bind(i64::from(binding_index))
+        .fetch_optional(pool)
+        .await?
+        .map(row_to_bip448_attempt)
+        .transpose()
+}
+
+async fn list_bip448_transfer_intents_on(
+    connection: &mut SqliteConnection,
+    wallet_name: &str,
+    statechain_id: &str,
+) -> Result<Vec<Bip448TransferIntent>> {
+    let query = format!(
+        "SELECT {BIP448_INTENT_COLUMNS} FROM bip448_transfer_intents \
+         WHERE wallet_name = $1 AND statechain_id = $2 ORDER BY intent_id"
+    );
+    sqlx::query(&query)
+        .bind(wallet_name)
+        .bind(statechain_id)
+        .fetch_all(connection)
+        .await?
+        .into_iter()
+        .map(row_to_bip448_intent)
+        .collect()
+}
+
+pub async fn list_bip448_transfer_intents(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+) -> Result<Vec<Bip448TransferIntent>> {
+    let mut connection = pool.acquire().await?;
+    list_bip448_transfer_intents_on(&mut connection, wallet_name, statechain_id).await
+}
+
+pub async fn get_active_bip448_transfer_intent(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+) -> Result<Option<Bip448TransferIntent>> {
+    let intents = list_bip448_transfer_intents(pool, wallet_name, statechain_id).await?;
+    validate_bip448_transfer_intent_lineage(&intents)?;
+    Ok(intents
+        .into_iter()
+        .find(|intent| intent.activity_status == Bip448TransferIntentActivityStatus::Active))
+}
+
+fn validate_bip448_transfer_intent_lineage(
+    intents: &[Bip448TransferIntent],
+) -> Result<Option<usize>> {
+    if intents.is_empty() {
+        return Ok(None);
+    }
+    let wallet_name = &intents[0].wallet_name;
+    let statechain_id = &intents[0].statechain_id;
+    if intents
+        .iter()
+        .any(|intent| &intent.wallet_name != wallet_name || &intent.statechain_id != statechain_id)
+    {
+        return Err(anyhow!(
+            "BIP448 transfer intent lineage crosses wallet or statechain identity"
+        ));
+    }
+    let by_id = intents
+        .iter()
+        .enumerate()
+        .map(|(index, intent)| (intent.intent_id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    if by_id.len() != intents.len() {
+        return Err(anyhow!("duplicate BIP448 transfer intent identity"));
+    }
+    let active = intents
+        .iter()
+        .enumerate()
+        .filter(|(_, intent)| intent.activity_status == Bip448TransferIntentActivityStatus::Active)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if active.len() != 1 {
+        return Err(anyhow!(
+            "BIP448 transfer intent lineage must contain exactly one Active row"
+        ));
+    }
+
+    let active_index = active[0];
+    let mut visited = HashSet::new();
+    let mut current = Some(active_index);
+    while let Some(index) = current {
+        let intent = &intents[index];
+        if !visited.insert(intent.intent_id.as_str()) {
+            return Err(anyhow!("BIP448 transfer intent predecessor cycle"));
+        }
+        current = match intent.predecessor_intent_id.as_deref() {
+            Some(predecessor) => {
+                let predecessor_index = by_id
+                    .get(predecessor)
+                    .copied()
+                    .ok_or_else(|| anyhow!("BIP448 transfer intent predecessor is missing"))?;
+                if intents[predecessor_index].activity_status
+                    != Bip448TransferIntentActivityStatus::Superseded
+                {
+                    return Err(anyhow!(
+                        "BIP448 transfer intent predecessor is not Superseded"
+                    ));
+                }
+                Some(predecessor_index)
+            }
+            None => None,
+        };
+    }
+    if visited.len() != intents.len() {
+        return Err(anyhow!("orphan Superseded BIP448 transfer intent row"));
+    }
+    Ok(Some(active_index))
+}
+
+pub struct Bip448MutationGuard {
+    transaction: Transaction<'static, Sqlite>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct Bip448BeginImmediateTestHook {
+    before_acquire: tokio::sync::Notify,
+    after_acquire: tokio::sync::Notify,
+    before_emitted: std::sync::atomic::AtomicBool,
+    after_emitted: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static BIP448_BEGIN_IMMEDIATE_TEST_HOOK:
+        std::sync::Arc<Bip448BeginImmediateTestHook>;
+}
+
+pub async fn begin_bip448_mutation_guard(pool: &Pool<Sqlite>) -> Result<Bip448MutationGuard> {
+    let begin = pool.begin_with("BEGIN IMMEDIATE");
+    #[cfg(not(test))]
+    let transaction = begin.await?;
+    #[cfg(test)]
+    let transaction = match BIP448_BEGIN_IMMEDIATE_TEST_HOOK.try_with(Clone::clone) {
+        Ok(hook) => {
+            use std::future::Future;
+            let mut begin = std::pin::pin!(begin);
+            let transaction = std::future::poll_fn(|context| {
+                if !hook
+                    .before_emitted
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    hook.before_acquire.notify_one();
+                }
+                begin.as_mut().poll(context)
+            })
+            .await?;
+            hook.after_emitted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            hook.after_acquire.notify_one();
+            transaction
+        }
+        Err(_) => begin.await?,
+    };
+    Ok(Bip448MutationGuard { transaction })
+}
+
+impl Bip448MutationGuard {
+    pub async fn commit(self) -> Result<()> {
+        self.transaction.commit().await?;
+        Ok(())
+    }
+
+    fn connection(&mut self) -> &mut SqliteConnection {
+        &mut self.transaction
+    }
+
+    pub async fn apply_scan_cache_and_cursor(
+        &mut self,
+        wallet_name: &str,
+        script_pubkey: &str,
+        candidate: &Bip448ScanCursor,
+        outpoints: &[ChainUtxo],
+    ) -> Result<Bip448AppliedScanRevision> {
+        bip448_funding::require_canonical_script(script_pubkey)?;
+        let block_hash = canonical_block_hash(&candidate.last_scanned_block_hash)?;
+        let outpoints = outpoints
+            .iter()
+            .map(|outpoint| {
+                Ok((
+                    canonical_txid(&outpoint.txid)?,
+                    outpoint.vout,
+                    outpoint.value,
+                    outpoint.height,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let live = sqlx::query(
+            "SELECT coverage_start_height,scan_revision FROM bip448_scan_cursors \
+            WHERE wallet_name = $1 AND script_pubkey = $2",
+        )
+        .bind(wallet_name)
+        .bind(script_pubkey)
+        .fetch_optional(self.connection())
+        .await?;
+        let (coverage, revision, existed) = match live {
+            Some(row) => (
+                checked_u32(&row, 0, "BIP448 coverage floor")?.min(candidate.coverage_start_height),
+                checked_u64(&row, 1, "BIP448 scan revision")?,
+                true,
+            ),
+            None => (candidate.coverage_start_height, 0, false),
+        };
+        if revision != candidate.scan_revision {
+            return Err(anyhow!("BIP448 scan candidate lost its revision CAS"));
+        }
+        let next_revision = revision
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("BIP448 scan revision overflow"))?;
+        let next_revision_i64 = i64::try_from(next_revision)
+            .map_err(|_| anyhow!("BIP448 scan revision exceeds SQLite integer domain"))?;
+        replace_bip448_scan_cache_on(self.connection(), wallet_name, script_pubkey, &outpoints)
+            .await?;
+        let cursor_write = if existed {
+            sqlx::query(
+                "UPDATE bip448_scan_cursors SET coverage_start_height=$1,scan_revision=$2,\
+                last_scanned_height=$3,last_scanned_block_hash=$4,updated_at=CURRENT_TIMESTAMP \
+                WHERE wallet_name=$5 AND script_pubkey=$6 AND scan_revision=$7",
+            )
+            .bind(i64::from(coverage))
+            .bind(next_revision_i64)
+            .bind(i64::from(candidate.last_scanned_height))
+            .bind(block_hash)
+            .bind(wallet_name)
+            .bind(script_pubkey)
+            .bind(i64::try_from(revision)?)
+            .execute(self.connection())
+            .await?
+        } else {
+            sqlx::query(
+                "INSERT INTO bip448_scan_cursors (wallet_name,script_pubkey,\
+                coverage_start_height,scan_revision,last_scanned_height,last_scanned_block_hash) \
+                VALUES ($1,$2,$3,$4,$5,$6)",
+            )
+            .bind(wallet_name)
+            .bind(script_pubkey)
+            .bind(i64::from(coverage))
+            .bind(next_revision_i64)
+            .bind(i64::from(candidate.last_scanned_height))
+            .bind(block_hash)
+            .execute(self.connection())
+            .await?
+        };
+        if cursor_write.rows_affected() != 1 {
+            return Err(anyhow!("BIP448 scan cursor CAS lost"));
+        }
+        Ok(Bip448AppliedScanRevision {
+            script_pubkey: script_pubkey.to_owned(),
+            scan_revision: next_revision,
+        })
+    }
+
+    pub async fn update_wallet_if_unchanged_and_scan_current(
+        &mut self,
+        wallet_name: &str,
+        expected_raw_wallet_json: &str,
+        replacement_wallet: &Wallet,
+        applied_revisions: &[Bip448AppliedScanRevision],
+    ) -> Result<bool> {
+        if replacement_wallet.name != wallet_name {
+            return Err(anyhow!("BIP448 wallet CAS identity mismatch"));
+        }
+        let replacement = canonical_wallet_json(replacement_wallet)?;
+        let mut tokens = applied_revisions.to_vec();
+        tokens.sort_by(|left, right| left.script_pubkey.cmp(&right.script_pubkey));
+        if tokens
+            .windows(2)
+            .any(|pair| pair[0].script_pubkey == pair[1].script_pubkey)
+        {
+            return Err(anyhow!("duplicate BIP448 applied scan revision token"));
+        }
+        let live_wallet = sqlx::query_scalar::<_, String>(
+            "SELECT wallet_json FROM wallet WHERE wallet_name = $1",
+        )
+        .bind(wallet_name)
+        .fetch_optional(self.connection())
+        .await?;
+        if live_wallet.as_deref() != Some(expected_raw_wallet_json) {
+            return Ok(false);
+        }
+        for token in &tokens {
+            bip448_funding::require_canonical_script(&token.script_pubkey)?;
+            let live_revision = sqlx::query_scalar::<_, i64>(
+                "SELECT scan_revision FROM bip448_scan_cursors \
+                 WHERE wallet_name = $1 AND script_pubkey = $2",
+            )
+            .bind(wallet_name)
+            .bind(&token.script_pubkey)
+            .fetch_optional(self.connection())
+            .await?;
+            if live_revision.map(u64::try_from).transpose()? != Some(token.scan_revision) {
+                return Ok(false);
+            }
+        }
+        let result = sqlx::query(
+            "UPDATE wallet SET wallet_json = $1 WHERE wallet_name = $2 AND wallet_json = $3",
+        )
+        .bind(replacement)
+        .bind(wallet_name)
+        .bind(expected_raw_wallet_json)
+        .execute(self.connection())
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(anyhow!(
+                "BIP448 wallet CAS affected an unexpected row count"
+            ));
+        }
+        Ok(true)
+    }
+
+    pub async fn prepare_or_supersede_transfer_intent(
+        &mut self,
+        expected_active_intent_id: Option<&str>,
+        intent: &Bip448TransferIntent,
+    ) -> Result<Bip448TransferIntent> {
+        bip448_funding::validate_transfer_intent(intent)?;
+        if intent.intent_kind != Bip448TransferIntentKind::UserTransfer
+            || intent.activity_status != Bip448TransferIntentActivityStatus::Active
+            || intent.phase != Bip448TransferIntentPhase::Prepared
+            || intent.state_signing_phase != Bip448TransferStateSigningPhase::NotStarted
+            || intent.batch_id.is_some() && expected_active_intent_id.is_some()
+        {
+            return Err(anyhow!("invalid BIP448 user-transfer intent plan"));
+        }
+        match expected_active_intent_id {
+            None if intent.predecessor_intent_id.is_some() => {
+                return Err(anyhow!("root BIP448 transfer intent has a predecessor"));
+            }
+            Some(expected) => {
+                bip448_funding::require_canonical_hex(expected, Some(32))?;
+                if intent.predecessor_intent_id.as_deref() != Some(expected) {
+                    return Err(anyhow!("BIP448 successor names the wrong predecessor"));
+                }
+            }
+            None => {}
+        }
+
+        let intents = list_bip448_transfer_intents_on(
+            self.connection(),
+            &intent.wallet_name,
+            &intent.statechain_id,
+        )
+        .await?;
+        if let Some(existing) = intents.iter().find(|row| row.intent_id == intent.intent_id) {
+            validate_bip448_transfer_intent_lineage(&intents)?;
+            if existing.activity_status != Bip448TransferIntentActivityStatus::Active
+                || !bip448_funding::transfer_intent_immutable_eq(existing, intent)
+            {
+                return Err(anyhow!("BIP448 transfer intent immutable replay conflict"));
+            }
+            return Ok(existing.clone());
+        }
+
+        if let Some(expected) = expected_active_intent_id {
+            let active_index = validate_bip448_transfer_intent_lineage(&intents)?
+                .ok_or_else(|| anyhow!("BIP448 transfer intent successor has no predecessor"))?;
+            let active = &intents[active_index];
+            if active.intent_id != expected
+                || !intent_is_directly_supersedable(active)
+                || active.batch_id.is_some()
+            {
+                return Err(anyhow!(
+                    "BIP448 active predecessor is not at a supersedable boundary"
+                ));
+            }
+            require_materialized_signed_transfer_intent_on(self.connection(), active).await?;
+            validate_bip448_successor_plan_on(self.connection(), active, intent).await?;
+            ensure_transfer_insert_blockers_on(self.connection(), intent).await?;
+            let superseded = sqlx::query(
+                "UPDATE bip448_transfer_intents SET activity_status='Superseded', \
+                 updated_at=CURRENT_TIMESTAMP WHERE wallet_name=$1 AND statechain_id=$2 \
+                 AND intent_id=$3 AND activity_status='Active' AND phase=$4 \
+                 AND state_signing_phase=$5",
+            )
+            .bind(&intent.wallet_name)
+            .bind(&intent.statechain_id)
+            .bind(expected)
+            .bind(active.phase.as_str())
+            .bind(active.state_signing_phase.as_str())
+            .execute(self.connection())
+            .await?;
+            if superseded.rows_affected() != 1 {
+                return Err(anyhow!(
+                    "BIP448 predecessor supersession compare-and-set lost"
+                ));
+            }
+        } else {
+            if !intents.is_empty() {
+                validate_bip448_transfer_intent_lineage(&intents)?;
+                return Err(anyhow!(
+                    "a different Active BIP448 transfer intent already exists"
+                ));
+            }
+            ensure_transfer_insert_blockers_on(self.connection(), intent).await?;
+        }
+
+        insert_transfer_intent_on(self.connection(), intent).await?;
+        let all = list_bip448_transfer_intents_on(
+            self.connection(),
+            &intent.wallet_name,
+            &intent.statechain_id,
+        )
+        .await?;
+        validate_bip448_transfer_intent_lineage(&all)?;
+        all.into_iter()
+            .find(|row| row.intent_id == intent.intent_id)
+            .ok_or_else(|| anyhow!("BIP448 transfer intent disappeared after insertion"))
+    }
+
+    pub async fn persist_cancellation_wallet_and_intent(
+        &mut self,
+        expected_active_intent_id: Option<&str>,
+        intent: &Bip448TransferIntent,
+        expected_raw_wallet_json: &str,
+        replacement_wallet: &Wallet,
+    ) -> Result<Bip448TransferIntent> {
+        bip448_funding::validate_transfer_intent(intent)?;
+        if intent.intent_kind != Bip448TransferIntentKind::Cancellation
+            || intent.activity_status != Bip448TransferIntentActivityStatus::Active
+            || intent.phase != Bip448TransferIntentPhase::Prepared
+            || intent.state_signing_phase != Bip448TransferStateSigningPhase::NotStarted
+            || intent.batch_id.is_some()
+        {
+            return Err(anyhow!("invalid BIP448 cancellation intent plan"));
+        }
+        match expected_active_intent_id {
+            None if intent.predecessor_intent_id.is_some() => {
+                return Err(anyhow!("root BIP448 cancellation intent has a predecessor"));
+            }
+            Some(expected) => {
+                bip448_funding::require_canonical_hex(expected, Some(32))?;
+                if intent.predecessor_intent_id.as_deref() != Some(expected) {
+                    return Err(anyhow!("BIP448 cancellation names the wrong predecessor"));
+                }
+            }
+            None => {}
+        }
+        let replacement = validate_bip448_cancellation_wallet_append(
+            intent,
+            expected_raw_wallet_json,
+            replacement_wallet,
+        )?;
+        let intents = list_bip448_transfer_intents_on(
+            self.connection(),
+            &intent.wallet_name,
+            &intent.statechain_id,
+        )
+        .await?;
+        if let Some(existing) = intents.iter().find(|row| row.intent_id == intent.intent_id) {
+            validate_bip448_transfer_intent_lineage(&intents)?;
+            if existing.activity_status != Bip448TransferIntentActivityStatus::Active
+                || !bip448_funding::transfer_intent_immutable_eq(existing, intent)
+            {
+                return Err(anyhow!("BIP448 cancellation immutable replay conflict"));
+            }
+            let raw = sqlx::query_scalar::<_, String>(
+                "SELECT wallet_json FROM wallet WHERE wallet_name=$1",
+            )
+            .bind(&intent.wallet_name)
+            .fetch_one(self.connection())
+            .await?;
+            let wallet: Wallet = serde_json::from_str(&raw)?;
+            let matches = wallet
+                .coins
+                .iter()
+                .filter(|coin| {
+                    Some(coin.user_pubkey.as_str()) == intent.generated_coin_user_pubkey.as_deref()
+                        && Some(coin.auth_pubkey.as_str())
+                            == intent.generated_coin_auth_pubkey.as_deref()
+                        && Some(coin.address.as_str()) == intent.generated_coin_address.as_deref()
+                        && coin
+                            .statechain_id
+                            .as_deref()
+                            .is_none_or(|id| id == intent.statechain_id)
+                })
+                .count();
+            if matches != 1 {
+                return Err(anyhow!(
+                    "BIP448 cancellation replay has no unique generated Coin"
+                ));
+            }
+            return Ok(existing.clone());
+        }
+
+        let active = if let Some(expected) = expected_active_intent_id {
+            let active_index = validate_bip448_transfer_intent_lineage(&intents)?
+                .ok_or_else(|| anyhow!("BIP448 cancellation successor has no predecessor"))?;
+            let active = intents[active_index].clone();
+            if active.intent_id != expected
+                || !intent_is_directly_supersedable(&active)
+                || active.batch_id.is_some()
+            {
+                return Err(anyhow!(
+                    "BIP448 active predecessor is not at a cancellation boundary"
+                ));
+            }
+            require_materialized_signed_transfer_intent_on(self.connection(), &active).await?;
+            validate_bip448_successor_plan_on(self.connection(), &active, intent).await?;
+            Some(active)
+        } else {
+            if !intents.is_empty() {
+                validate_bip448_transfer_intent_lineage(&intents)?;
+                return Err(anyhow!(
+                    "BIP448 cancellation conflicts with an active intent"
+                ));
+            }
+            None
+        };
+        ensure_transfer_insert_blockers_on(self.connection(), intent).await?;
+        let wallet =
+            sqlx::query("UPDATE wallet SET wallet_json=$1 WHERE wallet_name=$2 AND wallet_json=$3")
+                .bind(replacement)
+                .bind(&intent.wallet_name)
+                .bind(expected_raw_wallet_json)
+                .execute(self.connection())
+                .await?;
+        if wallet.rows_affected() != 1 {
+            return Err(anyhow!("BIP448 cancellation wallet CAS lost"));
+        }
+        if let Some(active) = active {
+            let superseded = sqlx::query(
+                "UPDATE bip448_transfer_intents SET activity_status='Superseded', \
+                 updated_at=CURRENT_TIMESTAMP WHERE wallet_name=$1 AND statechain_id=$2 \
+                 AND intent_id=$3 AND activity_status='Active' AND phase=$4 \
+                 AND state_signing_phase=$5",
+            )
+            .bind(&intent.wallet_name)
+            .bind(&intent.statechain_id)
+            .bind(&active.intent_id)
+            .bind(active.phase.as_str())
+            .bind(active.state_signing_phase.as_str())
+            .execute(self.connection())
+            .await?;
+            if superseded.rows_affected() != 1 {
+                return Err(anyhow!("BIP448 cancellation predecessor CAS lost"));
+            }
+        }
+        insert_transfer_intent_on(self.connection(), intent).await?;
+        let all = list_bip448_transfer_intents_on(
+            self.connection(),
+            &intent.wallet_name,
+            &intent.statechain_id,
+        )
+        .await?;
+        validate_bip448_transfer_intent_lineage(&all)?;
+        all.into_iter()
+            .find(|row| row.intent_id == intent.intent_id)
+            .ok_or_else(|| anyhow!("BIP448 cancellation intent disappeared after insertion"))
+    }
+
+    pub async fn reconcile_funding_bindings(
+        &mut self,
+        wallet_name: &str,
+        statechain_id: &str,
+        owner_user_pubkey: &str,
+        owner_state_number: u32,
+        observations: &[Bip448BindingObservation],
+    ) -> Result<Vec<Bip448FundingBinding>> {
+        reconcile_bip448_funding_bindings_in_guard(
+            self,
+            wallet_name,
+            statechain_id,
+            owner_user_pubkey,
+            owner_state_number,
+            observations,
+        )
+        .await
+    }
+
+    pub async fn update_withdrawal_broadcast_status(
+        &mut self,
+        wallet_name: &str,
+        statechain_id: &str,
+        binding_index: u32,
+        signing_id: &str,
+        expected: Bip448BroadcastStatus,
+        next: Bip448BroadcastStatus,
+    ) -> Result<Bip448WithdrawalAttempt> {
+        if !legal_broadcast_transition(expected, next) {
+            return Err(anyhow!("illegal BIP448 broadcast-status regression"));
+        }
+        let result = sqlx::query(
+            "UPDATE bip448_withdrawal_attempts SET broadcast_status = $1, \
+             updated_at = CURRENT_TIMESTAMP WHERE wallet_name = $2 AND statechain_id = $3 \
+             AND binding_index = $4 AND signing_id = $5 AND phase = 'Signed' \
+             AND broadcast_status = $6",
+        )
+        .bind(next.as_str())
+        .bind(wallet_name)
+        .bind(statechain_id)
+        .bind(i64::from(binding_index))
+        .bind(signing_id)
+        .bind(expected.as_str())
+        .execute(self.connection())
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(anyhow!("BIP448 broadcast-status compare-and-set lost"));
+        }
+        self.exact_attempt(wallet_name, statechain_id, binding_index)
+            .await?
+            .ok_or_else(|| anyhow!("BIP448 attempt disappeared after broadcast update"))
+    }
+
+    async fn exact_binding(
+        &mut self,
+        wallet_name: &str,
+        statechain_id: &str,
+        binding_index: u32,
+    ) -> Result<Option<Bip448FundingBinding>> {
+        let query = format!(
+            "SELECT {BIP448_BINDING_COLUMNS} FROM bip448_funding_bindings \
+             WHERE wallet_name = $1 AND statechain_id = $2 AND binding_index = $3"
+        );
+        sqlx::query(&query)
+            .bind(wallet_name)
+            .bind(statechain_id)
+            .bind(i64::from(binding_index))
+            .fetch_optional(self.connection())
+            .await?
+            .map(row_to_bip448_binding)
+            .transpose()
+    }
+
+    async fn exact_attempt(
+        &mut self,
+        wallet_name: &str,
+        statechain_id: &str,
+        binding_index: u32,
+    ) -> Result<Option<Bip448WithdrawalAttempt>> {
+        let query = format!(
+            "SELECT {BIP448_ATTEMPT_COLUMNS} FROM bip448_withdrawal_attempts \
+             WHERE wallet_name = $1 AND statechain_id = $2 AND binding_index = $3"
+        );
+        sqlx::query(&query)
+            .bind(wallet_name)
+            .bind(statechain_id)
+            .bind(i64::from(binding_index))
+            .fetch_optional(self.connection())
+            .await?
+            .map(row_to_bip448_attempt)
+            .transpose()
+    }
+
+    async fn ensure_attempt_insert_blockers(
+        &mut self,
+        attempt: &Bip448WithdrawalAttempt,
+    ) -> Result<()> {
+        let intents = list_bip448_transfer_intents_on(
+            self.connection(),
+            &attempt.wallet_name,
+            &attempt.statechain_id,
+        )
+        .await?;
+        if !intents.is_empty() {
+            validate_bip448_transfer_intent_lineage(&intents)?;
+            return Err(anyhow!(
+                "active BIP448 transfer intent blocks withdrawal signing"
+            ));
+        }
+        let pending = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM bip448_pending_transfer_signings \
+             WHERE wallet_name = $1 AND statechain_id = $2",
+        )
+        .bind(&attempt.wallet_name)
+        .bind(&attempt.statechain_id)
+        .fetch_one(self.connection())
+        .await?;
+        if pending != 0 {
+            return Err(anyhow!(
+                "pending BIP448 transfer signing blocks withdrawal signing"
+            ));
+        }
+        let messages = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM bip448_transfer_messages \
+             WHERE wallet_name = $1 AND statechain_id = $2",
+        )
+        .bind(&attempt.wallet_name)
+        .bind(&attempt.statechain_id)
+        .fetch_one(self.connection())
+        .await?;
+        if messages != 0 {
+            return Err(anyhow!(
+                "outgoing BIP448 transfer message blocks withdrawal signing"
+            ));
+        }
+        let wallet_json = sqlx::query_scalar::<_, String>(
+            "SELECT wallet_json FROM wallet WHERE wallet_name = $1",
+        )
+        .bind(&attempt.wallet_name)
+        .fetch_optional(self.connection())
+        .await?;
+        if let Some(wallet_json) = wallet_json {
+            let wallet: Wallet = serde_json::from_str(&wallet_json)?;
+            if wallet.coins.iter().any(|coin| {
+                coin.statechain_id.as_deref() == Some(attempt.statechain_id.as_str())
+                    && coin.status == mercurylib::wallet::CoinStatus::IN_TRANSFER
+            }) {
+                return Err(anyhow!("IN_TRANSFER BIP448 Coin blocks withdrawal signing"));
+            }
+        }
+        Ok(())
+    }
+
+    async fn require_attempt_binding_and_owner_identity(
+        &mut self,
+        attempt: &Bip448WithdrawalAttempt,
+    ) -> Result<Bip448FundingBinding> {
+        let (record, history) = accepted_record_and_history_on(
+            self.connection(),
+            &attempt.wallet_name,
+            &attempt.statechain_id,
+        )
+        .await?;
+        let accepted_owner = history
+            .get(
+                usize::try_from(record.latest_state_number)?
+                    .checked_sub(1)
+                    .ok_or_else(|| anyhow!("BIP448 accepted state number must be positive"))?,
+            )
+            .ok_or_else(|| anyhow!("BIP448 accepted owner history is missing"))?;
+        if record.wallet_name != attempt.wallet_name
+            || record.statechain_id != attempt.statechain_id
+            || record.latest_state_number != attempt.owner_state_number
+            || accepted_owner.owner_public_key != attempt.owner_user_pubkey
+            || accepted_funding_script(&record)? != attempt.source_script_pubkey
+        {
+            return Err(anyhow!(
+                "BIP448 withdrawal attempt does not match accepted owner history"
+            ));
+        }
+        let binding = self
+            .exact_binding(
+                &attempt.wallet_name,
+                &attempt.statechain_id,
+                attempt.binding_index,
+            )
+            .await?
+            .ok_or_else(|| anyhow!("BIP448 withdrawal attempt binding is missing"))?;
+        if binding.ownership_status != Bip448OwnershipStatus::Current
+            || binding.owner_user_pubkey != attempt.owner_user_pubkey
+            || binding.owner_state_number != attempt.owner_state_number
+            || binding.txid != attempt.source_txid
+            || binding.vout != attempt.source_vout
+            || binding.value_sats != attempt.source_value_sats
+            || binding.script_pubkey != attempt.source_script_pubkey
+            || match binding.role {
+                Bip448BindingRole::Canonical => {
+                    attempt.attempt_kind != Bip448WithdrawalAttemptKind::Canonical
+                }
+                Bip448BindingRole::Duplicate => {
+                    attempt.attempt_kind != Bip448WithdrawalAttemptKind::Duplicate
+                }
+            }
+        {
+            return Err(anyhow!(
+                "BIP448 withdrawal attempt does not match its current-owner binding"
+            ));
+        }
+        Ok(binding)
+    }
+
+    async fn require_confirmed_canonical_owner_coin(
+        &mut self,
+        attempt: &Bip448WithdrawalAttempt,
+    ) -> Result<()> {
+        let (record, history) = accepted_record_and_history_on(
+            self.connection(),
+            &attempt.wallet_name,
+            &attempt.statechain_id,
+        )
+        .await?;
+        let accepted_owner = history
+            .get(
+                usize::try_from(record.latest_state_number)?
+                    .checked_sub(1)
+                    .ok_or_else(|| anyhow!("BIP448 accepted state number must be positive"))?,
+            )
+            .ok_or_else(|| anyhow!("BIP448 accepted owner history is missing"))?;
+        let owner = XOnlyPublicKey::from_str(&accepted_owner.owner_public_key)?;
+        require_selected_bip448_wallet_coin_on(
+            self.connection(),
+            &record,
+            owner,
+            Bip448WalletCoinRequirement::ConfirmedCanonicalAttempt,
+        )
+        .await
+    }
+
+    pub async fn insert_withdrawal_attempt_if_absent(
+        &mut self,
+        attempt: &Bip448WithdrawalAttempt,
+    ) -> Result<Bip448WithdrawalAttempt> {
+        bip448_funding::validate_withdrawal_attempt(attempt)?;
+        if attempt.phase != Bip448WithdrawalPhase::Prepared
+            || attempt.broadcast_status != Bip448BroadcastStatus::NotBroadcast
+        {
+            return Err(anyhow!("new BIP448 withdrawal attempt must be Prepared"));
+        }
+        if let Some(existing) = self
+            .exact_attempt(
+                &attempt.wallet_name,
+                &attempt.statechain_id,
+                attempt.binding_index,
+            )
+            .await?
+        {
+            if !bip448_funding::withdrawal_attempt_immutable_eq(&existing, attempt) {
+                return Err(anyhow!(
+                    "BIP448 withdrawal attempt conflicts with immutable persisted identity"
+                ));
+            }
+            self.require_attempt_binding_and_owner_identity(&existing)
+                .await?;
+            return Ok(existing);
+        }
+
+        self.ensure_attempt_insert_blockers(attempt).await?;
+        let binding = self
+            .require_attempt_binding_and_owner_identity(attempt)
+            .await?;
+        if binding.observation_status != Bip448ObservationStatus::Confirmed {
+            return Err(anyhow!(
+                "new BIP448 withdrawal attempt requires a Confirmed binding"
+            ));
+        }
+        if attempt.attempt_kind == Bip448WithdrawalAttemptKind::Canonical {
+            self.require_confirmed_canonical_owner_coin(attempt).await?;
+            let closing_tip_height = attempt
+                .closing_tip_height
+                .ok_or_else(|| anyhow!("canonical BIP448 attempt closing tip is missing"))?;
+            let closing_tip_hash = attempt
+                .closing_tip_hash
+                .as_deref()
+                .ok_or_else(|| anyhow!("canonical BIP448 attempt closing tip is missing"))?;
+            let cursor_match = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM bip448_scan_cursors WHERE wallet_name = $1 \
+                 AND script_pubkey = $2 AND coverage_start_height = 0 \
+                 AND last_scanned_height = $3 AND last_scanned_block_hash = $4",
+            )
+            .bind(&attempt.wallet_name)
+            .bind(&attempt.source_script_pubkey)
+            .bind(i64::from(closing_tip_height))
+            .bind(closing_tip_hash)
+            .fetch_one(self.connection())
+            .await?;
+            if cursor_match != 1 {
+                return Err(anyhow!(
+                    "canonical BIP448 close tip is not the current height-0 scan"
+                ));
+            }
+            let bindings = list_bip448_funding_bindings_on(
+                self.connection(),
+                &attempt.wallet_name,
+                &attempt.statechain_id,
+            )
+            .await?;
+            let attempts = list_bip448_withdrawal_attempts_on(
+                self.connection(),
+                &attempt.wallet_name,
+                &attempt.statechain_id,
+            )
+            .await?;
+            match bip448_funding::evaluate_bip448_close_gate(&bindings, &attempts)? {
+                Bip448CloseGate::Ready {
+                    closing_bindings_json,
+                    ..
+                } if Some(closing_bindings_json.as_str())
+                    == attempt.closing_bindings_json.as_deref() => {}
+                Bip448CloseGate::Ready { .. } => {
+                    return Err(anyhow!(
+                        "canonical BIP448 close snapshot does not match the exact gate rows"
+                    ));
+                }
+                Bip448CloseGate::Blocked { .. } => {
+                    return Err(anyhow!(
+                        "current BIP448 duplicate rows block canonical attempt insertion"
+                    ));
+                }
+            }
+        }
+        let attempts = list_bip448_withdrawal_attempts_on(
+            self.connection(),
+            &attempt.wallet_name,
+            &attempt.statechain_id,
+        )
+        .await?;
+        if attempt.attempt_kind == Bip448WithdrawalAttemptKind::Duplicate
+            && attempts.iter().any(|row| row.binding_index == 0)
+        {
+            return Err(anyhow!(
+                "BIP448 address is retired by a canonical withdrawal attempt"
+            ));
+        }
+        for prior in &attempts {
+            if prior.phase != Bip448WithdrawalPhase::Signed {
+                return Err(anyhow!("another BIP448 withdrawal signing is active"));
+            }
+            if !matches!(
+                prior.broadcast_status,
+                Bip448BroadcastStatus::Accepted
+                    | Bip448BroadcastStatus::Confirmed
+                    | Bip448BroadcastStatus::Conflicted
+            ) {
+                return Err(anyhow!(
+                    "prior BIP448 withdrawal bytes require reconciliation"
+                ));
+            }
+            if prior.broadcast_status == Bip448BroadcastStatus::Conflicted {
+                let prior_binding = self
+                    .exact_binding(
+                        &prior.wallet_name,
+                        &prior.statechain_id,
+                        prior.binding_index,
+                    )
+                    .await?
+                    .ok_or_else(|| anyhow!("conflicted BIP448 attempt binding is missing"))?;
+                if prior_binding.observation_status != Bip448ObservationStatus::SpentConfirmed
+                    || prior_binding.spend_txid.is_none()
+                    || prior_binding.spend_txid == prior.txid
+                {
+                    return Err(anyhow!(
+                        "prior BIP448 conflict is not target-confirmed by a different spender"
+                    ));
+                }
+            }
+        }
+
+        let result = sqlx::query(
+            "INSERT INTO bip448_withdrawal_attempts (\
+                wallet_name, statechain_id, binding_index, attempt_kind, owner_user_pubkey, \
+                owner_state_number, source_txid, source_vout, source_value_sats, \
+                source_script_pubkey, destination_address, destination_script_pubkey, \
+                fee_rate_sat_per_vbyte, fee_sats, lock_time, unsigned_tx_hex, signing_id, \
+                signed_statechain_id, sign_first_payload_json, client_secret_nonce, \
+                client_public_nonce, blinding_factor, server_public_nonce, message_hex, \
+                output_pubkey, client_partial_sig, encoded_session, sign_second_payload_json, \
+                server_partial_sig, aggregate_signature, signed_tx_hex, txid, phase, \
+                broadcast_status, completion_status, closing_tip_height, closing_tip_hash, \
+                closing_bindings_json\
+             ) VALUES (\
+                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,\
+                $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38\
+             )",
+        )
+        .bind(&attempt.wallet_name)
+        .bind(&attempt.statechain_id)
+        .bind(i64::from(attempt.binding_index))
+        .bind(attempt.attempt_kind.as_str())
+        .bind(&attempt.owner_user_pubkey)
+        .bind(i64::from(attempt.owner_state_number))
+        .bind(&attempt.source_txid)
+        .bind(i64::from(attempt.source_vout))
+        .bind(i64::try_from(attempt.source_value_sats)?)
+        .bind(&attempt.source_script_pubkey)
+        .bind(&attempt.destination_address)
+        .bind(&attempt.destination_script_pubkey)
+        .bind(attempt.fee_rate_sat_per_vbyte)
+        .bind(i64::try_from(attempt.fee_sats)?)
+        .bind(i64::from(attempt.lock_time))
+        .bind(&attempt.unsigned_tx_hex)
+        .bind(&attempt.signing_id)
+        .bind(&attempt.signed_statechain_id)
+        .bind(&attempt.sign_first_payload_json)
+        .bind(&attempt.client_secret_nonce)
+        .bind(&attempt.client_public_nonce)
+        .bind(&attempt.blinding_factor)
+        .bind(&attempt.server_public_nonce)
+        .bind(&attempt.message_hex)
+        .bind(&attempt.output_pubkey)
+        .bind(&attempt.client_partial_sig)
+        .bind(&attempt.encoded_session)
+        .bind(&attempt.sign_second_payload_json)
+        .bind(&attempt.server_partial_sig)
+        .bind(&attempt.aggregate_signature)
+        .bind(&attempt.signed_tx_hex)
+        .bind(&attempt.txid)
+        .bind(attempt.phase.as_str())
+        .bind(attempt.broadcast_status.as_str())
+        .bind(attempt.completion_status.as_str())
+        .bind(attempt.closing_tip_height.map(i64::from))
+        .bind(&attempt.closing_tip_hash)
+        .bind(&attempt.closing_bindings_json)
+        .execute(self.connection())
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(anyhow!(
+                "BIP448 withdrawal attempt insert affected an unexpected row count"
+            ));
+        }
+        self.exact_attempt(
+            &attempt.wallet_name,
+            &attempt.statechain_id,
+            attempt.binding_index,
+        )
+        .await?
+        .ok_or_else(|| anyhow!("BIP448 withdrawal attempt disappeared after insertion"))
+    }
+}
+
+pub async fn insert_bip448_withdrawal_attempt_if_absent(
+    pool: &Pool<Sqlite>,
+    attempt: &Bip448WithdrawalAttempt,
+) -> Result<Bip448WithdrawalAttempt> {
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let persisted = guard.insert_withdrawal_attempt_if_absent(attempt).await?;
+    guard.commit().await?;
+    Ok(persisted)
+}
+
+fn history_entry_matches_latest_state(
+    entry: &Bip448StateHistoryEntry,
+    state: &Bip448LatestState,
+) -> bool {
+    entry.state_number == state.state_number
+        && entry.state_locktime == state.state_locktime
+        && entry.update_template_hash == state.update_template_hash
+        && entry.settlement_template_hash == state.settlement_template_hash
+        && entry.update_signature == state.signing_metadata.update_signature
+        && entry.client_public_nonce == state.signing_metadata.client_public_nonce
+        && entry.server_public_nonce == state.signing_metadata.server_public_nonce
+        && entry.blinding_factor == state.signing_metadata.blinding_factor
+}
+
+fn validate_bip448_history_entry(entry: &Bip448StateHistoryEntry) -> Result<()> {
+    if entry.state_number == 0 {
+        return Err(anyhow!("BIP448 history state number must be positive"));
+    }
+    let state_locktime = absolute::LockTime::from_consensus(entry.state_locktime);
+    if entry.state_number == INITIAL_BIP448_STATE_NUMBER {
+        script::validate_initial_state_locktime(state_locktime)?;
+    } else {
+        script::validate_state_locktime(state_locktime)?;
+    }
+    bip448_funding::require_canonical_xonly_public_key(&entry.owner_public_key)?;
+    bip448_funding::require_canonical_hex(&entry.update_template_hash, Some(32))?;
+    bip448_funding::require_canonical_hex(&entry.settlement_template_hash, Some(32))?;
+    bip448_funding::require_canonical_hex(&entry.update_signature, Some(64))?;
+    bip448_funding::require_canonical_hex(&entry.client_public_nonce, Some(66))?;
+    bip448_funding::require_canonical_hex(&entry.server_public_nonce, Some(66))?;
+    bip448_funding::require_canonical_hex(&entry.blinding_factor, Some(32))?;
+    Ok(())
+}
+
+fn validate_bip448_accepted_artifacts(
+    record: &Bip448StatechainRecord,
+    history: &[Bip448StateHistoryEntry],
+) -> Result<()> {
+    if record.wallet_name.is_empty()
+        || record.statechain_id.is_empty()
+        || record.latest_state_number == 0
+        || record.latest_state_number != record.latest_state.state_number
+        || record.challenge_delay != DEFAULT_BIP448_CHALLENGE_DELAY
+        || record.latest_state.challenge_delay != record.challenge_delay
+        || record.amount_sats != record.funding_outpoint.value_sats
+        || record.latest_state.signing_metadata.server_signature_count
+            != u64::from(record.latest_state_number)
+        || record.latest_state.signing_metadata.role != Bip448RecoveryTemplateRole::FundingUpdate
+        || record.latest_state.fee_bump_policy != Bip448FeeBumpPolicy::ZeroFeeEphemeralAnchor
+        || !record.latest_state.cpfp_child_templates.is_empty()
+    {
+        return Err(anyhow!(
+            "BIP448 accepted record has incoherent state, count, or recovery policy"
+        ));
+    }
+    if canonical_txid(&record.funding_outpoint.txid)? != record.funding_outpoint.txid {
+        return Err(anyhow!("BIP448 accepted funding txid is not canonical"));
+    }
+    let network = mercurylib::utils::get_network(&record.network)
+        .context("invalid BIP448 accepted network")?;
+    let aggregate_pubkey = PublicKey::from_str(&record.aggregate_pubkey)
+        .context("invalid BIP448 accepted aggregate public key")?;
+    if aggregate_pubkey.to_string() != record.aggregate_pubkey {
+        return Err(anyhow!(
+            "BIP448 accepted aggregate public key is not canonical"
+        ));
+    }
+    bip448_funding::require_canonical_hex(
+        &record.latest_state.signing_metadata.signing_id,
+        Some(32),
+    )?;
+    let accepted_len = usize::try_from(record.latest_state_number)?;
+    if history.len() < accepted_len {
+        return Err(anyhow!("BIP448 accepted history prefix is incomplete"));
+    }
+
+    let secp = Secp256k1::new();
+    let funding_outpoint = OutPoint {
+        txid: Txid::from_str(&record.funding_outpoint.txid)?,
+        vout: record.funding_outpoint.vout,
+    };
+    for (index, entry) in history.iter().enumerate() {
+        validate_bip448_history_entry(entry)?;
+        let expected_state_number = u32::try_from(index)?
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("BIP448 history state number overflows"))?;
+        if entry.state_number != expected_state_number {
+            return Err(anyhow!("BIP448 accepted history is not contiguous"));
+        }
+        let owner = XOnlyPublicKey::from_str(&entry.owner_public_key)?;
+        let recovery_script = Address::p2tr(&secp, owner, None, network).script_pubkey();
+        let artifacts = build_funding_recovery_artifacts(
+            &secp,
+            &aggregate_pubkey,
+            funding_outpoint,
+            record.funding_outpoint.value_sats,
+            recovery_script,
+            entry.state_number,
+            absolute::LockTime::from_consensus(entry.state_locktime),
+            record.challenge_delay,
+            Bip448FeeBumpPolicy::ZeroFeeEphemeralAnchor,
+        )
+        .context("invalid BIP448 accepted recovery templates")?;
+        if entry.update_template_hash != hex::encode(artifacts.update_template_hash.to_byte_array())
+            || entry.settlement_template_hash
+                != hex::encode(artifacts.settlement_template_hash.to_byte_array())
+        {
+            return Err(anyhow!(
+                "BIP448 accepted history hashes do not match reconstructed templates"
+            ));
+        }
+        let update_signature = schnorr::Signature::from_str(&entry.update_signature)
+            .context("invalid BIP448 accepted update signature")?;
+        schnorr::verify(
+            &update_signature,
+            artifacts.update_template_hash.as_byte_array(),
+            &aggregate_pubkey.x_only_public_key().0,
+        )
+        .context("BIP448 accepted update signature does not verify")?;
+        let client_nonce = PublicNonce::from_slice(&hex::decode(&entry.client_public_nonce)?)
+            .context("invalid BIP448 accepted client public nonce")?;
+        let server_nonce = PublicNonce::from_slice(&hex::decode(&entry.server_public_nonce)?)
+            .context("invalid BIP448 accepted server public nonce")?;
+        let blinding_factor = BlindingFactor::from_slice(&hex::decode(&entry.blinding_factor)?)
+            .context("invalid BIP448 accepted blinding factor")?;
+        CsfsSigningSession::new(
+            &secp,
+            CsfsSigningRole::FundingUpdate,
+            aggregate_pubkey,
+            &client_nonce,
+            &server_nonce,
+            artifacts.update_template_hash,
+            &blinding_factor,
+        )
+        .context("invalid BIP448 accepted blinded signing session")?;
+    }
+    for pair in history.windows(2) {
+        let stride = pair[1]
+            .state_locktime
+            .checked_sub(pair[0].state_locktime)
+            .ok_or_else(|| anyhow!("BIP448 accepted state locktime regressed"))?;
+        let next = script::checked_next_state_locktime(
+            absolute::LockTime::from_consensus(pair[0].state_locktime),
+            stride,
+        )?;
+        if next.to_consensus_u32() != pair[1].state_locktime {
+            return Err(anyhow!("BIP448 accepted state locktime stride is invalid"));
+        }
+    }
+
+    let accepted_entry = history
+        .get(
+            accepted_len
+                .checked_sub(1)
+                .ok_or_else(|| anyhow!("BIP448 accepted state number must be positive"))?,
+        )
+        .ok_or_else(|| anyhow!("BIP448 accepted history prefix is missing"))?;
+    if !history_entry_matches_latest_state(accepted_entry, &record.latest_state) {
+        return Err(anyhow!(
+            "BIP448 accepted history prefix does not match the accepted record"
+        ));
+    }
+    let accepted_owner = XOnlyPublicKey::from_str(&accepted_entry.owner_public_key)?;
+    let accepted_recovery_script =
+        Address::p2tr(&secp, accepted_owner, None, network).script_pubkey();
+    let accepted_artifacts = build_funding_recovery_artifacts(
+        &secp,
+        &aggregate_pubkey,
+        funding_outpoint,
+        record.funding_outpoint.value_sats,
+        accepted_recovery_script,
+        record.latest_state_number,
+        absolute::LockTime::from_consensus(record.latest_state.state_locktime),
+        record.challenge_delay,
+        Bip448FeeBumpPolicy::ZeroFeeEphemeralAnchor,
+    )?;
+    let canonical_latest = build_funding_latest_state(
+        &secp,
+        &aggregate_pubkey,
+        &accepted_artifacts,
+        record.latest_state.signing_metadata.clone(),
+        Vec::new(),
+    )?;
+    if canonical_latest != record.latest_state {
+        return Err(anyhow!(
+            "BIP448 accepted latest state is not the canonical reconstructed state"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum Bip448WalletCoinRequirement {
+    InitialAcceptance,
+    ConfirmedCanonicalAttempt,
+}
+
+fn validate_selected_bip448_coin(
+    coin: &Coin,
+    record: &Bip448StatechainRecord,
+    accepted_owner: XOnlyPublicKey,
+    requirement: Bip448WalletCoinRequirement,
+) -> Result<()> {
+    if coin.statechain_id.as_deref() != Some(record.statechain_id.as_str())
+        || coin.statechain_protocol.as_deref() != Some(BIP448_COIN_PROTOCOL)
+    {
+        return Err(anyhow!(
+            "selected BIP448 Coin does not match the accepted protocol identity"
+        ));
+    }
+    let user_pubkey = PublicKey::from_str(&coin.user_pubkey)
+        .context("invalid selected BIP448 Coin user public key")?;
+    if user_pubkey.to_string() != coin.user_pubkey
+        || user_pubkey.x_only_public_key().0 != accepted_owner
+    {
+        return Err(anyhow!(
+            "selected BIP448 Coin does not match the accepted owner"
+        ));
+    }
+    let server_text = coin
+        .server_pubkey
+        .as_deref()
+        .ok_or_else(|| anyhow!("selected BIP448 Coin is missing its server public key"))?;
+    let server_pubkey = PublicKey::from_str(server_text)
+        .context("invalid selected BIP448 Coin server public key")?;
+    if server_pubkey.to_string() != server_text
+        || user_pubkey.combine(&server_pubkey)? != PublicKey::from_str(&record.aggregate_pubkey)?
+        || coin.aggregated_pubkey.as_deref() != Some(record.aggregate_pubkey.as_str())
+    {
+        return Err(anyhow!(
+            "selected BIP448 Coin does not match the accepted aggregate key"
+        ));
+    }
+
+    let user_private = PrivateKey::from_wif(&coin.user_privkey)
+        .context("invalid selected BIP448 Coin user private key")?;
+    if user_private.inner.public_key(&Secp256k1::new()) != user_pubkey {
+        return Err(anyhow!(
+            "selected BIP448 Coin user private key does not match its public key"
+        ));
+    }
+    crate::bip448_owner::validate_bip448_coin_local_auth(coin, &record.statechain_id)?;
+    let (address_version, address_user, address_auth) =
+        std::panic::catch_unwind(|| mercurylib::decode_transfer_address(&coin.address))
+            .map_err(|_| anyhow!("invalid selected BIP448 Coin transfer address"))??;
+    if address_version != 0
+        || address_user != user_pubkey
+        || address_auth.to_string() != coin.auth_pubkey
+    {
+        return Err(anyhow!(
+            "selected BIP448 Coin transfer address does not match its local keys"
+        ));
+    }
+    let deposit_address = bip448_deposit::create_deposit_address(coin, &record.network)
+        .context("invalid selected BIP448 Coin funding or recovery address")?;
+    if deposit_address.aggregate_pubkey != record.aggregate_pubkey
+        || coin.aggregated_address.as_deref() != Some(deposit_address.address.as_str())
+        || coin.utxo_txid.as_deref() != Some(record.funding_outpoint.txid.as_str())
+        || coin.utxo_vout != Some(record.funding_outpoint.vout)
+        || coin.amount.map(u64::from) != Some(record.amount_sats)
+        || coin.locktime != Some(record.latest_state.state_locktime)
+        || coin.public_nonce.as_deref()
+            != Some(
+                record
+                    .latest_state
+                    .signing_metadata
+                    .client_public_nonce
+                    .as_str(),
+            )
+        || coin.server_public_nonce.as_deref()
+            != Some(
+                record
+                    .latest_state
+                    .signing_metadata
+                    .server_public_nonce
+                    .as_str(),
+            )
+        || coin.blinding_factor.as_deref()
+            != Some(
+                record
+                    .latest_state
+                    .signing_metadata
+                    .blinding_factor
+                    .as_str(),
+            )
+    {
+        return Err(anyhow!(
+            "selected BIP448 Coin does not match the accepted funding/state facts"
+        ));
+    }
+    match requirement {
+        Bip448WalletCoinRequirement::InitialAcceptance => {
+            if record.latest_state_number != INITIAL_BIP448_STATE_NUMBER
+                || !matches!(
+                    coin.status,
+                    CoinStatus::IN_MEMPOOL | CoinStatus::UNCONFIRMED | CoinStatus::CONFIRMED
+                )
+            {
+                return Err(anyhow!(
+                    "initial BIP448 acceptance requires a funded state-1 Coin"
+                ));
+            }
+        }
+        Bip448WalletCoinRequirement::ConfirmedCanonicalAttempt => {
+            if coin.status != CoinStatus::CONFIRMED
+                || coin.tx_withdraw.is_some()
+                || coin.withdrawal_address.is_some()
+            {
+                return Err(anyhow!(
+                    "canonical BIP448 attempt requires exactly one CONFIRMED Coin"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn require_selected_bip448_wallet_coin_on(
+    connection: &mut SqliteConnection,
+    record: &Bip448StatechainRecord,
+    accepted_owner: XOnlyPublicKey,
+    requirement: Bip448WalletCoinRequirement,
+) -> Result<()> {
+    let raw_wallet =
+        sqlx::query_scalar::<_, String>("SELECT wallet_json FROM wallet WHERE wallet_name = $1")
+            .bind(&record.wallet_name)
+            .fetch_optional(&mut *connection)
+            .await?
+            .ok_or_else(|| anyhow!("BIP448 accepted wallet is missing"))?;
+    let wallet: Wallet = serde_json::from_str(&raw_wallet)?;
+    if wallet.name != record.wallet_name
+        || wallet.network != record.network
+        || wallet.settings.network != record.network
+        || canonical_wallet_json(&wallet)? != raw_wallet
+    {
+        return Err(anyhow!(
+            "BIP448 accepted wallet identity or canonical bytes are invalid"
+        ));
+    }
+    let mut matching_owner_coins = Vec::new();
+    for coin in &wallet.coins {
+        if coin.statechain_id.as_deref() != Some(record.statechain_id.as_str())
+            || coin.statechain_protocol.as_deref() != Some(BIP448_COIN_PROTOCOL)
+        {
+            continue;
+        }
+        let user_pubkey = PublicKey::from_str(&coin.user_pubkey)
+            .context("invalid current-statechain BIP448 Coin user public key")?;
+        if user_pubkey.to_string() != coin.user_pubkey {
+            return Err(anyhow!(
+                "current-statechain BIP448 Coin user public key is not canonical"
+            ));
+        }
+        if user_pubkey.x_only_public_key().0 == accepted_owner {
+            matching_owner_coins.push(coin);
+        }
+    }
+    match matching_owner_coins.as_slice() {
+        [coin] => validate_selected_bip448_coin(coin, record, accepted_owner, requirement),
+        [] => Err(anyhow!(
+            "no wallet Coin exactly matches the accepted BIP448 owner and binding"
+        )),
+        _ => Err(anyhow!(
+            "multiple wallet Coins match the accepted BIP448 owner and binding"
+        )),
+    }
+}
+
+fn history_entry_matches_pending_intent(
+    entry: &Bip448StateHistoryEntry,
+    pending: &Bip448PendingDepositSigning,
+    intent: &Bip448TransferIntent,
+) -> Result<bool> {
+    let receiver_owner = secp256k1::PublicKey::from_str(&intent.receiver_user_pubkey)
+        .context("invalid BIP448 intent receiver user key")?
+        .x_only_public_key()
+        .0
+        .to_string();
+    Ok(entry.state_number == intent.planned_state_number
+        && entry.owner_public_key == receiver_owner
+        && entry.update_template_hash == pending.update_template_hash
+        && entry.settlement_template_hash == pending.settlement_template_hash
+        && entry.state_locktime == pending.state_locktime
+        && entry.client_public_nonce == pending.client_public_nonce
+        && pending.server_public_nonce.as_deref() == Some(entry.server_public_nonce.as_str())
+        && entry.blinding_factor == pending.blinding_factor
+        && intent.update_signature.as_deref() == Some(entry.update_signature.as_str()))
+}
+
+fn transfer_message_matches_record_and_history(
+    message: &Bip448TransferMsg,
+    record: &Bip448StatechainRecord,
+    history: &[Bip448StateHistoryEntry],
+) -> Result<bool> {
+    let receiver_owner = secp256k1::PublicKey::from_str(&message.receiver_user_public_key)
+        .context("invalid BIP448 transfer-message receiver user key")?
+        .x_only_public_key()
+        .0
+        .to_string();
+    Ok(message.msg_version == 2
+        && message.statechain_id == record.statechain_id
+        && message.aggregate_pubkey == record.aggregate_pubkey
+        && message.funding_outpoint == record.funding_outpoint
+        && message.challenge_delay == record.challenge_delay
+        && message.amount_sats == record.amount_sats
+        && message.network == record.network
+        && message
+            .state_history
+            .last()
+            .is_some_and(|entry| entry.owner_public_key == receiver_owner)
+        && transfer_message_matches_history_prefix(message, history)?)
+}
+
+pub async fn persist_bip448_initial_acceptance(
+    pool: &Pool<Sqlite>,
+    record: &Bip448StatechainRecord,
+    entry: &Bip448StateHistoryEntry,
+) -> Result<()> {
+    let mut record = record.clone();
+    record.funding_outpoint.txid = canonical_txid(&record.funding_outpoint.txid)?;
+    let record_json = validated_bip448_record_json(&record)?;
+    let entry_json = serde_json::to_string(entry)?;
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    validate_bip448_accepted_artifacts(&record, std::slice::from_ref(entry))?;
+    let owner = XOnlyPublicKey::from_str(&entry.owner_public_key)?;
+    require_selected_bip448_wallet_coin_on(
+        &mut *transaction,
+        &record,
+        owner,
+        Bip448WalletCoinRequirement::InitialAcceptance,
+    )
+    .await?;
+
+    let stored_record = sqlx::query_scalar::<_, String>(
+        "SELECT record_json FROM bip448_statechains \
+         WHERE wallet_name = $1 AND statechain_id = $2",
+    )
+    .bind(&record.wallet_name)
+    .bind(&record.statechain_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let stored_entry = sqlx::query_scalar::<_, String>(
+        "SELECT entry_json FROM bip448_state_history \
+         WHERE wallet_name = $1 AND statechain_id = $2 AND state_number = 1",
+    )
+    .bind(&record.wallet_name)
+    .bind(&record.statechain_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+
+    match (&stored_record, &stored_entry) {
+        (Some(stored), Some(stored_entry))
+            if stored == &record_json && stored_entry == &entry_json =>
+        {
+            transaction.commit().await?;
+            return Ok(());
+        }
+        (Some(stored), _) if stored != &record_json => {
+            return Err(anyhow!(
+                "BIP448 initial accepted record conflicts with storage"
+            ));
+        }
+        (_, Some(stored)) if stored != &entry_json => {
+            return Err(anyhow!(
+                "BIP448 initial state history conflicts with storage"
+            ));
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(anyhow!(
+                "BIP448 initial acceptance has a partial record/history pair"
+            ));
+        }
+        (None, None) => {
+            let result = sqlx::query(
+                "INSERT INTO bip448_statechains (\
+                    wallet_name, statechain_id, aggregate_pubkey, funding_txid, funding_vout, \
+                    funding_value_sats, latest_state_number, challenge_delay, amount_sats, network, \
+                    record_json\
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+            )
+            .bind(&record.wallet_name)
+            .bind(&record.statechain_id)
+            .bind(&record.aggregate_pubkey)
+            .bind(&record.funding_outpoint.txid)
+            .bind(i64::from(record.funding_outpoint.vout))
+            .bind(i64::try_from(record.funding_outpoint.value_sats)?)
+            .bind(i64::from(record.latest_state_number))
+            .bind(i64::from(record.challenge_delay))
+            .bind(i64::try_from(record.amount_sats)?)
+            .bind(&record.network)
+            .bind(&record_json)
+            .execute(&mut *transaction)
+            .await?;
+            if result.rows_affected() != 1 {
+                return Err(anyhow!(
+                    "BIP448 initial accepted record insert affected an unexpected row count"
+                ));
+            }
+            let result = sqlx::query(
+                "INSERT INTO bip448_state_history \
+                    (wallet_name, statechain_id, state_number, entry_json) \
+                 VALUES ($1,$2,1,$3)",
+            )
+            .bind(&record.wallet_name)
+            .bind(&record.statechain_id)
+            .bind(&entry_json)
+            .execute(&mut *transaction)
+            .await?;
+            if result.rows_affected() != 1 {
+                return Err(anyhow!(
+                    "BIP448 initial history insert affected an unexpected row count"
+                ));
+            }
+        }
+        (Some(_), Some(_)) => {
+            return Err(anyhow!(
+                "BIP448 initial acceptance pair failed exact replay validation"
+            ));
+        }
+    }
+    transaction.commit().await?;
+    Ok(())
+}
+
+async fn accepted_record_and_history_on(
+    connection: &mut SqliteConnection,
+    wallet_name: &str,
+    statechain_id: &str,
+) -> Result<(Bip448StatechainRecord, Vec<Bip448StateHistoryEntry>)> {
+    let record_row = sqlx::query(
+        "SELECT aggregate_pubkey, funding_txid, funding_vout, funding_value_sats, \
+         latest_state_number, challenge_delay, amount_sats, network, record_json \
+         FROM bip448_statechains \
+         WHERE wallet_name = $1 AND statechain_id = $2",
+    )
+    .bind(wallet_name)
+    .bind(statechain_id)
+    .fetch_optional(&mut *connection)
+    .await?
+    .ok_or_else(|| anyhow!("BIP448 accepted record is missing"))?;
+    let record_json: String = record_row.try_get(8)?;
+    let record: Bip448StatechainRecord = serde_json::from_str(&record_json)?;
+    if serde_json::to_string(&record)? != record_json
+        || record.wallet_name != wallet_name
+        || record.statechain_id != statechain_id
+        || record.aggregate_pubkey != record_row.try_get::<String, _>(0)?
+        || record.funding_outpoint.txid != record_row.try_get::<String, _>(1)?
+        || record.funding_outpoint.vout != u32::try_from(record_row.try_get::<i64, _>(2)?)?
+        || record.funding_outpoint.value_sats != u64::try_from(record_row.try_get::<i64, _>(3)?)?
+        || record.latest_state_number != u32::try_from(record_row.try_get::<i64, _>(4)?)?
+        || record.challenge_delay != u16::try_from(record_row.try_get::<i64, _>(5)?)?
+        || record.amount_sats != u64::try_from(record_row.try_get::<i64, _>(6)?)?
+        || record.network != record_row.try_get::<String, _>(7)?
+    {
+        return Err(anyhow!(
+            "BIP448 accepted record JSON and indexed columns disagree"
+        ));
+    }
+    let history_rows = sqlx::query(
+        "SELECT state_number, entry_json FROM bip448_state_history \
+         WHERE wallet_name = $1 AND statechain_id = $2 ORDER BY state_number",
+    )
+    .bind(wallet_name)
+    .bind(statechain_id)
+    .fetch_all(&mut *connection)
+    .await?;
+    let history = history_rows
+        .into_iter()
+        .map(|row| -> Result<Bip448StateHistoryEntry> {
+            let state_number = u32::try_from(row.try_get::<i64, _>(0)?)?;
+            let value: String = row.try_get(1)?;
+            let entry: Bip448StateHistoryEntry = serde_json::from_str(&value)?;
+            if entry.state_number != state_number || serde_json::to_string(&entry)? != value {
+                return Err(anyhow!(
+                    "BIP448 history JSON and indexed state number disagree"
+                ));
+            }
+            Ok(entry)
+        })
+        .collect::<Result<Vec<Bip448StateHistoryEntry>>>()?;
+    validate_bip448_accepted_artifacts(&record, &history)?;
+    let accepted_len = usize::try_from(record.latest_state_number)?;
+    let maximum_len = accepted_len
+        .checked_add(2)
+        .ok_or_else(|| anyhow!("BIP448 state-history length overflow"))?;
+    if history.len() < accepted_len
+        || history.len() > maximum_len
+        || history.iter().enumerate().try_fold(
+            false,
+            |mismatch, (index, entry)| -> Result<bool> {
+                let expected = u32::try_from(index)?
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("BIP448 history state-number overflow"))?;
+                Ok(mismatch || entry.state_number != expected)
+            },
+        )?
+    {
+        return Err(anyhow!(
+            "BIP448 state history is incomplete or has an unsupported suffix"
+        ));
+    }
+    let accepted_entry = history
+        .get(
+            accepted_len
+                .checked_sub(1)
+                .ok_or_else(|| anyhow!("BIP448 accepted state number must be positive"))?,
+        )
+        .ok_or_else(|| anyhow!("BIP448 accepted history prefix is missing"))?;
+    if !history_entry_matches_latest_state(accepted_entry, &record.latest_state) {
+        return Err(anyhow!(
+            "BIP448 accepted history prefix does not match the accepted record"
+        ));
+    }
+    if history.len() > accepted_len {
+        let outgoing_json = sqlx::query_scalar::<_, String>(
+            "SELECT transfer_msg_json FROM bip448_transfer_messages \
+             WHERE wallet_name = $1 AND statechain_id = $2 ORDER BY recipient_auth_pubkey",
+        )
+        .bind(wallet_name)
+        .bind(statechain_id)
+        .fetch_all(&mut *connection)
+        .await?;
+        let exact_message =
+            outgoing_json
+                .into_iter()
+                .try_fold(false, |found, json| -> Result<bool> {
+                    let message: Bip448TransferMsg = serde_json::from_str(&json)?;
+                    if serde_json::to_string(&message)? != json {
+                        return Err(anyhow!(
+                            "BIP448 transfer-message suffix proof is not canonical JSON"
+                        ));
+                    }
+                    Ok(found
+                        || (message.state_history == history
+                            && transfer_message_matches_record_and_history(
+                                &message, &record, &history,
+                            )?))
+                })?;
+        if !exact_message {
+            let intents =
+                list_bip448_transfer_intents_on(connection, wallet_name, statechain_id).await?;
+            if intents.is_empty() {
+                return Err(anyhow!(
+                    "BIP448 state history suffix has no exact transfer journal"
+                ));
+            }
+            validate_bip448_transfer_intent_lineage(&intents)?;
+            let active = intents
+                .iter()
+                .find(|intent| intent.activity_status == Bip448TransferIntentActivityStatus::Active)
+                .ok_or_else(|| anyhow!("BIP448 transfer intent lineage has no Active row"))?;
+            if active.state_signing_phase != Bip448TransferStateSigningPhase::Signed
+                || usize::try_from(active.planned_state_number)? != history.len()
+            {
+                return Err(anyhow!(
+                    "BIP448 state history suffix does not match its active transfer intent"
+                ));
+            }
+            let pending = pending_transfer_on(connection, wallet_name, statechain_id)
+                .await?
+                .ok_or_else(|| anyhow!("BIP448 active suffix pending signing is missing"))?;
+            if active.current_pending_signing_id.as_deref() != Some(pending.signing_id.as_str())
+                || pending.funding_txid != record.funding_outpoint.txid
+                || pending.funding_vout != record.funding_outpoint.vout
+                || pending.funding_value_sats != record.funding_outpoint.value_sats
+                || !history_entry_matches_pending_intent(
+                    history
+                        .last()
+                        .ok_or_else(|| anyhow!("BIP448 state history suffix is empty"))?,
+                    &pending,
+                    active,
+                )?
+            {
+                return Err(anyhow!(
+                    "BIP448 state history suffix artifacts do not match the active journal"
+                ));
+            }
+            if history.len()
+                == accepted_len
+                    .checked_add(2)
+                    .ok_or_else(|| anyhow!("BIP448 state-history length overflow"))?
+            {
+                let recipient = active
+                    .prior_transfer_recipient_auth_pubkey
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("BIP448 N+2 suffix has no predecessor recipient"))?;
+                let expected_hash = active
+                    .prior_transfer_msg_hash
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("BIP448 N+2 suffix has no predecessor hash"))?;
+                let prior_json = sqlx::query_scalar::<_, String>(
+                    "SELECT transfer_msg_json FROM bip448_transfer_messages \
+                     WHERE wallet_name=$1 AND statechain_id=$2 AND recipient_auth_pubkey=$3",
+                )
+                .bind(wallet_name)
+                .bind(statechain_id)
+                .bind(recipient)
+                .fetch_optional(&mut *connection)
+                .await?
+                .ok_or_else(|| anyhow!("BIP448 N+2 predecessor message is missing"))?;
+                if sha256::Hash::hash(prior_json.as_bytes()).to_string() != expected_hash {
+                    return Err(anyhow!("BIP448 N+2 predecessor message hash changed"));
+                }
+                let prior: Bip448TransferMsg = serde_json::from_str(&prior_json)?;
+                let predecessor_len = accepted_len
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("BIP448 predecessor state length overflow"))?;
+                if serde_json::to_string(&prior)? != prior_json
+                    || prior.state_history.as_slice() != &history[..predecessor_len]
+                    || !transfer_message_matches_record_and_history(
+                        &prior,
+                        &record,
+                        &history[..predecessor_len],
+                    )?
+                {
+                    return Err(anyhow!(
+                        "BIP448 N+2 predecessor message does not prove the first suffix"
+                    ));
+                }
+            }
+        }
+    }
+    Ok((record, history))
+}
+
+fn accepted_funding_script(record: &Bip448StatechainRecord) -> Result<String> {
+    let aggregate = secp256k1::PublicKey::from_str(&record.aggregate_pubkey)?;
+    let spend_info = script::funding_spend_info(
+        &secp256k1::Secp256k1::new(),
+        aggregate.x_only_public_key().0,
+    )?;
+    Ok(hex::encode(
+        script::output_script_pubkey(&spend_info).as_bytes(),
+    ))
+}
+
+async fn reconcile_bip448_funding_bindings_in_guard(
+    guard: &mut Bip448MutationGuard,
+    wallet_name: &str,
+    statechain_id: &str,
+    owner_user_pubkey: &str,
+    owner_state_number: u32,
+    observations: &[Bip448BindingObservation],
+) -> Result<Vec<Bip448FundingBinding>> {
+    let owner_user_pubkey = bip448_funding::canonical_xonly_public_key(owner_user_pubkey)?;
+    if owner_state_number == 0 {
+        return Err(anyhow!(
+            "BIP448 binding owner state number must be positive"
+        ));
+    }
+    let (record, history) =
+        accepted_record_and_history_on(guard.connection(), wallet_name, statechain_id).await?;
+    if record.wallet_name != wallet_name
+        || record.statechain_id != statechain_id
+        || record.latest_state_number != owner_state_number
+        || history
+            .get(
+                usize::try_from(record.latest_state_number)?
+                    .checked_sub(1)
+                    .ok_or_else(|| anyhow!("BIP448 accepted state number must be positive"))?,
+            )
+            .map(|entry| entry.owner_public_key.as_str())
+            != Some(owner_user_pubkey.as_str())
+    {
+        return Err(anyhow!(
+            "BIP448 accepted record/history does not match the selected owner generation"
+        ));
+    }
+    let expected_script = accepted_funding_script(&record)?;
+    let mut observations = observations.to_vec();
+    for observation in &mut observations {
+        observation.txid = canonical_txid(&observation.txid)?;
+        if let Some(spend_txid) = &mut observation.spend_txid {
+            *spend_txid = canonical_txid(spend_txid)?;
+        }
+        bip448_funding::validate_binding_observation(observation)?;
+        if observation.script_pubkey != expected_script {
+            return Err(anyhow!(
+                "BIP448 binding script does not match the accepted aggregate key"
+            ));
+        }
+    }
+    observations.sort_by(|left, right| {
+        (left.txid.as_str(), left.vout).cmp(&(right.txid.as_str(), right.vout))
+    });
+    if observations
+        .windows(2)
+        .any(|rows| rows[0].txid == rows[1].txid && rows[0].vout == rows[1].vout)
+    {
+        return Err(anyhow!("duplicate BIP448 binding observation"));
+    }
+    let canonical_position = observations.iter().position(|observation| {
+        observation.txid == record.funding_outpoint.txid
+            && observation.vout == record.funding_outpoint.vout
+    });
+    let canonical_position = canonical_position.ok_or_else(|| {
+        anyhow!("BIP448 reconciliation is missing the accepted canonical outpoint")
+    })?;
+    if observations[canonical_position].value_sats != record.funding_outpoint.value_sats {
+        return Err(anyhow!(
+            "BIP448 canonical binding value conflicts with the accepted record"
+        ));
+    }
+
+    let existing =
+        list_bip448_funding_bindings_on(guard.connection(), wallet_name, statechain_id).await?;
+    let mut by_outpoint = existing
+        .iter()
+        .map(|binding| ((binding.txid.clone(), binding.vout), binding.clone()))
+        .collect::<HashMap<_, _>>();
+    if let Some(canonical) = existing.iter().find(|binding| binding.binding_index == 0) {
+        if canonical.txid != record.funding_outpoint.txid
+            || canonical.vout != record.funding_outpoint.vout
+            || canonical.value_sats != record.funding_outpoint.value_sats
+            || canonical.script_pubkey != expected_script
+            || canonical.role != Bip448BindingRole::Canonical
+        {
+            return Err(anyhow!(
+                "BIP448 canonical binding immutable identity conflict"
+            ));
+        }
+    }
+    let mut highest_index = existing.iter().map(|binding| binding.binding_index).max();
+
+    for observation in observations {
+        let is_canonical = observation.txid == record.funding_outpoint.txid
+            && observation.vout == record.funding_outpoint.vout;
+        let key = (observation.txid.clone(), observation.vout);
+        if let Some(binding) = by_outpoint.get(&key) {
+            let expected_role = if is_canonical {
+                Bip448BindingRole::Canonical
+            } else {
+                Bip448BindingRole::Duplicate
+            };
+            if binding.role != expected_role
+                || (binding.binding_index == 0) != is_canonical
+                || binding.value_sats != observation.value_sats
+                || binding.script_pubkey != observation.script_pubkey
+                || binding.owner_user_pubkey != owner_user_pubkey
+                || binding.owner_state_number != owner_state_number
+            {
+                return Err(anyhow!("BIP448 binding immutable identity conflict"));
+            }
+            let result = sqlx::query(
+                "UPDATE bip448_funding_bindings SET observation_status = $1, \
+                    funding_height = $2, spend_txid = $3, spend_height = $4, \
+                    last_scanned_height = $5, last_seen_at = CURRENT_TIMESTAMP \
+                 WHERE wallet_name = $6 AND statechain_id = $7 AND binding_index = $8 \
+                   AND txid = $9 AND vout = $10 AND value_sats = $11 AND script_pubkey = $12 \
+                   AND role = $13 AND owner_user_pubkey = $14 AND owner_state_number = $15",
+            )
+            .bind(observation.observation_status.as_str())
+            .bind(observation.funding_height.map(i64::from))
+            .bind(&observation.spend_txid)
+            .bind(observation.spend_height.map(i64::from))
+            .bind(i64::from(observation.last_scanned_height))
+            .bind(wallet_name)
+            .bind(statechain_id)
+            .bind(i64::from(binding.binding_index))
+            .bind(&binding.txid)
+            .bind(i64::from(binding.vout))
+            .bind(i64::try_from(binding.value_sats)?)
+            .bind(&binding.script_pubkey)
+            .bind(binding.role.as_str())
+            .bind(&binding.owner_user_pubkey)
+            .bind(i64::from(binding.owner_state_number))
+            .execute(guard.connection())
+            .await?;
+            if result.rows_affected() != 1 {
+                return Err(anyhow!("BIP448 binding observation compare-and-set lost"));
+            }
+        } else {
+            let binding_index = if is_canonical {
+                0
+            } else {
+                let allocated = highest_index.map_or(Ok(1), |index| {
+                    index
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("BIP448 duplicate binding index overflow"))
+                })?;
+                highest_index = Some(allocated);
+                allocated
+            };
+            let role = if is_canonical {
+                Bip448BindingRole::Canonical
+            } else {
+                Bip448BindingRole::Duplicate
+            };
+            let result = sqlx::query(
+                "INSERT INTO bip448_funding_bindings (\
+                    wallet_name, statechain_id, binding_index, txid, vout, value_sats, \
+                    script_pubkey, role, observation_status, funding_height, spend_txid, \
+                    spend_height, last_scanned_height, owner_user_pubkey, owner_state_number, \
+                    ownership_status\
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
+            )
+            .bind(wallet_name)
+            .bind(statechain_id)
+            .bind(i64::from(binding_index))
+            .bind(&observation.txid)
+            .bind(i64::from(observation.vout))
+            .bind(i64::try_from(observation.value_sats)?)
+            .bind(&observation.script_pubkey)
+            .bind(role.as_str())
+            .bind(observation.observation_status.as_str())
+            .bind(observation.funding_height.map(i64::from))
+            .bind(&observation.spend_txid)
+            .bind(observation.spend_height.map(i64::from))
+            .bind(i64::from(observation.last_scanned_height))
+            .bind(&owner_user_pubkey)
+            .bind(i64::from(owner_state_number))
+            .bind(Bip448OwnershipStatus::Current.as_str())
+            .execute(guard.connection())
+            .await?;
+            if result.rows_affected() != 1 {
+                return Err(anyhow!(
+                    "BIP448 binding insert affected an unexpected row count"
+                ));
+            }
+            let inserted = guard
+                .exact_binding(wallet_name, statechain_id, binding_index)
+                .await?
+                .ok_or_else(|| anyhow!("BIP448 binding disappeared after insertion"))?;
+            by_outpoint.insert(key, inserted);
+        }
+    }
+    list_bip448_funding_bindings_on(guard.connection(), wallet_name, statechain_id).await
+}
+
+pub async fn reconcile_bip448_funding_bindings(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    owner_user_pubkey: &str,
+    owner_state_number: u32,
+    observations: &[Bip448BindingObservation],
+) -> Result<Vec<Bip448FundingBinding>> {
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let bindings = reconcile_bip448_funding_bindings_in_guard(
+        &mut guard,
+        wallet_name,
+        statechain_id,
+        owner_user_pubkey,
+        owner_state_number,
+        observations,
+    )
+    .await?;
+    guard.commit().await?;
+    Ok(bindings)
+}
+
+pub async fn update_bip448_funding_binding_observation(
+    pool: &Pool<Sqlite>,
+    expected: &Bip448FundingBinding,
+    observation: &Bip448BindingObservation,
+) -> Result<Bip448FundingBinding> {
+    bip448_funding::validate_binding(expected)?;
+    bip448_funding::validate_binding_observation(observation)?;
+    if expected.txid != observation.txid
+        || expected.vout != observation.vout
+        || expected.value_sats != observation.value_sats
+        || expected.script_pubkey != observation.script_pubkey
+    {
+        return Err(anyhow!("BIP448 observation cannot mutate binding identity"));
+    }
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let live = guard
+        .exact_binding(
+            &expected.wallet_name,
+            &expected.statechain_id,
+            expected.binding_index,
+        )
+        .await?
+        .ok_or_else(|| anyhow!("BIP448 binding disappeared before observation update"))?;
+    if live != *expected {
+        return Err(anyhow!("BIP448 binding changed before observation update"));
+    }
+    let result = sqlx::query(
+        "UPDATE bip448_funding_bindings SET observation_status = $1, funding_height = $2, \
+            spend_txid = $3, spend_height = $4, last_scanned_height = $5, \
+            last_seen_at = CURRENT_TIMESTAMP \
+         WHERE wallet_name = $6 AND statechain_id = $7 AND binding_index = $8 \
+           AND txid = $9 AND vout = $10 AND value_sats = $11 AND script_pubkey = $12 \
+           AND role = $13 AND owner_user_pubkey = $14 AND owner_state_number = $15 \
+           AND ownership_status = $16 AND observation_status = $17",
+    )
+    .bind(observation.observation_status.as_str())
+    .bind(observation.funding_height.map(i64::from))
+    .bind(&observation.spend_txid)
+    .bind(observation.spend_height.map(i64::from))
+    .bind(i64::from(observation.last_scanned_height))
+    .bind(&expected.wallet_name)
+    .bind(&expected.statechain_id)
+    .bind(i64::from(expected.binding_index))
+    .bind(&expected.txid)
+    .bind(i64::from(expected.vout))
+    .bind(i64::try_from(expected.value_sats)?)
+    .bind(&expected.script_pubkey)
+    .bind(expected.role.as_str())
+    .bind(&expected.owner_user_pubkey)
+    .bind(i64::from(expected.owner_state_number))
+    .bind(expected.ownership_status.as_str())
+    .bind(expected.observation_status.as_str())
+    .execute(guard.connection())
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(anyhow!("BIP448 binding observation compare-and-set lost"));
+    }
+    let updated = guard
+        .exact_binding(
+            &expected.wallet_name,
+            &expected.statechain_id,
+            expected.binding_index,
+        )
+        .await?
+        .ok_or_else(|| anyhow!("BIP448 binding disappeared after observation update"))?;
+    guard.commit().await?;
+    Ok(updated)
+}
+
+pub async fn reassign_bip448_funding_bindings_owner(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    expected_owner_user_pubkey: &str,
+    expected_owner_state_number: u32,
+    new_owner_user_pubkey: &str,
+    new_owner_state_number: u32,
+) -> Result<Vec<Bip448FundingBinding>> {
+    let expected_owner_user_pubkey =
+        bip448_funding::canonical_xonly_public_key(expected_owner_user_pubkey)?;
+    let new_owner_user_pubkey = bip448_funding::canonical_xonly_public_key(new_owner_user_pubkey)?;
+    if expected_owner_state_number == 0 || new_owner_state_number == 0 {
+        return Err(anyhow!("BIP448 owner state number must be positive"));
+    }
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let (record, history) =
+        accepted_record_and_history_on(guard.connection(), wallet_name, statechain_id).await?;
+    let new_index = usize::try_from(new_owner_state_number)?
+        .checked_sub(1)
+        .ok_or_else(|| anyhow!("BIP448 owner state number must be positive"))?;
+    if record.latest_state_number != new_owner_state_number
+        || history
+            .get(new_index)
+            .map(|entry| entry.owner_public_key.as_str())
+            != Some(new_owner_user_pubkey.as_str())
+    {
+        return Err(anyhow!(
+            "BIP448 accepted history does not prove the new owner"
+        ));
+    }
+    let before =
+        list_bip448_funding_bindings_on(guard.connection(), wallet_name, statechain_id).await?;
+    if before.is_empty()
+        || before.iter().any(|binding| {
+            binding.owner_user_pubkey != expected_owner_user_pubkey
+                || binding.owner_state_number != expected_owner_state_number
+                || binding.ownership_status != Bip448OwnershipStatus::Current
+        })
+    {
+        return Err(anyhow!(
+            "BIP448 binding owner generation changed before reassignment"
+        ));
+    }
+    for binding in &before {
+        let result = sqlx::query(
+            "UPDATE bip448_funding_bindings SET owner_user_pubkey=$1,owner_state_number=$2, \
+                ownership_status='Current',last_seen_at=CURRENT_TIMESTAMP \
+             WHERE wallet_name=$3 AND statechain_id=$4 AND binding_index=$5 \
+               AND txid=$6 AND vout=$7 AND value_sats=$8 AND script_pubkey=$9 AND role=$10 \
+               AND owner_user_pubkey=$11 AND owner_state_number=$12 \
+               AND ownership_status='Current'",
+        )
+        .bind(&new_owner_user_pubkey)
+        .bind(i64::from(new_owner_state_number))
+        .bind(wallet_name)
+        .bind(statechain_id)
+        .bind(i64::from(binding.binding_index))
+        .bind(&binding.txid)
+        .bind(i64::from(binding.vout))
+        .bind(i64::try_from(binding.value_sats)?)
+        .bind(&binding.script_pubkey)
+        .bind(binding.role.as_str())
+        .bind(&expected_owner_user_pubkey)
+        .bind(i64::from(expected_owner_state_number))
+        .execute(guard.connection())
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(anyhow!("BIP448 binding owner reassignment CAS lost"));
+        }
+    }
+    let after =
+        list_bip448_funding_bindings_on(guard.connection(), wallet_name, statechain_id).await?;
+    if before.iter().zip(&after).any(|(old, new)| {
+        old.binding_index != new.binding_index || old.txid != new.txid || old.vout != new.vout
+    }) {
+        return Err(anyhow!(
+            "BIP448 owner reassignment changed stable binding identity"
+        ));
+    }
+    guard.commit().await?;
+    Ok(after)
+}
+
+pub async fn mark_bip448_funding_bindings_previous(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    owner_user_pubkey: &str,
+    owner_state_number: u32,
+) -> Result<Vec<Bip448FundingBinding>> {
+    let owner_user_pubkey = bip448_funding::canonical_xonly_public_key(owner_user_pubkey)?;
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let before =
+        list_bip448_funding_bindings_on(guard.connection(), wallet_name, statechain_id).await?;
+    let expected = before
+        .iter()
+        .filter(|binding| {
+            binding.owner_user_pubkey == owner_user_pubkey
+                && binding.owner_state_number == owner_state_number
+                && binding.ownership_status == Bip448OwnershipStatus::Current
+        })
+        .count();
+    if expected == 0 || expected != before.len() {
+        return Err(anyhow!(
+            "BIP448 current binding generation does not match rotation proof"
+        ));
+    }
+    for binding in &before {
+        let result = sqlx::query(
+            "UPDATE bip448_funding_bindings SET ownership_status='Previous', \
+                last_seen_at=CURRENT_TIMESTAMP WHERE wallet_name=$1 AND statechain_id=$2 \
+                AND binding_index=$3 AND txid=$4 AND vout=$5 AND value_sats=$6 \
+                AND script_pubkey=$7 AND role=$8 AND owner_user_pubkey=$9 \
+                AND owner_state_number=$10 AND ownership_status='Current'",
+        )
+        .bind(wallet_name)
+        .bind(statechain_id)
+        .bind(i64::from(binding.binding_index))
+        .bind(&binding.txid)
+        .bind(i64::from(binding.vout))
+        .bind(i64::try_from(binding.value_sats)?)
+        .bind(&binding.script_pubkey)
+        .bind(binding.role.as_str())
+        .bind(&owner_user_pubkey)
+        .bind(i64::from(owner_state_number))
+        .execute(guard.connection())
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(anyhow!("BIP448 ownership invalidation CAS lost"));
+        }
+    }
+    let after =
+        list_bip448_funding_bindings_on(guard.connection(), wallet_name, statechain_id).await?;
+    guard.commit().await?;
+    Ok(after)
+}
+
+async fn update_attempt_phase_on(
+    guard: &mut Bip448MutationGuard,
+    wallet_name: &str,
+    statechain_id: &str,
+    binding_index: u32,
+    signing_id: &str,
+    expected_phase: Bip448WithdrawalPhase,
+    next_phase: Bip448WithdrawalPhase,
+) -> Result<Bip448WithdrawalAttempt> {
+    if !matches!(
+        (expected_phase, next_phase),
+        (
+            Bip448WithdrawalPhase::Prepared,
+            Bip448WithdrawalPhase::FirstArmed
+        ) | (
+            Bip448WithdrawalPhase::NonceStored,
+            Bip448WithdrawalPhase::SecondArmed
+        )
+    ) {
+        return Err(anyhow!("illegal BIP448 withdrawal phase transition"));
+    }
+    let attempt = guard
+        .exact_attempt(wallet_name, statechain_id, binding_index)
+        .await?
+        .ok_or_else(|| anyhow!("BIP448 withdrawal attempt is missing"))?;
+    if attempt.signing_id != signing_id || attempt.phase != expected_phase {
+        return Err(anyhow!("stale BIP448 withdrawal phase identity"));
+    }
+    let binding = guard
+        .require_attempt_binding_and_owner_identity(&attempt)
+        .await?;
+    match (expected_phase, next_phase) {
+        (Bip448WithdrawalPhase::Prepared, Bip448WithdrawalPhase::FirstArmed)
+            if binding.observation_status != Bip448ObservationStatus::Confirmed =>
+        {
+            return Err(anyhow!(
+                "BIP448 Prepared attempt source is not target-confirmed and unspent"
+            ));
+        }
+        (Bip448WithdrawalPhase::NonceStored, Bip448WithdrawalPhase::SecondArmed) => {
+            let prospective_txid = bip448_funding::expected_withdrawal_txid(&attempt)?;
+            let exact_confirmed_conflict = binding.observation_status
+                == Bip448ObservationStatus::SpentConfirmed
+                && binding
+                    .spend_txid
+                    .as_deref()
+                    .is_some_and(|spend_txid| spend_txid != prospective_txid.as_str());
+            if binding.observation_status != Bip448ObservationStatus::Confirmed
+                && !exact_confirmed_conflict
+            {
+                return Err(anyhow!(
+                    "BIP448 NonceStored attempt must wait for an unspent source or a target-confirmed conflict"
+                ));
+            }
+        }
+        _ => {}
+    }
+    if binding_index == 0 && next_phase == Bip448WithdrawalPhase::SecondArmed {
+        validate_canonical_close_snapshot_on(guard, wallet_name, statechain_id, signing_id).await?;
+    }
+    let result = sqlx::query(
+        "UPDATE bip448_withdrawal_attempts SET phase = $1, updated_at = CURRENT_TIMESTAMP \
+         WHERE wallet_name = $2 AND statechain_id = $3 AND binding_index = $4 \
+           AND signing_id = $5 AND phase = $6 AND broadcast_status = 'NotBroadcast'",
+    )
+    .bind(next_phase.as_str())
+    .bind(wallet_name)
+    .bind(statechain_id)
+    .bind(i64::from(binding_index))
+    .bind(signing_id)
+    .bind(expected_phase.as_str())
+    .execute(guard.connection())
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(anyhow!("BIP448 withdrawal phase compare-and-set lost"));
+    }
+    guard
+        .exact_attempt(wallet_name, statechain_id, binding_index)
+        .await?
+        .ok_or_else(|| anyhow!("BIP448 withdrawal attempt disappeared after transition"))
+}
+
+pub async fn transition_bip448_withdrawal_phase(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    binding_index: u32,
+    signing_id: &str,
+    expected_phase: Bip448WithdrawalPhase,
+    next_phase: Bip448WithdrawalPhase,
+) -> Result<Bip448WithdrawalAttempt> {
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let row = update_attempt_phase_on(
+        &mut guard,
+        wallet_name,
+        statechain_id,
+        binding_index,
+        signing_id,
+        expected_phase,
+        next_phase,
+    )
+    .await?;
+    guard.commit().await?;
+    Ok(row)
+}
+
+async fn validate_canonical_close_snapshot_on(
+    guard: &mut Bip448MutationGuard,
+    wallet_name: &str,
+    statechain_id: &str,
+    signing_id: &str,
+) -> Result<()> {
+    let canonical = guard
+        .exact_attempt(wallet_name, statechain_id, 0)
+        .await?
+        .ok_or_else(|| anyhow!("canonical BIP448 close attempt is missing"))?;
+    if canonical.signing_id != signing_id
+        || canonical.attempt_kind != Bip448WithdrawalAttemptKind::Canonical
+    {
+        return Err(anyhow!("canonical BIP448 close signing identity changed"));
+    }
+    let frozen = canonical
+        .closing_bindings_json
+        .as_deref()
+        .ok_or_else(|| anyhow!("canonical BIP448 close snapshot is missing"))?;
+    bip448_funding::decode_bip448_closing_bindings(frozen)?;
+    let bindings =
+        list_bip448_funding_bindings_on(guard.connection(), wallet_name, statechain_id).await?;
+    let attempts =
+        list_bip448_withdrawal_attempts_on(guard.connection(), wallet_name, statechain_id).await?;
+    match bip448_funding::evaluate_bip448_close_gate(&bindings, &attempts)? {
+        Bip448CloseGate::Ready {
+            closing_bindings_json,
+            ..
+        } if closing_bindings_json == frozen => Ok(()),
+        Bip448CloseGate::Ready { .. } => Err(anyhow!(
+            "BIP448 close binding set changed outside the frozen snapshot"
+        )),
+        Bip448CloseGate::Blocked { reasons } => Err(anyhow!(
+            "BIP448 frozen close snapshot is no longer satisfied: {reasons:?}"
+        )),
+    }
+}
+
+pub async fn validate_bip448_canonical_close_snapshot(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    signing_id: &str,
+) -> Result<()> {
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    validate_canonical_close_snapshot_on(&mut guard, wallet_name, statechain_id, signing_id)
+        .await?;
+    guard.commit().await
+}
+
+pub async fn arm_bip448_withdrawal_sign_first(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    binding_index: u32,
+    signing_id: &str,
+) -> Result<Bip448WithdrawalAttempt> {
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let row = update_attempt_phase_on(
+        &mut guard,
+        wallet_name,
+        statechain_id,
+        binding_index,
+        signing_id,
+        Bip448WithdrawalPhase::Prepared,
+        Bip448WithdrawalPhase::FirstArmed,
+    )
+    .await?;
+    guard.commit().await?;
+    Ok(row)
+}
+
+pub async fn store_bip448_withdrawal_nonce_session(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    binding_index: u32,
+    signing_id: &str,
+    server_public_nonce: &str,
+    message_hex: &str,
+    output_pubkey: &str,
+    client_partial_sig: &str,
+    encoded_session: &str,
+    sign_second_payload_json: &str,
+) -> Result<Bip448WithdrawalAttempt> {
+    for value in [
+        server_public_nonce,
+        message_hex,
+        output_pubkey,
+        client_partial_sig,
+        encoded_session,
+    ] {
+        bip448_funding::require_canonical_hex(value, None)?;
+    }
+    let sign_second =
+        bip448_funding::parse_canonical_sign_second_payload(sign_second_payload_json)?;
+    if sign_second.statechain_id != statechain_id
+        || sign_second.signing_id != signing_id
+        || sign_second.server_pub_nonce != server_public_nonce
+        || sign_second.session != encoded_session
+        || !matches!(sign_second.negate_seckey, 0 | 1)
+    {
+        return Err(anyhow!(
+            "BIP448 sign/second payload does not match the persisted session"
+        ));
+    }
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let result = sqlx::query(
+        "UPDATE bip448_withdrawal_attempts SET server_public_nonce = $1, message_hex = $2, \
+            output_pubkey = $3, client_partial_sig = $4, encoded_session = $5, \
+            sign_second_payload_json = $6, phase = 'NonceStored', updated_at = CURRENT_TIMESTAMP \
+         WHERE wallet_name = $7 AND statechain_id = $8 AND binding_index = $9 \
+           AND signing_id = $10 AND phase = 'FirstArmed' AND broadcast_status = 'NotBroadcast' \
+           AND server_public_nonce IS NULL AND message_hex IS NULL AND output_pubkey IS NULL \
+           AND client_partial_sig IS NULL AND encoded_session IS NULL \
+           AND sign_second_payload_json IS NULL",
+    )
+    .bind(server_public_nonce)
+    .bind(message_hex)
+    .bind(output_pubkey)
+    .bind(client_partial_sig)
+    .bind(encoded_session)
+    .bind(sign_second_payload_json)
+    .bind(wallet_name)
+    .bind(statechain_id)
+    .bind(i64::from(binding_index))
+    .bind(signing_id)
+    .execute(guard.connection())
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(anyhow!("BIP448 withdrawal nonce compare-and-set lost"));
+    }
+    let row = guard
+        .exact_attempt(wallet_name, statechain_id, binding_index)
+        .await?
+        .ok_or_else(|| anyhow!("BIP448 withdrawal attempt disappeared after nonce storage"))?;
+    guard.commit().await?;
+    Ok(row)
+}
+
+pub async fn store_bip448_withdrawal_nonce_artifacts(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    binding_index: u32,
+    signing_id: &str,
+    server_public_nonce: &str,
+    message_hex: &str,
+    output_pubkey: &str,
+    client_partial_sig: &str,
+    encoded_session: &str,
+    sign_second_payload_json: &str,
+) -> Result<Bip448WithdrawalAttempt> {
+    store_bip448_withdrawal_nonce_session(
+        pool,
+        wallet_name,
+        statechain_id,
+        binding_index,
+        signing_id,
+        server_public_nonce,
+        message_hex,
+        output_pubkey,
+        client_partial_sig,
+        encoded_session,
+        sign_second_payload_json,
+    )
+    .await
+}
+
+pub async fn arm_bip448_withdrawal_sign_second(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    binding_index: u32,
+    signing_id: &str,
+) -> Result<Bip448WithdrawalAttempt> {
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let row = update_attempt_phase_on(
+        &mut guard,
+        wallet_name,
+        statechain_id,
+        binding_index,
+        signing_id,
+        Bip448WithdrawalPhase::NonceStored,
+        Bip448WithdrawalPhase::SecondArmed,
+    )
+    .await?;
+    guard.commit().await?;
+    Ok(row)
+}
+
+pub async fn store_signed_bip448_withdrawal(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    binding_index: u32,
+    signing_id: &str,
+    server_partial_sig: &str,
+    aggregate_signature: &str,
+    signed_tx_hex: &str,
+    txid: &str,
+    initial_broadcast_status: Bip448BroadcastStatus,
+) -> Result<Bip448WithdrawalAttempt> {
+    for value in [server_partial_sig, aggregate_signature, signed_tx_hex] {
+        bip448_funding::require_canonical_hex(value, None)?;
+    }
+    let txid = canonical_txid(txid)?;
+    if !matches!(
+        initial_broadcast_status,
+        Bip448BroadcastStatus::NotBroadcast
+            | Bip448BroadcastStatus::Conflicting
+            | Bip448BroadcastStatus::Conflicted
+    ) {
+        return Err(anyhow!(
+            "illegal initial BIP448 withdrawal broadcast status"
+        ));
+    }
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let result = sqlx::query(
+        "UPDATE bip448_withdrawal_attempts SET server_partial_sig = $1, \
+            aggregate_signature = $2, signed_tx_hex = $3, txid = $4, phase = 'Signed', \
+            broadcast_status = $5, updated_at = CURRENT_TIMESTAMP \
+         WHERE wallet_name = $6 AND statechain_id = $7 AND binding_index = $8 \
+           AND signing_id = $9 AND phase = 'SecondArmed' \
+           AND broadcast_status = 'NotBroadcast' AND server_partial_sig IS NULL \
+           AND aggregate_signature IS NULL AND signed_tx_hex IS NULL AND txid IS NULL",
+    )
+    .bind(server_partial_sig)
+    .bind(aggregate_signature)
+    .bind(signed_tx_hex)
+    .bind(&txid)
+    .bind(initial_broadcast_status.as_str())
+    .bind(wallet_name)
+    .bind(statechain_id)
+    .bind(i64::from(binding_index))
+    .bind(signing_id)
+    .execute(guard.connection())
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(anyhow!("BIP448 signed-artifact compare-and-set lost"));
+    }
+    let row = guard
+        .exact_attempt(wallet_name, statechain_id, binding_index)
+        .await?
+        .ok_or_else(|| anyhow!("BIP448 attempt disappeared after signed-artifact storage"))?;
+    guard.commit().await?;
+    Ok(row)
+}
+
+pub async fn store_bip448_withdrawal_signed_artifacts(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    binding_index: u32,
+    signing_id: &str,
+    server_partial_sig: &str,
+    aggregate_signature: &str,
+    signed_tx_hex: &str,
+    txid: &str,
+    initial_broadcast_status: Bip448BroadcastStatus,
+) -> Result<Bip448WithdrawalAttempt> {
+    store_signed_bip448_withdrawal(
+        pool,
+        wallet_name,
+        statechain_id,
+        binding_index,
+        signing_id,
+        server_partial_sig,
+        aggregate_signature,
+        signed_tx_hex,
+        txid,
+        initial_broadcast_status,
+    )
+    .await
+}
+
+fn legal_broadcast_transition(from: Bip448BroadcastStatus, to: Bip448BroadcastStatus) -> bool {
+    use Bip448BroadcastStatus::*;
+    from == to
+        || matches!(
+            (from, to),
+            (
+                NotBroadcast,
+                Accepted | Confirmed | NeedsRebroadcast | Conflicting | Conflicted
+            ) | (
+                Accepted,
+                Confirmed | NeedsRebroadcast | Conflicting | Conflicted
+            ) | (
+                Confirmed,
+                Accepted | NeedsRebroadcast | Conflicting | Conflicted
+            ) | (
+                NeedsRebroadcast,
+                Accepted | Confirmed | Conflicting | Conflicted
+            ) | (
+                Conflicting,
+                Accepted | Confirmed | NeedsRebroadcast | Conflicted
+            ) | (
+                Conflicted,
+                Accepted | Confirmed | NeedsRebroadcast | Conflicting
+            )
+        )
+}
+
+pub async fn transition_bip448_withdrawal_broadcast_status(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    binding_index: u32,
+    signing_id: &str,
+    expected: Bip448BroadcastStatus,
+    next: Bip448BroadcastStatus,
+) -> Result<Bip448WithdrawalAttempt> {
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let row = guard
+        .update_withdrawal_broadcast_status(
+            wallet_name,
+            statechain_id,
+            binding_index,
+            signing_id,
+            expected,
+            next,
+        )
+        .await?;
+    guard.commit().await?;
+    Ok(row)
+}
+
+pub async fn update_bip448_withdrawal_broadcast_status(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    binding_index: u32,
+    signing_id: &str,
+    expected: Bip448BroadcastStatus,
+    next: Bip448BroadcastStatus,
+) -> Result<Bip448WithdrawalAttempt> {
+    transition_bip448_withdrawal_broadcast_status(
+        pool,
+        wallet_name,
+        statechain_id,
+        binding_index,
+        signing_id,
+        expected,
+        next,
+    )
+    .await
+}
+
+pub async fn transition_bip448_withdrawal_completion_status(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    signing_id: &str,
+    expected: Bip448CompletionStatus,
+    next: Bip448CompletionStatus,
+) -> Result<Bip448WithdrawalAttempt> {
+    if !matches!(
+        (expected, next),
+        (
+            Bip448CompletionStatus::Open,
+            Bip448CompletionStatus::CloseArmed
+        ) | (
+            Bip448CompletionStatus::CloseArmed,
+            Bip448CompletionStatus::Closed
+        )
+    ) {
+        return Err(anyhow!("illegal BIP448 completion-status transition"));
+    }
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    if expected == Bip448CompletionStatus::Open && next == Bip448CompletionStatus::CloseArmed {
+        validate_canonical_close_snapshot_on(&mut guard, wallet_name, statechain_id, signing_id)
+            .await?;
+        let canonical = guard
+            .exact_attempt(wallet_name, statechain_id, 0)
+            .await?
+            .ok_or_else(|| anyhow!("canonical BIP448 attempt is missing"))?;
+        if !matches!(
+            canonical.broadcast_status,
+            Bip448BroadcastStatus::Accepted | Bip448BroadcastStatus::Confirmed
+        ) {
+            return Err(anyhow!(
+                "canonical BIP448 close can arm only while exact bytes are accepted"
+            ));
+        }
+    }
+    let result = sqlx::query(
+        "UPDATE bip448_withdrawal_attempts SET completion_status = $1, \
+            updated_at = CURRENT_TIMESTAMP WHERE wallet_name = $2 AND statechain_id = $3 \
+            AND binding_index = 0 AND signing_id = $4 AND phase = 'Signed' \
+            AND broadcast_status <> 'NotBroadcast' AND completion_status = $5",
+    )
+    .bind(next.as_str())
+    .bind(wallet_name)
+    .bind(statechain_id)
+    .bind(signing_id)
+    .bind(expected.as_str())
+    .execute(guard.connection())
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(anyhow!("BIP448 completion-status compare-and-set lost"));
+    }
+    let row = guard
+        .exact_attempt(wallet_name, statechain_id, 0)
+        .await?
+        .ok_or_else(|| anyhow!("canonical BIP448 attempt disappeared after completion update"))?;
+    guard.commit().await?;
+    Ok(row)
+}
+
+pub async fn update_bip448_withdrawal_completion_status(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    signing_id: &str,
+    expected: Bip448CompletionStatus,
+    next: Bip448CompletionStatus,
+) -> Result<Bip448WithdrawalAttempt> {
+    transition_bip448_withdrawal_completion_status(
+        pool,
+        wallet_name,
+        statechain_id,
+        signing_id,
+        expected,
+        next,
+    )
+    .await
+}
+
+pub async fn delete_prepared_bip448_withdrawal_attempt_for_confirmed_spend(
+    pool: &Pool<Sqlite>,
+    expected: &Bip448WithdrawalAttempt,
+    competing_spend_txid: &str,
+    stable_tip_height: u32,
+    stable_tip_hash: &str,
+) -> Result<()> {
+    bip448_funding::validate_withdrawal_attempt(expected)?;
+    let competing_spend_txid = canonical_txid(competing_spend_txid)?;
+    let stable_tip_hash = canonical_block_hash(stable_tip_hash)?;
+    let prospective_sweep_txid = bip448_funding::expected_withdrawal_txid(expected)?;
+    if expected.binding_index == 0
+        || expected.attempt_kind != Bip448WithdrawalAttemptKind::Duplicate
+        || expected.phase != Bip448WithdrawalPhase::Prepared
+        || expected.broadcast_status != Bip448BroadcastStatus::NotBroadcast
+    {
+        return Err(anyhow!(
+            "only a duplicate Prepared BIP448 attempt may be compare-deleted"
+        ));
+    }
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let live = guard
+        .exact_attempt(
+            &expected.wallet_name,
+            &expected.statechain_id,
+            expected.binding_index,
+        )
+        .await?
+        .ok_or_else(|| anyhow!("BIP448 attempt is missing"))?;
+    if live != *expected {
+        return Err(anyhow!("BIP448 attempt changed before compare-delete"));
+    }
+    let binding = guard
+        .exact_binding(
+            &expected.wallet_name,
+            &expected.statechain_id,
+            expected.binding_index,
+        )
+        .await?
+        .ok_or_else(|| anyhow!("BIP448 binding is missing"))?;
+    if binding.observation_status != Bip448ObservationStatus::SpentConfirmed
+        || binding.spend_txid.as_deref() != Some(competing_spend_txid.as_str())
+        || competing_spend_txid == prospective_sweep_txid
+        || binding.last_scanned_height != stable_tip_height
+    {
+        return Err(anyhow!(
+            "BIP448 competing spend is not the stable confirmed binding fact"
+        ));
+    }
+    let cursor_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM bip448_scan_cursors WHERE wallet_name = $1 \
+         AND script_pubkey = $2 AND last_scanned_height = $3 \
+         AND last_scanned_block_hash = $4",
+    )
+    .bind(&expected.wallet_name)
+    .bind(&expected.source_script_pubkey)
+    .bind(i64::from(stable_tip_height))
+    .bind(&stable_tip_hash)
+    .fetch_one(guard.connection())
+    .await?;
+    if cursor_count != 1 {
+        return Err(anyhow!(
+            "BIP448 stable tip changed before duplicate compare-delete"
+        ));
+    }
+    let result = sqlx::query(
+        "DELETE FROM bip448_withdrawal_attempts WHERE wallet_name = $1 \
+         AND statechain_id = $2 AND binding_index = $3 AND binding_index > 0 \
+         AND attempt_kind = 'Duplicate' AND signing_id = $4 AND phase = 'Prepared' \
+         AND broadcast_status = 'NotBroadcast' AND source_txid = $5 AND source_vout = $6 \
+         AND source_value_sats = $7 AND source_script_pubkey = $8",
+    )
+    .bind(&expected.wallet_name)
+    .bind(&expected.statechain_id)
+    .bind(i64::from(expected.binding_index))
+    .bind(&expected.signing_id)
+    .bind(&expected.source_txid)
+    .bind(i64::from(expected.source_vout))
+    .bind(i64::try_from(expected.source_value_sats)?)
+    .bind(&expected.source_script_pubkey)
+    .execute(guard.connection())
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(anyhow!("BIP448 duplicate compare-delete lost"));
+    }
+    guard.commit().await?;
+    Ok(())
+}
+
+pub async fn bip448_active_withdrawal_attempt(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+) -> Result<Option<Bip448WithdrawalAttempt>> {
+    let attempts = list_bip448_withdrawal_attempts(pool, wallet_name, statechain_id).await?;
+    let mut active = attempts
+        .into_iter()
+        .filter(|attempt| attempt.phase != Bip448WithdrawalPhase::Signed);
+    let result = active.next();
+    if active.next().is_some() {
+        return Err(anyhow!("multiple active BIP448 withdrawal attempts"));
+    }
+    Ok(result)
+}
+
+pub async fn bip448_statechain_is_exit_only(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+) -> Result<bool> {
+    let attempts = list_bip448_withdrawal_attempts(pool, wallet_name, statechain_id).await?;
+    Ok(bip448_funding::bip448_attempts_are_exit_only(&attempts))
+}
+
+pub async fn bip448_expected_signature_count(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+) -> Result<bip448_funding::Bip448SignatureCountExpectation> {
+    let record = get_bip448_statechain(pool, wallet_name, statechain_id).await?;
+    let attempts = list_bip448_withdrawal_attempts(pool, wallet_name, statechain_id).await?;
+    bip448_funding::bip448_signature_count_expectation(record.latest_state_number, &attempts)
+}
+
+pub async fn classify_bip448_close_gate(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+) -> Result<Bip448CloseGate> {
+    let mut connection = pool.acquire().await?;
+    let intents =
+        list_bip448_transfer_intents_on(&mut connection, wallet_name, statechain_id).await?;
+    if !intents.is_empty() {
+        if let Err(error) = validate_bip448_transfer_intent_lineage(&intents) {
+            return Ok(Bip448CloseGate::Blocked {
+                reasons: vec![Bip448CloseBlockReason::InvalidTransferIntentLineage {
+                    detail: error.to_string(),
+                }],
+            });
+        }
+        let active = intents
+            .iter()
+            .find(|intent| intent.activity_status == Bip448TransferIntentActivityStatus::Active)
+            .ok_or_else(|| anyhow!("BIP448 intent lineage has no active row"))?;
+        return Ok(Bip448CloseGate::Blocked {
+            reasons: vec![Bip448CloseBlockReason::ActiveTransferIntent {
+                intent_id: active.intent_id.clone(),
+            }],
+        });
+    }
+    if sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM bip448_pending_transfer_signings WHERE wallet_name = $1 AND statechain_id = $2")
+        .bind(wallet_name).bind(statechain_id).fetch_one(&mut *connection).await? != 0 {
+        return Ok(Bip448CloseGate::Blocked { reasons: vec![Bip448CloseBlockReason::PendingTransferSigning] });
+    }
+    let messages = sqlx::query_scalar::<_, String>("SELECT recipient_auth_pubkey FROM bip448_transfer_messages WHERE wallet_name = $1 AND statechain_id = $2 ORDER BY recipient_auth_pubkey")
+        .bind(wallet_name).bind(statechain_id).fetch_all(&mut *connection).await?;
+    if let Some(recipient_auth_pubkey) = messages.first() {
+        return Ok(Bip448CloseGate::Blocked {
+            reasons: vec![Bip448CloseBlockReason::OutgoingTransferMessage {
+                recipient_auth_pubkey: recipient_auth_pubkey.clone(),
+            }],
+        });
+    }
+    let wallet_json =
+        sqlx::query_scalar::<_, String>("SELECT wallet_json FROM wallet WHERE wallet_name = $1")
+            .bind(wallet_name)
+            .fetch_optional(&mut *connection)
+            .await?;
+    if wallet_json.is_some_and(|json| {
+        serde_json::from_str::<Wallet>(&json).is_ok_and(|wallet| {
+            wallet.coins.iter().any(|coin| {
+                coin.statechain_id.as_deref() == Some(statechain_id)
+                    && coin.status == mercurylib::wallet::CoinStatus::IN_TRANSFER
+            })
+        })
+    }) {
+        return Ok(Bip448CloseGate::Blocked {
+            reasons: vec![Bip448CloseBlockReason::CoinInTransfer],
+        });
+    }
+    let bindings =
+        list_bip448_funding_bindings_on(&mut connection, wallet_name, statechain_id).await?;
+    let attempts =
+        list_bip448_withdrawal_attempts_on(&mut connection, wallet_name, statechain_id).await?;
+    bip448_funding::evaluate_bip448_close_gate(&bindings, &attempts)
+}
+
+async fn insert_transfer_intent_on(
+    connection: &mut SqliteConnection,
+    intent: &Bip448TransferIntent,
+) -> Result<()> {
+    let result = sqlx::query(
+        "INSERT INTO bip448_transfer_intents (wallet_name, statechain_id, intent_id, \
+            predecessor_intent_id, activity_status, intent_kind, \
+            acknowledge_cooperative_duplicates, recipient_address, receiver_user_pubkey, \
+            recipient_auth_pubkey, batch_id, sender_signed_statechain_id, planned_state_number, \
+            expected_signature_count, previous_locktime, prior_pending_signing_id, \
+            prior_transfer_recipient_auth_pubkey, prior_transfer_msg_hash, reuse_pending, \
+            reuse_signed_state, clear_local_attempt, generated_coin_user_pubkey, \
+            generated_coin_auth_pubkey, generated_coin_address, phase, server_x1, \
+            current_pending_signing_id, state_signing_phase, server_partial_sig, update_signature) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,\
+                 $21,$22,$23,$24,$25,$26,$27,$28,$29,$30)",
+    )
+    .bind(&intent.wallet_name)
+    .bind(&intent.statechain_id)
+    .bind(&intent.intent_id)
+    .bind(&intent.predecessor_intent_id)
+    .bind(intent.activity_status.as_str())
+    .bind(intent.intent_kind.as_str())
+    .bind(i64::from(intent.acknowledge_cooperative_duplicates))
+    .bind(&intent.recipient_address)
+    .bind(&intent.receiver_user_pubkey)
+    .bind(&intent.recipient_auth_pubkey)
+    .bind(&intent.batch_id)
+    .bind(&intent.sender_signed_statechain_id)
+    .bind(i64::from(intent.planned_state_number))
+    .bind(i64::from(intent.expected_signature_count))
+    .bind(i64::from(intent.previous_locktime))
+    .bind(&intent.prior_pending_signing_id)
+    .bind(&intent.prior_transfer_recipient_auth_pubkey)
+    .bind(&intent.prior_transfer_msg_hash)
+    .bind(i64::from(intent.reuse_pending))
+    .bind(i64::from(intent.reuse_signed_state))
+    .bind(i64::from(intent.clear_local_attempt))
+    .bind(&intent.generated_coin_user_pubkey)
+    .bind(&intent.generated_coin_auth_pubkey)
+    .bind(&intent.generated_coin_address)
+    .bind(intent.phase.as_str())
+    .bind(&intent.server_x1)
+    .bind(&intent.current_pending_signing_id)
+    .bind(intent.state_signing_phase.as_str())
+    .bind(&intent.server_partial_sig)
+    .bind(&intent.update_signature)
+    .execute(connection)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(anyhow!(
+            "BIP448 transfer intent insert affected an unexpected row count"
+        ));
+    }
+    Ok(())
+}
+
+async fn exact_transfer_intent_on(
+    connection: &mut SqliteConnection,
+    wallet_name: &str,
+    statechain_id: &str,
+    intent_id: &str,
+) -> Result<Option<Bip448TransferIntent>> {
+    let query = format!(
+        "SELECT {BIP448_INTENT_COLUMNS} FROM bip448_transfer_intents \
+        WHERE wallet_name = $1 AND statechain_id = $2 AND intent_id = $3"
+    );
+    sqlx::query(&query)
+        .bind(wallet_name)
+        .bind(statechain_id)
+        .bind(intent_id)
+        .fetch_optional(connection)
+        .await?
+        .map(row_to_bip448_intent)
+        .transpose()
+}
+
+async fn ensure_transfer_insert_blockers_on(
+    connection: &mut SqliteConnection,
+    intent: &Bip448TransferIntent,
+) -> Result<()> {
+    let attempts =
+        list_bip448_withdrawal_attempts_on(connection, &intent.wallet_name, &intent.statechain_id)
+            .await?;
+    if let Some(attempt) = attempts.iter().find(|attempt| {
+        matches!(
+            attempt.phase,
+            Bip448WithdrawalPhase::SecondArmed | Bip448WithdrawalPhase::Signed
+        )
+    }) {
+        return Err(anyhow!(
+            "exit-only BIP448 withdrawal attempt {} blocks transfer",
+            attempt.binding_index
+        ));
+    }
+    if let Some(attempt) = attempts.first() {
+        return Err(anyhow!(
+            "active BIP448 withdrawal attempt {} blocks transfer",
+            attempt.binding_index
+        ));
+    }
+    let (record, history) =
+        accepted_record_and_history_on(connection, &intent.wallet_name, &intent.statechain_id)
+            .await?;
+    if record.latest_state_number == 0
+        || usize::try_from(intent.expected_signature_count)? != history.len()
+    {
+        return Err(anyhow!(
+            "BIP448 transfer intent count/history plan is stale"
+        ));
+    }
+    let expected_previous_locktime = if intent.planned_state_number
+        == record
+            .latest_state_number
+            .checked_add(2)
+            .ok_or_else(|| anyhow!("BIP448 transfer plan state number overflows"))?
+    {
+        history
+            .last()
+            .ok_or_else(|| anyhow!("BIP448 transfer plan history is empty"))?
+            .state_locktime
+    } else {
+        record.latest_state.state_locktime
+    };
+    if intent.previous_locktime != expected_previous_locktime {
+        return Err(anyhow!(
+            "BIP448 transfer intent previous-locktime plan is stale"
+        ));
+    }
+    let pending =
+        pending_transfer_on(connection, &intent.wallet_name, &intent.statechain_id).await?;
+    if intent.prior_pending_signing_id.as_deref()
+        != pending.as_ref().map(|row| row.signing_id.as_str())
+    {
+        return Err(anyhow!(
+            "BIP448 transfer intent pending-signing fingerprint is stale"
+        ));
+    }
+    let messages = sqlx::query(
+        "SELECT recipient_auth_pubkey,transfer_msg_json FROM bip448_transfer_messages \
+         WHERE wallet_name=$1 AND statechain_id=$2 ORDER BY recipient_auth_pubkey",
+    )
+    .bind(&intent.wallet_name)
+    .bind(&intent.statechain_id)
+    .fetch_all(&mut *connection)
+    .await?;
+    match (
+        intent.prior_transfer_recipient_auth_pubkey.as_deref(),
+        intent.prior_transfer_msg_hash.as_deref(),
+    ) {
+        (Some(recipient), Some(expected_hash)) if messages.len() == 1 => {
+            let stored_recipient: String = messages[0].try_get(0)?;
+            let stored_json: String = messages[0].try_get(1)?;
+            if stored_recipient != recipient
+                || sha256::Hash::hash(stored_json.as_bytes()).to_string() != expected_hash
+            {
+                return Err(anyhow!(
+                    "BIP448 transfer intent message fingerprint is stale"
+                ));
+            }
+        }
+        (None, None) if messages.is_empty() => {}
+        _ => {
+            return Err(anyhow!(
+                "BIP448 transfer intent outgoing-message plan is stale"
+            ));
+        }
+    }
+    let has_local_attempt = pending.is_some() || !messages.is_empty();
+    if intent.reuse_pending && pending.is_none()
+        || intent.clear_local_attempt != (has_local_attempt && !intent.reuse_pending)
+    {
+        return Err(anyhow!(
+            "BIP448 transfer intent retained-state flags are incoherent"
+        ));
+    }
+    let unresolved_duplicates =
+        list_bip448_funding_bindings_on(connection, &intent.wallet_name, &intent.statechain_id)
+            .await?
+            .into_iter()
+            .any(|binding| {
+                binding.role == Bip448BindingRole::Duplicate
+                    && binding.ownership_status == Bip448OwnershipStatus::Current
+                    && binding.observation_status != Bip448ObservationStatus::SpentConfirmed
+            });
+    if unresolved_duplicates && !intent.acknowledge_cooperative_duplicates {
+        return Err(anyhow!(
+            "BIP448 cooperative duplicate acknowledgement is required"
+        ));
+    }
+    Ok(())
+}
+
+pub async fn insert_bip448_transfer_intent_if_absent(
+    pool: &Pool<Sqlite>,
+    intent: &Bip448TransferIntent,
+) -> Result<Bip448TransferIntent> {
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let stored = guard
+        .prepare_or_supersede_transfer_intent(None, intent)
+        .await?;
+    guard.commit().await?;
+    Ok(stored)
+}
+
+fn validate_bip448_cancellation_wallet_append(
+    intent: &Bip448TransferIntent,
+    expected_raw_wallet_json: &str,
+    replacement_wallet: &Wallet,
+) -> Result<String> {
+    if intent.intent_kind != Bip448TransferIntentKind::Cancellation
+        || replacement_wallet.name != intent.wallet_name
+    {
+        return Err(anyhow!("invalid BIP448 cancellation wallet identity"));
+    }
+    let old_wallet: Wallet = serde_json::from_str(expected_raw_wallet_json)?;
+    if old_wallet.name != intent.wallet_name
+        || replacement_wallet.coins.len()
+            != old_wallet
+                .coins
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("BIP448 cancellation Coin count overflow"))?
+    {
+        return Err(anyhow!(
+            "BIP448 cancellation wallet does not append exactly one Coin"
+        ));
+    }
+    let generated = replacement_wallet
+        .coins
+        .last()
+        .ok_or_else(|| anyhow!("BIP448 cancellation generated Coin is missing"))?;
+    if generated.status != mercurylib::wallet::CoinStatus::INITIALISED
+        || generated.statechain_id.is_some()
+        || Some(generated.user_pubkey.as_str()) != intent.generated_coin_user_pubkey.as_deref()
+        || Some(generated.auth_pubkey.as_str()) != intent.generated_coin_auth_pubkey.as_deref()
+        || Some(generated.address.as_str()) != intent.generated_coin_address.as_deref()
+    {
+        return Err(anyhow!(
+            "BIP448 cancellation generated Coin does not match its intent"
+        ));
+    }
+    let generated_matches = replacement_wallet
+        .coins
+        .iter()
+        .filter(|coin| {
+            Some(coin.user_pubkey.as_str()) == intent.generated_coin_user_pubkey.as_deref()
+                && Some(coin.auth_pubkey.as_str()) == intent.generated_coin_auth_pubkey.as_deref()
+                && Some(coin.address.as_str()) == intent.generated_coin_address.as_deref()
+        })
+        .count();
+    if generated_matches != 1 {
+        return Err(anyhow!(
+            "BIP448 cancellation generated Coin identity is not unique"
+        ));
+    }
+    let mut without_generated = replacement_wallet.clone();
+    without_generated.coins.pop();
+    if serde_json::to_value(&without_generated)? != serde_json::to_value(&old_wallet)? {
+        return Err(anyhow!(
+            "BIP448 cancellation wallet changes more than the appended generated Coin"
+        ));
+    }
+    canonical_wallet_json(replacement_wallet)
+}
+
+pub async fn insert_bip448_cancellation_intent_with_wallet(
+    pool: &Pool<Sqlite>,
+    intent: &Bip448TransferIntent,
+    expected_raw_wallet_json: &str,
+    replacement_wallet: &Wallet,
+) -> Result<Bip448TransferIntent> {
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let stored = guard
+        .persist_cancellation_wallet_and_intent(
+            None,
+            intent,
+            expected_raw_wallet_json,
+            replacement_wallet,
+        )
+        .await?;
+    guard.commit().await?;
+    Ok(stored)
+}
+
+fn intent_is_directly_supersedable(intent: &Bip448TransferIntent) -> bool {
+    intent.phase == Bip448TransferIntentPhase::Prepared
+        || (intent.phase == Bip448TransferIntentPhase::X1Stored
+            && matches!(
+                intent.state_signing_phase,
+                Bip448TransferStateSigningPhase::NotStarted
+                    | Bip448TransferStateSigningPhase::NonceStored
+                    | Bip448TransferStateSigningPhase::Signed
+            ))
+}
+
+async fn require_materialized_signed_transfer_intent_on(
+    connection: &mut SqliteConnection,
+    intent: &Bip448TransferIntent,
+) -> Result<()> {
+    if intent.state_signing_phase != Bip448TransferStateSigningPhase::Signed {
+        return Ok(());
+    }
+    let pending = pending_transfer_on(connection, &intent.wallet_name, &intent.statechain_id)
+        .await?
+        .ok_or_else(|| anyhow!("BIP448 Signed transfer intent pending row is missing"))?;
+    if intent.current_pending_signing_id.as_deref() != Some(pending.signing_id.as_str()) {
+        return Err(anyhow!(
+            "BIP448 Signed transfer intent pending identity changed"
+        ));
+    }
+    let (record, history) =
+        accepted_record_and_history_on(connection, &intent.wallet_name, &intent.statechain_id)
+            .await?;
+    let planned_len = usize::try_from(intent.planned_state_number)?;
+    let planned_entry = history
+        .get(
+            planned_len
+                .checked_sub(1)
+                .ok_or_else(|| anyhow!("BIP448 planned state number must be positive"))?,
+        )
+        .ok_or_else(|| anyhow!("BIP448 Signed transfer intent history is not materialized"))?;
+    if history.len() != planned_len
+        || pending.funding_txid != record.funding_outpoint.txid
+        || pending.funding_vout != record.funding_outpoint.vout
+        || pending.funding_value_sats != record.funding_outpoint.value_sats
+        || !history_entry_matches_pending_intent(planned_entry, &pending, intent)?
+    {
+        return Err(anyhow!(
+            "BIP448 Signed transfer intent history does not match its pending row"
+        ));
+    }
+    let message_json = sqlx::query_scalar::<_, String>(
+        "SELECT transfer_msg_json FROM bip448_transfer_messages WHERE wallet_name=$1 \
+         AND statechain_id=$2 AND recipient_auth_pubkey=$3",
+    )
+    .bind(&intent.wallet_name)
+    .bind(&intent.statechain_id)
+    .bind(&intent.recipient_auth_pubkey)
+    .fetch_optional(&mut *connection)
+    .await?
+    .ok_or_else(|| anyhow!("BIP448 Signed transfer intent message is not materialized"))?;
+    let message: Bip448TransferMsg = serde_json::from_str(&message_json)?;
+    if serde_json::to_string(&message)? != message_json
+        || message.statechain_id != intent.statechain_id
+        || message.receiver_user_public_key != intent.receiver_user_pubkey
+        || message.latest_state_number != intent.planned_state_number
+        || !transfer_message_matches_record_and_history(&message, &record, &history)?
+    {
+        return Err(anyhow!(
+            "BIP448 Signed transfer intent message does not match its lineage"
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_bip448_successor_plan_on(
+    connection: &mut SqliteConnection,
+    predecessor: &Bip448TransferIntent,
+    successor: &Bip448TransferIntent,
+) -> Result<()> {
+    if successor.predecessor_intent_id.as_deref() != Some(predecessor.intent_id.as_str()) {
+        return Err(anyhow!("BIP448 successor names the wrong predecessor"));
+    }
+    let pending =
+        pending_transfer_on(connection, &successor.wallet_name, &successor.statechain_id).await?;
+    if successor.prior_pending_signing_id.as_deref()
+        != pending.as_ref().map(|row| row.signing_id.as_str())
+    {
+        return Err(anyhow!(
+            "BIP448 successor pending-signing fingerprint is stale"
+        ));
+    }
+    let expected_message_fingerprint =
+        if predecessor.state_signing_phase == Bip448TransferStateSigningPhase::Signed {
+            let json = sqlx::query_scalar::<_, String>(
+                "SELECT transfer_msg_json FROM bip448_transfer_messages WHERE wallet_name=$1 \
+                 AND statechain_id=$2 AND recipient_auth_pubkey=$3",
+            )
+            .bind(&successor.wallet_name)
+            .bind(&successor.statechain_id)
+            .bind(&predecessor.recipient_auth_pubkey)
+            .fetch_optional(&mut *connection)
+            .await?
+            .ok_or_else(|| anyhow!("BIP448 Signed predecessor message is missing"))?;
+            Some((
+                predecessor.recipient_auth_pubkey.clone(),
+                sha256::Hash::hash(json.as_bytes()).to_string(),
+            ))
+        } else {
+            match (
+                predecessor.prior_transfer_recipient_auth_pubkey.clone(),
+                predecessor.prior_transfer_msg_hash.clone(),
+            ) {
+                (Some(recipient), Some(hash)) => Some((recipient, hash)),
+                (None, None) => None,
+                _ => {
+                    return Err(anyhow!(
+                        "BIP448 predecessor message fingerprint is incoherent"
+                    ));
+                }
+            }
+        };
+    if let Some((recipient, expected_hash)) = &expected_message_fingerprint {
+        let json = sqlx::query_scalar::<_, String>(
+            "SELECT transfer_msg_json FROM bip448_transfer_messages WHERE wallet_name=$1 \
+             AND statechain_id=$2 AND recipient_auth_pubkey=$3",
+        )
+        .bind(&successor.wallet_name)
+        .bind(&successor.statechain_id)
+        .bind(recipient)
+        .fetch_optional(&mut *connection)
+        .await?
+        .ok_or_else(|| anyhow!("BIP448 successor predecessor message is missing"))?;
+        if sha256::Hash::hash(json.as_bytes()).to_string() != *expected_hash {
+            return Err(anyhow!(
+                "BIP448 successor predecessor message bytes changed"
+            ));
+        }
+    }
+    if successor.prior_transfer_recipient_auth_pubkey.as_deref()
+        != expected_message_fingerprint
+            .as_ref()
+            .map(|(recipient, _)| recipient.as_str())
+        || successor.prior_transfer_msg_hash.as_deref()
+            != expected_message_fingerprint
+                .as_ref()
+                .map(|(_, hash)| hash.as_str())
+    {
+        return Err(anyhow!(
+            "BIP448 successor transfer-message fingerprint is stale"
+        ));
+    }
+    let has_local_attempt = pending.is_some() || expected_message_fingerprint.is_some();
+    if successor.reuse_pending && pending.is_none()
+        || successor.clear_local_attempt != (has_local_attempt && !successor.reuse_pending)
+    {
+        return Err(anyhow!(
+            "BIP448 successor retained-state plan is incoherent"
+        ));
+    }
+    Ok(())
+}
+
+pub async fn supersede_bip448_transfer_intent(
+    pool: &Pool<Sqlite>,
+    expected_active_intent_id: &str,
+    successor: &Bip448TransferIntent,
+) -> Result<Bip448TransferIntent> {
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let stored = guard
+        .prepare_or_supersede_transfer_intent(Some(expected_active_intent_id), successor)
+        .await?;
+    guard.commit().await?;
+    Ok(stored)
+}
+
+pub async fn supersede_bip448_transfer_intent_with_cancellation_wallet(
+    pool: &Pool<Sqlite>,
+    expected_active_intent_id: &str,
+    successor: &Bip448TransferIntent,
+    expected_raw_wallet_json: &str,
+    replacement_wallet: &Wallet,
+) -> Result<Bip448TransferIntent> {
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let stored = guard
+        .persist_cancellation_wallet_and_intent(
+            Some(expected_active_intent_id),
+            successor,
+            expected_raw_wallet_json,
+            replacement_wallet,
+        )
+        .await?;
+    guard.commit().await?;
+    Ok(stored)
+}
+
+async fn transition_active_intent_on(
+    guard: &mut Bip448MutationGuard,
+    wallet_name: &str,
+    statechain_id: &str,
+    intent_id: &str,
+    expected_phase: Bip448TransferIntentPhase,
+    next_phase: Bip448TransferIntentPhase,
+    expected_signing_phase: Bip448TransferStateSigningPhase,
+) -> Result<()> {
+    let result = sqlx::query(
+        "UPDATE bip448_transfer_intents SET phase = $1, \
+        updated_at = CURRENT_TIMESTAMP WHERE wallet_name = $2 AND statechain_id = $3 \
+        AND intent_id = $4 AND activity_status = 'Active' AND phase = $5 \
+        AND state_signing_phase = $6",
+    )
+    .bind(next_phase.as_str())
+    .bind(wallet_name)
+    .bind(statechain_id)
+    .bind(intent_id)
+    .bind(expected_phase.as_str())
+    .bind(expected_signing_phase.as_str())
+    .execute(guard.connection())
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(anyhow!(
+            "stale BIP448 transfer intent worker lost its activity CAS"
+        ));
+    }
+    Ok(())
+}
+
+pub async fn arm_bip448_transfer_sender(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    intent_id: &str,
+) -> Result<Bip448TransferIntent> {
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    transition_active_intent_on(
+        &mut guard,
+        wallet_name,
+        statechain_id,
+        intent_id,
+        Bip448TransferIntentPhase::Prepared,
+        Bip448TransferIntentPhase::SenderArmed,
+        Bip448TransferStateSigningPhase::NotStarted,
+    )
+    .await?;
+    let row = exact_transfer_intent_on(guard.connection(), wallet_name, statechain_id, intent_id)
+        .await?
+        .ok_or_else(|| anyhow!("BIP448 transfer intent disappeared after sender arm"))?;
+    guard.commit().await?;
+    Ok(row)
+}
+
+pub async fn transition_bip448_transfer_intent_phase(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    intent_id: &str,
+    expected_phase: Bip448TransferIntentPhase,
+    next_phase: Bip448TransferIntentPhase,
+) -> Result<Bip448TransferIntent> {
+    if (expected_phase, next_phase)
+        != (
+            Bip448TransferIntentPhase::Prepared,
+            Bip448TransferIntentPhase::SenderArmed,
+        )
+    {
+        return Err(anyhow!(
+            "BIP448 transfer phase requires its artifact-specific transition helper"
+        ));
+    }
+    arm_bip448_transfer_sender(pool, wallet_name, statechain_id, intent_id).await
+}
+
+pub async fn store_bip448_transfer_server_x1(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    intent_id: &str,
+    server_x1: &str,
+) -> Result<Bip448TransferIntent> {
+    bip448_funding::require_canonical_hex(server_x1, Some(32))?;
+    secp256k1::SecretKey::from_str(server_x1).context("invalid BIP448 transfer x1 scalar")?;
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let result = sqlx::query(
+        "UPDATE bip448_transfer_intents SET server_x1 = $1, phase = 'X1Stored', \
+        updated_at = CURRENT_TIMESTAMP WHERE wallet_name = $2 AND statechain_id = $3 \
+        AND intent_id = $4 AND activity_status = 'Active' AND phase = 'SenderArmed' \
+        AND state_signing_phase = 'NotStarted' AND server_x1 IS NULL",
+    )
+    .bind(server_x1)
+    .bind(wallet_name)
+    .bind(statechain_id)
+    .bind(intent_id)
+    .execute(guard.connection())
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(anyhow!("BIP448 transfer x1 compare-and-set lost"));
+    }
+    let row = exact_transfer_intent_on(guard.connection(), wallet_name, statechain_id, intent_id)
+        .await?
+        .ok_or_else(|| anyhow!("BIP448 intent disappeared after x1 storage"))?;
+    guard.commit().await?;
+    Ok(row)
+}
+
+pub async fn store_bip448_transfer_intent_x1(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    intent_id: &str,
+    server_x1: &str,
+) -> Result<Bip448TransferIntent> {
+    store_bip448_transfer_server_x1(pool, wallet_name, statechain_id, intent_id, server_x1).await
+}
+
+fn pending_transfer_immutable_eq(
+    left: &Bip448PendingDepositSigning,
+    right: &Bip448PendingDepositSigning,
+) -> bool {
+    left.wallet_name == right.wallet_name
+        && left.statechain_id == right.statechain_id
+        && left.funding_txid == right.funding_txid
+        && left.funding_vout == right.funding_vout
+        && left.funding_value_sats == right.funding_value_sats
+        && left.update_template_hash == right.update_template_hash
+        && left.settlement_template_hash == right.settlement_template_hash
+        && left.state_locktime == right.state_locktime
+        && left.signing_id == right.signing_id
+        && left.client_secret_nonce == right.client_secret_nonce
+        && left.client_public_nonce == right.client_public_nonce
+        && left.blinding_factor == right.blinding_factor
+}
+
+fn validate_bip448_transfer_pending_signing(pending: &Bip448PendingDepositSigning) -> Result<()> {
+    bip448_funding::require_canonical_txid(&pending.funding_txid)?;
+    bip448_funding::require_canonical_hex(&pending.update_template_hash, Some(32))?;
+    bip448_funding::require_canonical_hex(&pending.settlement_template_hash, Some(32))?;
+    bip448_funding::require_canonical_hex(&pending.signing_id, Some(32))?;
+    bip448_funding::require_canonical_hex(&pending.client_secret_nonce, Some(132))?;
+    bip448_funding::require_canonical_hex(&pending.client_public_nonce, Some(66))?;
+    bip448_funding::require_canonical_hex(&pending.blinding_factor, Some(32))?;
+    if let Some(server_public_nonce) = &pending.server_public_nonce {
+        bip448_funding::require_canonical_hex(server_public_nonce, Some(66))?;
+    }
+    if pending.funding_value_sats > bip448_funding::BIP448_MAX_MONEY_SATS
+        || pending.state_locktime < 500_000_000
+    {
+        return Err(anyhow!(
+            "invalid BIP448 transfer pending-signing integer domain"
+        ));
+    }
+    Ok(())
+}
+
+async fn pending_transfer_on(
+    connection: &mut SqliteConnection,
+    wallet_name: &str,
+    statechain_id: &str,
+) -> Result<Option<Bip448PendingDepositSigning>> {
+    let row = sqlx::query(
+        "SELECT wallet_name, statechain_id, funding_txid, funding_vout, \
+        funding_value_sats, update_template_hash, settlement_template_hash, state_locktime, \
+        signing_id, client_secret_nonce, client_public_nonce, blinding_factor, server_public_nonce \
+        FROM bip448_pending_transfer_signings WHERE wallet_name = $1 AND statechain_id = $2",
+    )
+    .bind(wallet_name)
+    .bind(statechain_id)
+    .fetch_optional(connection)
+    .await?;
+    row.map(|row| {
+        let pending = Bip448PendingDepositSigning {
+            wallet_name: row.try_get(0)?,
+            statechain_id: row.try_get(1)?,
+            funding_txid: canonical_txid(row.try_get(2)?)?,
+            funding_vout: checked_u32(&row, 3, "BIP448 pending funding vout")?,
+            funding_value_sats: checked_u64(&row, 4, "BIP448 pending funding value")?,
+            update_template_hash: row.try_get(5)?,
+            settlement_template_hash: row.try_get(6)?,
+            state_locktime: checked_u32(&row, 7, "BIP448 pending locktime")?,
+            signing_id: row.try_get(8)?,
+            client_secret_nonce: row.try_get(9)?,
+            client_public_nonce: row.try_get(10)?,
+            blinding_factor: row.try_get(11)?,
+            server_public_nonce: row.try_get(12)?,
+        };
+        validate_bip448_transfer_pending_signing(&pending)?;
+        Ok(pending)
+    })
+    .transpose()
+}
+
+pub async fn install_bip448_transfer_target_pending_signing(
+    pool: &Pool<Sqlite>,
+    intent_id: &str,
+    pending: &Bip448PendingDepositSigning,
+) -> Result<Bip448TransferIntent> {
+    validate_bip448_transfer_pending_signing(pending)?;
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let intent = exact_transfer_intent_on(
+        guard.connection(),
+        &pending.wallet_name,
+        &pending.statechain_id,
+        intent_id,
+    )
+    .await?
+    .ok_or_else(|| anyhow!("BIP448 transfer intent is missing"))?;
+    if intent.activity_status != Bip448TransferIntentActivityStatus::Active
+        || intent.phase != Bip448TransferIntentPhase::X1Stored
+        || intent.state_signing_phase != Bip448TransferStateSigningPhase::NotStarted
+        || intent.reuse_signed_state
+    {
+        return Err(anyhow!(
+            "BIP448 transfer intent is not ready to install target pending signing"
+        ));
+    }
+    if pending.funding_txid != canonical_txid(&pending.funding_txid)? {
+        return Err(anyhow!("BIP448 pending transfer outpoint is not canonical"));
+    }
+    let (record, history) = accepted_record_and_history_on(
+        guard.connection(),
+        &pending.wallet_name,
+        &pending.statechain_id,
+    )
+    .await?;
+    if pending.funding_txid != record.funding_outpoint.txid
+        || pending.funding_vout != record.funding_outpoint.vout
+        || pending.funding_value_sats != record.funding_outpoint.value_sats
+        || pending.state_locktime <= intent.previous_locktime
+        || usize::try_from(intent.expected_signature_count)? != history.len()
+    {
+        return Err(anyhow!(
+            "BIP448 target pending signing does not match its retained state plan"
+        ));
+    }
+    let prior_pending = pending_transfer_on(
+        guard.connection(),
+        &pending.wallet_name,
+        &pending.statechain_id,
+    )
+    .await?;
+    match prior_pending {
+        Some(prior) if intent.reuse_pending => {
+            if intent.prior_pending_signing_id.as_deref() != Some(prior.signing_id.as_str())
+                || !pending_transfer_immutable_eq(&prior, pending)
+            {
+                return Err(anyhow!("BIP448 reused predecessor pending signing changed"));
+            }
+        }
+        Some(prior) => {
+            if !intent.clear_local_attempt
+                || intent.prior_pending_signing_id.as_deref() != Some(prior.signing_id.as_str())
+                || prior.signing_id == pending.signing_id
+                || pending.server_public_nonce.is_some()
+            {
+                return Err(anyhow!(
+                    "BIP448 predecessor pending signing fingerprint changed"
+                ));
+            }
+            let deleted = sqlx::query(
+                "DELETE FROM bip448_pending_transfer_signings \
+                WHERE wallet_name = $1 AND statechain_id = $2 AND signing_id = $3",
+            )
+            .bind(&pending.wallet_name)
+            .bind(&pending.statechain_id)
+            .bind(&prior.signing_id)
+            .execute(guard.connection())
+            .await?;
+            if deleted.rows_affected() != 1 {
+                return Err(anyhow!("BIP448 predecessor pending compare-delete lost"));
+            }
+        }
+        None if intent.reuse_pending || intent.prior_pending_signing_id.is_some() => {
+            return Err(anyhow!(
+                "BIP448 predecessor pending signing is missing before replacement"
+            ));
+        }
+        None if pending.server_public_nonce.is_some() => {
+            return Err(anyhow!(
+                "fresh BIP448 target pending signing already contains a server nonce"
+            ));
+        }
+        None => {}
+    }
+    if intent.prior_transfer_msg_hash.is_none() {
+        let unjournaled_messages = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM bip448_transfer_messages WHERE wallet_name=$1 \
+             AND statechain_id=$2",
+        )
+        .bind(&pending.wallet_name)
+        .bind(&pending.statechain_id)
+        .fetch_one(guard.connection())
+        .await?;
+        if unjournaled_messages != 0 {
+            return Err(anyhow!(
+                "BIP448 unjournaled predecessor transfer message blocks replacement"
+            ));
+        }
+    }
+    if let (Some(recipient), Some(expected_hash)) = (
+        intent.prior_transfer_recipient_auth_pubkey.as_deref(),
+        intent.prior_transfer_msg_hash.as_deref(),
+    ) {
+        if !intent.clear_local_attempt {
+            return Err(anyhow!(
+                "BIP448 predecessor message replacement is not authorized"
+            ));
+        }
+        let prior_json = sqlx::query_scalar::<_, String>(
+            "SELECT transfer_msg_json \
+            FROM bip448_transfer_messages WHERE wallet_name=$1 AND statechain_id=$2 \
+            AND recipient_auth_pubkey=$3",
+        )
+        .bind(&pending.wallet_name)
+        .bind(&pending.statechain_id)
+        .bind(recipient)
+        .fetch_optional(guard.connection())
+        .await?
+        .ok_or_else(|| anyhow!("BIP448 predecessor transfer message is missing"))?;
+        let actual_hash = sha256::Hash::hash(prior_json.as_bytes()).to_string();
+        if actual_hash != expected_hash {
+            return Err(anyhow!(
+                "BIP448 predecessor transfer-message fingerprint changed"
+            ));
+        }
+        let deleted = sqlx::query(
+            "DELETE FROM bip448_transfer_messages WHERE wallet_name=$1 \
+            AND statechain_id=$2 AND recipient_auth_pubkey=$3 AND transfer_msg_json=$4",
+        )
+        .bind(&pending.wallet_name)
+        .bind(&pending.statechain_id)
+        .bind(recipient)
+        .bind(&prior_json)
+        .execute(guard.connection())
+        .await?;
+        if deleted.rows_affected() != 1 {
+            return Err(anyhow!("BIP448 predecessor message compare-delete lost"));
+        }
+    }
+    if pending_transfer_on(
+        guard.connection(),
+        &pending.wallet_name,
+        &pending.statechain_id,
+    )
+    .await?
+    .is_none()
+    {
+        let inserted = sqlx::query(
+            "INSERT INTO bip448_pending_transfer_signings \
+            (wallet_name,statechain_id,funding_txid,funding_vout,funding_value_sats,\
+             update_template_hash,settlement_template_hash,state_locktime,signing_id,\
+             client_secret_nonce,client_public_nonce,blinding_factor,server_public_nonce) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+        )
+        .bind(&pending.wallet_name)
+        .bind(&pending.statechain_id)
+        .bind(&pending.funding_txid)
+        .bind(i64::from(pending.funding_vout))
+        .bind(i64::try_from(pending.funding_value_sats)?)
+        .bind(&pending.update_template_hash)
+        .bind(&pending.settlement_template_hash)
+        .bind(i64::from(pending.state_locktime))
+        .bind(&pending.signing_id)
+        .bind(&pending.client_secret_nonce)
+        .bind(&pending.client_public_nonce)
+        .bind(&pending.blinding_factor)
+        .bind(&pending.server_public_nonce)
+        .execute(guard.connection())
+        .await?;
+        if inserted.rows_affected() != 1 {
+            return Err(anyhow!("BIP448 target pending signing insert failed"));
+        }
+    }
+    let lineage = list_bip448_transfer_intents_on(
+        guard.connection(),
+        &pending.wallet_name,
+        &pending.statechain_id,
+    )
+    .await?;
+    validate_bip448_transfer_intent_lineage(&lineage)?;
+    let generated = lineage
+        .iter()
+        .filter(|row| {
+            row.activity_status == Bip448TransferIntentActivityStatus::Superseded
+                && row.intent_kind == Bip448TransferIntentKind::Cancellation
+        })
+        .collect::<Vec<_>>();
+    if !generated.is_empty() {
+        let raw =
+            sqlx::query_scalar::<_, String>("SELECT wallet_json FROM wallet WHERE wallet_name=$1")
+                .bind(&pending.wallet_name)
+                .fetch_one(guard.connection())
+                .await?;
+        let mut wallet: Wallet = serde_json::from_str(&raw)?;
+        for old in generated {
+            let matches = wallet
+                .coins
+                .iter()
+                .enumerate()
+                .filter(|(_, coin)| {
+                    coin.status == mercurylib::wallet::CoinStatus::INITIALISED
+                        && Some(coin.user_pubkey.as_str())
+                            == old.generated_coin_user_pubkey.as_deref()
+                        && Some(coin.auth_pubkey.as_str())
+                            == old.generated_coin_auth_pubkey.as_deref()
+                        && Some(coin.address.as_str()) == old.generated_coin_address.as_deref()
+                        && coin.statechain_id.is_none()
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            if matches.len() != 1 {
+                return Err(anyhow!(
+                    "superseded BIP448 cancellation Coin is not uniquely removable"
+                ));
+            }
+            wallet.coins.remove(matches[0]);
+        }
+        let replacement = canonical_wallet_json(&wallet)?;
+        let updated =
+            sqlx::query("UPDATE wallet SET wallet_json=$1 WHERE wallet_name=$2 AND wallet_json=$3")
+                .bind(replacement)
+                .bind(&pending.wallet_name)
+                .bind(&raw)
+                .execute(guard.connection())
+                .await?;
+        if updated.rows_affected() != 1 {
+            return Err(anyhow!("BIP448 superseded Coin cleanup CAS lost"));
+        }
+    }
+    let result = sqlx::query(
+        "UPDATE bip448_transfer_intents SET current_pending_signing_id = $1, \
+        state_signing_phase = 'FirstArmed', updated_at = CURRENT_TIMESTAMP \
+        WHERE wallet_name = $2 AND statechain_id = $3 AND intent_id = $4 \
+        AND activity_status = 'Active' AND phase = 'X1Stored' \
+        AND state_signing_phase = 'NotStarted' AND current_pending_signing_id IS NULL",
+    )
+    .bind(&pending.signing_id)
+    .bind(&pending.wallet_name)
+    .bind(&pending.statechain_id)
+    .bind(intent_id)
+    .execute(guard.connection())
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(anyhow!(
+            "stale BIP448 worker lost target-pending installation CAS"
+        ));
+    }
+    let stored = exact_transfer_intent_on(
+        guard.connection(),
+        &pending.wallet_name,
+        &pending.statechain_id,
+        intent_id,
+    )
+    .await?
+    .ok_or_else(|| anyhow!("BIP448 intent disappeared"))?;
+    guard.commit().await?;
+    Ok(stored)
+}
+
+pub async fn install_bip448_transfer_target_pending(
+    pool: &Pool<Sqlite>,
+    intent_id: &str,
+    pending: &Bip448PendingDepositSigning,
+) -> Result<Bip448TransferIntent> {
+    install_bip448_transfer_target_pending_signing(pool, intent_id, pending).await
+}
+
+pub async fn store_bip448_transfer_state_nonce(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    intent_id: &str,
+    signing_id: &str,
+    server_public_nonce: &str,
+) -> Result<Bip448TransferIntent> {
+    bip448_funding::require_canonical_hex(server_public_nonce, Some(66))?;
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let live_intent =
+        exact_transfer_intent_on(guard.connection(), wallet_name, statechain_id, intent_id)
+            .await?
+            .ok_or_else(|| anyhow!("BIP448 transfer intent is missing before nonce storage"))?;
+    if live_intent.activity_status != Bip448TransferIntentActivityStatus::Active
+        || live_intent.phase != Bip448TransferIntentPhase::X1Stored
+        || live_intent.state_signing_phase != Bip448TransferStateSigningPhase::FirstArmed
+        || live_intent.current_pending_signing_id.as_deref() != Some(signing_id)
+    {
+        return Err(anyhow!("stale BIP448 transfer worker lost nonce identity"));
+    }
+    let live_pending = pending_transfer_on(guard.connection(), wallet_name, statechain_id)
+        .await?
+        .ok_or_else(|| anyhow!("BIP448 transfer nonce pending row is missing"))?;
+    if live_pending.signing_id != signing_id {
+        return Err(anyhow!("BIP448 transfer nonce pending identity changed"));
+    }
+    match live_pending.server_public_nonce.as_deref() {
+        Some(stored) if stored == server_public_nonce => {}
+        Some(_) => return Err(anyhow!("BIP448 transfer server nonce replay conflicts")),
+        None => {
+            let pending = sqlx::query(
+                "UPDATE bip448_pending_transfer_signings SET server_public_nonce=$1, \
+                updated_at=CURRENT_TIMESTAMP WHERE wallet_name=$2 AND statechain_id=$3 \
+                AND signing_id=$4 AND server_public_nonce IS NULL",
+            )
+            .bind(server_public_nonce)
+            .bind(wallet_name)
+            .bind(statechain_id)
+            .bind(signing_id)
+            .execute(guard.connection())
+            .await?;
+            if pending.rows_affected() != 1 {
+                return Err(anyhow!("BIP448 transfer nonce pending-row CAS lost"));
+            }
+        }
+    }
+    let intent = sqlx::query(
+        "UPDATE bip448_transfer_intents SET state_signing_phase = 'NonceStored', \
+        updated_at = CURRENT_TIMESTAMP WHERE wallet_name = $1 AND statechain_id = $2 \
+        AND intent_id = $3 AND activity_status = 'Active' AND phase = 'X1Stored' \
+        AND state_signing_phase = 'FirstArmed' AND current_pending_signing_id = $4",
+    )
+    .bind(wallet_name)
+    .bind(statechain_id)
+    .bind(intent_id)
+    .bind(signing_id)
+    .execute(guard.connection())
+    .await?;
+    if intent.rows_affected() != 1 {
+        return Err(anyhow!("stale BIP448 transfer worker lost nonce CAS"));
+    }
+    let row = exact_transfer_intent_on(guard.connection(), wallet_name, statechain_id, intent_id)
+        .await?
+        .ok_or_else(|| anyhow!("BIP448 intent disappeared after nonce storage"))?;
+    guard.commit().await?;
+    Ok(row)
+}
+
+pub async fn arm_bip448_transfer_state_sign_second(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    intent_id: &str,
+    signing_id: &str,
+) -> Result<Bip448TransferIntent> {
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let live = exact_transfer_intent_on(guard.connection(), wallet_name, statechain_id, intent_id)
+        .await?
+        .ok_or_else(|| anyhow!("BIP448 transfer intent is missing before sign/second"))?;
+    let pending = pending_transfer_on(guard.connection(), wallet_name, statechain_id)
+        .await?
+        .ok_or_else(|| anyhow!("BIP448 transfer pending row is missing before sign/second"))?;
+    if live.activity_status != Bip448TransferIntentActivityStatus::Active
+        || live.phase != Bip448TransferIntentPhase::X1Stored
+        || live.state_signing_phase != Bip448TransferStateSigningPhase::NonceStored
+        || live.current_pending_signing_id.as_deref() != Some(signing_id)
+        || pending.signing_id != signing_id
+        || pending.server_public_nonce.is_none()
+    {
+        return Err(anyhow!(
+            "BIP448 transfer sign/second journal identity is incoherent"
+        ));
+    }
+    let result = sqlx::query(
+        "UPDATE bip448_transfer_intents SET state_signing_phase = 'SecondArmed', \
+        updated_at = CURRENT_TIMESTAMP WHERE wallet_name = $1 AND statechain_id = $2 \
+        AND intent_id = $3 AND activity_status = 'Active' AND phase = 'X1Stored' \
+        AND state_signing_phase = 'NonceStored' AND current_pending_signing_id = $4",
+    )
+    .bind(wallet_name)
+    .bind(statechain_id)
+    .bind(intent_id)
+    .bind(signing_id)
+    .execute(guard.connection())
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(anyhow!("stale BIP448 transfer worker lost sign/second CAS"));
+    }
+    let row = exact_transfer_intent_on(guard.connection(), wallet_name, statechain_id, intent_id)
+        .await?
+        .ok_or_else(|| anyhow!("BIP448 intent disappeared after sign/second arm"))?;
+    guard.commit().await?;
+    Ok(row)
+}
+
+pub async fn transition_bip448_transfer_state_signing_phase(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    intent_id: &str,
+    signing_id: &str,
+    expected_phase: Bip448TransferStateSigningPhase,
+    next_phase: Bip448TransferStateSigningPhase,
+) -> Result<Bip448TransferIntent> {
+    if (expected_phase, next_phase)
+        != (
+            Bip448TransferStateSigningPhase::NonceStored,
+            Bip448TransferStateSigningPhase::SecondArmed,
+        )
+    {
+        return Err(anyhow!(
+            "BIP448 state-signing phase requires its artifact-specific transition helper"
+        ));
+    }
+    arm_bip448_transfer_state_sign_second(pool, wallet_name, statechain_id, intent_id, signing_id)
+        .await
+}
+
+pub async fn store_signed_bip448_transfer_state(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    intent_id: &str,
+    signing_id: &str,
+    server_partial_sig: &str,
+    update_signature: &str,
+) -> Result<Bip448TransferIntent> {
+    bip448_funding::require_canonical_hex(server_partial_sig, Some(32))?;
+    bip448_funding::require_canonical_hex(update_signature, Some(64))?;
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let live = exact_transfer_intent_on(guard.connection(), wallet_name, statechain_id, intent_id)
+        .await?
+        .ok_or_else(|| anyhow!("BIP448 transfer intent is missing before Signed storage"))?;
+    let pending = pending_transfer_on(guard.connection(), wallet_name, statechain_id)
+        .await?
+        .ok_or_else(|| anyhow!("BIP448 transfer pending row is missing before Signed storage"))?;
+    if live.activity_status != Bip448TransferIntentActivityStatus::Active
+        || live.phase != Bip448TransferIntentPhase::X1Stored
+        || live.state_signing_phase != Bip448TransferStateSigningPhase::SecondArmed
+        || live.current_pending_signing_id.as_deref() != Some(signing_id)
+        || pending.signing_id != signing_id
+        || pending.server_public_nonce.is_none()
+    {
+        return Err(anyhow!(
+            "BIP448 transfer Signed journal identity is incoherent"
+        ));
+    }
+    let result = sqlx::query(
+        "UPDATE bip448_transfer_intents SET server_partial_sig = $1, \
+        update_signature = $2, state_signing_phase = 'Signed', updated_at = CURRENT_TIMESTAMP \
+        WHERE wallet_name = $3 AND statechain_id = $4 AND intent_id = $5 \
+        AND activity_status = 'Active' AND phase = 'X1Stored' \
+        AND state_signing_phase = 'SecondArmed' AND current_pending_signing_id = $6 \
+        AND server_partial_sig IS NULL AND update_signature IS NULL",
+    )
+    .bind(server_partial_sig)
+    .bind(update_signature)
+    .bind(wallet_name)
+    .bind(statechain_id)
+    .bind(intent_id)
+    .bind(signing_id)
+    .execute(guard.connection())
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(anyhow!("stale BIP448 worker lost signed-state CAS"));
+    }
+    let row = exact_transfer_intent_on(guard.connection(), wallet_name, statechain_id, intent_id)
+        .await?
+        .ok_or_else(|| anyhow!("BIP448 intent disappeared after signed-state storage"))?;
+    guard.commit().await?;
+    Ok(row)
+}
+
+pub async fn store_bip448_transfer_state_signed_artifacts(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    intent_id: &str,
+    signing_id: &str,
+    server_partial_sig: &str,
+    update_signature: &str,
+) -> Result<Bip448TransferIntent> {
+    store_signed_bip448_transfer_state(
+        pool,
+        wallet_name,
+        statechain_id,
+        intent_id,
+        signing_id,
+        server_partial_sig,
+        update_signature,
+    )
+    .await
+}
+
+pub async fn install_reused_signed_bip448_transfer_state(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    intent_id: &str,
+    pending_signing_id: &str,
+    update_signature: &str,
+) -> Result<Bip448TransferIntent> {
+    bip448_funding::require_canonical_hex(pending_signing_id, Some(32))?;
+    bip448_funding::require_canonical_hex(update_signature, Some(64))?;
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let intent =
+        exact_transfer_intent_on(guard.connection(), wallet_name, statechain_id, intent_id)
+            .await?
+            .ok_or_else(|| anyhow!("BIP448 reused-state intent is missing"))?;
+    if !intent.reuse_signed_state
+        || !intent.reuse_pending
+        || intent.activity_status != Bip448TransferIntentActivityStatus::Active
+        || intent.phase != Bip448TransferIntentPhase::X1Stored
+        || intent.state_signing_phase != Bip448TransferStateSigningPhase::NotStarted
+        || intent.prior_pending_signing_id.as_deref() != Some(pending_signing_id)
+    {
+        return Err(anyhow!(
+            "BIP448 intent does not authorize signed-state reuse"
+        ));
+    }
+    let pending = pending_transfer_on(guard.connection(), wallet_name, statechain_id)
+        .await?
+        .ok_or_else(|| anyhow!("BIP448 reused pending signing is missing"))?;
+    if pending.signing_id != pending_signing_id {
+        return Err(anyhow!("BIP448 reused pending signing identity changed"));
+    }
+    let (record, history) =
+        accepted_record_and_history_on(guard.connection(), wallet_name, statechain_id).await?;
+    let history_index = usize::try_from(intent.planned_state_number)?
+        .checked_sub(1)
+        .ok_or_else(|| anyhow!("BIP448 planned state number must be positive"))?;
+    let entry = history
+        .get(history_index)
+        .ok_or_else(|| anyhow!("BIP448 reused signed history entry is missing"))?;
+    if history.len() != usize::try_from(intent.planned_state_number)?
+        || pending.funding_txid != record.funding_outpoint.txid
+        || pending.funding_vout != record.funding_outpoint.vout
+        || pending.funding_value_sats != record.funding_outpoint.value_sats
+        || entry.update_signature != update_signature
+        || !history_entry_matches_pending_intent(entry, &pending, &intent)?
+    {
+        return Err(anyhow!(
+            "BIP448 reused signed history does not match pending signing"
+        ));
+    }
+    if let (Some(recipient), Some(expected_hash)) = (
+        intent.prior_transfer_recipient_auth_pubkey.as_deref(),
+        intent.prior_transfer_msg_hash.as_deref(),
+    ) {
+        let prior_json = sqlx::query_scalar::<_, String>(
+            "SELECT transfer_msg_json FROM bip448_transfer_messages WHERE wallet_name=$1 \
+             AND statechain_id=$2 AND recipient_auth_pubkey=$3",
+        )
+        .bind(wallet_name)
+        .bind(statechain_id)
+        .bind(recipient)
+        .fetch_optional(guard.connection())
+        .await?
+        .ok_or_else(|| anyhow!("BIP448 reused-state predecessor message is missing"))?;
+        if sha256::Hash::hash(prior_json.as_bytes()).to_string() != expected_hash {
+            return Err(anyhow!(
+                "BIP448 reused-state predecessor message fingerprint changed"
+            ));
+        }
+    } else {
+        let messages = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM bip448_transfer_messages WHERE wallet_name=$1 \
+             AND statechain_id=$2",
+        )
+        .bind(wallet_name)
+        .bind(statechain_id)
+        .fetch_one(guard.connection())
+        .await?;
+        if messages != 0 {
+            return Err(anyhow!(
+                "BIP448 reused-state replacement has an unjournaled predecessor message"
+            ));
+        }
+    }
+    let result = sqlx::query(
+        "UPDATE bip448_transfer_intents SET current_pending_signing_id=$1,\
+        update_signature=$2,state_signing_phase='Signed',updated_at=CURRENT_TIMESTAMP \
+        WHERE wallet_name=$3 AND statechain_id=$4 AND intent_id=$5 AND activity_status='Active' \
+        AND phase='X1Stored' AND state_signing_phase='NotStarted' \
+        AND current_pending_signing_id IS NULL AND server_partial_sig IS NULL \
+        AND update_signature IS NULL AND reuse_signed_state=1",
+    )
+    .bind(pending_signing_id)
+    .bind(update_signature)
+    .bind(wallet_name)
+    .bind(statechain_id)
+    .bind(intent_id)
+    .execute(guard.connection())
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(anyhow!("BIP448 reused-state CAS lost"));
+    }
+    let stored =
+        exact_transfer_intent_on(guard.connection(), wallet_name, statechain_id, intent_id)
+            .await?
+            .ok_or_else(|| anyhow!("BIP448 reused-state intent disappeared"))?;
+    guard.commit().await?;
+    Ok(stored)
+}
+
+fn validate_bip448_sender_finish_wallet_transition(
+    expected: &Bip448TransferIntent,
+    expected_raw_wallet_json: &str,
+    replacement_wallet: &Wallet,
+) -> Result<String> {
+    let old_wallet: Wallet = serde_json::from_str(expected_raw_wallet_json)?;
+    if old_wallet.name != expected.wallet_name
+        || replacement_wallet.name != expected.wallet_name
+        || replacement_wallet.coins.len() != old_wallet.coins.len()
+    {
+        return Err(anyhow!("BIP448 sender-finish wallet identity changed"));
+    }
+    let matching = old_wallet
+        .coins
+        .iter()
+        .enumerate()
+        .filter(|(_, coin)| {
+            coin.statechain_id.as_deref() == Some(expected.statechain_id.as_str())
+                && coin.signed_statechain_id.as_deref()
+                    == Some(expected.sender_signed_statechain_id.as_str())
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if matching.len() != 1 {
+        return Err(anyhow!(
+            "BIP448 sender-finish source Coin identity is not unique"
+        ));
+    }
+    let index = matching[0];
+    if replacement_wallet
+        .coins
+        .get(index)
+        .is_none_or(|coin| coin.status != mercurylib::wallet::CoinStatus::IN_TRANSFER)
+    {
+        return Err(anyhow!(
+            "BIP448 sender-finish replacement Coin is not IN_TRANSFER"
+        ));
+    }
+    let mut normalized = replacement_wallet.clone();
+    normalized
+        .coins
+        .get_mut(index)
+        .ok_or_else(|| anyhow!("BIP448 sender-finish replacement Coin disappeared"))?
+        .status = old_wallet.coins[index].status.clone();
+    if serde_json::to_value(&normalized)? != serde_json::to_value(&old_wallet)? {
+        return Err(anyhow!(
+            "BIP448 sender finish changes fields other than the selected Coin status"
+        ));
+    }
+    canonical_wallet_json(replacement_wallet)
+}
+
+pub async fn finish_bip448_transfer_sender(
+    pool: &Pool<Sqlite>,
+    expected: &Bip448TransferIntent,
+    expected_raw_wallet_json: &str,
+    replacement_wallet: &Wallet,
+    transfer_msg_json: &str,
+) -> Result<Option<Bip448TransferIntent>> {
+    bip448_funding::validate_transfer_intent(expected)?;
+    if expected.activity_status != Bip448TransferIntentActivityStatus::Active
+        || expected.phase != Bip448TransferIntentPhase::X1Stored
+        || expected.state_signing_phase != Bip448TransferStateSigningPhase::Signed
+    {
+        return Err(anyhow!(
+            "BIP448 transfer intent is not ready for sender finish"
+        ));
+    }
+    let message: Bip448TransferMsg = serde_json::from_str(transfer_msg_json)?;
+    let cancellation_identity_matches = expected.intent_kind
+        != Bip448TransferIntentKind::Cancellation
+        || (expected.generated_coin_user_pubkey.as_deref()
+            == Some(message.receiver_user_public_key.as_str())
+            && expected.generated_coin_auth_pubkey.as_deref()
+                == Some(expected.recipient_auth_pubkey.as_str()));
+    if serde_json::to_string(&message)? != transfer_msg_json
+        || message.statechain_id != expected.statechain_id
+        || message.receiver_user_public_key != expected.receiver_user_pubkey
+        || message.latest_state_number != expected.planned_state_number
+        || !cancellation_identity_matches
+    {
+        return Err(anyhow!(
+            "BIP448 sender-finish message does not match intent"
+        ));
+    }
+    let replacement = validate_bip448_sender_finish_wallet_transition(
+        expected,
+        expected_raw_wallet_json,
+        replacement_wallet,
+    )?;
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let live = exact_transfer_intent_on(
+        guard.connection(),
+        &expected.wallet_name,
+        &expected.statechain_id,
+        &expected.intent_id,
+    )
+    .await?
+    .ok_or_else(|| anyhow!("BIP448 intent is missing"))?;
+    if live != *expected {
+        return Err(anyhow!("stale BIP448 sender worker lost activity CAS"));
+    }
+    require_materialized_signed_transfer_intent_on(guard.connection(), &live).await?;
+    let stored_msg = sqlx::query_scalar::<_, String>(
+        "SELECT transfer_msg_json FROM bip448_transfer_messages \
+        WHERE wallet_name=$1 AND statechain_id=$2 AND recipient_auth_pubkey=$3",
+    )
+    .bind(&expected.wallet_name)
+    .bind(&expected.statechain_id)
+    .bind(&expected.recipient_auth_pubkey)
+    .fetch_optional(guard.connection())
+    .await?;
+    if stored_msg.as_deref() != Some(transfer_msg_json) {
+        return Err(anyhow!(
+            "BIP448 sender-finish outgoing message is missing or changed"
+        ));
+    }
+    let wallet =
+        sqlx::query("UPDATE wallet SET wallet_json=$1 WHERE wallet_name=$2 AND wallet_json=$3")
+            .bind(replacement)
+            .bind(&expected.wallet_name)
+            .bind(expected_raw_wallet_json)
+            .execute(guard.connection())
+            .await?;
+    if wallet.rows_affected() != 1 {
+        return Err(anyhow!("BIP448 sender-finish wallet CAS lost"));
+    }
+    if let Some(signing_id) = expected.current_pending_signing_id.as_deref() {
+        let deleted = sqlx::query(
+            "DELETE FROM bip448_pending_transfer_signings WHERE wallet_name=$1 \
+            AND statechain_id=$2 AND signing_id=$3",
+        )
+        .bind(&expected.wallet_name)
+        .bind(&expected.statechain_id)
+        .bind(signing_id)
+        .execute(guard.connection())
+        .await?;
+        if deleted.rows_affected() != 1 {
+            return Err(anyhow!("BIP448 sender-finish pending cleanup lost"));
+        }
+    }
+    let lineage = list_bip448_transfer_intents_on(
+        guard.connection(),
+        &expected.wallet_name,
+        &expected.statechain_id,
+    )
+    .await?;
+    validate_bip448_transfer_intent_lineage(&lineage)?;
+    let result = match expected.intent_kind {
+        Bip448TransferIntentKind::UserTransfer => {
+            let deleted = sqlx::query(
+                "DELETE FROM bip448_transfer_intents WHERE wallet_name=$1 AND statechain_id=$2",
+            )
+            .bind(&expected.wallet_name)
+            .bind(&expected.statechain_id)
+            .execute(guard.connection())
+            .await?;
+            if deleted.rows_affected() != u64::try_from(lineage.len())? {
+                return Err(anyhow!(
+                    "BIP448 user-transfer lineage cleanup affected an unexpected row count"
+                ));
+            }
+            None
+        }
+        Bip448TransferIntentKind::Cancellation => {
+            let updated = sqlx::query(
+                "UPDATE bip448_transfer_intents SET phase='SenderFinished',\
+                updated_at=CURRENT_TIMESTAMP WHERE wallet_name=$1 AND statechain_id=$2 \
+                AND intent_id=$3 AND activity_status='Active' AND phase='X1Stored' \
+                AND state_signing_phase='Signed'",
+            )
+            .bind(&expected.wallet_name)
+            .bind(&expected.statechain_id)
+            .bind(&expected.intent_id)
+            .execute(guard.connection())
+            .await?;
+            if updated.rows_affected() != 1 {
+                return Err(anyhow!("BIP448 cancellation sender-finish CAS lost"));
+            }
+            exact_transfer_intent_on(
+                guard.connection(),
+                &expected.wallet_name,
+                &expected.statechain_id,
+                &expected.intent_id,
+            )
+            .await?
+        }
+    };
+    guard.commit().await?;
+    Ok(result)
+}
+
+pub async fn finish_bip448_user_transfer_and_delete_intent(
+    pool: &Pool<Sqlite>,
+    expected: &Bip448TransferIntent,
+    expected_raw_wallet_json: &str,
+    replacement_wallet: &Wallet,
+    transfer_msg_json: &str,
+) -> Result<()> {
+    if expected.intent_kind != Bip448TransferIntentKind::UserTransfer {
+        return Err(anyhow!("BIP448 sender finish is not a UserTransfer"));
+    }
+    if finish_bip448_transfer_sender(
+        pool,
+        expected,
+        expected_raw_wallet_json,
+        replacement_wallet,
+        transfer_msg_json,
+    )
+    .await?
+    .is_some()
+    {
+        return Err(anyhow!(
+            "BIP448 user-transfer finish unexpectedly retained an intent"
+        ));
+    }
+    Ok(())
+}
+
+pub async fn finish_bip448_cancellation_sender(
+    pool: &Pool<Sqlite>,
+    expected: &Bip448TransferIntent,
+    expected_raw_wallet_json: &str,
+    replacement_wallet: &Wallet,
+    transfer_msg_json: &str,
+) -> Result<Bip448TransferIntent> {
+    if expected.intent_kind != Bip448TransferIntentKind::Cancellation {
+        return Err(anyhow!("BIP448 sender finish is not a Cancellation"));
+    }
+    finish_bip448_transfer_sender(
+        pool,
+        expected,
+        expected_raw_wallet_json,
+        replacement_wallet,
+        transfer_msg_json,
+    )
+    .await?
+    .ok_or_else(|| anyhow!("BIP448 cancellation finish deleted its recovery intent"))
+}
+
+async fn require_bip448_cancellation_accepted_owner_on(
+    connection: &mut SqliteConnection,
+    intent: &Bip448TransferIntent,
+) -> Result<String> {
+    if intent.intent_kind != Bip448TransferIntentKind::Cancellation
+        || intent.activity_status != Bip448TransferIntentActivityStatus::Active
+        || intent.state_signing_phase != Bip448TransferStateSigningPhase::Signed
+    {
+        return Err(anyhow!(
+            "BIP448 cancellation accepted-owner journal is incoherent"
+        ));
+    }
+    let (record, history) =
+        accepted_record_and_history_on(connection, &intent.wallet_name, &intent.statechain_id)
+            .await?;
+    if record.latest_state_number != intent.planned_state_number
+        || history.len() != usize::try_from(record.latest_state_number)?
+    {
+        return Err(anyhow!(
+            "BIP448 cancellation is not the accepted latest state"
+        ));
+    }
+    let transfer_msg_json = sqlx::query_scalar::<_, String>(
+        "SELECT transfer_msg_json FROM bip448_transfer_messages WHERE wallet_name=$1 \
+         AND statechain_id=$2 AND recipient_auth_pubkey=$3",
+    )
+    .bind(&intent.wallet_name)
+    .bind(&intent.statechain_id)
+    .bind(&intent.recipient_auth_pubkey)
+    .fetch_optional(&mut *connection)
+    .await?
+    .ok_or_else(|| anyhow!("BIP448 cancellation outgoing message is missing"))?;
+    let message: Bip448TransferMsg = serde_json::from_str(&transfer_msg_json)?;
+    if serde_json::to_string(&message)? != transfer_msg_json
+        || message.receiver_user_public_key != intent.receiver_user_pubkey
+        || message.latest_state_number != intent.planned_state_number
+        || !transfer_message_matches_record_and_history(&message, &record, &history)?
+    {
+        return Err(anyhow!(
+            "BIP448 cancellation outgoing message is not the accepted state"
+        ));
+    }
+    let raw_wallet =
+        sqlx::query_scalar::<_, String>("SELECT wallet_json FROM wallet WHERE wallet_name=$1")
+            .bind(&intent.wallet_name)
+            .fetch_one(&mut *connection)
+            .await?;
+    let wallet: Wallet = serde_json::from_str(&raw_wallet)?;
+    let matching = wallet
+        .coins
+        .iter()
+        .filter(|coin| {
+            coin.statechain_id.as_deref() == Some(intent.statechain_id.as_str())
+                && Some(coin.user_pubkey.as_str()) == intent.generated_coin_user_pubkey.as_deref()
+                && Some(coin.auth_pubkey.as_str()) == intent.generated_coin_auth_pubkey.as_deref()
+                && Some(coin.address.as_str()) == intent.generated_coin_address.as_deref()
+        })
+        .collect::<Vec<_>>();
+    if matching.len() != 1 {
+        return Err(anyhow!(
+            "BIP448 cancellation accepted owner Coin is not unique"
+        ));
+    }
+    let coin = matching[0];
+    if coin.statechain_protocol.as_deref() != Some("bip448")
+        || !matches!(
+            coin.status,
+            mercurylib::wallet::CoinStatus::IN_MEMPOOL
+                | mercurylib::wallet::CoinStatus::UNCONFIRMED
+                | mercurylib::wallet::CoinStatus::CONFIRMED
+        )
+    {
+        return Err(anyhow!(
+            "BIP448 cancellation generated Coin is not an accepted current owner"
+        ));
+    }
+    let aggregate = secp256k1::PublicKey::from_str(&coin.user_pubkey)?.combine(
+        &secp256k1::PublicKey::from_str(
+            coin.server_pubkey
+                .as_deref()
+                .ok_or_else(|| anyhow!("BIP448 cancellation Coin has no server key"))?,
+        )?,
+    )?;
+    if aggregate.to_string() != record.aggregate_pubkey
+        || coin.aggregated_pubkey.as_deref() != Some(record.aggregate_pubkey.as_str())
+    {
+        return Err(anyhow!(
+            "BIP448 cancellation Coin keys do not match the accepted aggregate key"
+        ));
+    }
+    Ok(transfer_msg_json)
+}
+
+pub async fn mark_bip448_cancellation_receiver_accepted(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    intent_id: &str,
+) -> Result<Bip448TransferIntent> {
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let live = exact_transfer_intent_on(guard.connection(), wallet_name, statechain_id, intent_id)
+        .await?
+        .ok_or_else(|| anyhow!("BIP448 cancellation intent is missing"))?;
+    if !matches!(
+        live.phase,
+        Bip448TransferIntentPhase::SenderFinished | Bip448TransferIntentPhase::ReceiverAccepted
+    ) {
+        return Err(anyhow!(
+            "BIP448 cancellation is not ready for receiver acceptance"
+        ));
+    }
+    require_bip448_cancellation_accepted_owner_on(guard.connection(), &live).await?;
+    if live.phase == Bip448TransferIntentPhase::ReceiverAccepted {
+        guard.commit().await?;
+        return Ok(live);
+    }
+    transition_active_intent_on(
+        &mut guard,
+        wallet_name,
+        statechain_id,
+        intent_id,
+        Bip448TransferIntentPhase::SenderFinished,
+        Bip448TransferIntentPhase::ReceiverAccepted,
+        Bip448TransferStateSigningPhase::Signed,
+    )
+    .await?;
+    let row = exact_transfer_intent_on(guard.connection(), wallet_name, statechain_id, intent_id)
+        .await?
+        .ok_or_else(|| anyhow!("BIP448 cancellation intent disappeared"))?;
+    guard.commit().await?;
+    Ok(row)
+}
+
+async fn capture_bip448_sync_base_on(
+    connection: &mut SqliteConnection,
+    wallet_name: &str,
+    script_pubkey: &str,
+) -> Result<Bip448SyncBase> {
+    let raw_wallet_json =
+        sqlx::query_scalar::<_, String>("SELECT wallet_json FROM wallet WHERE wallet_name = $1")
+            .bind(wallet_name)
+            .fetch_optional(&mut *connection)
+            .await?
+            .ok_or_else(|| anyhow!("BIP448 synchronization wallet is missing"))?;
+    let pending_deposit_rows = sqlx::query_scalar::<_, String>(
+        "SELECT json_array(wallet_name,statechain_id,update_template_hash,signing_id,\
+         client_secret_nonce,client_public_nonce,blinding_factor,server_public_nonce,\
+         state_locktime,funding_txid,funding_vout,funding_value_sats,settlement_template_hash,\
+         created_at,updated_at) FROM bip448_pending_deposit_signings \
+         WHERE wallet_name = $1 ORDER BY statechain_id",
+    )
+    .bind(wallet_name)
+    .fetch_all(&mut *connection)
+    .await?;
+    let accepted_record_rows = sqlx::query_scalar::<_, String>(
+        "SELECT json_array(wallet_name,statechain_id,aggregate_pubkey,funding_txid,funding_vout,\
+         funding_value_sats,latest_state_number,challenge_delay,amount_sats,network,record_json,\
+         created_at,updated_at) FROM bip448_statechains WHERE wallet_name = $1 ORDER BY statechain_id",
+    ).bind(wallet_name).fetch_all(&mut *connection).await?;
+    let state_history_rows = sqlx::query_scalar::<_, String>(
+        "SELECT json_array(wallet_name,statechain_id,state_number,entry_json) \
+         FROM bip448_state_history WHERE wallet_name = $1 ORDER BY statechain_id,state_number",
+    )
+    .bind(wallet_name)
+    .fetch_all(&mut *connection)
+    .await?;
+    let cursor_rows = sqlx::query_scalar::<_, String>(
+        "SELECT json_array(wallet_name,script_pubkey,coverage_start_height,scan_revision,\
+         last_scanned_height,last_scanned_block_hash,updated_at) FROM bip448_scan_cursors \
+         WHERE wallet_name = $1 AND script_pubkey = $2",
+    )
+    .bind(wallet_name)
+    .bind(script_pubkey)
+    .fetch_all(&mut *connection)
+    .await?;
+    let scan_cache_rows = sqlx::query_scalar::<_, String>(
+        "SELECT json_array(wallet_name,txid,vout,script_pubkey,value_sats,height,reserved_by,\
+         reserved_at) FROM bip448_scanned_outpoints WHERE wallet_name = $1 \
+         AND script_pubkey = $2 ORDER BY txid,vout",
+    )
+    .bind(wallet_name)
+    .bind(script_pubkey)
+    .fetch_all(&mut *connection)
+    .await?;
+    let funding_binding_rows = sqlx::query_scalar::<_, String>(
+        "SELECT json_array(wallet_name,statechain_id,binding_index,txid,vout,value_sats,\
+         script_pubkey,role,observation_status,funding_height,spend_txid,spend_height,\
+         last_scanned_height,owner_user_pubkey,owner_state_number,ownership_status,\
+         first_seen_at,last_seen_at) FROM bip448_funding_bindings WHERE wallet_name = $1 \
+         ORDER BY statechain_id,binding_index",
+    )
+    .bind(wallet_name)
+    .fetch_all(&mut *connection)
+    .await?;
+    let withdrawal_attempt_rows = sqlx::query_scalar::<_, String>(
+        "SELECT json_array(wallet_name,statechain_id,binding_index,attempt_kind,owner_user_pubkey,\
+         owner_state_number,source_txid,source_vout,source_value_sats,source_script_pubkey,\
+         destination_address,destination_script_pubkey,quote(fee_rate_sat_per_vbyte),fee_sats,\
+         lock_time,unsigned_tx_hex,signing_id,signed_statechain_id,sign_first_payload_json,\
+         client_secret_nonce,client_public_nonce,blinding_factor,server_public_nonce,message_hex,\
+         output_pubkey,client_partial_sig,encoded_session,sign_second_payload_json,\
+         server_partial_sig,aggregate_signature,signed_tx_hex,txid,phase,broadcast_status,\
+         completion_status,closing_tip_height,closing_tip_hash,closing_bindings_json,\
+         created_at,updated_at) FROM bip448_withdrawal_attempts WHERE wallet_name = $1 \
+         ORDER BY statechain_id,binding_index",
+    )
+    .bind(wallet_name)
+    .fetch_all(&mut *connection)
+    .await?;
+    let transfer_intent_rows = sqlx::query_scalar::<_, String>(
+        "SELECT json_array(wallet_name,statechain_id,intent_id,predecessor_intent_id,\
+         activity_status,intent_kind,acknowledge_cooperative_duplicates,recipient_address,\
+         receiver_user_pubkey,recipient_auth_pubkey,batch_id,sender_signed_statechain_id,\
+         planned_state_number,expected_signature_count,previous_locktime,prior_pending_signing_id,\
+         prior_transfer_recipient_auth_pubkey,prior_transfer_msg_hash,reuse_pending,\
+         reuse_signed_state,clear_local_attempt,generated_coin_user_pubkey,generated_coin_auth_pubkey,\
+         generated_coin_address,phase,server_x1,current_pending_signing_id,state_signing_phase,\
+         server_partial_sig,update_signature,created_at,updated_at) FROM bip448_transfer_intents \
+         WHERE wallet_name = $1 ORDER BY statechain_id,intent_id",
+    ).bind(wallet_name).fetch_all(&mut *connection).await?;
+    let pending_transfer_rows = sqlx::query_scalar::<_, String>(
+        "SELECT json_array(wallet_name,statechain_id,funding_txid,funding_vout,funding_value_sats,\
+         update_template_hash,settlement_template_hash,state_locktime,signing_id,client_secret_nonce,\
+         client_public_nonce,blinding_factor,server_public_nonce,created_at,updated_at) \
+         FROM bip448_pending_transfer_signings WHERE wallet_name = $1 ORDER BY statechain_id",
+    ).bind(wallet_name).fetch_all(&mut *connection).await?;
+    let outgoing_transfer_message_rows = sqlx::query_scalar::<_, String>(
+        "SELECT json_array(wallet_name,statechain_id,recipient_auth_pubkey,transfer_msg_json,\
+         created_at,updated_at) FROM bip448_transfer_messages WHERE wallet_name = $1 \
+         ORDER BY statechain_id,recipient_auth_pubkey",
+    )
+    .bind(wallet_name)
+    .fetch_all(&mut *connection)
+    .await?;
+    Ok(Bip448SyncBase {
+        wallet_name: wallet_name.to_owned(),
+        script_pubkey: script_pubkey.to_owned(),
+        raw_wallet_json,
+        pending_deposit_rows,
+        accepted_record_rows,
+        state_history_rows,
+        cursor_rows,
+        scan_cache_rows,
+        funding_binding_rows,
+        withdrawal_attempt_rows,
+        transfer_intent_rows,
+        pending_transfer_rows,
+        outgoing_transfer_message_rows,
+    })
+}
+
+pub async fn capture_bip448_sync_base(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    script_pubkey: &str,
+) -> Result<Bip448SyncBase> {
+    bip448_funding::require_canonical_script(script_pubkey)?;
+    let mut connection = pool.acquire().await?;
+    capture_bip448_sync_base_on(&mut connection, wallet_name, script_pubkey).await
+}
+
+pub async fn begin_bip448_sync_base_guard(
+    pool: &Pool<Sqlite>,
+    expected: &Bip448SyncBase,
+) -> Result<Bip448MutationGuard> {
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let live = capture_bip448_sync_base_on(
+        guard.connection(),
+        &expected.wallet_name,
+        &expected.script_pubkey,
+    )
+    .await?;
+    if live != *expected {
+        return Err(anyhow!(
+            "BIP448 synchronization base changed during RPC work"
+        ));
+    }
+    Ok(guard)
+}
+
+pub async fn compare_and_set_wallet_after_bip448_scan(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    expected_raw_wallet_json: &str,
+    replacement_wallet: &Wallet,
+    applied_revisions: &[Bip448AppliedScanRevision],
+) -> Result<bool> {
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    if !guard
+        .update_wallet_if_unchanged_and_scan_current(
+            wallet_name,
+            expected_raw_wallet_json,
+            replacement_wallet,
+            applied_revisions,
+        )
+        .await?
+    {
+        return Ok(false);
+    }
+    guard.commit().await?;
+    Ok(true)
+}
+
+pub async fn reject_bip448_transfer_intent_and_reactivate_predecessor(
+    pool: &Pool<Sqlite>,
+    expected: &Bip448TransferIntent,
+) -> Result<Option<Bip448TransferIntent>> {
+    bip448_funding::validate_transfer_intent(expected)?;
+    if expected.activity_status != Bip448TransferIntentActivityStatus::Active
+        || !matches!(
+            expected.phase,
+            Bip448TransferIntentPhase::Prepared | Bip448TransferIntentPhase::SenderArmed
+        )
+    {
+        return Err(anyhow!(
+            "BIP448 transfer rejection is not at a definitive pre-insert boundary"
+        ));
+    }
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let intents = list_bip448_transfer_intents_on(
+        guard.connection(),
+        &expected.wallet_name,
+        &expected.statechain_id,
+    )
+    .await?;
+    let active_index = validate_bip448_transfer_intent_lineage(&intents)?
+        .ok_or_else(|| anyhow!("BIP448 rejected intent lineage is missing"))?;
+    if intents[active_index] != *expected {
+        return Err(anyhow!(
+            "stale BIP448 worker cannot reject a changed intent"
+        ));
+    }
+    if expected.intent_kind == Bip448TransferIntentKind::Cancellation {
+        let raw =
+            sqlx::query_scalar::<_, String>("SELECT wallet_json FROM wallet WHERE wallet_name=$1")
+                .bind(&expected.wallet_name)
+                .fetch_one(guard.connection())
+                .await?;
+        let mut wallet: Wallet = serde_json::from_str(&raw)?;
+        let matches = wallet
+            .coins
+            .iter()
+            .enumerate()
+            .filter(|(_, coin)| {
+                coin.status == mercurylib::wallet::CoinStatus::INITIALISED
+                    && Some(coin.user_pubkey.as_str())
+                        == expected.generated_coin_user_pubkey.as_deref()
+                    && Some(coin.auth_pubkey.as_str())
+                        == expected.generated_coin_auth_pubkey.as_deref()
+                    && Some(coin.address.as_str()) == expected.generated_coin_address.as_deref()
+                    && coin.statechain_id.is_none()
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(anyhow!(
+                "BIP448 cancellation generated Coin identity is not unique"
+            ));
+        }
+        wallet.coins.remove(matches[0]);
+        let replacement = canonical_wallet_json(&wallet)?;
+        let updated =
+            sqlx::query("UPDATE wallet SET wallet_json=$1 WHERE wallet_name=$2 AND wallet_json=$3")
+                .bind(replacement)
+                .bind(&expected.wallet_name)
+                .bind(&raw)
+                .execute(guard.connection())
+                .await?;
+        if updated.rows_affected() != 1 {
+            return Err(anyhow!("BIP448 cancellation Coin compare-delete lost"));
+        }
+    }
+    let deleted = sqlx::query(
+        "DELETE FROM bip448_transfer_intents WHERE wallet_name=$1 \
+        AND statechain_id=$2 AND intent_id=$3 AND activity_status='Active' AND phase=$4 \
+        AND state_signing_phase=$5",
+    )
+    .bind(&expected.wallet_name)
+    .bind(&expected.statechain_id)
+    .bind(&expected.intent_id)
+    .bind(expected.phase.as_str())
+    .bind(expected.state_signing_phase.as_str())
+    .execute(guard.connection())
+    .await?;
+    if deleted.rows_affected() != 1 {
+        return Err(anyhow!("BIP448 rejected intent compare-delete lost"));
+    }
+    let predecessor = if let Some(predecessor_id) = &expected.predecessor_intent_id {
+        let reactivated = sqlx::query("UPDATE bip448_transfer_intents SET activity_status='Active',\
+            updated_at=CURRENT_TIMESTAMP WHERE wallet_name=$1 AND statechain_id=$2 AND intent_id=$3 \
+            AND activity_status='Superseded'")
+            .bind(&expected.wallet_name).bind(&expected.statechain_id).bind(predecessor_id)
+            .execute(guard.connection()).await?;
+        if reactivated.rows_affected() != 1 {
+            return Err(anyhow!("BIP448 predecessor reactivation CAS lost"));
+        }
+        exact_transfer_intent_on(
+            guard.connection(),
+            &expected.wallet_name,
+            &expected.statechain_id,
+            predecessor_id,
+        )
+        .await?
+    } else {
+        None
+    };
+    let remaining = list_bip448_transfer_intents_on(
+        guard.connection(),
+        &expected.wallet_name,
+        &expected.statechain_id,
+    )
+    .await?;
+    if !remaining.is_empty() {
+        validate_bip448_transfer_intent_lineage(&remaining)?;
+    }
+    guard.commit().await?;
+    Ok(predecessor)
+}
+
+pub async fn reactivate_bip448_transfer_intent_predecessor_after_definitive_rejection(
+    pool: &Pool<Sqlite>,
+    expected: &Bip448TransferIntent,
+) -> Result<Option<Bip448TransferIntent>> {
+    reject_bip448_transfer_intent_and_reactivate_predecessor(pool, expected).await
+}
+
+fn transfer_message_matches_history_prefix(
+    message: &Bip448TransferMsg,
+    accepted: &[Bip448StateHistoryEntry],
+) -> Result<bool> {
+    let message_len = usize::try_from(message.latest_state_number)?;
+    if message_len == 0
+        || message.state_history.len() != message_len
+        || accepted.len() < message_len
+        || message.state_history.as_slice() != &accepted[..message_len]
+        || message.latest_state.state_number != message.latest_state_number
+        || !message
+            .state_history
+            .last()
+            .is_some_and(|entry| history_entry_matches_latest_state(entry, &message.latest_state))
+        || message.server_signature_count != u64::from(message.latest_state_number)
+        || message.latest_state.signing_metadata.server_signature_count
+            != u64::from(message.latest_state_number)
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+pub async fn reconcile_bip448_accepted_local_outgoing_messages(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+) -> Result<usize> {
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let (record, history) =
+        accepted_record_and_history_on(guard.connection(), wallet_name, statechain_id).await?;
+    let accepted_len = usize::try_from(record.latest_state_number)?;
+    let accepted_history = history
+        .get(..accepted_len)
+        .ok_or_else(|| anyhow!("BIP448 accepted history prefix is missing"))?;
+    let intents =
+        list_bip448_transfer_intents_on(guard.connection(), wallet_name, statechain_id).await?;
+    if !intents.is_empty() {
+        validate_bip448_transfer_intent_lineage(&intents)?;
+    }
+    let referenced_recipients = intents
+        .iter()
+        .filter_map(|intent| intent.prior_transfer_recipient_auth_pubkey.as_deref())
+        .chain(
+            intents
+                .iter()
+                .map(|intent| intent.recipient_auth_pubkey.as_str()),
+        )
+        .collect::<HashSet<_>>();
+    let raw_wallet =
+        sqlx::query_scalar::<_, String>("SELECT wallet_json FROM wallet WHERE wallet_name=$1")
+            .bind(wallet_name)
+            .fetch_one(guard.connection())
+            .await?;
+    let wallet: Wallet = serde_json::from_str(&raw_wallet)?;
+    let rows = sqlx::query(
+        "SELECT recipient_auth_pubkey,transfer_msg_json FROM bip448_transfer_messages \
+        WHERE wallet_name=$1 AND statechain_id=$2 ORDER BY recipient_auth_pubkey",
+    )
+    .bind(wallet_name)
+    .bind(statechain_id)
+    .fetch_all(guard.connection())
+    .await?;
+    let mut deletions = Vec::new();
+    for row in rows {
+        let recipient_auth: String = row.try_get(0)?;
+        bip448_funding::require_canonical_public_key(&recipient_auth)?;
+        let stored_json: String = row.try_get(1)?;
+        let message: Bip448TransferMsg = serde_json::from_str(&stored_json)
+            .context("malformed BIP448 outgoing transfer-message journal")?;
+        if serde_json::to_string(&message)? != stored_json || message.statechain_id != statechain_id
+        {
+            return Err(anyhow!(
+                "noncanonical or conflicting BIP448 outgoing transfer message"
+            ));
+        }
+        if referenced_recipients.contains(recipient_auth.as_str()) {
+            continue;
+        }
+        let message_len = usize::try_from(message.latest_state_number)?;
+        if message_len > accepted_len {
+            if transfer_message_matches_record_and_history(&message, &record, &history)? {
+                continue;
+            }
+            return Err(anyhow!("BIP448 current-sender suffix message is invalid"));
+        }
+        if !transfer_message_matches_record_and_history(&message, &record, accepted_history)? {
+            return Err(anyhow!(
+                "BIP448 outgoing message is not an exact accepted history prefix"
+            ));
+        }
+        let owner = message
+            .state_history
+            .last()
+            .ok_or_else(|| anyhow!("BIP448 message history is empty"))?;
+        let receiver_owner = secp256k1::PublicKey::from_str(&message.receiver_user_public_key)
+            .context("invalid BIP448 outgoing-message receiver user key")?
+            .x_only_public_key()
+            .0
+            .to_string();
+        if receiver_owner != owner.owner_public_key {
+            return Err(anyhow!(
+                "BIP448 outgoing message receiver does not own its prefix endpoint"
+            ));
+        }
+        let local_matches = wallet
+            .coins
+            .iter()
+            .filter(|coin| {
+                coin.statechain_id.as_deref() == Some(statechain_id)
+                    && coin.auth_pubkey == recipient_auth
+                    && coin.user_pubkey == message.receiver_user_public_key
+            })
+            .count();
+        if local_matches != 1 {
+            return Err(anyhow!(
+                "BIP448 accepted local outgoing message has no unique local Coin"
+            ));
+        }
+        deletions.push((recipient_auth, stored_json));
+    }
+    if deletions.len() > 1 {
+        return Err(anyhow!(
+            "multiple BIP448 outgoing rows claim the accepted local history prefix"
+        ));
+    }
+    for (recipient_auth, stored_json) in &deletions {
+        let result = sqlx::query(
+            "DELETE FROM bip448_transfer_messages WHERE wallet_name=$1 \
+            AND statechain_id=$2 AND recipient_auth_pubkey=$3 AND transfer_msg_json=$4",
+        )
+        .bind(wallet_name)
+        .bind(statechain_id)
+        .bind(recipient_auth)
+        .bind(stored_json)
+        .execute(guard.connection())
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(anyhow!("BIP448 accepted-message compare-delete lost"));
+        }
+    }
+    let count = deletions.len();
+    guard.commit().await?;
+    Ok(count)
+}
+
+pub async fn cleanup_bip448_cancellation_after_acceptance(
+    pool: &Pool<Sqlite>,
+    expected: &Bip448TransferIntent,
+    transfer_msg_json: &str,
+) -> Result<()> {
+    if expected.intent_kind != Bip448TransferIntentKind::Cancellation
+        || expected.activity_status != Bip448TransferIntentActivityStatus::Active
+        || expected.phase != Bip448TransferIntentPhase::ReceiverAccepted
+    {
+        return Err(anyhow!("BIP448 cancellation is not ReceiverAccepted"));
+    }
+    let message: Bip448TransferMsg = serde_json::from_str(transfer_msg_json)?;
+    if serde_json::to_string(&message)? != transfer_msg_json
+        || message.statechain_id != expected.statechain_id
+        || message.receiver_user_public_key != expected.receiver_user_pubkey
+        || message.latest_state_number != expected.planned_state_number
+        || expected.generated_coin_user_pubkey.as_deref()
+            != Some(message.receiver_user_public_key.as_str())
+        || expected.generated_coin_auth_pubkey.as_deref()
+            != Some(expected.recipient_auth_pubkey.as_str())
+    {
+        return Err(anyhow!(
+            "BIP448 cancellation message does not match its intent"
+        ));
+    }
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let live = exact_transfer_intent_on(
+        guard.connection(),
+        &expected.wallet_name,
+        &expected.statechain_id,
+        &expected.intent_id,
+    )
+    .await?
+    .ok_or_else(|| anyhow!("BIP448 cancellation intent is missing"))?;
+    if live != *expected {
+        return Err(anyhow!(
+            "BIP448 cancellation intent changed before terminal cleanup"
+        ));
+    }
+    let exact_message =
+        require_bip448_cancellation_accepted_owner_on(guard.connection(), &live).await?;
+    if exact_message != transfer_msg_json {
+        return Err(anyhow!(
+            "BIP448 cancellation terminal message bytes changed"
+        ));
+    }
+    let (record, history) = accepted_record_and_history_on(
+        guard.connection(),
+        &expected.wallet_name,
+        &expected.statechain_id,
+    )
+    .await?;
+    let accepted_len = usize::try_from(record.latest_state_number)?;
+    let accepted_history = history
+        .get(..accepted_len)
+        .ok_or_else(|| anyhow!("BIP448 accepted history prefix is missing"))?;
+    if message.latest_state_number != record.latest_state_number
+        || !transfer_message_matches_history_prefix(&message, accepted_history)?
+    {
+        return Err(anyhow!(
+            "BIP448 cancellation message is not accepted history"
+        ));
+    }
+    let raw_wallet =
+        sqlx::query_scalar::<_, String>("SELECT wallet_json FROM wallet WHERE wallet_name=$1")
+            .bind(&expected.wallet_name)
+            .fetch_one(guard.connection())
+            .await?;
+    let wallet: Wallet = serde_json::from_str(&raw_wallet)?;
+    let generated_matches = wallet
+        .coins
+        .iter()
+        .filter(|coin| {
+            coin.statechain_id.as_deref() == Some(expected.statechain_id.as_str())
+                && Some(coin.user_pubkey.as_str()) == expected.generated_coin_user_pubkey.as_deref()
+                && Some(coin.auth_pubkey.as_str()) == expected.generated_coin_auth_pubkey.as_deref()
+                && Some(coin.address.as_str()) == expected.generated_coin_address.as_deref()
+        })
+        .count();
+    if generated_matches != 1 {
+        return Err(anyhow!(
+            "BIP448 cancellation accepted owner Coin is not unique"
+        ));
+    }
+    let deleted_msg = sqlx::query(
+        "DELETE FROM bip448_transfer_messages WHERE wallet_name=$1 \
+        AND statechain_id=$2 AND recipient_auth_pubkey=$3 AND transfer_msg_json=$4",
+    )
+    .bind(&expected.wallet_name)
+    .bind(&expected.statechain_id)
+    .bind(&expected.recipient_auth_pubkey)
+    .bind(transfer_msg_json)
+    .execute(guard.connection())
+    .await?;
+    if deleted_msg.rows_affected() != 1 {
+        return Err(anyhow!("BIP448 cancellation message compare-delete lost"));
+    }
+    let lineage = list_bip448_transfer_intents_on(
+        guard.connection(),
+        &expected.wallet_name,
+        &expected.statechain_id,
+    )
+    .await?;
+    validate_bip448_transfer_intent_lineage(&lineage)?;
+    let deleted_intents = sqlx::query(
+        "DELETE FROM bip448_transfer_intents WHERE wallet_name=$1 AND statechain_id=$2",
+    )
+    .bind(&expected.wallet_name)
+    .bind(&expected.statechain_id)
+    .execute(guard.connection())
+    .await?;
+    if deleted_intents.rows_affected() != u64::try_from(lineage.len())? {
+        return Err(anyhow!(
+            "BIP448 cancellation lineage cleanup affected an unexpected row count"
+        ));
+    }
+    guard.commit().await?;
+    Ok(())
+}
+
+pub async fn delete_bip448_cancellation_artifacts_after_sync(
+    pool: &Pool<Sqlite>,
+    expected: &Bip448TransferIntent,
+    transfer_msg_json: &str,
+) -> Result<()> {
+    cleanup_bip448_cancellation_after_acceptance(pool, expected, transfer_msg_json).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1287,14 +6813,22 @@ mod tests {
         client_config::ClientConfig,
     };
     use bitcoin::Network;
-    use mercurylib::bip448_statechain::storage::{
-        Bip448AnchorOutput, Bip448CpfpChildTemplate, Bip448CsfsKeyMetadata, Bip448FeeBumpPolicy,
-        Bip448FundingOutpoint, Bip448LatestState, Bip448RecoveryTemplateRole,
-        Bip448SigningMetadata, Bip448ValueSchedule,
+    use mercurylib::bip448_statechain::{
+        deposit::Bip448DepositSigningData,
+        storage::{
+            Bip448AnchorOutput, Bip448CpfpChildTemplate, Bip448CsfsKeyMetadata,
+            Bip448FeeBumpPolicy, Bip448FundingOutpoint, Bip448LatestState,
+            Bip448RecoveryTemplateRole, Bip448SigningMetadata, Bip448ValueSchedule,
+        },
     };
     use mercurylib::transfer::bip448::Bip448TransferMsg;
     use mercurylib::wallet::{CoinStatus, Settings};
-    use sqlx::sqlite::SqlitePoolOptions;
+    use secp256k1::{
+        musig::{new_musig_nonce_pair, BlindingFactor, MusigSessionId},
+        schnorr, KeyPair, Message, Scalar, SecretKey,
+    };
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::{path::PathBuf, sync::Arc, time::Duration};
 
     async fn migrated_pool() -> Result<Pool<Sqlite>> {
         let pool = SqlitePoolOptions::new()
@@ -1305,6 +6839,89 @@ mod tests {
         sqlx::migrate!("./migrations").run(&pool).await?;
 
         Ok(pool)
+    }
+
+    struct IndependentTestPools {
+        first: Pool<Sqlite>,
+        second: Pool<Sqlite>,
+        path: PathBuf,
+    }
+
+    impl Drop for IndependentTestPools {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+            for suffix in ["-journal", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", self.path.display()));
+            }
+        }
+    }
+
+    async fn independent_migrated_pools() -> Result<IndependentTestPools> {
+        let path = std::env::temp_dir().join(format!(
+            "mercurylayer-bip448-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .busy_timeout(Duration::from_secs(5));
+        let first = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.clone())
+            .await?;
+        sqlx::migrate!("./migrations").run(&first).await?;
+        let second = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await?;
+        Ok(IndependentTestPools {
+            first,
+            second,
+            path,
+        })
+    }
+
+    async fn assert_begin_is_contested(hook: &Arc<Bip448BeginImmediateTestHook>) -> Result<()> {
+        hook.before_acquire.notified().await;
+        if hook.after_emitted.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(anyhow!(
+                "contested BEGIN IMMEDIATE acquired before the winner released"
+            ));
+        }
+        Ok(())
+    }
+
+    fn spawn_sync_base_loser(
+        pool: Pool<Sqlite>,
+        base: Bip448SyncBase,
+    ) -> (
+        Arc<Bip448BeginImmediateTestHook>,
+        tokio::task::JoinHandle<Result<Bip448MutationGuard>>,
+    ) {
+        let hook = Arc::new(Bip448BeginImmediateTestHook::default());
+        let task_hook = hook.clone();
+        let task = tokio::spawn(
+            BIP448_BEGIN_IMMEDIATE_TEST_HOOK.scope(task_hook, async move {
+                begin_bip448_sync_base_guard(&pool, &base).await
+            }),
+        );
+        (hook, task)
+    }
+
+    async fn commit_winner_and_assert_sync_loser_loses(
+        hook: Arc<Bip448BeginImmediateTestHook>,
+        winner: Bip448MutationGuard,
+        loser: tokio::task::JoinHandle<Result<Bip448MutationGuard>>,
+    ) -> Result<()> {
+        assert_begin_is_contested(&hook).await?;
+        winner.commit().await?;
+        hook.after_acquire.notified().await;
+        if loser.await?.is_ok() {
+            return Err(anyhow!(
+                "stale BIP448 synchronization base passed after deterministic serialization"
+            ));
+        }
+        Ok(())
     }
 
     fn sample_wallet() -> Wallet {
@@ -1444,6 +7061,446 @@ mod tests {
         }
     }
 
+    fn exact_transfer_message(
+        record: &Bip448StatechainRecord,
+        latest_state: Bip448LatestState,
+        receiver_user_public_key: &str,
+        history: Vec<Bip448StateHistoryEntry>,
+    ) -> Bip448TransferMsg {
+        let mut message = sample_bip448_transfer_msg();
+        message.statechain_id = record.statechain_id.clone();
+        message.receiver_user_public_key = receiver_user_public_key.to_owned();
+        message.aggregate_pubkey = record.aggregate_pubkey.clone();
+        message.funding_outpoint = record.funding_outpoint.clone();
+        message.latest_state_number = latest_state.state_number;
+        message.challenge_delay = record.challenge_delay;
+        message.amount_sats = record.amount_sats;
+        message.network = record.network.clone();
+        message.value_schedule = latest_state.value_schedule.clone();
+        message.server_signature_count = u64::from(latest_state.state_number);
+        message.latest_state = latest_state;
+        message.state_history = history;
+        message
+    }
+
+    fn sample_owner_key(byte: u8) -> (secp256k1::PublicKey, XOnlyPublicKey) {
+        let secret = secp256k1::SecretKey::from_secret_bytes([byte; 32]).unwrap();
+        let public = secp256k1::PublicKey::from_secret_key(&secp256k1::Secp256k1::new(), &secret);
+        (public, public.x_only_public_key().0)
+    }
+
+    fn real_accepted_fixture_for(
+        status: CoinStatus,
+        statechain_id: &str,
+        funding_txid: &str,
+    ) -> Result<(
+        Wallet,
+        Bip448StatechainRecord,
+        Bip448StateHistoryEntry,
+        XOnlyPublicKey,
+    )> {
+        let mut wallet = sample_wallet();
+        let mut coin = wallet.get_new_coin()?;
+        let secp = Secp256k1::new();
+        let server_secret = SecretKey::from_secret_bytes([7u8; 32])?;
+        let server_pubkey = server_secret.public_key(&secp);
+        let user_pubkey = PublicKey::from_str(&coin.user_pubkey)?;
+        let aggregate_pubkey = user_pubkey.combine(&server_pubkey)?;
+        coin.server_pubkey = Some(server_pubkey.to_string());
+        coin.aggregated_pubkey = Some(aggregate_pubkey.to_string());
+        coin.statechain_protocol = Some(BIP448_COIN_PROTOCOL.to_string());
+        coin.statechain_id = Some(statechain_id.to_owned());
+        coin.signed_statechain_id = Some(mercurylib::transfer::receiver::sign_message(
+            statechain_id,
+            &coin,
+        )?);
+        coin.utxo_txid = Some(funding_txid.to_owned());
+        coin.utxo_vout = Some(0);
+        coin.amount = Some(100_000);
+        coin.status = status;
+        let deposit_address = bip448_deposit::create_deposit_address(&coin, "regtest")?;
+        coin.aggregated_address = Some(deposit_address.address);
+
+        let templates = bip448_deposit::build_deposit_templates(
+            &coin,
+            Bip448FundingOutpoint {
+                txid: funding_txid.to_owned(),
+                vout: 0,
+                value_sats: 100_000,
+            },
+            absolute::LockTime::from_consensus(700_000_042),
+            DEFAULT_BIP448_CHALLENGE_DELAY,
+            "regtest",
+        )?;
+        let user_secret = PrivateKey::from_wif(&coin.user_privkey)?.inner;
+        let server_scalar = Scalar::from_be_bytes(server_secret.to_secret_bytes())?;
+        let aggregate_secret = user_secret.add_tweak(&server_scalar)?;
+        let aggregate_keypair = KeyPair::from_secret_key(&secp, &aggregate_secret);
+        let update_signature = schnorr::sign(
+            templates.artifacts.update_template_hash.as_byte_array(),
+            &aggregate_keypair,
+        );
+        let message: Message = templates.artifacts.update_template_hash.into();
+        let client_nonce_key = SecretKey::from_secret_bytes([3u8; 32])?;
+        let server_nonce_key = SecretKey::from_secret_bytes([4u8; 32])?;
+        let (_, client_public_nonce) = new_musig_nonce_pair(
+            &secp,
+            MusigSessionId::assume_unique_per_nonce_gen([1u8; 32]),
+            None,
+            Some(client_nonce_key),
+            client_nonce_key.public_key(&secp),
+            Some(message),
+            None,
+        )?;
+        let (_, server_public_nonce) = new_musig_nonce_pair(
+            &secp,
+            MusigSessionId::assume_unique_per_nonce_gen([2u8; 32]),
+            None,
+            Some(server_nonce_key),
+            server_nonce_key.public_key(&secp),
+            Some(message),
+            None,
+        )?;
+        let blinding_factor = BlindingFactor::from_slice(&[21u8; 32])?;
+        let signing_data = Bip448DepositSigningData {
+            signing_id: "77".repeat(32),
+            client_public_nonce: hex::encode(client_public_nonce.serialize()),
+            server_public_nonce: hex::encode(server_public_nonce.serialize()),
+            blinding_factor: hex::encode(blinding_factor.as_bytes()),
+            update_signature: update_signature.to_string(),
+            server_signature_count: 1,
+        };
+        let record = bip448_deposit::build_deposit_record(
+            "wallet",
+            statechain_id,
+            "regtest",
+            &templates,
+            signing_data.clone(),
+        )?;
+        coin.locktime = Some(record.latest_state.state_locktime);
+        coin.public_nonce = Some(signing_data.client_public_nonce);
+        coin.server_public_nonce = Some(signing_data.server_public_nonce);
+        coin.blinding_factor = Some(signing_data.blinding_factor);
+        let owner = user_pubkey.x_only_public_key().0;
+        let entry = history_entry(&record.latest_state, owner);
+        wallet.coins.push(coin);
+        Ok((wallet, record, entry, owner))
+    }
+
+    fn real_accepted_fixture(
+        status: CoinStatus,
+    ) -> Result<(
+        Wallet,
+        Bip448StatechainRecord,
+        Bip448StateHistoryEntry,
+        XOnlyPublicKey,
+    )> {
+        real_accepted_fixture_for(status, "statechain", &"34".repeat(32))
+    }
+
+    fn real_fixture_aggregate_secret(
+        wallet: &Wallet,
+        record: &Bip448StatechainRecord,
+    ) -> Result<SecretKey> {
+        let coin = wallet
+            .coins
+            .iter()
+            .find(|coin| {
+                coin.statechain_id.as_deref() == Some(record.statechain_id.as_str())
+                    && coin.aggregated_pubkey.as_deref() == Some(record.aggregate_pubkey.as_str())
+            })
+            .ok_or_else(|| anyhow!("real fixture aggregate Coin is missing"))?;
+        let user_secret = PrivateKey::from_wif(&coin.user_privkey)?.inner;
+        let server_secret = SecretKey::from_secret_bytes([7u8; 32])?;
+        let aggregate_secret =
+            user_secret.add_tweak(&Scalar::from_be_bytes(server_secret.to_secret_bytes())?)?;
+        if aggregate_secret.public_key(&Secp256k1::new()).to_string() != record.aggregate_pubkey {
+            return Err(anyhow!(
+                "real fixture aggregate secret does not match record"
+            ));
+        }
+        Ok(aggregate_secret)
+    }
+
+    fn real_fixture_state_for_owner(
+        wallet: &Wallet,
+        record: &Bip448StatechainRecord,
+        owner: XOnlyPublicKey,
+        state_number: u32,
+        state_locktime: u32,
+    ) -> Result<Bip448LatestState> {
+        let secp = Secp256k1::new();
+        let aggregate_pubkey = PublicKey::from_str(&record.aggregate_pubkey)?;
+        let recovery_script = Address::p2tr(
+            &secp,
+            owner,
+            None,
+            mercurylib::utils::get_network(&record.network)?,
+        )
+        .script_pubkey();
+        let artifacts = build_funding_recovery_artifacts(
+            &secp,
+            &aggregate_pubkey,
+            OutPoint {
+                txid: Txid::from_str(&record.funding_outpoint.txid)?,
+                vout: record.funding_outpoint.vout,
+            },
+            record.funding_outpoint.value_sats,
+            recovery_script,
+            state_number,
+            absolute::LockTime::from_consensus(state_locktime),
+            record.challenge_delay,
+            Bip448FeeBumpPolicy::ZeroFeeEphemeralAnchor,
+        )?;
+        let aggregate_secret = real_fixture_aggregate_secret(wallet, record)?;
+        let aggregate_keypair = KeyPair::from_secret_key(&secp, &aggregate_secret);
+        let update_signature = schnorr::sign(
+            artifacts.update_template_hash.as_byte_array(),
+            &aggregate_keypair,
+        );
+        let message: Message = artifacts.update_template_hash.into();
+        let state_seed = u8::try_from(state_number)?;
+        let client_nonce_key = SecretKey::from_secret_bytes([state_seed + 30; 32])?;
+        let server_nonce_key = SecretKey::from_secret_bytes([state_seed + 40; 32])?;
+        let (_, client_public_nonce) = new_musig_nonce_pair(
+            &secp,
+            MusigSessionId::assume_unique_per_nonce_gen([state_seed + 50; 32]),
+            None,
+            Some(client_nonce_key),
+            client_nonce_key.public_key(&secp),
+            Some(message),
+            None,
+        )?;
+        let (_, server_public_nonce) = new_musig_nonce_pair(
+            &secp,
+            MusigSessionId::assume_unique_per_nonce_gen([state_seed + 60; 32]),
+            None,
+            Some(server_nonce_key),
+            server_nonce_key.public_key(&secp),
+            Some(message),
+            None,
+        )?;
+        let blinding_factor = BlindingFactor::from_slice(&[state_seed + 70; 32])?;
+        let signing_metadata = Bip448SigningMetadata {
+            role: Bip448RecoveryTemplateRole::FundingUpdate,
+            signing_id: hex::encode([state_seed + 80; 32]),
+            client_public_nonce: hex::encode(client_public_nonce.serialize()),
+            server_public_nonce: hex::encode(server_public_nonce.serialize()),
+            blinding_factor: hex::encode(blinding_factor.as_bytes()),
+            update_template_hash: hex::encode(artifacts.update_template_hash.to_byte_array()),
+            update_signature: update_signature.to_string(),
+            server_signature_count: u64::from(state_number),
+        };
+        Ok(build_funding_latest_state(
+            &secp,
+            &aggregate_pubkey,
+            &artifacts,
+            signing_metadata,
+            Vec::new(),
+        )?)
+    }
+
+    async fn accepted_binding_fixture(
+        pool: &Pool<Sqlite>,
+    ) -> Result<(Bip448StatechainRecord, XOnlyPublicKey, String)> {
+        let (wallet, record, entry, owner) = real_accepted_fixture(CoinStatus::CONFIRMED)?;
+        insert_wallet(pool, &wallet).await?;
+        persist_bip448_initial_acceptance(pool, &record, &entry).await?;
+        let script = accepted_funding_script(&record)?;
+        Ok((record, owner, script))
+    }
+
+    fn sample_binding_observation(
+        txid_byte: &str,
+        vout: u32,
+        value_sats: u64,
+        script_pubkey: &str,
+    ) -> Bip448BindingObservation {
+        Bip448BindingObservation {
+            txid: txid_byte.repeat(32),
+            vout,
+            value_sats,
+            script_pubkey: script_pubkey.to_owned(),
+            observation_status: Bip448ObservationStatus::Confirmed,
+            funding_height: Some(10),
+            spend_txid: None,
+            spend_height: None,
+            last_scanned_height: 20,
+        }
+    }
+
+    fn sample_duplicate_attempt(binding: &Bip448FundingBinding) -> Bip448WithdrawalAttempt {
+        let signing_id = "71".repeat(32);
+        let signed_statechain_id = "75".repeat(64);
+        let sign_first_payload_json = serde_json::to_string(
+            &mercurylib::bip448_statechain::signing_api::Bip448SignFirstRequestPayload {
+                statechain_id: binding.statechain_id.clone(),
+                signed_statechain_id: signed_statechain_id.clone(),
+                signing_id: signing_id.clone(),
+            },
+        )
+        .unwrap();
+        let unsigned_transaction = bitcoin::Transaction {
+            version: 2,
+            lock_time: bitcoin::absolute::LockTime::from_height(42).unwrap(),
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint {
+                    txid: bitcoin::Txid::from_str(&binding.txid).unwrap(),
+                    vout: binding.vout,
+                },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence(0),
+                witness: bitcoin::Witness::default(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: binding.value_sats - 140,
+                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        Bip448WithdrawalAttempt {
+            wallet_name: binding.wallet_name.clone(),
+            statechain_id: binding.statechain_id.clone(),
+            binding_index: binding.binding_index,
+            attempt_kind: Bip448WithdrawalAttemptKind::Duplicate,
+            owner_user_pubkey: binding.owner_user_pubkey.clone(),
+            owner_state_number: binding.owner_state_number,
+            source_txid: binding.txid.clone(),
+            source_vout: binding.vout,
+            source_value_sats: binding.value_sats,
+            source_script_pubkey: binding.script_pubkey.clone(),
+            destination_address: "destination".into(),
+            destination_script_pubkey: "51".into(),
+            fee_rate_sat_per_vbyte: 1.25,
+            fee_sats: 140,
+            lock_time: 42,
+            unsigned_tx_hex: hex::encode(bitcoin::consensus::serialize(&unsigned_transaction)),
+            signing_id,
+            signed_statechain_id,
+            sign_first_payload_json,
+            client_secret_nonce: "72".repeat(132),
+            client_public_nonce: "73".repeat(66),
+            blinding_factor: "74".repeat(32),
+            server_public_nonce: None,
+            message_hex: None,
+            output_pubkey: None,
+            client_partial_sig: None,
+            encoded_session: None,
+            sign_second_payload_json: None,
+            server_partial_sig: None,
+            aggregate_signature: None,
+            signed_tx_hex: None,
+            txid: None,
+            phase: Bip448WithdrawalPhase::Prepared,
+            broadcast_status: Bip448BroadcastStatus::NotBroadcast,
+            completion_status: Bip448CompletionStatus::NotApplicable,
+            closing_tip_height: None,
+            closing_tip_hash: None,
+            closing_bindings_json: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    fn refresh_attempt_sign_first_payload(attempt: &mut Bip448WithdrawalAttempt) {
+        attempt.sign_first_payload_json = serde_json::to_string(
+            &mercurylib::bip448_statechain::signing_api::Bip448SignFirstRequestPayload {
+                statechain_id: attempt.statechain_id.clone(),
+                signed_statechain_id: attempt.signed_statechain_id.clone(),
+                signing_id: attempt.signing_id.clone(),
+            },
+        )
+        .unwrap();
+    }
+
+    fn sample_transfer_intent(intent_id_byte: &str) -> Bip448TransferIntent {
+        let (receiver, _) = sample_owner_key(2);
+        let (auth, _) = sample_owner_key(3);
+        Bip448TransferIntent {
+            wallet_name: "wallet".into(),
+            statechain_id: "statechain".into(),
+            intent_id: intent_id_byte.repeat(32),
+            predecessor_intent_id: None,
+            activity_status: Bip448TransferIntentActivityStatus::Active,
+            intent_kind: Bip448TransferIntentKind::UserTransfer,
+            acknowledge_cooperative_duplicates: false,
+            recipient_address: "recipient".into(),
+            receiver_user_pubkey: receiver.to_string(),
+            recipient_auth_pubkey: auth.to_string(),
+            batch_id: None,
+            sender_signed_statechain_id: "b1".repeat(64),
+            planned_state_number: 2,
+            expected_signature_count: 1,
+            previous_locktime: 700_000_042,
+            prior_pending_signing_id: None,
+            prior_transfer_recipient_auth_pubkey: None,
+            prior_transfer_msg_hash: None,
+            reuse_pending: false,
+            reuse_signed_state: false,
+            clear_local_attempt: false,
+            generated_coin_user_pubkey: None,
+            generated_coin_auth_pubkey: None,
+            generated_coin_address: None,
+            phase: Bip448TransferIntentPhase::Prepared,
+            server_x1: None,
+            current_pending_signing_id: None,
+            state_signing_phase: Bip448TransferStateSigningPhase::NotStarted,
+            server_partial_sig: None,
+            update_signature: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    fn transfer_intent_for_phase_pair(
+        intent_id_byte: &str,
+        phase: Bip448TransferIntentPhase,
+        signing_phase: Bip448TransferStateSigningPhase,
+        reuse_signed_state: bool,
+    ) -> Result<Bip448TransferIntent> {
+        let mut intent = sample_transfer_intent(intent_id_byte);
+        intent.activity_status = Bip448TransferIntentActivityStatus::Superseded;
+        intent.phase = phase;
+        intent.server_x1 = (!matches!(
+            phase,
+            Bip448TransferIntentPhase::Prepared | Bip448TransferIntentPhase::SenderArmed
+        ))
+        .then(|| "01".repeat(32));
+        intent.state_signing_phase = signing_phase;
+        if reuse_signed_state {
+            intent.reuse_pending = true;
+            intent.reuse_signed_state = true;
+            intent.prior_pending_signing_id = Some("31".repeat(32));
+            intent.planned_state_number = intent.expected_signature_count;
+        }
+        match signing_phase {
+            Bip448TransferStateSigningPhase::NotStarted => {}
+            Bip448TransferStateSigningPhase::FirstArmed
+            | Bip448TransferStateSigningPhase::NonceStored
+            | Bip448TransferStateSigningPhase::SecondArmed => {
+                intent.current_pending_signing_id = Some("32".repeat(32));
+            }
+            Bip448TransferStateSigningPhase::Signed => {
+                intent.current_pending_signing_id = Some("32".repeat(32));
+                intent.server_partial_sig = (!reuse_signed_state).then(|| "33".repeat(32));
+                intent.update_signature = Some("34".repeat(64));
+            }
+        }
+        if matches!(
+            phase,
+            Bip448TransferIntentPhase::SenderFinished | Bip448TransferIntentPhase::ReceiverAccepted
+        ) {
+            let generated = sample_wallet().get_new_coin()?;
+            intent.intent_kind = Bip448TransferIntentKind::Cancellation;
+            intent.recipient_address = generated.address.clone();
+            intent.receiver_user_pubkey = generated.user_pubkey.clone();
+            intent.recipient_auth_pubkey = generated.auth_pubkey.clone();
+            intent.generated_coin_user_pubkey = Some(generated.user_pubkey);
+            intent.generated_coin_auth_pubkey = Some(generated.auth_pubkey);
+            intent.generated_coin_address = Some(generated.address);
+        }
+        Ok(intent)
+    }
+
     fn sender_test_config(pool: Pool<Sqlite>) -> Result<ClientConfig> {
         let url = "http://127.0.0.1:1";
         Ok(ClientConfig {
@@ -1466,6 +7523,230 @@ mod tests {
             max_fee_rate: 10.0,
         })
     }
+
+    async fn accepted_local_outgoing_fixture() -> Result<(
+        Pool<Sqlite>,
+        Bip448StatechainRecord,
+        String,
+        Bip448TransferMsg,
+    )> {
+        let pool = migrated_pool().await?;
+        let (mut record, _, _) = accepted_binding_fixture(&pool).await?;
+        let mut wallet = get_wallet(&pool, "wallet").await?;
+        let mut local_coin = wallet.get_new_coin()?;
+        local_coin.statechain_protocol = Some("bip448".into());
+        local_coin.statechain_id = Some("statechain".into());
+        local_coin.status = CoinStatus::CONFIRMED;
+        let recipient_auth = local_coin.auth_pubkey.clone();
+        let receiver_user = local_coin.user_pubkey.clone();
+        let receiver = secp256k1::PublicKey::from_str(&receiver_user)?;
+        let state_two = real_fixture_state_for_owner(
+            &wallet,
+            &record,
+            receiver.x_only_public_key().0,
+            2,
+            record.latest_state.state_locktime + 1,
+        )?;
+        wallet.coins.push(local_coin);
+        update_wallet(&pool, &wallet).await?;
+
+        record.latest_state_number = 2;
+        record.latest_state = state_two.clone();
+        upsert_bip448_statechain_record(&pool, &record).await?;
+        let entry_two = history_entry(&state_two, receiver.x_only_public_key().0);
+        insert_bip448_state_history_entry(&pool, "wallet", "statechain", &entry_two).await?;
+        let history = get_bip448_state_history(&pool, "wallet", "statechain").await?;
+        let message = exact_transfer_message(&record, state_two, &receiver_user, history);
+        insert_or_update_bip448_transfer_msg(&pool, "wallet", &recipient_auth, &message).await?;
+        Ok((pool, record, recipient_auth, message))
+    }
+
+    async fn second_arm_duplicate_attempt(
+        pool: &Pool<Sqlite>,
+        binding: &Bip448FundingBinding,
+    ) -> Result<Bip448WithdrawalAttempt> {
+        let attempt = sample_duplicate_attempt(binding);
+        let attempt = insert_bip448_withdrawal_attempt_if_absent(pool, &attempt).await?;
+        arm_bip448_withdrawal_sign_first(
+            pool,
+            &attempt.wallet_name,
+            &attempt.statechain_id,
+            attempt.binding_index,
+            &attempt.signing_id,
+        )
+        .await?;
+        let server_public_nonce = "81".repeat(66);
+        let encoded_session = "85".repeat(32);
+        let sign_second_payload_json = serde_json::to_string(
+            &mercurylib::bip448_statechain::signing_api::Bip448PartialSignatureRequestPayload {
+                statechain_id: attempt.statechain_id.clone(),
+                signed_statechain_id: attempt.signed_statechain_id.clone(),
+                signing_id: attempt.signing_id.clone(),
+                negate_seckey: 0,
+                session: encoded_session.clone(),
+                server_pub_nonce: server_public_nonce.clone(),
+            },
+        )?;
+        store_bip448_withdrawal_nonce_artifacts(
+            pool,
+            &attempt.wallet_name,
+            &attempt.statechain_id,
+            attempt.binding_index,
+            &attempt.signing_id,
+            &server_public_nonce,
+            &"82".repeat(32),
+            &sample_owner_key(4).0.to_string(),
+            &"84".repeat(32),
+            &encoded_session,
+            &sign_second_payload_json,
+        )
+        .await?;
+        arm_bip448_withdrawal_sign_second(
+            pool,
+            &attempt.wallet_name,
+            &attempt.statechain_id,
+            attempt.binding_index,
+            &attempt.signing_id,
+        )
+        .await
+    }
+
+    async fn sign_duplicate_attempt(
+        pool: &Pool<Sqlite>,
+        binding: &Bip448FundingBinding,
+    ) -> Result<Bip448WithdrawalAttempt> {
+        let attempt = second_arm_duplicate_attempt(pool, binding).await?;
+        let aggregate_signature = "92".repeat(64);
+        let mut signed_transaction: bitcoin::Transaction =
+            bitcoin::consensus::deserialize(&hex::decode(&attempt.unsigned_tx_hex)?)?;
+        signed_transaction
+            .input
+            .get_mut(0)
+            .ok_or_else(|| anyhow!("sample BIP448 withdrawal has no input"))?
+            .witness
+            .push(hex::decode(&aggregate_signature)?);
+        store_bip448_withdrawal_signed_artifacts(
+            pool,
+            &attempt.wallet_name,
+            &attempt.statechain_id,
+            attempt.binding_index,
+            &attempt.signing_id,
+            &"91".repeat(32),
+            &aggregate_signature,
+            &hex::encode(bitcoin::consensus::serialize(&signed_transaction)),
+            &signed_transaction.txid().to_string(),
+            Bip448BroadcastStatus::NotBroadcast,
+        )
+        .await
+    }
+
+    async fn ready_canonical_attempt_fixture(
+        pool: &Pool<Sqlite>,
+    ) -> Result<Bip448WithdrawalAttempt> {
+        let (_, owner, script) = accepted_binding_fixture(pool).await?;
+        let canonical = reconcile_bip448_funding_bindings(
+            pool,
+            "wallet",
+            "statechain",
+            &owner.to_string(),
+            1,
+            &[sample_binding_observation("34", 0, 100_000, &script)],
+        )
+        .await?
+        .into_iter()
+        .find(|binding| binding.binding_index == 0)
+        .ok_or_else(|| anyhow!("canonical test binding is missing"))?;
+        let close_tip_hash = "61".repeat(32);
+        persist_bip448_scan_state(
+            pool,
+            "wallet",
+            &script,
+            &Bip448ScanCursor {
+                coverage_start_height: 0,
+                scan_revision: 0,
+                last_scanned_height: 20,
+                last_scanned_block_hash: close_tip_hash.clone(),
+            },
+            &[],
+        )
+        .await?;
+        let closing_bindings_json =
+            match classify_bip448_close_gate(pool, "wallet", "statechain").await? {
+                Bip448CloseGate::Ready {
+                    closing_bindings_json,
+                    ..
+                } => closing_bindings_json,
+                blocked => return Err(anyhow!("unexpected canonical close blocker: {blocked:?}")),
+            };
+        let mut attempt = sample_duplicate_attempt(&canonical);
+        attempt.attempt_kind = Bip448WithdrawalAttemptKind::Canonical;
+        attempt.completion_status = Bip448CompletionStatus::Open;
+        attempt.closing_tip_height = Some(20);
+        attempt.closing_tip_hash = Some(close_tip_hash);
+        attempt.closing_bindings_json = Some(closing_bindings_json);
+        Ok(attempt)
+    }
+
+    async fn assert_corrupt_transfer_lineage_blocks(
+        intents: &[Bip448TransferIntent],
+        remove_active_index: bool,
+    ) -> Result<()> {
+        let pool = migrated_pool().await?;
+        let (_, owner, script) = accepted_binding_fixture(&pool).await?;
+        let duplicate = reconcile_bip448_funding_bindings(
+            &pool,
+            "wallet",
+            "statechain",
+            &owner.to_string(),
+            1,
+            &[
+                sample_binding_observation("34", 0, 100_000, &script),
+                sample_binding_observation("11", 1, 70_000, &script),
+            ],
+        )
+        .await?
+        .into_iter()
+        .find(|row| row.binding_index == 1)
+        .ok_or_else(|| anyhow!("duplicate fixture binding is missing"))?;
+        if remove_active_index {
+            sqlx::query("DROP INDEX bip448_one_active_transfer_intent")
+                .execute(&pool)
+                .await?;
+        }
+        let mut connection = pool.acquire().await?;
+        for intent in intents {
+            insert_transfer_intent_on(&mut connection, intent).await?;
+        }
+        drop(connection);
+
+        assert!(
+            get_active_bip448_transfer_intent(&pool, "wallet", "statechain")
+                .await
+                .is_err(),
+            "corrupt intent lineage must fail the active-intent query"
+        );
+        assert!(matches!(
+            classify_bip448_close_gate(&pool, "wallet", "statechain").await?,
+            Bip448CloseGate::Blocked { reasons }
+                if matches!(reasons.as_slice(), [Bip448CloseBlockReason::InvalidTransferIntentLineage { .. }])
+        ));
+        assert!(
+            insert_bip448_withdrawal_attempt_if_absent(
+                &pool,
+                &sample_duplicate_attempt(&duplicate)
+            )
+            .await
+            .is_err(),
+            "corrupt intent lineage must block attempt insertion"
+        );
+        assert!(
+            list_bip448_withdrawal_attempts(&pool, "wallet", "statechain")
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
     async fn assert_sender_ineligible(config: &ClientConfig) {
         let error = transfer_bip448_sender(config, "unused", "wallet", "statechain", None)
             .await
@@ -1538,6 +7819,8 @@ mod tests {
     #[tokio::test]
     async fn fresh_bip448_client_schema_has_exact_application_tables() -> Result<()> {
         let pool = migrated_pool().await?;
+        sqlx::migrate!("./migrations").run(&pool).await?;
+        sqlx::migrate!("./migrations").run(&pool).await?;
         let tables = sqlx::query_scalar::<_, String>(
             "SELECT name FROM sqlite_schema \
              WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
@@ -1549,6 +7832,7 @@ mod tests {
         assert_eq!(
             tables,
             vec![
+                "bip448_funding_bindings",
                 "bip448_package_attempts",
                 "bip448_pending_deposit_signings",
                 "bip448_pending_transfer_signings",
@@ -1556,10 +7840,363 @@ mod tests {
                 "bip448_scanned_outpoints",
                 "bip448_state_history",
                 "bip448_statechains",
+                "bip448_transfer_intents",
                 "bip448_transfer_messages",
+                "bip448_withdrawal_attempts",
                 "wallet",
             ]
         );
+
+        let expected_columns = [
+            (
+                "bip448_scan_cursors",
+                vec![
+                    "wallet_name",
+                    "script_pubkey",
+                    "coverage_start_height",
+                    "scan_revision",
+                    "last_scanned_height",
+                    "last_scanned_block_hash",
+                    "updated_at",
+                ],
+            ),
+            (
+                "bip448_funding_bindings",
+                vec![
+                    "wallet_name",
+                    "statechain_id",
+                    "binding_index",
+                    "txid",
+                    "vout",
+                    "value_sats",
+                    "script_pubkey",
+                    "role",
+                    "observation_status",
+                    "funding_height",
+                    "spend_txid",
+                    "spend_height",
+                    "last_scanned_height",
+                    "owner_user_pubkey",
+                    "owner_state_number",
+                    "ownership_status",
+                    "first_seen_at",
+                    "last_seen_at",
+                ],
+            ),
+            (
+                "bip448_withdrawal_attempts",
+                vec![
+                    "wallet_name",
+                    "statechain_id",
+                    "binding_index",
+                    "attempt_kind",
+                    "owner_user_pubkey",
+                    "owner_state_number",
+                    "source_txid",
+                    "source_vout",
+                    "source_value_sats",
+                    "source_script_pubkey",
+                    "destination_address",
+                    "destination_script_pubkey",
+                    "fee_rate_sat_per_vbyte",
+                    "fee_sats",
+                    "lock_time",
+                    "unsigned_tx_hex",
+                    "signing_id",
+                    "signed_statechain_id",
+                    "sign_first_payload_json",
+                    "client_secret_nonce",
+                    "client_public_nonce",
+                    "blinding_factor",
+                    "server_public_nonce",
+                    "message_hex",
+                    "output_pubkey",
+                    "client_partial_sig",
+                    "encoded_session",
+                    "sign_second_payload_json",
+                    "server_partial_sig",
+                    "aggregate_signature",
+                    "signed_tx_hex",
+                    "txid",
+                    "phase",
+                    "broadcast_status",
+                    "completion_status",
+                    "closing_tip_height",
+                    "closing_tip_hash",
+                    "closing_bindings_json",
+                    "created_at",
+                    "updated_at",
+                ],
+            ),
+            (
+                "bip448_transfer_intents",
+                vec![
+                    "wallet_name",
+                    "statechain_id",
+                    "intent_id",
+                    "predecessor_intent_id",
+                    "activity_status",
+                    "intent_kind",
+                    "acknowledge_cooperative_duplicates",
+                    "recipient_address",
+                    "receiver_user_pubkey",
+                    "recipient_auth_pubkey",
+                    "batch_id",
+                    "sender_signed_statechain_id",
+                    "planned_state_number",
+                    "expected_signature_count",
+                    "previous_locktime",
+                    "prior_pending_signing_id",
+                    "prior_transfer_recipient_auth_pubkey",
+                    "prior_transfer_msg_hash",
+                    "reuse_pending",
+                    "reuse_signed_state",
+                    "clear_local_attempt",
+                    "generated_coin_user_pubkey",
+                    "generated_coin_auth_pubkey",
+                    "generated_coin_address",
+                    "phase",
+                    "server_x1",
+                    "current_pending_signing_id",
+                    "state_signing_phase",
+                    "server_partial_sig",
+                    "update_signature",
+                    "created_at",
+                    "updated_at",
+                ],
+            ),
+        ];
+        for (table, names) in expected_columns {
+            let pragma = format!("PRAGMA table_info('{table}')");
+            let metadata: Vec<(i64, String, String, i64, Option<String>, i64)> =
+                sqlx::query_as(&pragma).fetch_all(&pool).await?;
+            assert_eq!(metadata.len(), names.len(), "{table} column count");
+            for (offset, (cid, name, ty, not_null, default_value, pk)) in
+                metadata.iter().enumerate()
+            {
+                assert_eq!(*cid, i64::try_from(offset)?);
+                assert_eq!(name, names[offset], "{table} column {offset}");
+                let expected_type = if name == "fee_rate_sat_per_vbyte" {
+                    "REAL"
+                } else if [
+                    "wallet_name",
+                    "script_pubkey",
+                    "last_scanned_block_hash",
+                    "statechain_id",
+                    "txid",
+                    "role",
+                    "observation_status",
+                    "spend_txid",
+                    "owner_user_pubkey",
+                    "ownership_status",
+                    "attempt_kind",
+                    "source_txid",
+                    "source_script_pubkey",
+                    "destination_address",
+                    "destination_script_pubkey",
+                    "unsigned_tx_hex",
+                    "signing_id",
+                    "signed_statechain_id",
+                    "sign_first_payload_json",
+                    "client_secret_nonce",
+                    "client_public_nonce",
+                    "blinding_factor",
+                    "server_public_nonce",
+                    "message_hex",
+                    "output_pubkey",
+                    "client_partial_sig",
+                    "encoded_session",
+                    "sign_second_payload_json",
+                    "server_partial_sig",
+                    "aggregate_signature",
+                    "signed_tx_hex",
+                    "phase",
+                    "broadcast_status",
+                    "completion_status",
+                    "closing_tip_hash",
+                    "closing_bindings_json",
+                    "intent_id",
+                    "predecessor_intent_id",
+                    "activity_status",
+                    "intent_kind",
+                    "recipient_address",
+                    "receiver_user_pubkey",
+                    "recipient_auth_pubkey",
+                    "batch_id",
+                    "sender_signed_statechain_id",
+                    "prior_pending_signing_id",
+                    "prior_transfer_recipient_auth_pubkey",
+                    "prior_transfer_msg_hash",
+                    "generated_coin_user_pubkey",
+                    "generated_coin_auth_pubkey",
+                    "generated_coin_address",
+                    "server_x1",
+                    "current_pending_signing_id",
+                    "update_signature",
+                    "state_signing_phase",
+                    "created_at",
+                    "updated_at",
+                    "first_seen_at",
+                    "last_seen_at",
+                ]
+                .contains(&name.as_str())
+                {
+                    "TEXT"
+                } else {
+                    "INTEGER"
+                };
+                assert_eq!(ty, expected_type, "{table}.{name} type");
+                let nullable_columns: &[&str] = match table {
+                    "bip448_scan_cursors" => &[],
+                    "bip448_funding_bindings" => &["funding_height", "spend_txid", "spend_height"],
+                    "bip448_withdrawal_attempts" => &[
+                        "server_public_nonce",
+                        "message_hex",
+                        "output_pubkey",
+                        "client_partial_sig",
+                        "encoded_session",
+                        "sign_second_payload_json",
+                        "server_partial_sig",
+                        "aggregate_signature",
+                        "signed_tx_hex",
+                        "txid",
+                        "closing_tip_height",
+                        "closing_tip_hash",
+                        "closing_bindings_json",
+                    ],
+                    "bip448_transfer_intents" => &[
+                        "predecessor_intent_id",
+                        "batch_id",
+                        "prior_pending_signing_id",
+                        "prior_transfer_recipient_auth_pubkey",
+                        "prior_transfer_msg_hash",
+                        "generated_coin_user_pubkey",
+                        "generated_coin_auth_pubkey",
+                        "generated_coin_address",
+                        "server_x1",
+                        "current_pending_signing_id",
+                        "server_partial_sig",
+                        "update_signature",
+                    ],
+                    _ => unreachable!(),
+                };
+                let nullable = nullable_columns.contains(&name.as_str());
+                assert_eq!(
+                    *not_null,
+                    i64::from(!nullable),
+                    "{table}.{name} nullability"
+                );
+                let expected_default =
+                    if ["created_at", "updated_at", "first_seen_at", "last_seen_at"]
+                        .contains(&name.as_str())
+                    {
+                        Some("CURRENT_TIMESTAMP")
+                    } else {
+                        None
+                    };
+                assert_eq!(
+                    default_value.as_deref(),
+                    expected_default,
+                    "{table}.{name} default"
+                );
+                let expected_pk = match (table, name.as_str()) {
+                    ("bip448_scan_cursors", "wallet_name")
+                    | ("bip448_funding_bindings", "wallet_name")
+                    | ("bip448_withdrawal_attempts", "wallet_name")
+                    | ("bip448_transfer_intents", "wallet_name") => 1,
+                    ("bip448_scan_cursors", "script_pubkey")
+                    | ("bip448_funding_bindings", "statechain_id")
+                    | ("bip448_withdrawal_attempts", "statechain_id")
+                    | ("bip448_transfer_intents", "statechain_id") => 2,
+                    ("bip448_funding_bindings", "binding_index")
+                    | ("bip448_withdrawal_attempts", "binding_index")
+                    | ("bip448_transfer_intents", "intent_id") => 3,
+                    _ => 0,
+                };
+                assert_eq!(*pk, expected_pk, "{table}.{name} PK ordinal");
+            }
+        }
+
+        let indexes: Vec<(String,String)> = sqlx::query_as("SELECT name,sql FROM sqlite_schema \
+            WHERE type='index' AND name IN ('bip448_one_canonical_binding',\
+            'bip448_one_active_withdrawal_signing','bip448_one_active_transfer_intent') ORDER BY name")
+            .fetch_all(&pool).await?;
+        assert_eq!(indexes.len(), 3);
+        assert_eq!(indexes[0].0, "bip448_one_active_transfer_intent");
+        assert!(indexes[0].1.contains("WHERE activity_status = 'Active'"));
+        assert_eq!(indexes[1].0, "bip448_one_active_withdrawal_signing");
+        assert!(indexes[1].1.contains("WHERE phase <> 'Signed'"));
+        assert_eq!(indexes[2].0, "bip448_one_canonical_binding");
+        assert!(indexes[2].1.contains("WHERE role = 'Canonical'"));
+        for table in &tables {
+            let pragma = format!("PRAGMA foreign_key_list('{table}')");
+            let foreign_keys = sqlx::query(&pragma).fetch_all(&pool).await?;
+            assert!(foreign_keys.is_empty(), "{table} introduced a foreign key");
+        }
+        let migration_sql = include_str!("../migrations/0001_bip448_client_schema.sql");
+        let normalized_migration = migration_sql
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for fragment in [
+            "binding_index BETWEEN 0 AND 4294967295",
+            "length(txid) = 64",
+            "vout BETWEEN 0 AND 4294967295",
+            "value_sats BETWEEN 0 AND 2100000000000000",
+            "role IN ('Canonical', 'Duplicate')",
+            "'Mempool', 'Unconfirmed', 'Confirmed', 'SpentMempool', 'SpentUnconfirmed', 'SpentConfirmed', 'Absent'",
+            "owner_state_number BETWEEN 1 AND 4294967295",
+            "ownership_status IN ('Current', 'Previous')",
+            "binding_index = 0 AND role = 'Canonical'",
+            "observation_status = 'SpentMempool' AND spend_txid IS NOT NULL AND spend_height IS NULL",
+            "observation_status = 'Mempool' AND funding_height IS NULL",
+            "attempt_kind IN ('Duplicate', 'Canonical')",
+            "fee_rate_sat_per_vbyte > 0",
+            "lock_time BETWEEN 0 AND 499999999",
+            "'Prepared', 'FirstArmed', 'NonceStored', 'SecondArmed', 'Signed'",
+            "'NotBroadcast', 'Accepted', 'Confirmed', 'NeedsRebroadcast', 'Conflicting', 'Conflicted'",
+            "'NotApplicable', 'Open', 'CloseArmed', 'Closed'",
+            "binding_index = 0 AND attempt_kind = 'Canonical'",
+            "phase IN ('Prepared', 'FirstArmed') OR",
+            "phase <> 'Signed' OR",
+            "phase = 'Signed' OR broadcast_status = 'NotBroadcast'",
+            "completion_status <> 'CloseArmed' OR",
+            "completion_status <> 'Closed' OR",
+            "predecessor_intent_id <> intent_id",
+            "activity_status IN ('Active', 'Superseded')",
+            "intent_kind IN ('UserTransfer', 'Cancellation')",
+            "acknowledge_cooperative_duplicates IN (0, 1)",
+            "planned_state_number BETWEEN 1 AND 4294967295",
+            "expected_signature_count BETWEEN 1 AND 4294967295",
+            "previous_locktime BETWEEN 500000000 AND 4294967294",
+            "reuse_pending IN (0, 1)",
+            "reuse_signed_state IN (0, 1)",
+            "clear_local_attempt IN (0, 1)",
+            "'Prepared', 'SenderArmed', 'X1Stored', 'SenderFinished', 'ReceiverAccepted'",
+            "'NotStarted', 'FirstArmed', 'NonceStored', 'SecondArmed', 'Signed'",
+            "intent_kind = 'UserTransfer' AND generated_coin_user_pubkey IS NULL",
+            "phase IN ('Prepared', 'SenderArmed') AND server_x1 IS NULL",
+            "prior_transfer_recipient_auth_pubkey IS NULL AND prior_transfer_msg_hash IS NULL",
+            "reuse_pending = 0 OR prior_pending_signing_id IS NOT NULL",
+            "reuse_signed_state = 0 OR reuse_pending = 1",
+            "planned_state_number = expected_signature_count + 1",
+            "reuse_pending = 0 OR clear_local_attempt = 0",
+            "intent_kind = 'UserTransfer' OR batch_id IS NULL",
+            "intent_kind = 'Cancellation' OR phase IN ('Prepared', 'SenderArmed', 'X1Stored')",
+            "state_signing_phase = 'NotStarted' AND current_pending_signing_id IS NULL",
+        ] {
+            assert!(
+                normalized_migration.contains(fragment),
+                "missing named CHECK fragment: {fragment}"
+            );
+        }
+        let uppercase = normalized_migration.to_ascii_uppercase();
+        for forbidden in [" ALTER ", " TRIGGER ", " CREATE VIEW ", " BACKUP "] {
+            assert!(
+                !uppercase.contains(forbidden),
+                "forbidden schema object: {forbidden}"
+            );
+        }
 
         let pending_deposit_columns: Vec<(i64, String, String, i64, Option<String>, i64)> =
             sqlx::query_as("PRAGMA table_info('bip448_pending_deposit_signings')")
@@ -1622,6 +8259,150 @@ mod tests {
         .await?;
         assert_eq!(backup_txs_exists, 0);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bip448_transfer_outer_and_signing_phase_cross_product_is_exact() -> Result<()> {
+        let pool = migrated_pool().await?;
+        let outer_phases = [
+            Bip448TransferIntentPhase::Prepared,
+            Bip448TransferIntentPhase::SenderArmed,
+            Bip448TransferIntentPhase::X1Stored,
+            Bip448TransferIntentPhase::SenderFinished,
+            Bip448TransferIntentPhase::ReceiverAccepted,
+        ];
+        let signing_phases = [
+            Bip448TransferStateSigningPhase::NotStarted,
+            Bip448TransferStateSigningPhase::FirstArmed,
+            Bip448TransferStateSigningPhase::NonceStored,
+            Bip448TransferStateSigningPhase::SecondArmed,
+            Bip448TransferStateSigningPhase::Signed,
+        ];
+        let mut case_number = 1u8;
+        for outer in outer_phases {
+            for signing in signing_phases {
+                let legal = matches!(
+                    (outer, signing),
+                    (
+                        Bip448TransferIntentPhase::Prepared
+                            | Bip448TransferIntentPhase::SenderArmed,
+                        Bip448TransferStateSigningPhase::NotStarted,
+                    ) | (
+                        Bip448TransferIntentPhase::X1Stored,
+                        Bip448TransferStateSigningPhase::NotStarted
+                            | Bip448TransferStateSigningPhase::FirstArmed
+                            | Bip448TransferStateSigningPhase::NonceStored
+                            | Bip448TransferStateSigningPhase::SecondArmed
+                            | Bip448TransferStateSigningPhase::Signed,
+                    ) | (
+                        Bip448TransferIntentPhase::SenderFinished
+                            | Bip448TransferIntentPhase::ReceiverAccepted,
+                        Bip448TransferStateSigningPhase::Signed,
+                    )
+                );
+                let id = format!("{case_number:02x}");
+                case_number = case_number
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("BIP448 transfer matrix case number overflow"))?;
+                let intent = transfer_intent_for_phase_pair(&id, outer, signing, false)?;
+                assert_eq!(
+                    bip448_funding::validate_transfer_intent(&intent).is_ok(),
+                    legal,
+                    "domain matrix mismatch for {outer:?} × {signing:?}"
+                );
+                let mut connection = pool.acquire().await?;
+                let inserted = insert_transfer_intent_on(&mut connection, &intent).await;
+                assert_eq!(
+                    inserted.is_ok(),
+                    legal,
+                    "SQL matrix mismatch for {outer:?} × {signing:?}"
+                );
+            }
+        }
+
+        let mut invalid_reuse = transfer_intent_for_phase_pair(
+            "e1",
+            Bip448TransferIntentPhase::X1Stored,
+            Bip448TransferStateSigningPhase::FirstArmed,
+            true,
+        )?;
+        let mut signed_without_partial = transfer_intent_for_phase_pair(
+            "e2",
+            Bip448TransferIntentPhase::X1Stored,
+            Bip448TransferStateSigningPhase::Signed,
+            false,
+        )?;
+        signed_without_partial.server_partial_sig = None;
+        let mut reused_with_partial = transfer_intent_for_phase_pair(
+            "e3",
+            Bip448TransferIntentPhase::X1Stored,
+            Bip448TransferStateSigningPhase::Signed,
+            true,
+        )?;
+        reused_with_partial.server_partial_sig = Some("35".repeat(32));
+        let mut unstarted_with_artifact = transfer_intent_for_phase_pair(
+            "e4",
+            Bip448TransferIntentPhase::Prepared,
+            Bip448TransferStateSigningPhase::NotStarted,
+            false,
+        )?;
+        unstarted_with_artifact.current_pending_signing_id = Some("36".repeat(32));
+        let mut active_with_result = transfer_intent_for_phase_pair(
+            "e5",
+            Bip448TransferIntentPhase::X1Stored,
+            Bip448TransferStateSigningPhase::NonceStored,
+            false,
+        )?;
+        active_with_result.update_signature = Some("37".repeat(64));
+        for invalid in [
+            &mut invalid_reuse,
+            &mut signed_without_partial,
+            &mut reused_with_partial,
+            &mut unstarted_with_artifact,
+            &mut active_with_result,
+        ] {
+            assert!(bip448_funding::validate_transfer_intent(invalid).is_err());
+            let mut connection = pool.acquire().await?;
+            assert!(insert_transfer_intent_on(&mut connection, invalid)
+                .await
+                .is_err());
+        }
+
+        let corrupt_pool = migrated_pool().await?;
+        let corrupt = transfer_intent_for_phase_pair(
+            "f1",
+            Bip448TransferIntentPhase::Prepared,
+            Bip448TransferStateSigningPhase::FirstArmed,
+            false,
+        )?;
+        let mut connection = corrupt_pool.acquire().await?;
+        sqlx::query("PRAGMA ignore_check_constraints = ON")
+            .execute(&mut *connection)
+            .await?;
+        insert_transfer_intent_on(&mut connection, &corrupt).await?;
+        sqlx::query("PRAGMA ignore_check_constraints = OFF")
+            .execute(&mut *connection)
+            .await?;
+        drop(connection);
+        assert!(
+            list_bip448_transfer_intents(&corrupt_pool, "wallet", "statechain")
+                .await
+                .is_err()
+        );
+        assert!(
+            reject_bip448_transfer_intent_and_reactivate_predecessor(&corrupt_pool, &corrupt,)
+                .await
+                .is_err()
+        );
+        assert!(
+            reactivate_bip448_transfer_intent_predecessor_after_definitive_rejection(
+                &corrupt_pool,
+                &corrupt,
+            )
+            .await
+            .is_err()
+        );
         Ok(())
     }
 
@@ -1697,9 +8478,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bip448_scan_state_round_trips_canonical_txids_and_clears() -> Result<()> {
+    async fn bip448_scan_state_round_trips_canonical_txids_and_clears_only_cache() -> Result<()> {
         let pool = migrated_pool().await?;
         let cursor = Bip448ScanCursor {
+            coverage_start_height: 7,
+            scan_revision: 0,
             last_scanned_height: 42,
             last_scanned_block_hash: "22".repeat(32),
         };
@@ -1718,13 +8501,25 @@ mod tests {
         .await?;
 
         let (stored_cursor, outpoints) = load_bip448_scan_state(&pool, "wallet", "51").await?;
-        assert_eq!(stored_cursor, Some(cursor));
+        assert_eq!(
+            stored_cursor,
+            Some(Bip448ScanCursor {
+                scan_revision: 1,
+                ..cursor.clone()
+            })
+        );
         assert_eq!(outpoints[0].txid, "aa".repeat(32));
 
         clear_bip448_scan_state(&pool, "wallet", "51").await?;
         assert_eq!(
             load_bip448_scan_state(&pool, "wallet", "51").await?,
-            (None, Vec::new())
+            (
+                Some(Bip448ScanCursor {
+                    scan_revision: 1,
+                    ..cursor
+                }),
+                Vec::new()
+            )
         );
         Ok(())
     }
@@ -1813,11 +8608,14 @@ mod tests {
             value: 50_000,
             height: 2,
         };
-        let cursor = Bip448ScanCursor {
+        let mut cursor = Bip448ScanCursor {
+            coverage_start_height: 0,
+            scan_revision: 0,
             last_scanned_height: 3,
             last_scanned_block_hash: "11".repeat(32),
         };
         persist_bip448_scan_state(&pool, "wallet", "51", &cursor, &[fee.clone()]).await?;
+        cursor.scan_revision = 1;
         let attempt = Bip448PackageAttempt {
             wallet_name: "wallet".into(),
             statechain_id: "statechain".into(),
@@ -1838,9 +8636,10 @@ mod tests {
         clear_bip448_scan_state(&pool, "wallet", "51").await?;
         assert_eq!(
             load_bip448_scan_state(&pool, "wallet", "51").await?,
-            (None, Vec::new())
+            (Some(cursor.clone()), Vec::new())
         );
         persist_bip448_scan_state(&pool, "wallet", "51", &cursor, &[fee.clone()]).await?;
+        cursor.scan_revision = 2;
         assert_eq!(
             load_bip448_scan_state(&pool, "wallet", "51").await?.1,
             vec![fee.clone()]
@@ -1856,6 +8655,7 @@ mod tests {
             bip448_reservation_id("statechain", "funding_update")
         );
         persist_bip448_scan_state(&pool, "wallet", "51", &cursor, &[]).await?;
+        cursor.scan_revision = 3;
         assert!(load_bip448_scan_state(&pool, "wallet", "51")
             .await?
             .1
@@ -2354,6 +9154,3144 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("state_locktime"));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bip448_initial_acceptance_is_atomic_exact_replay_or_full_rollback() -> Result<()> {
+        let pool = migrated_pool().await?;
+        let (wallet, record, entry, _) = real_accepted_fixture(CoinStatus::UNCONFIRMED)?;
+        insert_wallet(&pool, &wallet).await?;
+        persist_bip448_initial_acceptance(&pool, &record, &entry).await?;
+        persist_bip448_initial_acceptance(&pool, &record, &entry).await?;
+        assert_eq!(
+            get_bip448_statechain(&pool, "wallet", "statechain").await?,
+            record
+        );
+        assert_eq!(
+            get_bip448_state_history(&pool, "wallet", "statechain").await?,
+            vec![entry.clone()]
+        );
+
+        let fault_pool = migrated_pool().await?;
+        insert_wallet(&fault_pool, &wallet).await?;
+        let mut conflicting = entry.clone();
+        conflicting.update_signature = "cc".repeat(64);
+        sqlx::query("INSERT INTO bip448_state_history (wallet_name,statechain_id,state_number,entry_json) VALUES ($1,$2,1,$3)")
+            .bind("wallet").bind("statechain").bind(serde_json::to_string(&conflicting)?)
+            .execute(&fault_pool).await?;
+        assert!(
+            persist_bip448_initial_acceptance(&fault_pool, &record, &entry)
+                .await
+                .is_err()
+        );
+        assert!(
+            get_bip448_statechain_optional(&fault_pool, "wallet", "statechain")
+                .await?
+                .is_none()
+        );
+        assert_eq!(
+            get_bip448_state_history(&fault_pool, "wallet", "statechain").await?,
+            vec![conflicting]
+        );
+
+        let record_only_pool = migrated_pool().await?;
+        insert_wallet(&record_only_pool, &wallet).await?;
+        upsert_bip448_statechain_record(&record_only_pool, &record).await?;
+        assert!(
+            persist_bip448_initial_acceptance(&record_only_pool, &record, &entry)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            get_bip448_statechain(&record_only_pool, "wallet", "statechain").await?,
+            record
+        );
+        assert!(
+            get_bip448_state_history(&record_only_pool, "wallet", "statechain")
+                .await?
+                .is_empty()
+        );
+
+        let record_conflict_pool = migrated_pool().await?;
+        insert_wallet(&record_conflict_pool, &wallet).await?;
+        let mut other_record = record.clone();
+        other_record.network = "signet".into();
+        upsert_bip448_statechain_record(&record_conflict_pool, &other_record).await?;
+        assert!(
+            persist_bip448_initial_acceptance(&record_conflict_pool, &record, &entry)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            get_bip448_statechain(&record_conflict_pool, "wallet", "statechain").await?,
+            other_record
+        );
+        assert!(
+            get_bip448_state_history(&record_conflict_pool, "wallet", "statechain")
+                .await?
+                .is_empty()
+        );
+
+        let write_fault_pool = migrated_pool().await?;
+        insert_wallet(&write_fault_pool, &wallet).await?;
+        sqlx::query(
+            "INSERT INTO bip448_state_history \
+             (wallet_name,statechain_id,state_number,entry_json) VALUES ('other','other',1,$1)",
+        )
+        .bind(serde_json::to_string(&entry)?)
+        .execute(&write_fault_pool)
+        .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX test_bip448_history_fault ON bip448_state_history(entry_json)",
+        )
+        .execute(&write_fault_pool)
+        .await?;
+        assert!(
+            persist_bip448_initial_acceptance(&write_fault_pool, &record, &entry)
+                .await
+                .is_err()
+        );
+        assert!(
+            get_bip448_statechain_optional(&write_fault_pool, "wallet", "statechain")
+                .await?
+                .is_none()
+        );
+        assert!(
+            get_bip448_state_history(&write_fault_pool, "wallet", "statechain")
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    async fn accepted_table_bytes(pool: &Pool<Sqlite>) -> Result<(Vec<String>, Vec<String>)> {
+        let records = sqlx::query_scalar::<_, String>(
+            "SELECT record_json FROM bip448_statechains ORDER BY wallet_name, statechain_id",
+        )
+        .fetch_all(pool)
+        .await?;
+        let history = sqlx::query_scalar::<_, String>(
+            "SELECT entry_json FROM bip448_state_history \
+             ORDER BY wallet_name, statechain_id, state_number",
+        )
+        .fetch_all(pool)
+        .await?;
+        Ok((records, history))
+    }
+
+    #[tokio::test]
+    async fn bip448_initial_acceptance_requires_one_exact_real_wallet_coin() -> Result<()> {
+        let (wallet, record, entry, _) = real_accepted_fixture(CoinStatus::UNCONFIRMED)?;
+
+        let empty_pool = migrated_pool().await?;
+        insert_wallet(&empty_pool, &sample_wallet()).await?;
+        let before = accepted_table_bytes(&empty_pool).await?;
+        assert!(
+            persist_bip448_initial_acceptance(&empty_pool, &record, &entry)
+                .await
+                .is_err()
+        );
+        assert_eq!(accepted_table_bytes(&empty_pool).await?, before);
+
+        let unrelated_pool = migrated_pool().await?;
+        let mut unrelated_wallet = wallet.clone();
+        unrelated_wallet.coins[0].statechain_id = Some("unrelated-statechain".into());
+        insert_wallet(&unrelated_pool, &unrelated_wallet).await?;
+        let before = accepted_table_bytes(&unrelated_pool).await?;
+        assert!(
+            persist_bip448_initial_acceptance(&unrelated_pool, &record, &entry)
+                .await
+                .is_err()
+        );
+        assert_eq!(accepted_table_bytes(&unrelated_pool).await?, before);
+
+        let absent_wallet_pool = migrated_pool().await?;
+        let before = accepted_table_bytes(&absent_wallet_pool).await?;
+        assert!(
+            persist_bip448_initial_acceptance(&absent_wallet_pool, &record, &entry)
+                .await
+                .is_err()
+        );
+        assert_eq!(accepted_table_bytes(&absent_wallet_pool).await?, before);
+
+        let multiple_pool = migrated_pool().await?;
+        let mut multiple_wallet = wallet.clone();
+        multiple_wallet.coins.push(wallet.coins[0].clone());
+        insert_wallet(&multiple_pool, &multiple_wallet).await?;
+        let before = accepted_table_bytes(&multiple_pool).await?;
+        assert!(
+            persist_bip448_initial_acceptance(&multiple_pool, &record, &entry)
+                .await
+                .is_err()
+        );
+        assert_eq!(accepted_table_bytes(&multiple_pool).await?, before);
+
+        for mutate in [
+            |record: &mut Bip448StatechainRecord, entry: &mut Bip448StateHistoryEntry| {
+                record.latest_state.update_tx.push_str("00");
+                let _ = entry;
+            },
+            |record: &mut Bip448StatechainRecord, entry: &mut Bip448StateHistoryEntry| {
+                let bad_signature = "00".repeat(64);
+                record.latest_state.signing_metadata.update_signature = bad_signature.clone();
+                entry.update_signature = bad_signature;
+            },
+            |record: &mut Bip448StatechainRecord, entry: &mut Bip448StateHistoryEntry| {
+                let bad_nonce = "00".repeat(66);
+                record.latest_state.signing_metadata.client_public_nonce = bad_nonce.clone();
+                entry.client_public_nonce = bad_nonce;
+            },
+        ] {
+            let malformed_pool = migrated_pool().await?;
+            insert_wallet(&malformed_pool, &wallet).await?;
+            let mut malformed_record = record.clone();
+            let mut malformed_entry = entry.clone();
+            mutate(&mut malformed_record, &mut malformed_entry);
+            let before = accepted_table_bytes(&malformed_pool).await?;
+            assert!(persist_bip448_initial_acceptance(
+                &malformed_pool,
+                &malformed_record,
+                &malformed_entry,
+            )
+            .await
+            .is_err());
+            assert_eq!(accepted_table_bytes(&malformed_pool).await?, before);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bip448_binding_indices_are_canonical_deterministic_stable_and_checked() -> Result<()> {
+        let pool = migrated_pool().await?;
+        let (record, owner, script) = accepted_binding_fixture(&pool).await?;
+        let canonical = sample_binding_observation("34", 0, 100_000, &script);
+        let one = sample_binding_observation("11", 1, 70_000, &script);
+        let two = sample_binding_observation("22", 2, 80_000, &script);
+        let bindings = reconcile_bip448_funding_bindings(
+            &pool,
+            "wallet",
+            "statechain",
+            &owner.to_string(),
+            1,
+            &[two.clone(), canonical.clone(), one.clone()],
+        )
+        .await?;
+        assert_eq!(
+            bindings
+                .iter()
+                .map(|row| (row.binding_index, row.txid.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, record.funding_outpoint.txid.clone()),
+                (1, one.txid.clone()),
+                (2, two.txid.clone())
+            ]
+        );
+        let replay = reconcile_bip448_funding_bindings(
+            &pool,
+            "wallet",
+            "statechain",
+            &owner.to_string(),
+            1,
+            &[one.clone(), canonical.clone()],
+        )
+        .await?;
+        assert_eq!(
+            replay.len(),
+            3,
+            "an absent observation never deletes or renumbers a binding"
+        );
+        let three = sample_binding_observation("01", 3, 90_000, &script);
+        let rows = reconcile_bip448_funding_bindings(
+            &pool,
+            "wallet",
+            "statechain",
+            &owner.to_string(),
+            1,
+            &[canonical.clone(), three.clone()],
+        )
+        .await?;
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.txid == three.txid)
+                .unwrap()
+                .binding_index,
+            3
+        );
+
+        let before = rows.clone();
+        let mut conflict = canonical.clone();
+        conflict.value_sats += 1;
+        assert!(reconcile_bip448_funding_bindings(
+            &pool,
+            "wallet",
+            "statechain",
+            &owner.to_string(),
+            1,
+            &[conflict]
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            list_bip448_funding_bindings(&pool, "wallet", "statechain").await?,
+            before
+        );
+        for (status, spend_txid, spend_height) in [
+            ("Unconfirmed", None, None),
+            ("Confirmed", None, None),
+            ("SpentUnconfirmed", Some("aa".repeat(32)), Some(11_i64)),
+            ("SpentConfirmed", Some("aa".repeat(32)), Some(11_i64)),
+        ] {
+            let result = sqlx::query(
+                "UPDATE bip448_funding_bindings SET observation_status=$1,\
+                funding_height=NULL,spend_txid=$2,spend_height=$3 WHERE wallet_name='wallet' \
+                AND statechain_id='statechain' AND binding_index=1",
+            )
+            .bind(status)
+            .bind(spend_txid)
+            .bind(spend_height)
+            .execute(&pool)
+            .await;
+            assert!(result.is_err(), "{status} accepted a null funding height");
+        }
+        assert!(sqlx::query(
+            "UPDATE bip448_funding_bindings SET role='DebugCanonical' WHERE wallet_name='wallet'"
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query("UPDATE bip448_funding_bindings SET binding_index=4294967296 WHERE wallet_name='wallet' AND binding_index=3")
+            .execute(&pool).await.is_err());
+        let moved = sqlx::query(
+            "UPDATE bip448_funding_bindings SET binding_index=4294967295 \
+             WHERE wallet_name='wallet' AND statechain_id='statechain' AND binding_index=3",
+        )
+        .execute(&pool)
+        .await?;
+        assert_eq!(moved.rows_affected(), 1);
+        let max_replay = reconcile_bip448_funding_bindings(
+            &pool,
+            "wallet",
+            "statechain",
+            &owner.to_string(),
+            1,
+            &[canonical.clone(), three.clone()],
+        )
+        .await?;
+        assert_eq!(
+            max_replay
+                .iter()
+                .find(|row| row.txid == three.txid)
+                .unwrap()
+                .binding_index,
+            u32::MAX,
+            "u32::MAX remains replayable when no allocation is required"
+        );
+        let four = sample_binding_observation("02", 4, 95_000, &script);
+        let before_overflow = max_replay;
+        assert!(reconcile_bip448_funding_bindings(
+            &pool,
+            "wallet",
+            "statechain",
+            &owner.to_string(),
+            1,
+            &[canonical, four]
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            list_bip448_funding_bindings(&pool, "wallet", "statechain").await?,
+            before_overflow,
+            "allocation overflow rolls back every earlier observation update"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bip448_binding_sql_domains_nullable_states_and_wallet_uniqueness() -> Result<()> {
+        let pool = migrated_pool().await?;
+        let (_record, owner, script) = accepted_binding_fixture(&pool).await?;
+        reconcile_bip448_funding_bindings(
+            &pool,
+            "wallet",
+            "statechain",
+            &owner.to_string(),
+            1,
+            &[
+                sample_binding_observation("34", 0, 100_000, &script),
+                sample_binding_observation("11", 1, 70_000, &script),
+            ],
+        )
+        .await?;
+
+        for (status, funding_height, spend_txid, spend_height, accepted) in [
+            ("Mempool", None, None, None, true),
+            ("Mempool", Some(10_i64), None, None, false),
+            ("Unconfirmed", None, None, None, false),
+            ("Unconfirmed", Some(10), None, None, true),
+            ("Confirmed", None, None, None, false),
+            ("Confirmed", Some(10), None, None, true),
+            ("SpentMempool", None, Some("aa".repeat(32)), None, true),
+            ("SpentMempool", Some(10), Some("aa".repeat(32)), None, true),
+            (
+                "SpentUnconfirmed",
+                None,
+                Some("aa".repeat(32)),
+                Some(11),
+                false,
+            ),
+            (
+                "SpentUnconfirmed",
+                Some(10),
+                Some("aa".repeat(32)),
+                Some(11),
+                true,
+            ),
+            (
+                "SpentConfirmed",
+                None,
+                Some("aa".repeat(32)),
+                Some(11),
+                false,
+            ),
+            (
+                "SpentConfirmed",
+                Some(10),
+                Some("aa".repeat(32)),
+                Some(11),
+                true,
+            ),
+            ("Absent", None, None, None, true),
+            ("Absent", Some(10), None, None, true),
+        ] {
+            let result = sqlx::query(
+                "UPDATE bip448_funding_bindings SET observation_status=$1, \
+                 funding_height=$2,spend_txid=$3,spend_height=$4 \
+                 WHERE wallet_name='wallet' AND statechain_id='statechain' AND binding_index=1",
+            )
+            .bind(status)
+            .bind(funding_height)
+            .bind(spend_txid)
+            .bind(spend_height)
+            .execute(&pool)
+            .await;
+            assert_eq!(result.is_ok(), accepted, "direct SQL status case {status}");
+        }
+        sqlx::query(
+            "UPDATE bip448_funding_bindings SET observation_status='Confirmed',funding_height=10, \
+             spend_txid=NULL,spend_height=NULL WHERE wallet_name='wallet' \
+             AND statechain_id='statechain' AND binding_index=1",
+        )
+        .execute(&pool)
+        .await?;
+        for statement in [
+            "UPDATE bip448_funding_bindings SET role='canonical' WHERE wallet_name='wallet' AND binding_index=1",
+            "UPDATE bip448_funding_bindings SET observation_status='Unknown' WHERE wallet_name='wallet' AND binding_index=1",
+            "UPDATE bip448_funding_bindings SET ownership_status='current' WHERE wallet_name='wallet' AND binding_index=1",
+        ] {
+            assert!(sqlx::query(statement).execute(&pool).await.is_err());
+        }
+        let max_value = i64::try_from(bip448_funding::BIP448_MAX_MONEY_SATS)?;
+        assert_eq!(
+            sqlx::query("UPDATE bip448_funding_bindings SET value_sats=$1 WHERE wallet_name='wallet' AND binding_index=1")
+                .bind(max_value)
+                .execute(&pool)
+                .await?
+                .rows_affected(),
+            1
+        );
+        assert_eq!(
+            get_bip448_funding_binding(&pool, "wallet", "statechain", 1)
+                .await?
+                .unwrap()
+                .value_sats,
+            bip448_funding::BIP448_MAX_MONEY_SATS
+        );
+        assert!(sqlx::query("UPDATE bip448_funding_bindings SET value_sats=$1 WHERE wallet_name='wallet' AND binding_index=1")
+            .bind(max_value.checked_add(1).unwrap())
+            .execute(&pool).await.is_err());
+        assert!(sqlx::query("UPDATE bip448_funding_bindings SET value_sats=-1 WHERE wallet_name='wallet' AND binding_index=1")
+            .execute(&pool).await.is_err());
+        sqlx::query("UPDATE bip448_funding_bindings SET value_sats=70000 WHERE wallet_name='wallet' AND binding_index=1")
+            .execute(&pool).await?;
+        assert_eq!(
+            sqlx::query("UPDATE bip448_funding_bindings SET vout=4294967295 WHERE wallet_name='wallet' AND binding_index=1")
+                .execute(&pool).await?.rows_affected(),
+            1
+        );
+        assert_eq!(
+            get_bip448_funding_binding(&pool, "wallet", "statechain", 1)
+                .await?
+                .unwrap()
+                .vout,
+            u32::MAX
+        );
+        assert!(sqlx::query("UPDATE bip448_funding_bindings SET vout=4294967296 WHERE wallet_name='wallet' AND binding_index=1")
+            .execute(&pool).await.is_err());
+        sqlx::query("UPDATE bip448_funding_bindings SET vout=1 WHERE wallet_name='wallet' AND binding_index=1")
+            .execute(&pool).await?;
+
+        let (second_wallet, second_record, second_entry, second_owner) =
+            real_accepted_fixture_for(CoinStatus::CONFIRMED, "statechain-two", &"35".repeat(32))?;
+        let mut combined_wallet = get_wallet(&pool, "wallet").await?;
+        combined_wallet.coins.extend(second_wallet.coins);
+        update_wallet(&pool, &combined_wallet).await?;
+        persist_bip448_initial_acceptance(&pool, &second_record, &second_entry).await?;
+        let second_script = accepted_funding_script(&second_record)?;
+        assert!(reconcile_bip448_funding_bindings(
+            &pool,
+            "wallet",
+            "statechain-two",
+            &second_owner.to_string(),
+            1,
+            &[
+                sample_binding_observation("35", 0, 100_000, &second_script),
+                sample_binding_observation("11", 1, 70_000, &second_script),
+            ],
+        )
+        .await
+        .is_err());
+        assert!(
+            list_bip448_funding_bindings(&pool, "wallet", "statechain-two")
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bip448_signed_attempt_requires_exact_keypath_witness_and_rolls_back() -> Result<()> {
+        let pool = migrated_pool().await?;
+        let (_, owner, script) = accepted_binding_fixture(&pool).await?;
+        let binding = reconcile_bip448_funding_bindings(
+            &pool,
+            "wallet",
+            "statechain",
+            &owner.to_string(),
+            1,
+            &[
+                sample_binding_observation("34", 0, 100_000, &script),
+                sample_binding_observation("11", 1, 70_000, &script),
+            ],
+        )
+        .await?
+        .into_iter()
+        .find(|binding| binding.binding_index == 1)
+        .ok_or_else(|| anyhow!("duplicate test binding is missing"))?;
+        let armed = second_arm_duplicate_attempt(&pool, &binding).await?;
+        let aggregate_signature = hex::decode("92".repeat(64))?;
+        let mut with_sighash_byte = aggregate_signature.clone();
+        with_sighash_byte.push(1);
+        let invalid_witnesses = vec![
+            Vec::<Vec<u8>>::new(),
+            vec![Vec::new()],
+            vec![hex::decode("93".repeat(64))?],
+            vec![aggregate_signature.clone(), vec![1]],
+            vec![with_sighash_byte],
+        ];
+        for witness_items in invalid_witnesses {
+            let mut transaction: bitcoin::Transaction =
+                bitcoin::consensus::deserialize(&hex::decode(&armed.unsigned_tx_hex)?)?;
+            for item in witness_items {
+                transaction.input[0].witness.push(item);
+            }
+            let result = store_bip448_withdrawal_signed_artifacts(
+                &pool,
+                "wallet",
+                "statechain",
+                1,
+                &armed.signing_id,
+                &"91".repeat(32),
+                &hex::encode(&aggregate_signature),
+                &hex::encode(bitcoin::consensus::serialize(&transaction)),
+                &transaction.txid().to_string(),
+                Bip448BroadcastStatus::NotBroadcast,
+            )
+            .await;
+            assert!(result.is_err());
+            let unchanged = get_bip448_withdrawal_attempt(&pool, "wallet", "statechain", 1)
+                .await?
+                .ok_or_else(|| anyhow!("armed attempt disappeared"))?;
+            assert_eq!(unchanged.phase, Bip448WithdrawalPhase::SecondArmed);
+            assert!(unchanged.server_partial_sig.is_none());
+            assert!(unchanged.aggregate_signature.is_none());
+            assert!(unchanged.signed_tx_hex.is_none());
+            assert!(unchanged.txid.is_none());
+        }
+
+        let mut transaction: bitcoin::Transaction =
+            bitcoin::consensus::deserialize(&hex::decode(&armed.unsigned_tx_hex)?)?;
+        transaction.input[0]
+            .witness
+            .push(aggregate_signature.clone());
+        let stored = store_bip448_withdrawal_signed_artifacts(
+            &pool,
+            "wallet",
+            "statechain",
+            1,
+            &armed.signing_id,
+            &"91".repeat(32),
+            &hex::encode(&aggregate_signature),
+            &hex::encode(bitcoin::consensus::serialize(&transaction)),
+            &transaction.txid().to_string(),
+            Bip448BroadcastStatus::NotBroadcast,
+        )
+        .await?;
+        assert_eq!(stored.phase, Bip448WithdrawalPhase::Signed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bip448_attempt_transitions_serialize_and_never_regress() -> Result<()> {
+        let pool = migrated_pool().await?;
+        let (record, owner, script) = accepted_binding_fixture(&pool).await?;
+        let canonical = sample_binding_observation("34", 0, 100_000, &script);
+        let duplicate = sample_binding_observation("11", 1, 70_000, &script);
+        let bindings = reconcile_bip448_funding_bindings(
+            &pool,
+            "wallet",
+            "statechain",
+            &owner.to_string(),
+            1,
+            &[canonical, duplicate],
+        )
+        .await?;
+        let binding = bindings
+            .into_iter()
+            .find(|row| row.binding_index == 1)
+            .unwrap();
+        let attempt = sample_duplicate_attempt(&binding);
+        let inserted = insert_bip448_withdrawal_attempt_if_absent(&pool, &attempt).await?;
+        assert_eq!(
+            insert_bip448_withdrawal_attempt_if_absent(&pool, &attempt).await?,
+            inserted
+        );
+        assert!(transition_bip448_withdrawal_phase(
+            &pool,
+            "wallet",
+            "statechain",
+            1,
+            &attempt.signing_id,
+            Bip448WithdrawalPhase::Prepared,
+            Bip448WithdrawalPhase::SecondArmed,
+        )
+        .await
+        .is_err());
+        arm_bip448_withdrawal_sign_first(&pool, "wallet", "statechain", 1, &attempt.signing_id)
+            .await?;
+        assert!(arm_bip448_withdrawal_sign_first(
+            &pool,
+            "wallet",
+            "statechain",
+            1,
+            &attempt.signing_id
+        )
+        .await
+        .is_err());
+        let output_pubkey = sample_owner_key(4).0.to_string();
+        let server_public_nonce = "81".repeat(66);
+        let encoded_session = "85".repeat(32);
+        let sign_second_payload_json = serde_json::to_string(
+            &mercurylib::bip448_statechain::signing_api::Bip448PartialSignatureRequestPayload {
+                statechain_id: "statechain".into(),
+                signed_statechain_id: attempt.signed_statechain_id.clone(),
+                signing_id: attempt.signing_id.clone(),
+                negate_seckey: 0,
+                session: encoded_session.clone(),
+                server_pub_nonce: server_public_nonce.clone(),
+            },
+        )?;
+        store_bip448_withdrawal_nonce_session(
+            &pool,
+            "wallet",
+            "statechain",
+            1,
+            &attempt.signing_id,
+            &server_public_nonce,
+            &"82".repeat(32),
+            &output_pubkey,
+            &"84".repeat(32),
+            &encoded_session,
+            &sign_second_payload_json,
+        )
+        .await?;
+        assert!(store_bip448_withdrawal_nonce_session(
+            &pool,
+            "wallet",
+            "statechain",
+            1,
+            &attempt.signing_id,
+            &server_public_nonce,
+            &"82".repeat(32),
+            &output_pubkey,
+            &"84".repeat(32),
+            &encoded_session,
+            &sign_second_payload_json,
+        )
+        .await
+        .is_err());
+        arm_bip448_withdrawal_sign_second(&pool, "wallet", "statechain", 1, &attempt.signing_id)
+            .await?;
+        assert!(arm_bip448_withdrawal_sign_second(
+            &pool,
+            "wallet",
+            "statechain",
+            1,
+            &attempt.signing_id
+        )
+        .await
+        .is_err());
+        assert!(bip448_statechain_is_exit_only(&pool, "wallet", "statechain").await?);
+        let expectation = bip448_expected_signature_count(&pool, "wallet", "statechain").await?;
+        assert_eq!(expectation.settled_count, 1);
+        assert_eq!(expectation.second_armed_landed_count, Some(2));
+        let server_partial_sig = "91".repeat(32);
+        let aggregate_signature = "92".repeat(64);
+        let mut signed_transaction: bitcoin::Transaction =
+            bitcoin::consensus::deserialize(&hex::decode(&attempt.unsigned_tx_hex)?)?;
+        signed_transaction.input[0]
+            .witness
+            .push(hex::decode(&aggregate_signature)?);
+        let signed_tx_hex = hex::encode(bitcoin::consensus::serialize(&signed_transaction));
+        let signed_txid = signed_transaction.txid().to_string();
+        store_signed_bip448_withdrawal(
+            &pool,
+            "wallet",
+            "statechain",
+            1,
+            &attempt.signing_id,
+            &server_partial_sig,
+            &aggregate_signature,
+            &signed_tx_hex,
+            &signed_txid,
+            Bip448BroadcastStatus::NotBroadcast,
+        )
+        .await?;
+        assert!(store_signed_bip448_withdrawal(
+            &pool,
+            "wallet",
+            "statechain",
+            1,
+            &attempt.signing_id,
+            &server_partial_sig,
+            &aggregate_signature,
+            &signed_tx_hex,
+            &signed_txid,
+            Bip448BroadcastStatus::NotBroadcast,
+        )
+        .await
+        .is_err());
+        for (from, to) in [
+            (
+                Bip448BroadcastStatus::NotBroadcast,
+                Bip448BroadcastStatus::Accepted,
+            ),
+            (
+                Bip448BroadcastStatus::Accepted,
+                Bip448BroadcastStatus::NeedsRebroadcast,
+            ),
+            (
+                Bip448BroadcastStatus::NeedsRebroadcast,
+                Bip448BroadcastStatus::Conflicting,
+            ),
+            (
+                Bip448BroadcastStatus::Conflicting,
+                Bip448BroadcastStatus::Conflicted,
+            ),
+            (
+                Bip448BroadcastStatus::Conflicted,
+                Bip448BroadcastStatus::NeedsRebroadcast,
+            ),
+        ] {
+            transition_bip448_withdrawal_broadcast_status(
+                &pool,
+                "wallet",
+                "statechain",
+                1,
+                &attempt.signing_id,
+                from,
+                to,
+            )
+            .await?;
+        }
+        assert!(transition_bip448_withdrawal_broadcast_status(
+            &pool,
+            "wallet",
+            "statechain",
+            1,
+            &attempt.signing_id,
+            Bip448BroadcastStatus::NeedsRebroadcast,
+            Bip448BroadcastStatus::NotBroadcast
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            bip448_expected_signature_count(&pool, "wallet", "statechain")
+                .await?
+                .settled_count,
+            2
+        );
+        assert_eq!(
+            get_bip448_statechain(&pool, "wallet", "statechain").await?,
+            record
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bip448_broadcast_transition_matrix_is_exact() {
+        let statuses = [
+            Bip448BroadcastStatus::NotBroadcast,
+            Bip448BroadcastStatus::Accepted,
+            Bip448BroadcastStatus::Confirmed,
+            Bip448BroadcastStatus::NeedsRebroadcast,
+            Bip448BroadcastStatus::Conflicting,
+            Bip448BroadcastStatus::Conflicted,
+        ];
+        for from in statuses {
+            for to in statuses {
+                let expected = from == to
+                    || from == Bip448BroadcastStatus::NotBroadcast
+                    || to != Bip448BroadcastStatus::NotBroadcast;
+                assert_eq!(
+                    legal_broadcast_transition(from, to),
+                    expected,
+                    "unexpected broadcast edge {from:?} -> {to:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bip448_sync_base_revision_pending_and_wallet_tokens_are_full_cas() -> Result<()> {
+        let pool = migrated_pool().await?;
+        let wallet = sample_wallet();
+        insert_wallet(&pool, &wallet).await?;
+        let base = capture_bip448_sync_base(&pool, "wallet", "51").await?;
+        let pending = Bip448PendingDepositSigning {
+            wallet_name: "wallet".into(),
+            statechain_id: "statechain".into(),
+            funding_txid: "11".repeat(32),
+            funding_vout: 0,
+            funding_value_sats: 1,
+            update_template_hash: "21".repeat(32),
+            settlement_template_hash: "22".repeat(32),
+            state_locktime: 700_000_000,
+            signing_id: "23".repeat(32),
+            client_secret_nonce: "24".repeat(32),
+            client_public_nonce: "25".repeat(33),
+            blinding_factor: "26".repeat(32),
+            server_public_nonce: None,
+        };
+        insert_bip448_pending_deposit_signing_if_absent(&pool, &pending).await?;
+        assert!(begin_bip448_sync_base_guard(&pool, &base).await.is_err());
+        let inserted_base = capture_bip448_sync_base(&pool, "wallet", "51").await?;
+        update_bip448_pending_deposit_server_public_nonce(
+            &pool,
+            "wallet",
+            "statechain",
+            &pending.signing_id,
+            &"27".repeat(33),
+        )
+        .await?;
+        assert!(begin_bip448_sync_base_guard(&pool, &inserted_base)
+            .await
+            .is_err());
+        let nonce_base = capture_bip448_sync_base(&pool, "wallet", "51").await?;
+        delete_bip448_pending_deposit_signing(&pool, "wallet", "statechain", &pending.signing_id)
+            .await?;
+        assert!(begin_bip448_sync_base_guard(&pool, &nonce_base)
+            .await
+            .is_err());
+
+        let base = capture_bip448_sync_base(&pool, "wallet", "51").await?;
+        let candidate = Bip448ScanCursor {
+            coverage_start_height: 10,
+            scan_revision: 0,
+            last_scanned_height: 20,
+            last_scanned_block_hash: "31".repeat(32),
+        };
+        let mut guard = begin_bip448_sync_base_guard(&pool, &base).await?;
+        let token1 = guard
+            .apply_scan_cache_and_cursor("wallet", "51", &candidate, &[])
+            .await?;
+        guard.commit().await?;
+        assert_eq!(token1.scan_revision, 1);
+        assert!(begin_bip448_sync_base_guard(&pool, &base).await.is_err());
+        let base2 = capture_bip448_sync_base(&pool, "wallet", "51").await?;
+        let candidate2 = Bip448ScanCursor {
+            scan_revision: 1,
+            ..candidate.clone()
+        };
+        let mut guard = begin_bip448_sync_base_guard(&pool, &base2).await?;
+        let token2 = guard
+            .apply_scan_cache_and_cursor("wallet", "51", &candidate2, &[])
+            .await?;
+        guard.commit().await?;
+        assert_eq!(
+            token2.scan_revision, 2,
+            "same-tip semantic no-op increments revision"
+        );
+        let mut replacement = wallet.clone();
+        replacement.blockheight += 1;
+        assert!(
+            !compare_and_set_wallet_after_bip448_scan(
+                &pool,
+                "wallet",
+                &base.raw_wallet_json,
+                &replacement,
+                &[token1]
+            )
+            .await?
+        );
+        let live_raw = sqlx::query_scalar::<_, String>(
+            "SELECT wallet_json FROM wallet WHERE wallet_name='wallet'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert!(
+            compare_and_set_wallet_after_bip448_scan(
+                &pool,
+                "wallet",
+                &live_raw,
+                &replacement,
+                &[token2]
+            )
+            .await?
+        );
+        let base3 = capture_bip448_sync_base(&pool, "wallet", "51").await?;
+        let lower = Bip448ScanCursor {
+            coverage_start_height: 0,
+            scan_revision: 2,
+            ..candidate
+        };
+        let mut guard = begin_bip448_sync_base_guard(&pool, &base3).await?;
+        let token3 = guard
+            .apply_scan_cache_and_cursor("wallet", "51", &lower, &[])
+            .await?;
+        guard.commit().await?;
+        assert_eq!(token3.scan_revision, 3);
+        assert_eq!(
+            load_bip448_scan_state(&pool, "wallet", "51")
+                .await?
+                .0
+                .unwrap()
+                .coverage_start_height,
+            0
+        );
+        let expected_after_lower = sqlx::query_scalar::<_, String>(
+            "SELECT wallet_json FROM wallet WHERE wallet_name='wallet'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        let mut winning_wallet: Wallet = serde_json::from_str(&expected_after_lower)?;
+        winning_wallet.blockheight = winning_wallet
+            .blockheight
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("wallet height overflow"))?;
+        update_wallet(&pool, &winning_wallet).await?;
+        let winning_raw = sqlx::query_scalar::<_, String>(
+            "SELECT wallet_json FROM wallet WHERE wallet_name='wallet'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        let mut losing_wallet = winning_wallet.clone();
+        losing_wallet.blockheight = losing_wallet
+            .blockheight
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("wallet height overflow"))?;
+        assert!(
+            !compare_and_set_wallet_after_bip448_scan(
+                &pool,
+                "wallet",
+                &expected_after_lower,
+                &losing_wallet,
+                std::slice::from_ref(&token3),
+            )
+            .await?,
+            "wallet-only CAS loss must report false"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT wallet_json FROM wallet WHERE wallet_name='wallet'"
+            )
+            .fetch_one(&pool)
+            .await?,
+            winning_raw,
+            "a losing wallet CAS must not overwrite the winner"
+        );
+        assert!(compare_and_set_wallet_after_bip448_scan(
+            &pool,
+            "wallet",
+            &winning_raw,
+            &losing_wallet,
+            &[token3.clone(), token3.clone()],
+        )
+        .await
+        .is_err());
+        sqlx::query("UPDATE bip448_scan_cursors SET scan_revision=$1 WHERE wallet_name='wallet' AND script_pubkey='51'")
+            .bind(i64::MAX).execute(&pool).await?;
+        let overflow_base = capture_bip448_sync_base(&pool, "wallet", "51").await?;
+        let overflow = Bip448ScanCursor {
+            coverage_start_height: 0,
+            scan_revision: u64::try_from(i64::MAX)?,
+            last_scanned_height: 21,
+            last_scanned_block_hash: "32".repeat(32),
+        };
+        let mut guard = begin_bip448_sync_base_guard(&pool, &overflow_base).await?;
+        assert!(guard
+            .apply_scan_cache_and_cursor(
+                "wallet",
+                "51",
+                &overflow,
+                &[ChainUtxo {
+                    txid: "33".repeat(32),
+                    vout: 0,
+                    value: 1,
+                    height: 21
+                }]
+            )
+            .await
+            .is_err());
+        drop(guard);
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT scan_revision FROM bip448_scan_cursors WHERE wallet_name='wallet' AND script_pubkey='51'").fetch_one(&pool).await?,i64::MAX);
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM bip448_scanned_outpoints WHERE wallet_name='wallet' AND script_pubkey='51'").fetch_one(&pool).await?,0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bip448_pending_aba_and_wallet_cas_have_deterministic_ordering() -> Result<()> {
+        let pools = independent_migrated_pools().await?;
+        let wallet = sample_wallet();
+        insert_wallet(&pools.first, &wallet).await?;
+        let pending = Bip448PendingDepositSigning {
+            wallet_name: "wallet".into(),
+            statechain_id: "statechain".into(),
+            funding_txid: "11".repeat(32),
+            funding_vout: 0,
+            funding_value_sats: 1,
+            update_template_hash: "21".repeat(32),
+            settlement_template_hash: "22".repeat(32),
+            state_locktime: 700_000_000,
+            signing_id: "23".repeat(32),
+            client_secret_nonce: "24".repeat(132),
+            client_public_nonce: "25".repeat(66),
+            blinding_factor: "26".repeat(32),
+            server_public_nonce: None,
+        };
+
+        let insert_base = capture_bip448_sync_base(&pools.second, "wallet", "51").await?;
+        let mut insert_winner = begin_bip448_mutation_guard(&pools.first).await?;
+        sqlx::query(
+            "INSERT INTO bip448_pending_deposit_signings (wallet_name,statechain_id,\
+             funding_txid,funding_vout,funding_value_sats,update_template_hash,\
+             settlement_template_hash,state_locktime,signing_id,client_secret_nonce,\
+             client_public_nonce,blinding_factor,server_public_nonce) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NULL)",
+        )
+        .bind(&pending.wallet_name)
+        .bind(&pending.statechain_id)
+        .bind(&pending.funding_txid)
+        .bind(i64::from(pending.funding_vout))
+        .bind(i64::try_from(pending.funding_value_sats)?)
+        .bind(&pending.update_template_hash)
+        .bind(&pending.settlement_template_hash)
+        .bind(i64::from(pending.state_locktime))
+        .bind(&pending.signing_id)
+        .bind(&pending.client_secret_nonce)
+        .bind(&pending.client_public_nonce)
+        .bind(&pending.blinding_factor)
+        .execute(insert_winner.connection())
+        .await?;
+        let (hook, loser) = spawn_sync_base_loser(pools.second.clone(), insert_base);
+        commit_winner_and_assert_sync_loser_loses(hook, insert_winner, loser).await?;
+
+        let nonce_base = capture_bip448_sync_base(&pools.second, "wallet", "51").await?;
+        let mut nonce_winner = begin_bip448_mutation_guard(&pools.first).await?;
+        sqlx::query(
+            "UPDATE bip448_pending_deposit_signings SET server_public_nonce=$1 \
+             WHERE wallet_name='wallet' AND statechain_id='statechain' AND signing_id=$2",
+        )
+        .bind("27".repeat(66))
+        .bind(&pending.signing_id)
+        .execute(nonce_winner.connection())
+        .await?;
+        let (hook, loser) = spawn_sync_base_loser(pools.second.clone(), nonce_base);
+        commit_winner_and_assert_sync_loser_loses(hook, nonce_winner, loser).await?;
+
+        let delete_base = capture_bip448_sync_base(&pools.second, "wallet", "51").await?;
+        let mut delete_winner = begin_bip448_mutation_guard(&pools.first).await?;
+        sqlx::query(
+            "DELETE FROM bip448_pending_deposit_signings \
+             WHERE wallet_name='wallet' AND statechain_id='statechain' AND signing_id=$1",
+        )
+        .bind(&pending.signing_id)
+        .execute(delete_winner.connection())
+        .await?;
+        let (hook, loser) = spawn_sync_base_loser(pools.second.clone(), delete_base);
+        commit_winner_and_assert_sync_loser_loses(hook, delete_winner, loser).await?;
+
+        persist_bip448_scan_state(
+            &pools.first,
+            "wallet",
+            "51",
+            &Bip448ScanCursor {
+                coverage_start_height: 0,
+                scan_revision: 0,
+                last_scanned_height: 20,
+                last_scanned_block_hash: "31".repeat(32),
+            },
+            &[],
+        )
+        .await?;
+        let aba_base = capture_bip448_sync_base(&pools.second, "wallet", "51").await?;
+        let mut aba_winner = begin_bip448_sync_base_guard(&pools.first, &aba_base).await?;
+        let token_two = aba_winner
+            .apply_scan_cache_and_cursor(
+                "wallet",
+                "51",
+                &Bip448ScanCursor {
+                    coverage_start_height: 0,
+                    scan_revision: 1,
+                    last_scanned_height: 20,
+                    last_scanned_block_hash: "31".repeat(32),
+                },
+                &[],
+            )
+            .await?;
+        let (hook, loser) = spawn_sync_base_loser(pools.second.clone(), aba_base);
+        commit_winner_and_assert_sync_loser_loses(hook, aba_winner, loser).await?;
+        assert_eq!(token_two.scan_revision, 2);
+
+        let expected_raw = sqlx::query_scalar::<_, String>(
+            "SELECT wallet_json FROM wallet WHERE wallet_name='wallet'",
+        )
+        .fetch_one(&pools.first)
+        .await?;
+        let mut replacement = wallet.clone();
+        replacement.blockheight = replacement
+            .blockheight
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("wallet height overflow"))?;
+        let token_winner_base = capture_bip448_sync_base(&pools.first, "wallet", "51").await?;
+        let mut token_winner =
+            begin_bip448_sync_base_guard(&pools.first, &token_winner_base).await?;
+        let token_three = token_winner
+            .apply_scan_cache_and_cursor(
+                "wallet",
+                "51",
+                &Bip448ScanCursor {
+                    coverage_start_height: 0,
+                    scan_revision: 2,
+                    last_scanned_height: 20,
+                    last_scanned_block_hash: "31".repeat(32),
+                },
+                &[],
+            )
+            .await?;
+        let hook = Arc::new(Bip448BeginImmediateTestHook::default());
+        let task_hook = hook.clone();
+        let second_pool = pools.second.clone();
+        let stale_expected_raw = expected_raw.clone();
+        let stale_replacement = replacement.clone();
+        let stale_token = token_two.clone();
+        let wallet_token_loser = tokio::spawn(BIP448_BEGIN_IMMEDIATE_TEST_HOOK.scope(
+            task_hook,
+            async move {
+                compare_and_set_wallet_after_bip448_scan(
+                    &second_pool,
+                    "wallet",
+                    &stale_expected_raw,
+                    &stale_replacement,
+                    &[stale_token],
+                )
+                .await
+            },
+        ));
+        assert_begin_is_contested(&hook).await?;
+        token_winner.commit().await?;
+        hook.after_acquire.notified().await;
+        assert!(!wallet_token_loser.await??);
+        assert_eq!(token_three.scan_revision, 3);
+
+        let raw_before_wallet_winner = sqlx::query_scalar::<_, String>(
+            "SELECT wallet_json FROM wallet WHERE wallet_name='wallet'",
+        )
+        .fetch_one(&pools.first)
+        .await?;
+        let mut winning_wallet = wallet.clone();
+        winning_wallet.blockheight = winning_wallet
+            .blockheight
+            .checked_add(2)
+            .ok_or_else(|| anyhow!("wallet height overflow"))?;
+        let winning_json = canonical_wallet_json(&winning_wallet)?;
+        let mut wallet_winner = begin_bip448_mutation_guard(&pools.first).await?;
+        sqlx::query(
+            "UPDATE wallet SET wallet_json=$1 WHERE wallet_name='wallet' AND wallet_json=$2",
+        )
+        .bind(&winning_json)
+        .bind(&raw_before_wallet_winner)
+        .execute(wallet_winner.connection())
+        .await?;
+        let hook = Arc::new(Bip448BeginImmediateTestHook::default());
+        let task_hook = hook.clone();
+        let second_pool = pools.second.clone();
+        let losing_expected = raw_before_wallet_winner.clone();
+        let losing_replacement = replacement;
+        let current_token = token_three;
+        let wallet_bytes_loser = tokio::spawn(BIP448_BEGIN_IMMEDIATE_TEST_HOOK.scope(
+            task_hook,
+            async move {
+                compare_and_set_wallet_after_bip448_scan(
+                    &second_pool,
+                    "wallet",
+                    &losing_expected,
+                    &losing_replacement,
+                    &[current_token],
+                )
+                .await
+            },
+        ));
+        assert_begin_is_contested(&hook).await?;
+        wallet_winner.commit().await?;
+        hook.after_acquire.notified().await;
+        assert!(!wallet_bytes_loser.await??);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT wallet_json FROM wallet WHERE wallet_name='wallet'",
+            )
+            .fetch_one(&pools.first)
+            .await?,
+            winning_json
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bip448_reverse_order_sync_base_cas_preserves_every_newer_fact_and_reruns() -> Result<()>
+    {
+        let pools = independent_migrated_pools().await?;
+        let (_, owner, script) = accepted_binding_fixture(&pools.first).await?;
+        let initial_observations = [
+            sample_binding_observation("34", 0, 100_000, &script),
+            sample_binding_observation("11", 1, 70_000, &script),
+        ];
+        let bindings = reconcile_bip448_funding_bindings(
+            &pools.first,
+            "wallet",
+            "statechain",
+            &owner.to_string(),
+            1,
+            &initial_observations,
+        )
+        .await?;
+        let duplicate = bindings
+            .iter()
+            .find(|row| row.binding_index == 1)
+            .ok_or_else(|| anyhow!("duplicate fixture binding is missing"))?;
+        let signed = sign_duplicate_attempt(&pools.first, duplicate).await?;
+        transition_bip448_withdrawal_broadcast_status(
+            &pools.first,
+            "wallet",
+            "statechain",
+            1,
+            &signed.signing_id,
+            Bip448BroadcastStatus::NotBroadcast,
+            Bip448BroadcastStatus::Accepted,
+        )
+        .await?;
+        persist_bip448_scan_state(
+            &pools.first,
+            "wallet",
+            &script,
+            &Bip448ScanCursor {
+                coverage_start_height: 10,
+                scan_revision: 0,
+                last_scanned_height: 20,
+                last_scanned_block_hash: "51".repeat(32),
+            },
+            &[],
+        )
+        .await?;
+        let (older_base, newer_base) = tokio::try_join!(
+            capture_bip448_sync_base(&pools.first, "wallet", &script),
+            capture_bip448_sync_base(&pools.second, "wallet", &script),
+        )?;
+        assert_eq!(older_base, newer_base);
+
+        let mut absent_duplicate = sample_binding_observation("11", 1, 70_000, &script);
+        absent_duplicate.observation_status = Bip448ObservationStatus::Absent;
+        absent_duplicate.funding_height = None;
+        absent_duplicate.last_scanned_height = 21;
+        let mut newer_canonical = sample_binding_observation("34", 0, 100_000, &script);
+        newer_canonical.last_scanned_height = 21;
+        let mut newer_guard = begin_bip448_sync_base_guard(&pools.first, &newer_base).await?;
+        newer_guard
+            .reconcile_funding_bindings(
+                "wallet",
+                "statechain",
+                &owner.to_string(),
+                1,
+                &[newer_canonical, absent_duplicate],
+            )
+            .await?;
+        newer_guard
+            .update_withdrawal_broadcast_status(
+                "wallet",
+                "statechain",
+                1,
+                &signed.signing_id,
+                Bip448BroadcastStatus::Accepted,
+                Bip448BroadcastStatus::NeedsRebroadcast,
+            )
+            .await?;
+        newer_guard
+            .apply_scan_cache_and_cursor(
+                "wallet",
+                &script,
+                &Bip448ScanCursor {
+                    coverage_start_height: 10,
+                    scan_revision: 1,
+                    last_scanned_height: 21,
+                    last_scanned_block_hash: "52".repeat(32),
+                },
+                &[],
+            )
+            .await?;
+        let hook = Arc::new(Bip448BeginImmediateTestHook::default());
+        let task_hook = hook.clone();
+        let second_pool = pools.second.clone();
+        let older_task = tokio::spawn(
+            BIP448_BEGIN_IMMEDIATE_TEST_HOOK.scope(task_hook, async move {
+                begin_bip448_sync_base_guard(&second_pool, &older_base).await
+            }),
+        );
+        assert_begin_is_contested(&hook).await?;
+        newer_guard.commit().await?;
+        hook.after_acquire.notified().await;
+        assert!(
+            older_task.await?.is_err(),
+            "the older observation candidate must lose its full SyncBase CAS"
+        );
+        let durable_binding = get_bip448_funding_binding(&pools.first, "wallet", "statechain", 1)
+            .await?
+            .ok_or_else(|| anyhow!("duplicate binding disappeared"))?;
+        assert_eq!(
+            durable_binding.observation_status,
+            Bip448ObservationStatus::Absent
+        );
+        assert_eq!(
+            get_bip448_withdrawal_attempt(&pools.first, "wallet", "statechain", 1)
+                .await?
+                .ok_or_else(|| anyhow!("signed attempt disappeared"))?
+                .broadcast_status,
+            Bip448BroadcastStatus::NeedsRebroadcast
+        );
+        assert_eq!(
+            load_bip448_scan_state(&pools.first, "wallet", &script)
+                .await?
+                .0
+                .ok_or_else(|| anyhow!("scan cursor disappeared"))?
+                .scan_revision,
+            2
+        );
+
+        let rerun_base = capture_bip448_sync_base(&pools.second, "wallet", &script).await?;
+        let mut rerun_guard = begin_bip448_sync_base_guard(&pools.second, &rerun_base).await?;
+        let mut rerun_canonical = sample_binding_observation("34", 0, 100_000, &script);
+        rerun_canonical.last_scanned_height = 22;
+        let mut rerun_duplicate = sample_binding_observation("11", 1, 70_000, &script);
+        rerun_duplicate.last_scanned_height = 22;
+        rerun_guard
+            .reconcile_funding_bindings(
+                "wallet",
+                "statechain",
+                &owner.to_string(),
+                1,
+                &[rerun_canonical, rerun_duplicate],
+            )
+            .await?;
+        rerun_guard
+            .update_withdrawal_broadcast_status(
+                "wallet",
+                "statechain",
+                1,
+                &signed.signing_id,
+                Bip448BroadcastStatus::NeedsRebroadcast,
+                Bip448BroadcastStatus::Accepted,
+            )
+            .await?;
+        rerun_guard
+            .apply_scan_cache_and_cursor(
+                "wallet",
+                &script,
+                &Bip448ScanCursor {
+                    coverage_start_height: 10,
+                    scan_revision: 2,
+                    last_scanned_height: 22,
+                    last_scanned_block_hash: "53".repeat(32),
+                },
+                &[],
+            )
+            .await?;
+        rerun_guard.commit().await?;
+        assert_eq!(
+            get_bip448_funding_binding(&pools.first, "wallet", "statechain", 1)
+                .await?
+                .ok_or_else(|| anyhow!("rerun binding disappeared"))?
+                .observation_status,
+            Bip448ObservationStatus::Confirmed
+        );
+        assert_eq!(
+            get_bip448_withdrawal_attempt(&pools.first, "wallet", "statechain", 1)
+                .await?
+                .ok_or_else(|| anyhow!("rerun attempt disappeared"))?
+                .broadcast_status,
+            Bip448BroadcastStatus::Accepted
+        );
+        assert_eq!(
+            load_bip448_scan_state(&pools.first, "wallet", &script)
+                .await?
+                .0
+                .ok_or_else(|| anyhow!("rerun cursor disappeared"))?
+                .scan_revision,
+            3
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bip448_lower_coverage_floor_preserves_durable_bindings_and_attempts() -> Result<()> {
+        let pool = migrated_pool().await?;
+        let (_, owner, script) = accepted_binding_fixture(&pool).await?;
+        let bindings = reconcile_bip448_funding_bindings(
+            &pool,
+            "wallet",
+            "statechain",
+            &owner.to_string(),
+            1,
+            &[
+                sample_binding_observation("34", 0, 100_000, &script),
+                sample_binding_observation("11", 1, 70_000, &script),
+            ],
+        )
+        .await?;
+        let duplicate = bindings
+            .iter()
+            .find(|row| row.binding_index == 1)
+            .ok_or_else(|| anyhow!("duplicate fixture binding is missing"))?;
+        insert_bip448_withdrawal_attempt_if_absent(&pool, &sample_duplicate_attempt(duplicate))
+            .await?;
+        persist_bip448_scan_state(
+            &pool,
+            "wallet",
+            &script,
+            &Bip448ScanCursor {
+                coverage_start_height: 10,
+                scan_revision: 0,
+                last_scanned_height: 20,
+                last_scanned_block_hash: "54".repeat(32),
+            },
+            &[ChainUtxo {
+                txid: "55".repeat(32),
+                vout: 0,
+                value: 42,
+                height: 20,
+            }],
+        )
+        .await?;
+        let bindings_before = list_bip448_funding_bindings(&pool, "wallet", "statechain").await?;
+        let attempts_before =
+            list_bip448_withdrawal_attempts(&pool, "wallet", "statechain").await?;
+        let base = capture_bip448_sync_base(&pool, "wallet", &script).await?;
+        let mut guard = begin_bip448_sync_base_guard(&pool, &base).await?;
+        let token = guard
+            .apply_scan_cache_and_cursor(
+                "wallet",
+                &script,
+                &Bip448ScanCursor {
+                    coverage_start_height: 0,
+                    scan_revision: 1,
+                    last_scanned_height: 21,
+                    last_scanned_block_hash: "56".repeat(32),
+                },
+                &[],
+            )
+            .await?;
+        guard.commit().await?;
+        assert_eq!(token.scan_revision, 2);
+        let (cursor, cache) = load_bip448_scan_state(&pool, "wallet", &script).await?;
+        let cursor = cursor.ok_or_else(|| anyhow!("lower-floor cursor disappeared"))?;
+        assert_eq!(cursor.coverage_start_height, 0);
+        assert_eq!(cursor.scan_revision, 2);
+        assert!(cache.is_empty(), "lower-floor apply replaces current cache");
+        assert_eq!(
+            list_bip448_funding_bindings(&pool, "wallet", "statechain").await?,
+            bindings_before
+        );
+        assert_eq!(
+            list_bip448_withdrawal_attempts(&pool, "wallet", "statechain").await?,
+            attempts_before
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bip448_transfer_intent_successors_reactivation_and_stale_workers_are_guarded(
+    ) -> Result<()> {
+        let pool = migrated_pool().await?;
+        let (record, _, _) = accepted_binding_fixture(&pool).await?;
+        let root = sample_transfer_intent("a1");
+        let persisted = insert_bip448_transfer_intent_if_absent(&pool, &root).await?;
+        assert_eq!(
+            insert_bip448_transfer_intent_if_absent(&pool, &root).await?,
+            persisted
+        );
+        let mut immutable_conflict = root.clone();
+        immutable_conflict.recipient_address = "different".into();
+        assert!(
+            insert_bip448_transfer_intent_if_absent(&pool, &immutable_conflict)
+                .await
+                .is_err()
+        );
+        arm_bip448_transfer_sender(&pool, "wallet", "statechain", &root.intent_id).await?;
+        let mut premature = sample_transfer_intent("a2");
+        premature.predecessor_intent_id = Some(root.intent_id.clone());
+        assert!(
+            supersede_bip448_transfer_intent(&pool, &root.intent_id, &premature)
+                .await
+                .is_err()
+        );
+        let x1 = "01".repeat(32);
+        store_bip448_transfer_server_x1(&pool, "wallet", "statechain", &root.intent_id, &x1)
+            .await?;
+        let successor =
+            supersede_bip448_transfer_intent(&pool, &root.intent_id, &premature).await?;
+        assert_eq!(
+            successor.predecessor_intent_id.as_deref(),
+            Some(root.intent_id.as_str())
+        );
+        assert!(
+            arm_bip448_transfer_sender(&pool, "wallet", "statechain", &root.intent_id)
+                .await
+                .is_err(),
+            "a superseded predecessor worker must lose its activity CAS"
+        );
+        let reactivated =
+            reject_bip448_transfer_intent_and_reactivate_predecessor(&pool, &successor)
+                .await?
+                .expect("direct predecessor reactivated");
+        assert_eq!(reactivated.intent_id, root.intent_id);
+        assert_eq!(reactivated.phase, Bip448TransferIntentPhase::X1Stored);
+        assert_eq!(reactivated.server_x1.as_deref(), Some(x1.as_str()));
+
+        let wallet = get_wallet(&pool, "wallet").await?;
+        let receiver = secp256k1::PublicKey::from_str(&root.receiver_user_pubkey)?;
+        let state_two = real_fixture_state_for_owner(
+            &wallet,
+            &record,
+            receiver.x_only_public_key().0,
+            2,
+            record.latest_state.state_locktime + 1,
+        )?;
+        let pending = Bip448PendingDepositSigning {
+            wallet_name: "wallet".into(),
+            statechain_id: "statechain".into(),
+            funding_txid: record.funding_outpoint.txid.clone(),
+            funding_vout: record.funding_outpoint.vout,
+            funding_value_sats: record.funding_outpoint.value_sats,
+            update_template_hash: state_two.update_template_hash.clone(),
+            settlement_template_hash: state_two.settlement_template_hash.clone(),
+            state_locktime: state_two.state_locktime,
+            signing_id: state_two.signing_metadata.signing_id.clone(),
+            client_secret_nonce: "44".repeat(132),
+            client_public_nonce: state_two.signing_metadata.client_public_nonce.clone(),
+            blinding_factor: state_two.signing_metadata.blinding_factor.clone(),
+            server_public_nonce: None,
+        };
+        install_bip448_transfer_target_pending_signing(&pool, &root.intent_id, &pending).await?;
+        store_bip448_transfer_state_nonce(
+            &pool,
+            "wallet",
+            "statechain",
+            &root.intent_id,
+            &pending.signing_id,
+            &state_two.signing_metadata.server_public_nonce,
+        )
+        .await?;
+        arm_bip448_transfer_state_sign_second(
+            &pool,
+            "wallet",
+            "statechain",
+            &root.intent_id,
+            &pending.signing_id,
+        )
+        .await?;
+        store_signed_bip448_transfer_state(
+            &pool,
+            "wallet",
+            "statechain",
+            &root.intent_id,
+            &pending.signing_id,
+            &"48".repeat(32),
+            &state_two.signing_metadata.update_signature,
+        )
+        .await?;
+        let active = get_active_bip448_transfer_intent(&pool, "wallet", "statechain")
+            .await?
+            .unwrap();
+        assert_eq!(
+            active.state_signing_phase,
+            Bip448TransferStateSigningPhase::Signed
+        );
+        let mut post_sign_plan = sample_transfer_intent("a3");
+        post_sign_plan.predecessor_intent_id = Some(root.intent_id.clone());
+        post_sign_plan.expected_signature_count = 2;
+        post_sign_plan.planned_state_number = 3;
+        post_sign_plan.previous_locktime = pending.state_locktime;
+        post_sign_plan.prior_pending_signing_id = Some(pending.signing_id.clone());
+        post_sign_plan.clear_local_attempt = true;
+        assert!(
+            supersede_bip448_transfer_intent(&pool, &root.intent_id, &post_sign_plan)
+                .await
+                .is_err(),
+            "Signed retarget must first materialize exact history and outgoing message"
+        );
+        let state_two_entry = history_entry(&state_two, receiver.x_only_public_key().0);
+        insert_bip448_state_history_entry(&pool, "wallet", "statechain", &state_two_entry).await?;
+        let complete_history = get_bip448_state_history(&pool, "wallet", "statechain").await?;
+        let mut message = sample_bip448_transfer_msg();
+        message.statechain_id = "statechain".into();
+        message.receiver_user_public_key = root.receiver_user_pubkey.clone();
+        message.aggregate_pubkey = record.aggregate_pubkey.clone();
+        message.funding_outpoint = record.funding_outpoint.clone();
+        message.latest_state = state_two;
+        message.latest_state_number = 2;
+        message.challenge_delay = record.challenge_delay;
+        message.amount_sats = record.amount_sats;
+        message.network = record.network.clone();
+        message.value_schedule = message.latest_state.value_schedule.clone();
+        message.server_signature_count = 2;
+        message.state_history = complete_history;
+        insert_or_update_bip448_transfer_msg(
+            &pool,
+            "wallet",
+            &root.recipient_auth_pubkey,
+            &message,
+        )
+        .await?;
+        post_sign_plan.prior_transfer_recipient_auth_pubkey =
+            Some(root.recipient_auth_pubkey.clone());
+        post_sign_plan.prior_transfer_msg_hash =
+            Some(sha256::Hash::hash(serde_json::to_string(&message)?.as_bytes()).to_string());
+        let post_sign =
+            supersede_bip448_transfer_intent(&pool, &root.intent_id, &post_sign_plan).await?;
+        assert_eq!(
+            list_bip448_transfer_intents(&pool, "wallet", "statechain")
+                .await?
+                .len(),
+            2,
+            "the predecessor chain remains durable through successor state signing"
+        );
+
+        let mut orphan = sample_transfer_intent("a4");
+        orphan.activity_status = Bip448TransferIntentActivityStatus::Superseded;
+        let mut connection = pool.acquire().await?;
+        insert_transfer_intent_on(&mut connection, &orphan).await?;
+        drop(connection);
+        assert!(
+            get_active_bip448_transfer_intent(&pool, "wallet", "statechain")
+                .await
+                .is_err()
+        );
+        assert!(
+            reject_bip448_transfer_intent_and_reactivate_predecessor(&pool, &post_sign)
+                .await
+                .is_err(),
+            "corrupt lineage blocks even otherwise legal cleanup"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bip448_every_corrupt_transfer_lineage_blocks_attempt_and_close() -> Result<()> {
+        let active = sample_transfer_intent("b1");
+        let mut orphan = sample_transfer_intent("b2");
+        orphan.activity_status = Bip448TransferIntentActivityStatus::Superseded;
+        assert_corrupt_transfer_lineage_blocks(&[active, orphan], false).await?;
+
+        let mut missing = sample_transfer_intent("b3");
+        missing.predecessor_intent_id = Some("b4".repeat(32));
+        assert_corrupt_transfer_lineage_blocks(&[missing], false).await?;
+
+        let mut cycle_active = sample_transfer_intent("b5");
+        cycle_active.predecessor_intent_id = Some("b6".repeat(32));
+        let mut cycle_predecessor = sample_transfer_intent("b6");
+        cycle_predecessor.predecessor_intent_id = Some(cycle_active.intent_id.clone());
+        cycle_predecessor.activity_status = Bip448TransferIntentActivityStatus::Superseded;
+        assert_corrupt_transfer_lineage_blocks(&[cycle_active, cycle_predecessor], false).await?;
+
+        assert_corrupt_transfer_lineage_blocks(
+            &[sample_transfer_intent("b7"), sample_transfer_intent("b8")],
+            true,
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bip448_accepted_local_outgoing_reconciliation_is_exact_and_conservative() -> Result<()>
+    {
+        let (pool, _, _recipient_auth, _message) = accepted_local_outgoing_fixture().await?;
+        assert_eq!(
+            reconcile_bip448_accepted_local_outgoing_messages(&pool, "wallet", "statechain")
+                .await?,
+            1
+        );
+        assert!(!has_bip448_transfer_msg_for_statechain(&pool, "wallet", "statechain").await?);
+
+        let (pool, record, recipient_auth, message) = accepted_local_outgoing_fixture().await?;
+        let stored_json = serde_json::to_string(&message)?;
+        let mut active = sample_transfer_intent("c1");
+        active.expected_signature_count = 2;
+        active.planned_state_number = 3;
+        active.previous_locktime = record.latest_state.state_locktime;
+        active.prior_transfer_recipient_auth_pubkey = Some(recipient_auth.clone());
+        active.prior_transfer_msg_hash =
+            Some(sha256::Hash::hash(stored_json.as_bytes()).to_string());
+        active.clear_local_attempt = true;
+        insert_bip448_transfer_intent_if_absent(&pool, &active).await?;
+        assert_eq!(
+            reconcile_bip448_accepted_local_outgoing_messages(&pool, "wallet", "statechain")
+                .await?,
+            0,
+            "an intent-referenced message must be retained"
+        );
+        assert!(has_bip448_transfer_msg_for_statechain(&pool, "wallet", "statechain").await?);
+
+        let suffix_pool = migrated_pool().await?;
+        let (suffix_record, _, _) = accepted_binding_fixture(&suffix_pool).await?;
+        let (receiver, _) = sample_owner_key(2);
+        let (auth, _) = sample_owner_key(3);
+        let suffix_wallet = get_wallet(&suffix_pool, "wallet").await?;
+        let state_two = real_fixture_state_for_owner(
+            &suffix_wallet,
+            &suffix_record,
+            receiver.x_only_public_key().0,
+            2,
+            suffix_record.latest_state.state_locktime + 1,
+        )?;
+        let entry_two = history_entry(&state_two, receiver.x_only_public_key().0);
+        insert_bip448_state_history_entry(&suffix_pool, "wallet", "statechain", &entry_two).await?;
+        let suffix_history = get_bip448_state_history(&suffix_pool, "wallet", "statechain").await?;
+        let suffix_message = exact_transfer_message(
+            &suffix_record,
+            state_two,
+            &receiver.to_string(),
+            suffix_history,
+        );
+        insert_or_update_bip448_transfer_msg(
+            &suffix_pool,
+            "wallet",
+            &auth.to_string(),
+            &suffix_message,
+        )
+        .await?;
+        assert_eq!(
+            reconcile_bip448_accepted_local_outgoing_messages(&suffix_pool, "wallet", "statechain")
+                .await?,
+            0,
+            "the journal-proven current sender suffix is not an accepted local prefix"
+        );
+        assert!(
+            has_bip448_transfer_msg_for_statechain(&suffix_pool, "wallet", "statechain").await?
+        );
+
+        let (malformed_pool, _, malformed_recipient, malformed_message) =
+            accepted_local_outgoing_fixture().await?;
+        sqlx::query(
+            "UPDATE bip448_transfer_messages SET transfer_msg_json='{' \
+             WHERE wallet_name='wallet' AND statechain_id='statechain'",
+        )
+        .execute(&malformed_pool)
+        .await?;
+        assert!(reconcile_bip448_accepted_local_outgoing_messages(
+            &malformed_pool,
+            "wallet",
+            "statechain"
+        )
+        .await
+        .is_err());
+        assert!(
+            has_bip448_transfer_msg_for_statechain(&malformed_pool, "wallet", "statechain").await?
+        );
+        let mut wrong_statechain = malformed_message;
+        wrong_statechain.statechain_id = "other-statechain".into();
+        let wrong_json = serde_json::to_string(&wrong_statechain)?;
+        sqlx::query(
+            "UPDATE bip448_transfer_messages SET transfer_msg_json=$1 \
+             WHERE wallet_name='wallet' AND statechain_id='statechain' \
+             AND recipient_auth_pubkey=$2",
+        )
+        .bind(wrong_json)
+        .bind(&malformed_recipient)
+        .execute(&malformed_pool)
+        .await?;
+        assert!(reconcile_bip448_accepted_local_outgoing_messages(
+            &malformed_pool,
+            "wallet",
+            "statechain"
+        )
+        .await
+        .is_err());
+
+        let (conflict_pool, _, first_recipient, conflict_message) =
+            accepted_local_outgoing_fixture().await?;
+        let mut wallet = get_wallet(&conflict_pool, "wallet").await?;
+        let mut second_coin = wallet.get_new_coin()?;
+        second_coin.user_pubkey = conflict_message.receiver_user_public_key.clone();
+        second_coin.statechain_protocol = Some("bip448".into());
+        second_coin.statechain_id = Some("statechain".into());
+        second_coin.status = CoinStatus::CONFIRMED;
+        let second_recipient = second_coin.auth_pubkey.clone();
+        assert_ne!(second_recipient, first_recipient);
+        wallet.coins.push(second_coin);
+        update_wallet(&conflict_pool, &wallet).await?;
+        insert_or_update_bip448_transfer_msg(
+            &conflict_pool,
+            "wallet",
+            &second_recipient,
+            &conflict_message,
+        )
+        .await?;
+        assert!(reconcile_bip448_accepted_local_outgoing_messages(
+            &conflict_pool,
+            "wallet",
+            "statechain"
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM bip448_transfer_messages \
+                 WHERE wallet_name='wallet' AND statechain_id='statechain'",
+            )
+            .fetch_one(&conflict_pool)
+            .await?,
+            2,
+            "conflicting rows must roll back without partial deletion"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bip448_cancellation_wallet_signing_acceptance_and_cleanup_are_atomic() -> Result<()> {
+        let pool = migrated_pool().await?;
+        let (wallet, mut record, initial_entry, _) = real_accepted_fixture(CoinStatus::CONFIRMED)?;
+        let generated_coin = wallet.get_new_coin()?;
+        insert_wallet(&pool, &wallet).await?;
+        let generated_user = secp256k1::PublicKey::from_str(&generated_coin.user_pubkey)?;
+        persist_bip448_initial_acceptance(&pool, &record, &initial_entry).await?;
+
+        let old_raw = sqlx::query_scalar::<_, String>(
+            "SELECT wallet_json FROM wallet WHERE wallet_name='wallet'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        let mut replacement_wallet = wallet.clone();
+        replacement_wallet.coins.push(generated_coin.clone());
+        let mut cancellation = sample_transfer_intent("d1");
+        cancellation.intent_kind = Bip448TransferIntentKind::Cancellation;
+        cancellation.sender_signed_statechain_id = wallet.coins[0]
+            .signed_statechain_id
+            .clone()
+            .ok_or_else(|| anyhow!("real source Coin has no statechain authorization"))?;
+        cancellation.recipient_address = generated_coin.address.clone();
+        cancellation.receiver_user_pubkey = generated_coin.user_pubkey.clone();
+        cancellation.recipient_auth_pubkey = generated_coin.auth_pubkey.clone();
+        cancellation.generated_coin_user_pubkey = Some(generated_coin.user_pubkey.clone());
+        cancellation.generated_coin_auth_pubkey = Some(generated_coin.auth_pubkey.clone());
+        cancellation.generated_coin_address = Some(generated_coin.address.clone());
+
+        let mut invalid_replacement = replacement_wallet.clone();
+        invalid_replacement.blockheight += 1;
+        assert!(insert_bip448_cancellation_intent_with_wallet(
+            &pool,
+            &cancellation,
+            &old_raw,
+            &invalid_replacement,
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT wallet_json FROM wallet WHERE wallet_name='wallet'"
+            )
+            .fetch_one(&pool)
+            .await?,
+            old_raw
+        );
+
+        let rejected = insert_bip448_cancellation_intent_with_wallet(
+            &pool,
+            &cancellation,
+            &old_raw,
+            &replacement_wallet,
+        )
+        .await?;
+        assert_eq!(
+            insert_bip448_cancellation_intent_with_wallet(
+                &pool,
+                &cancellation,
+                &old_raw,
+                &replacement_wallet,
+            )
+            .await?,
+            rejected,
+            "exact replay must not append a second generated Coin"
+        );
+        assert!(
+            reactivate_bip448_transfer_intent_predecessor_after_definitive_rejection(
+                &pool, &rejected
+            )
+            .await?
+            .is_none()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT wallet_json FROM wallet WHERE wallet_name='wallet'"
+            )
+            .fetch_one(&pool)
+            .await?,
+            old_raw,
+            "definitive rejection removes only the generated Coin"
+        );
+        assert!(list_bip448_transfer_intents(&pool, "wallet", "statechain")
+            .await?
+            .is_empty());
+
+        cancellation.intent_id = "d2".repeat(32);
+        let stored = insert_bip448_cancellation_intent_with_wallet(
+            &pool,
+            &cancellation,
+            &old_raw,
+            &replacement_wallet,
+        )
+        .await?;
+        transition_bip448_transfer_intent_phase(
+            &pool,
+            "wallet",
+            "statechain",
+            &stored.intent_id,
+            Bip448TransferIntentPhase::Prepared,
+            Bip448TransferIntentPhase::SenderArmed,
+        )
+        .await?;
+        let x1_stored = store_bip448_transfer_intent_x1(
+            &pool,
+            "wallet",
+            "statechain",
+            &stored.intent_id,
+            &"01".repeat(32),
+        )
+        .await?;
+        assert_eq!(x1_stored.phase, Bip448TransferIntentPhase::X1Stored);
+        assert!(transition_bip448_transfer_intent_phase(
+            &pool,
+            "wallet",
+            "statechain",
+            &stored.intent_id,
+            Bip448TransferIntentPhase::SenderArmed,
+            Bip448TransferIntentPhase::Prepared,
+        )
+        .await
+        .is_err());
+
+        let state_two = real_fixture_state_for_owner(
+            &wallet,
+            &record,
+            generated_user.x_only_public_key().0,
+            2,
+            record.latest_state.state_locktime + 1,
+        )?;
+        let pending = Bip448PendingDepositSigning {
+            wallet_name: "wallet".into(),
+            statechain_id: "statechain".into(),
+            funding_txid: record.funding_outpoint.txid.clone(),
+            funding_vout: record.funding_outpoint.vout,
+            funding_value_sats: record.funding_outpoint.value_sats,
+            update_template_hash: state_two.update_template_hash.clone(),
+            settlement_template_hash: state_two.settlement_template_hash.clone(),
+            state_locktime: state_two.state_locktime,
+            signing_id: state_two.signing_metadata.signing_id.clone(),
+            client_secret_nonce: "44".repeat(132),
+            client_public_nonce: state_two.signing_metadata.client_public_nonce.clone(),
+            blinding_factor: state_two.signing_metadata.blinding_factor.clone(),
+            server_public_nonce: None,
+        };
+        let first_armed =
+            install_bip448_transfer_target_pending(&pool, &stored.intent_id, &pending).await?;
+        assert_eq!(
+            first_armed.state_signing_phase,
+            Bip448TransferStateSigningPhase::FirstArmed
+        );
+        let nonce_stored = store_bip448_transfer_state_nonce(
+            &pool,
+            "wallet",
+            "statechain",
+            &stored.intent_id,
+            &pending.signing_id,
+            &state_two.signing_metadata.server_public_nonce,
+        )
+        .await?;
+        assert_eq!(
+            nonce_stored.state_signing_phase,
+            Bip448TransferStateSigningPhase::NonceStored
+        );
+        assert!(store_bip448_transfer_state_nonce(
+            &pool,
+            "wallet",
+            "statechain",
+            &stored.intent_id,
+            &pending.signing_id,
+            &state_two.signing_metadata.server_public_nonce,
+        )
+        .await
+        .is_err());
+        transition_bip448_transfer_state_signing_phase(
+            &pool,
+            "wallet",
+            "statechain",
+            &stored.intent_id,
+            &pending.signing_id,
+            Bip448TransferStateSigningPhase::NonceStored,
+            Bip448TransferStateSigningPhase::SecondArmed,
+        )
+        .await?;
+        assert!(transition_bip448_transfer_state_signing_phase(
+            &pool,
+            "wallet",
+            "statechain",
+            &stored.intent_id,
+            &pending.signing_id,
+            Bip448TransferStateSigningPhase::NonceStored,
+            Bip448TransferStateSigningPhase::SecondArmed,
+        )
+        .await
+        .is_err());
+        let signed = store_bip448_transfer_state_signed_artifacts(
+            &pool,
+            "wallet",
+            "statechain",
+            &stored.intent_id,
+            &pending.signing_id,
+            &"48".repeat(32),
+            &state_two.signing_metadata.update_signature,
+        )
+        .await?;
+        assert_eq!(
+            signed.state_signing_phase,
+            Bip448TransferStateSigningPhase::Signed
+        );
+        assert!(store_bip448_transfer_state_signed_artifacts(
+            &pool,
+            "wallet",
+            "statechain",
+            &stored.intent_id,
+            &pending.signing_id,
+            &"48".repeat(32),
+            &state_two.signing_metadata.update_signature,
+        )
+        .await
+        .is_err());
+
+        let state_two_entry = history_entry(&state_two, generated_user.x_only_public_key().0);
+        insert_bip448_state_history_entry(&pool, "wallet", "statechain", &state_two_entry).await?;
+        let complete_history = get_bip448_state_history(&pool, "wallet", "statechain").await?;
+        let message = exact_transfer_message(
+            &record,
+            state_two.clone(),
+            &generated_coin.user_pubkey,
+            complete_history,
+        );
+        let message_json = serde_json::to_string(&message)?;
+        insert_or_update_bip448_transfer_msg(
+            &pool,
+            "wallet",
+            &generated_coin.auth_pubkey,
+            &message,
+        )
+        .await?;
+        let signed = get_active_bip448_transfer_intent(&pool, "wallet", "statechain")
+            .await?
+            .unwrap();
+        let sender_raw = sqlx::query_scalar::<_, String>(
+            "SELECT wallet_json FROM wallet WHERE wallet_name='wallet'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        let mut sender_finished_wallet: Wallet = serde_json::from_str(&sender_raw)?;
+        sender_finished_wallet.coins[0].status = CoinStatus::IN_TRANSFER;
+        let sender_finished = finish_bip448_cancellation_sender(
+            &pool,
+            &signed,
+            &sender_raw,
+            &sender_finished_wallet,
+            &message_json,
+        )
+        .await?;
+        assert_eq!(
+            sender_finished.phase,
+            Bip448TransferIntentPhase::SenderFinished
+        );
+        assert!(
+            get_bip448_pending_transfer_signing(&pool, "wallet", "statechain")
+                .await?
+                .is_none()
+        );
+        assert_eq!(
+            list_bip448_transfer_intents(&pool, "wallet", "statechain")
+                .await?
+                .len(),
+            1
+        );
+
+        record.latest_state_number = 2;
+        record.latest_state = state_two;
+        upsert_bip448_statechain_record(&pool, &record).await?;
+        let mut accepted_wallet = get_wallet(&pool, "wallet").await?;
+        let accepted_coin = accepted_wallet
+            .coins
+            .iter_mut()
+            .find(|coin| coin.auth_pubkey == generated_coin.auth_pubkey)
+            .unwrap();
+        accepted_coin.statechain_protocol = Some("bip448".into());
+        accepted_coin.statechain_id = Some("statechain".into());
+        accepted_coin.signed_statechain_id = Some(mercurylib::transfer::receiver::sign_message(
+            "statechain",
+            accepted_coin,
+        )?);
+        accepted_coin.status = CoinStatus::CONFIRMED;
+        let aggregate_pubkey = PublicKey::from_str(&record.aggregate_pubkey)?;
+        let receiver_server_key = aggregate_pubkey.combine(&generated_user.negate())?;
+        accepted_coin.server_pubkey = Some(receiver_server_key.to_string());
+        accepted_coin.aggregated_pubkey = Some(record.aggregate_pubkey.clone());
+        accepted_coin.utxo_txid = Some(record.funding_outpoint.txid.clone());
+        accepted_coin.utxo_vout = Some(record.funding_outpoint.vout);
+        accepted_coin.amount = Some(u32::try_from(record.funding_outpoint.value_sats)?);
+        accepted_coin.locktime = Some(record.latest_state.state_locktime);
+        accepted_coin.public_nonce = Some(
+            record
+                .latest_state
+                .signing_metadata
+                .client_public_nonce
+                .clone(),
+        );
+        accepted_coin.server_public_nonce = Some(
+            record
+                .latest_state
+                .signing_metadata
+                .server_public_nonce
+                .clone(),
+        );
+        accepted_coin.blinding_factor =
+            Some(record.latest_state.signing_metadata.blinding_factor.clone());
+        accepted_coin.aggregated_address =
+            Some(bip448_deposit::create_deposit_address(accepted_coin, "regtest")?.address);
+        update_wallet(&pool, &accepted_wallet).await?;
+        let receiver_accepted = mark_bip448_cancellation_receiver_accepted(
+            &pool,
+            "wallet",
+            "statechain",
+            &stored.intent_id,
+        )
+        .await?;
+        assert_eq!(
+            receiver_accepted.phase,
+            Bip448TransferIntentPhase::ReceiverAccepted
+        );
+        assert_eq!(
+            mark_bip448_cancellation_receiver_accepted(
+                &pool,
+                "wallet",
+                "statechain",
+                &stored.intent_id,
+            )
+            .await?,
+            receiver_accepted,
+            "ReceiverAccepted is exact-idempotent"
+        );
+        delete_bip448_cancellation_artifacts_after_sync(&pool, &receiver_accepted, &message_json)
+            .await?;
+        assert!(list_bip448_transfer_intents(&pool, "wallet", "statechain")
+            .await?
+            .is_empty());
+        assert!(!has_bip448_transfer_msg_for_statechain(&pool, "wallet", "statechain").await?);
+        assert_eq!(
+            get_wallet(&pool, "wallet")
+                .await?
+                .coins
+                .iter()
+                .filter(|coin| coin.auth_pubkey == generated_coin.auth_pubkey)
+                .count(),
+            1,
+            "terminal cleanup preserves the accepted generated Coin"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bip448_begin_immediate_excludes_two_real_pool_connections() -> Result<()> {
+        let pools = independent_migrated_pools().await?;
+        let (_, owner, script) = accepted_binding_fixture(&pools.first).await?;
+        let canonical = sample_binding_observation("34", 0, 100_000, &script);
+        let duplicate = sample_binding_observation("11", 1, 70_000, &script);
+        let binding = reconcile_bip448_funding_bindings(
+            &pools.first,
+            "wallet",
+            "statechain",
+            &owner.to_string(),
+            1,
+            &[canonical, duplicate],
+        )
+        .await?
+        .into_iter()
+        .find(|row| row.binding_index == 1)
+        .unwrap();
+        let first = sample_duplicate_attempt(&binding);
+        let mut second = first.clone();
+        second.signing_id = "75".repeat(32);
+        second.client_secret_nonce = "76".repeat(132);
+        refresh_attempt_sign_first_payload(&mut second);
+
+        let mut first_guard = begin_bip448_mutation_guard(&pools.first).await?;
+        first_guard
+            .insert_withdrawal_attempt_if_absent(&first)
+            .await?;
+        let hook = Arc::new(Bip448BeginImmediateTestHook::default());
+        let task_hook = hook.clone();
+        let second_pool = pools.second.clone();
+        let task = tokio::spawn(
+            BIP448_BEGIN_IMMEDIATE_TEST_HOOK.scope(task_hook, async move {
+                insert_bip448_withdrawal_attempt_if_absent(&second_pool, &second).await
+            }),
+        );
+        assert_begin_is_contested(&hook).await?;
+        first_guard.commit().await?;
+        hook.after_acquire.notified().await;
+        assert!(
+            task.await?.is_err(),
+            "second competing immutable plan must lose after serialization"
+        );
+        assert_eq!(
+            list_bip448_withdrawal_attempts(&pools.first, "wallet", "statechain")
+                .await?
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bip448_accepted_to_needs_rebroadcast_serializes_before_later_attempt() -> Result<()> {
+        let pools = independent_migrated_pools().await?;
+        let (_, owner, script) = accepted_binding_fixture(&pools.first).await?;
+        let bindings = reconcile_bip448_funding_bindings(
+            &pools.first,
+            "wallet",
+            "statechain",
+            &owner.to_string(),
+            1,
+            &[
+                sample_binding_observation("34", 0, 100_000, &script),
+                sample_binding_observation("11", 1, 70_000, &script),
+                sample_binding_observation("12", 2, 60_000, &script),
+            ],
+        )
+        .await?;
+        let first_binding = bindings
+            .iter()
+            .find(|row| row.binding_index == 1)
+            .ok_or_else(|| anyhow!("first duplicate binding is missing"))?;
+        let second_binding = bindings
+            .iter()
+            .find(|row| row.binding_index == 2)
+            .ok_or_else(|| anyhow!("second duplicate binding is missing"))?;
+        let first = sign_duplicate_attempt(&pools.first, first_binding).await?;
+        transition_bip448_withdrawal_broadcast_status(
+            &pools.first,
+            "wallet",
+            "statechain",
+            1,
+            &first.signing_id,
+            Bip448BroadcastStatus::NotBroadcast,
+            Bip448BroadcastStatus::Accepted,
+        )
+        .await?;
+        let second = sample_duplicate_attempt(second_binding);
+
+        let mut reconciliation = begin_bip448_mutation_guard(&pools.first).await?;
+        reconciliation
+            .update_withdrawal_broadcast_status(
+                "wallet",
+                "statechain",
+                1,
+                &first.signing_id,
+                Bip448BroadcastStatus::Accepted,
+                Bip448BroadcastStatus::NeedsRebroadcast,
+            )
+            .await?;
+        let hook = Arc::new(Bip448BeginImmediateTestHook::default());
+        let task_hook = hook.clone();
+        let second_pool = pools.second.clone();
+        let task = tokio::spawn(
+            BIP448_BEGIN_IMMEDIATE_TEST_HOOK.scope(task_hook, async move {
+                insert_bip448_withdrawal_attempt_if_absent(&second_pool, &second).await
+            }),
+        );
+        assert_begin_is_contested(&hook).await?;
+        reconciliation.commit().await?;
+        hook.after_acquire.notified().await;
+        assert!(
+            task.await?.is_err(),
+            "later attempt must observe NeedsRebroadcast and roll back"
+        );
+        let attempts =
+            list_bip448_withdrawal_attempts(&pools.first, "wallet", "statechain").await?;
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(
+            attempts[0].broadcast_status,
+            Bip448BroadcastStatus::NeedsRebroadcast
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bip448_owner_reassignment_preserves_every_binding_index_and_identity() -> Result<()> {
+        let pool = migrated_pool().await?;
+        let (record, owner_one, script) = accepted_binding_fixture(&pool).await?;
+        let rows = reconcile_bip448_funding_bindings(
+            &pool,
+            "wallet",
+            "statechain",
+            &owner_one.to_string(),
+            1,
+            &[
+                sample_binding_observation("34", 0, 100_000, &script),
+                sample_binding_observation("11", 1, 70_000, &script),
+            ],
+        )
+        .await?;
+        let (_, owner_two) = sample_owner_key(2);
+        let wallet = get_wallet(&pool, "wallet").await?;
+        let mut state_two = record.clone();
+        state_two.latest_state_number = 2;
+        state_two.latest_state = real_fixture_state_for_owner(
+            &wallet,
+            &record,
+            owner_two,
+            2,
+            record.latest_state.state_locktime + 1,
+        )?;
+        upsert_bip448_statechain_record(&pool, &state_two).await?;
+        insert_bip448_state_history_entry(
+            &pool,
+            "wallet",
+            "statechain",
+            &history_entry(&state_two.latest_state, owner_two),
+        )
+        .await?;
+        let reassigned = reassign_bip448_funding_bindings_owner(
+            &pool,
+            "wallet",
+            "statechain",
+            &owner_one.to_string(),
+            1,
+            &owner_two.to_string(),
+            2,
+        )
+        .await?;
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.binding_index, row.txid.clone(), row.vout))
+                .collect::<Vec<_>>(),
+            reassigned
+                .iter()
+                .map(|row| (row.binding_index, row.txid.clone(), row.vout))
+                .collect::<Vec<_>>()
+        );
+        assert!(reassigned
+            .iter()
+            .all(|row| row.owner_user_pubkey == owner_two.to_string()
+                && row.owner_state_number == 2
+                && row.ownership_status == Bip448OwnershipStatus::Current));
+        let previous = mark_bip448_funding_bindings_previous(
+            &pool,
+            "wallet",
+            "statechain",
+            &owner_two.to_string(),
+            2,
+        )
+        .await?;
+        assert!(previous
+            .iter()
+            .all(|row| row.ownership_status == Bip448OwnershipStatus::Previous));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bip448_prepared_compare_delete_is_duplicate_only_and_tip_bound() -> Result<()> {
+        let pool = migrated_pool().await?;
+        let (_, owner, script) = accepted_binding_fixture(&pool).await?;
+        let binding = reconcile_bip448_funding_bindings(
+            &pool,
+            "wallet",
+            "statechain",
+            &owner.to_string(),
+            1,
+            &[
+                sample_binding_observation("34", 0, 100_000, &script),
+                sample_binding_observation("11", 1, 70_000, &script),
+            ],
+        )
+        .await?
+        .into_iter()
+        .find(|row| row.binding_index == 1)
+        .unwrap();
+        let candidate = Bip448ScanCursor {
+            coverage_start_height: 0,
+            scan_revision: 0,
+            last_scanned_height: 20,
+            last_scanned_block_hash: "61".repeat(32),
+        };
+        persist_bip448_scan_state(&pool, "wallet", &script, &candidate, &[]).await?;
+        let attempt = sample_duplicate_attempt(&binding);
+        let attempt = insert_bip448_withdrawal_attempt_if_absent(&pool, &attempt).await?;
+        let prospective_txid = bip448_funding::expected_withdrawal_txid(&attempt)?;
+        let exact_sweep_spend = Bip448BindingObservation {
+            observation_status: Bip448ObservationStatus::SpentConfirmed,
+            spend_txid: Some(prospective_txid.clone()),
+            spend_height: Some(19),
+            ..sample_binding_observation("11", 1, 70_000, &script)
+        };
+        let exact_spent_binding =
+            update_bip448_funding_binding_observation(&pool, &binding, &exact_sweep_spend).await?;
+        assert!(
+            delete_prepared_bip448_withdrawal_attempt_for_confirmed_spend(
+                &pool,
+                &attempt,
+                &prospective_txid,
+                20,
+                &"61".repeat(32),
+            )
+            .await
+            .is_err(),
+            "the attempt's own prospective txid is not a competing spend"
+        );
+        let spent = Bip448BindingObservation {
+            observation_status: Bip448ObservationStatus::SpentConfirmed,
+            spend_txid: Some("62".repeat(32)),
+            spend_height: Some(19),
+            ..sample_binding_observation("11", 1, 70_000, &script)
+        };
+        update_bip448_funding_binding_observation(&pool, &exact_spent_binding, &spent).await?;
+        assert!(
+            delete_prepared_bip448_withdrawal_attempt_for_confirmed_spend(
+                &pool,
+                &attempt,
+                &"62".repeat(32),
+                20,
+                &"63".repeat(32)
+            )
+            .await
+            .is_err(),
+            "wrong stable hash must retain row"
+        );
+        assert!(
+            get_bip448_withdrawal_attempt(&pool, "wallet", "statechain", 1)
+                .await?
+                .is_some()
+        );
+        delete_prepared_bip448_withdrawal_attempt_for_confirmed_spend(
+            &pool,
+            &attempt,
+            &"62".repeat(32),
+            20,
+            &"61".repeat(32),
+        )
+        .await?;
+        assert!(
+            get_bip448_withdrawal_attempt(&pool, "wallet", "statechain", 1)
+                .await?
+                .is_none()
+        );
+
+        let spent_binding = get_bip448_funding_binding(&pool, "wallet", "statechain", 1)
+            .await?
+            .unwrap();
+        let confirmed = sample_binding_observation("11", 1, 70_000, &script);
+        let confirmed_binding =
+            update_bip448_funding_binding_observation(&pool, &spent_binding, &confirmed).await?;
+        let mut armed = sample_duplicate_attempt(&confirmed_binding);
+        armed.signing_id = "76".repeat(32);
+        refresh_attempt_sign_first_payload(&mut armed);
+        let armed = insert_bip448_withdrawal_attempt_if_absent(&pool, &armed).await?;
+        arm_bip448_withdrawal_sign_first(&pool, "wallet", "statechain", 1, &armed.signing_id)
+            .await?;
+        let live = get_bip448_funding_binding(&pool, "wallet", "statechain", 1)
+            .await?
+            .unwrap();
+        update_bip448_funding_binding_observation(&pool, &live, &spent).await?;
+        let armed_live = get_bip448_withdrawal_attempt(&pool, "wallet", "statechain", 1)
+            .await?
+            .unwrap();
+        assert!(
+            delete_prepared_bip448_withdrawal_attempt_for_confirmed_spend(
+                &pool,
+                &armed_live,
+                &"62".repeat(32),
+                20,
+                &"61".repeat(32)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            get_bip448_withdrawal_attempt(&pool, "wallet", "statechain", 1)
+                .await?
+                .unwrap()
+                .phase,
+            Bip448WithdrawalPhase::FirstArmed
+        );
+        let output_pubkey = sample_owner_key(4).0.to_string();
+        let server_public_nonce = "81".repeat(66);
+        let encoded_session = "85".repeat(32);
+        let sign_second_payload_json = serde_json::to_string(
+            &mercurylib::bip448_statechain::signing_api::Bip448PartialSignatureRequestPayload {
+                statechain_id: "statechain".into(),
+                signed_statechain_id: armed.signed_statechain_id.clone(),
+                signing_id: armed.signing_id.clone(),
+                negate_seckey: 0,
+                session: encoded_session.clone(),
+                server_pub_nonce: server_public_nonce.clone(),
+            },
+        )?;
+        let nonce_stored = store_bip448_withdrawal_nonce_artifacts(
+            &pool,
+            "wallet",
+            "statechain",
+            1,
+            &armed.signing_id,
+            &server_public_nonce,
+            &"82".repeat(32),
+            &output_pubkey,
+            &"84".repeat(32),
+            &encoded_session,
+            &sign_second_payload_json,
+        )
+        .await?;
+        assert!(
+            delete_prepared_bip448_withdrawal_attempt_for_confirmed_spend(
+                &pool,
+                &nonce_stored,
+                &"62".repeat(32),
+                20,
+                &"61".repeat(32),
+            )
+            .await
+            .is_err()
+        );
+        let second_armed =
+            arm_bip448_withdrawal_sign_second(&pool, "wallet", "statechain", 1, &armed.signing_id)
+                .await?;
+        assert!(
+            delete_prepared_bip448_withdrawal_attempt_for_confirmed_spend(
+                &pool,
+                &second_armed,
+                &"62".repeat(32),
+                20,
+                &"61".repeat(32),
+            )
+            .await
+            .is_err()
+        );
+        let aggregate_signature = "92".repeat(64);
+        let mut signed_transaction: bitcoin::Transaction =
+            bitcoin::consensus::deserialize(&hex::decode(&armed.unsigned_tx_hex)?)?;
+        signed_transaction.input[0]
+            .witness
+            .push(hex::decode(&aggregate_signature)?);
+        let signed_tx_hex = hex::encode(bitcoin::consensus::serialize(&signed_transaction));
+        let signed = store_bip448_withdrawal_signed_artifacts(
+            &pool,
+            "wallet",
+            "statechain",
+            1,
+            &armed.signing_id,
+            &"91".repeat(32),
+            &aggregate_signature,
+            &signed_tx_hex,
+            &signed_transaction.txid().to_string(),
+            Bip448BroadcastStatus::Conflicted,
+        )
+        .await?;
+        assert!(
+            delete_prepared_bip448_withdrawal_attempt_for_confirmed_spend(
+                &pool,
+                &signed,
+                &"62".repeat(32),
+                20,
+                &"61".repeat(32),
+            )
+            .await
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bip448_canonical_attempt_requires_one_exact_confirmed_coin() -> Result<()> {
+        for status in [
+            CoinStatus::INITIALISED,
+            CoinStatus::IN_MEMPOOL,
+            CoinStatus::UNCONFIRMED,
+            CoinStatus::IN_TRANSFER,
+            CoinStatus::TRANSFERRED,
+            CoinStatus::WITHDRAWING,
+            CoinStatus::WITHDRAWN,
+        ] {
+            let pool = migrated_pool().await?;
+            let attempt = ready_canonical_attempt_fixture(&pool).await?;
+            let mut wallet = get_wallet(&pool, "wallet").await?;
+            wallet.coins[0].status = status;
+            update_wallet(&pool, &wallet).await?;
+            assert!(insert_bip448_withdrawal_attempt_if_absent(&pool, &attempt)
+                .await
+                .is_err());
+            assert!(
+                list_bip448_withdrawal_attempts(&pool, "wallet", "statechain")
+                    .await?
+                    .is_empty()
+            );
+        }
+
+        let absent_pool = migrated_pool().await?;
+        let absent_attempt = ready_canonical_attempt_fixture(&absent_pool).await?;
+        sqlx::query("DELETE FROM wallet WHERE wallet_name = 'wallet'")
+            .execute(&absent_pool)
+            .await?;
+        assert!(
+            insert_bip448_withdrawal_attempt_if_absent(&absent_pool, &absent_attempt)
+                .await
+                .is_err()
+        );
+
+        let empty_pool = migrated_pool().await?;
+        let empty_attempt = ready_canonical_attempt_fixture(&empty_pool).await?;
+        update_wallet(&empty_pool, &sample_wallet()).await?;
+        assert!(
+            insert_bip448_withdrawal_attempt_if_absent(&empty_pool, &empty_attempt)
+                .await
+                .is_err()
+        );
+
+        let unrelated_pool = migrated_pool().await?;
+        let unrelated_attempt = ready_canonical_attempt_fixture(&unrelated_pool).await?;
+        let mut unrelated_wallet = get_wallet(&unrelated_pool, "wallet").await?;
+        unrelated_wallet.coins[0].statechain_id = Some("unrelated".into());
+        update_wallet(&unrelated_pool, &unrelated_wallet).await?;
+        assert!(
+            insert_bip448_withdrawal_attempt_if_absent(&unrelated_pool, &unrelated_attempt,)
+                .await
+                .is_err()
+        );
+
+        let multiple_pool = migrated_pool().await?;
+        let multiple_attempt = ready_canonical_attempt_fixture(&multiple_pool).await?;
+        let mut multiple_wallet = get_wallet(&multiple_pool, "wallet").await?;
+        multiple_wallet.coins.push(multiple_wallet.coins[0].clone());
+        update_wallet(&multiple_pool, &multiple_wallet).await?;
+        assert!(
+            insert_bip448_withdrawal_attempt_if_absent(&multiple_pool, &multiple_attempt,)
+                .await
+                .is_err()
+        );
+
+        let confirmed_pool = migrated_pool().await?;
+        let confirmed_attempt = ready_canonical_attempt_fixture(&confirmed_pool).await?;
+        assert!(
+            insert_bip448_withdrawal_attempt_if_absent(&confirmed_pool, &confirmed_attempt,)
+                .await
+                .is_ok()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bip448_canonical_attempt_requires_and_freezes_exact_close_snapshot() -> Result<()> {
+        let pool = migrated_pool().await?;
+        let (_, owner, script) = accepted_binding_fixture(&pool).await?;
+        let bindings = reconcile_bip448_funding_bindings(
+            &pool,
+            "wallet",
+            "statechain",
+            &owner.to_string(),
+            1,
+            &[
+                sample_binding_observation("34", 0, 100_000, &script),
+                sample_binding_observation("11", 1, 70_000, &script),
+            ],
+        )
+        .await?;
+        let canonical_binding = bindings
+            .iter()
+            .find(|binding| binding.binding_index == 0)
+            .unwrap()
+            .clone();
+        let duplicate_binding = bindings
+            .iter()
+            .find(|binding| binding.binding_index == 1)
+            .unwrap()
+            .clone();
+        let spent_duplicate = Bip448BindingObservation {
+            observation_status: Bip448ObservationStatus::SpentConfirmed,
+            spend_txid: Some("62".repeat(32)),
+            spend_height: Some(19),
+            ..sample_binding_observation("11", 1, 70_000, &script)
+        };
+        update_bip448_funding_binding_observation(&pool, &duplicate_binding, &spent_duplicate)
+            .await?;
+        let close_tip_hash = "61".repeat(32);
+        persist_bip448_scan_state(
+            &pool,
+            "wallet",
+            &script,
+            &Bip448ScanCursor {
+                coverage_start_height: 0,
+                scan_revision: 0,
+                last_scanned_height: 20,
+                last_scanned_block_hash: close_tip_hash.clone(),
+            },
+            &[],
+        )
+        .await?;
+        let snapshot = match classify_bip448_close_gate(&pool, "wallet", "statechain").await? {
+            Bip448CloseGate::Ready {
+                closing_bindings_json,
+                ..
+            } => closing_bindings_json,
+            blocked => return Err(anyhow!("unexpected canonical close blocker: {blocked:?}")),
+        };
+        assert!(snapshot.contains("\"kind\":\"IndependentSpend\""));
+
+        let mut canonical_attempt = sample_duplicate_attempt(&canonical_binding);
+        canonical_attempt.attempt_kind = Bip448WithdrawalAttemptKind::Canonical;
+        canonical_attempt.completion_status = Bip448CompletionStatus::Open;
+        canonical_attempt.closing_tip_height = Some(20);
+        canonical_attempt.closing_tip_hash = Some(close_tip_hash.clone());
+        canonical_attempt.closing_bindings_json = Some(snapshot.clone());
+        let mut malformed = canonical_attempt.clone();
+        malformed.closing_bindings_json = Some(format!(" {snapshot}"));
+        assert!(
+            insert_bip448_withdrawal_attempt_if_absent(&pool, &malformed)
+                .await
+                .is_err()
+        );
+
+        let mut illegal_duplicate_snapshot = sample_duplicate_attempt(&duplicate_binding);
+        illegal_duplicate_snapshot.closing_tip_height = Some(20);
+        illegal_duplicate_snapshot.closing_tip_hash = Some(close_tip_hash.clone());
+        illegal_duplicate_snapshot.closing_bindings_json = Some(snapshot.clone());
+        assert!(bip448_funding::validate_withdrawal_attempt(&illegal_duplicate_snapshot).is_err());
+
+        let stored = insert_bip448_withdrawal_attempt_if_absent(&pool, &canonical_attempt).await?;
+        assert!(
+            delete_prepared_bip448_withdrawal_attempt_for_confirmed_spend(
+                &pool,
+                &stored,
+                &"62".repeat(32),
+                20,
+                &close_tip_hash,
+            )
+            .await
+            .is_err(),
+            "canonical index 0 is never compare-deletable"
+        );
+        assert_eq!(
+            insert_bip448_withdrawal_attempt_if_absent(&pool, &canonical_attempt).await?,
+            stored
+        );
+        let mut conflict = canonical_attempt.clone();
+        conflict.destination_address = "different-destination".into();
+        assert!(insert_bip448_withdrawal_attempt_if_absent(&pool, &conflict)
+            .await
+            .is_err());
+
+        arm_bip448_withdrawal_sign_first(
+            &pool,
+            "wallet",
+            "statechain",
+            0,
+            &canonical_attempt.signing_id,
+        )
+        .await?;
+        let server_public_nonce = "81".repeat(66);
+        let encoded_session = "85".repeat(32);
+        let sign_second_payload_json = serde_json::to_string(
+            &mercurylib::bip448_statechain::signing_api::Bip448PartialSignatureRequestPayload {
+                statechain_id: "statechain".into(),
+                signed_statechain_id: canonical_attempt.signed_statechain_id.clone(),
+                signing_id: canonical_attempt.signing_id.clone(),
+                negate_seckey: 0,
+                session: encoded_session.clone(),
+                server_pub_nonce: server_public_nonce.clone(),
+            },
+        )?;
+        store_bip448_withdrawal_nonce_artifacts(
+            &pool,
+            "wallet",
+            "statechain",
+            0,
+            &canonical_attempt.signing_id,
+            &server_public_nonce,
+            &"82".repeat(32),
+            &sample_owner_key(4).0.to_string(),
+            &"84".repeat(32),
+            &encoded_session,
+            &sign_second_payload_json,
+        )
+        .await?;
+        arm_bip448_withdrawal_sign_second(
+            &pool,
+            "wallet",
+            "statechain",
+            0,
+            &canonical_attempt.signing_id,
+        )
+        .await?;
+        let aggregate_signature = "92".repeat(64);
+        let mut signed_transaction: bitcoin::Transaction =
+            bitcoin::consensus::deserialize(&hex::decode(&canonical_attempt.unsigned_tx_hex)?)?;
+        signed_transaction
+            .input
+            .get_mut(0)
+            .ok_or_else(|| anyhow!("sample canonical withdrawal has no input"))?
+            .witness
+            .push(hex::decode(&aggregate_signature)?);
+        store_bip448_withdrawal_signed_artifacts(
+            &pool,
+            "wallet",
+            "statechain",
+            0,
+            &canonical_attempt.signing_id,
+            &"91".repeat(32),
+            &aggregate_signature,
+            &hex::encode(bitcoin::consensus::serialize(&signed_transaction)),
+            &signed_transaction.txid().to_string(),
+            Bip448BroadcastStatus::NotBroadcast,
+        )
+        .await?;
+        update_bip448_withdrawal_broadcast_status(
+            &pool,
+            "wallet",
+            "statechain",
+            0,
+            &canonical_attempt.signing_id,
+            Bip448BroadcastStatus::NotBroadcast,
+            Bip448BroadcastStatus::Accepted,
+        )
+        .await?;
+        update_bip448_withdrawal_completion_status(
+            &pool,
+            "wallet",
+            "statechain",
+            &canonical_attempt.signing_id,
+            Bip448CompletionStatus::Open,
+            Bip448CompletionStatus::CloseArmed,
+        )
+        .await?;
+        let mut current = Bip448BroadcastStatus::Accepted;
+        for next in [
+            Bip448BroadcastStatus::Confirmed,
+            Bip448BroadcastStatus::NeedsRebroadcast,
+            Bip448BroadcastStatus::Conflicting,
+            Bip448BroadcastStatus::Conflicted,
+            Bip448BroadcastStatus::Accepted,
+        ] {
+            let row = update_bip448_withdrawal_broadcast_status(
+                &pool,
+                "wallet",
+                "statechain",
+                0,
+                &canonical_attempt.signing_id,
+                current,
+                next,
+            )
+            .await?;
+            assert_eq!(row.completion_status, Bip448CompletionStatus::CloseArmed);
+            current = next;
+        }
+        update_bip448_withdrawal_completion_status(
+            &pool,
+            "wallet",
+            "statechain",
+            &canonical_attempt.signing_id,
+            Bip448CompletionStatus::CloseArmed,
+            Bip448CompletionStatus::Closed,
+        )
+        .await?;
+        assert!(update_bip448_withdrawal_completion_status(
+            &pool,
+            "wallet",
+            "statechain",
+            &canonical_attempt.signing_id,
+            Bip448CompletionStatus::Closed,
+            Bip448CompletionStatus::Open,
+        )
+        .await
+        .is_err());
+
+        let late = sample_binding_observation("12", 2, 60_000, &script);
+        let rows = reconcile_bip448_funding_bindings(
+            &pool,
+            "wallet",
+            "statechain",
+            &owner.to_string(),
+            1,
+            &[
+                sample_binding_observation("34", 0, 100_000, &script),
+                spent_duplicate,
+                late,
+            ],
+        )
+        .await?;
+        let late_binding = rows
+            .into_iter()
+            .find(|binding| binding.txid == "12".repeat(32))
+            .unwrap();
+        assert!(insert_bip448_withdrawal_attempt_if_absent(
+            &pool,
+            &sample_duplicate_attempt(&late_binding)
+        )
+        .await
+        .is_err());
+        assert!(validate_bip448_canonical_close_snapshot(
+            &pool,
+            "wallet",
+            "statechain",
+            &canonical_attempt.signing_id
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            get_bip448_withdrawal_attempt(&pool, "wallet", "statechain", 0)
+                .await?
+                .unwrap()
+                .closing_bindings_json,
+            Some(snapshot),
+            "late discovery never rewrites the frozen canonical snapshot"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bip448_close_gate_classifies_every_observation_phase_and_broadcast_blocker(
+    ) -> Result<()> {
+        let pool = migrated_pool().await?;
+        let (_, owner, script) = accepted_binding_fixture(&pool).await?;
+        let duplicate = reconcile_bip448_funding_bindings(
+            &pool,
+            "wallet",
+            "statechain",
+            &owner.to_string(),
+            1,
+            &[
+                sample_binding_observation("34", 0, 100_000, &script),
+                sample_binding_observation("11", 1, 70_000, &script),
+            ],
+        )
+        .await?
+        .into_iter()
+        .find(|row| row.binding_index == 1)
+        .unwrap();
+        for status in [
+            Bip448ObservationStatus::Mempool,
+            Bip448ObservationStatus::Unconfirmed,
+            Bip448ObservationStatus::Confirmed,
+            Bip448ObservationStatus::SpentMempool,
+            Bip448ObservationStatus::SpentUnconfirmed,
+            Bip448ObservationStatus::Absent,
+        ] {
+            let mut binding = duplicate.clone();
+            binding.observation_status = status;
+            binding.funding_height = match status {
+                Bip448ObservationStatus::Mempool
+                | Bip448ObservationStatus::SpentMempool
+                | Bip448ObservationStatus::Absent => None,
+                _ => Some(10),
+            };
+            binding.spend_txid = matches!(
+                status,
+                Bip448ObservationStatus::SpentMempool | Bip448ObservationStatus::SpentUnconfirmed
+            )
+            .then(|| "81".repeat(32));
+            binding.spend_height =
+                (status == Bip448ObservationStatus::SpentUnconfirmed).then_some(11);
+            assert!(
+                matches!(
+                    bip448_funding::evaluate_bip448_close_gate(&[binding], &[])?,
+                    Bip448CloseGate::Blocked { .. }
+                ),
+                "{status:?} did not block"
+            );
+        }
+        let mut independently_spent = duplicate.clone();
+        independently_spent.observation_status = Bip448ObservationStatus::SpentConfirmed;
+        independently_spent.spend_txid = Some("82".repeat(32));
+        independently_spent.spend_height = Some(11);
+        assert!(matches!(
+            bip448_funding::evaluate_bip448_close_gate(&[independently_spent.clone()], &[])?,
+            Bip448CloseGate::Ready { .. }
+        ));
+
+        let mut attempt = sample_duplicate_attempt(&duplicate);
+        for phase in [
+            Bip448WithdrawalPhase::Prepared,
+            Bip448WithdrawalPhase::FirstArmed,
+            Bip448WithdrawalPhase::NonceStored,
+            Bip448WithdrawalPhase::SecondArmed,
+        ] {
+            attempt.phase = phase;
+            assert!(matches!(
+                bip448_funding::evaluate_bip448_close_gate(
+                    &[duplicate.clone()],
+                    &[attempt.clone()]
+                )?,
+                Bip448CloseGate::Blocked { .. }
+            ));
+        }
+        attempt.phase = Bip448WithdrawalPhase::Signed;
+        attempt.txid = Some("83".repeat(32));
+        for status in [
+            Bip448BroadcastStatus::NotBroadcast,
+            Bip448BroadcastStatus::NeedsRebroadcast,
+            Bip448BroadcastStatus::Conflicting,
+        ] {
+            attempt.broadcast_status = status;
+            assert!(matches!(
+                bip448_funding::evaluate_bip448_close_gate(
+                    &[duplicate.clone()],
+                    &[attempt.clone()]
+                )?,
+                Bip448CloseGate::Blocked { .. }
+            ));
+        }
+        for status in [
+            Bip448BroadcastStatus::Accepted,
+            Bip448BroadcastStatus::Confirmed,
+        ] {
+            attempt.broadcast_status = status;
+            assert!(matches!(
+                bip448_funding::evaluate_bip448_close_gate(
+                    &[duplicate.clone()],
+                    &[attempt.clone()]
+                )?,
+                Bip448CloseGate::Ready { .. }
+            ));
+        }
+        attempt.broadcast_status = Bip448BroadcastStatus::Conflicted;
+        assert!(matches!(
+            bip448_funding::evaluate_bip448_close_gate(&[independently_spent], &[attempt])?,
+            Bip448CloseGate::Ready { .. }
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bip448_storage_close_gate_checks_transfer_pending_message_and_coin_blockers(
+    ) -> Result<()> {
+        let pool = migrated_pool().await?;
+        let (record, owner, script) = accepted_binding_fixture(&pool).await?;
+        reconcile_bip448_funding_bindings(
+            &pool,
+            "wallet",
+            "statechain",
+            &owner.to_string(),
+            1,
+            &[sample_binding_observation("34", 0, 100_000, &script)],
+        )
+        .await?;
+        assert!(matches!(
+            classify_bip448_close_gate(&pool, "wallet", "statechain").await?,
+            Bip448CloseGate::Ready { .. }
+        ));
+
+        let pending = Bip448PendingDepositSigning {
+            wallet_name: "wallet".into(),
+            statechain_id: "statechain".into(),
+            funding_txid: record.funding_outpoint.txid.clone(),
+            funding_vout: record.funding_outpoint.vout,
+            funding_value_sats: record.funding_outpoint.value_sats,
+            update_template_hash: "41".repeat(32),
+            settlement_template_hash: "42".repeat(32),
+            state_locktime: 700_000_043,
+            signing_id: "43".repeat(32),
+            client_secret_nonce: "44".repeat(132),
+            client_public_nonce: "45".repeat(66),
+            blinding_factor: "46".repeat(32),
+            server_public_nonce: None,
+        };
+        insert_bip448_pending_transfer_signing_if_absent(&pool, &pending).await?;
+        assert!(matches!(
+            classify_bip448_close_gate(&pool, "wallet", "statechain").await?,
+            Bip448CloseGate::Blocked { reasons }
+                if reasons == vec![Bip448CloseBlockReason::PendingTransferSigning]
+        ));
+        delete_bip448_pending_transfer_signing(&pool, "wallet", "statechain", &pending.signing_id)
+            .await?;
+
+        let recipient = sample_owner_key(3).0.to_string();
+        insert_or_update_bip448_transfer_msg(
+            &pool,
+            "wallet",
+            &recipient,
+            &sample_bip448_transfer_msg(),
+        )
+        .await?;
+        assert!(matches!(
+            classify_bip448_close_gate(&pool, "wallet", "statechain").await?,
+            Bip448CloseGate::Blocked { reasons }
+                if reasons == vec![Bip448CloseBlockReason::OutgoingTransferMessage {
+                    recipient_auth_pubkey: recipient.clone()
+                }]
+        ));
+        delete_bip448_transfer_msgs(&pool, "wallet", "statechain").await?;
+
+        let mut wallet = get_wallet(&pool, "wallet").await?;
+        let mut in_transfer = wallet.get_new_coin()?;
+        in_transfer.statechain_protocol = Some("bip448".into());
+        in_transfer.statechain_id = Some("statechain".into());
+        in_transfer.status = CoinStatus::IN_TRANSFER;
+        wallet.coins.push(in_transfer);
+        update_wallet(&pool, &wallet).await?;
+        assert!(matches!(
+            classify_bip448_close_gate(&pool, "wallet", "statechain").await?,
+            Bip448CloseGate::Blocked { reasons }
+                if reasons == vec![Bip448CloseBlockReason::CoinInTransfer]
+        ));
+        wallet.coins.clear();
+        update_wallet(&pool, &wallet).await?;
+
+        let intent = sample_transfer_intent("e1");
+        insert_bip448_transfer_intent_if_absent(&pool, &intent).await?;
+        assert!(matches!(
+            classify_bip448_close_gate(&pool, "wallet", "statechain").await?,
+            Bip448CloseGate::Blocked { reasons }
+                if reasons == vec![Bip448CloseBlockReason::ActiveTransferIntent {
+                    intent_id: intent.intent_id.clone()
+                }]
+        ));
         Ok(())
     }
 }
