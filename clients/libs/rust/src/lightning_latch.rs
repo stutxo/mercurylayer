@@ -1,4 +1,6 @@
-use crate::{client_config::ClientConfig, sqlite_manager::get_wallet};
+use crate::{
+    bip448_owner::get_current_bip448_owner, client_config::ClientConfig, sqlite_manager::get_wallet,
+};
 use anyhow::{anyhow, Result};
 use mercurylib::{
     transfer::sender::{
@@ -20,41 +22,29 @@ pub async fn create_pre_image(
     wallet_name: &str,
     statechain_id: &str,
 ) -> Result<CreatePreImageResponse> {
-    let batch_id = Some(uuid::Uuid::new_v4().to_string()).unwrap();
-
-    let mut wallet: mercurylib::wallet::Wallet =
-        get_wallet(&client_config.pool, &wallet_name).await?;
-
+    let wallet: mercurylib::wallet::Wallet = get_wallet(&client_config.pool, &wallet_name).await?;
+    let current_owner =
+        get_current_bip448_owner(client_config, &wallet, wallet_name, statechain_id).await?;
     let coin = wallet
         .coins
-        .iter_mut()
-        .filter(|tx| tx.statechain_id == Some(statechain_id.to_string())) // Filter coins with the specified statechain_id
-        .min_by_key(|tx| tx.locktime.unwrap_or(u32::MAX)); // Find the one with the lowest locktime
-
-    if coin.is_none() {
-        return Err(anyhow!(
-            "No coins associated with this statechain ID were found"
-        ));
-    }
-
-    let coin = coin.unwrap();
+        .get(current_owner.coin_index)
+        .ok_or_else(|| anyhow!("current BIP448 owner index is no longer present in the wallet"))?;
 
     if coin.amount.is_none() {
         return Err(anyhow::anyhow!("coin.amount is None"));
     }
 
-    if coin.status != CoinStatus::CONFIRMED && coin.status != CoinStatus::IN_TRANSFER {
-        return Err(anyhow::anyhow!(
-            "Coin status must be CONFIRMED or IN_TRANSFER to transfer it. The current status is {}",
-            coin.status
-        ));
-    }
+    ensure_create_pre_image_status(&coin.status)?;
 
     if coin.locktime.is_none() {
         return Err(anyhow::anyhow!("coin.locktime is None"));
     }
 
-    let signed_statechain_id = coin.signed_statechain_id.as_ref().unwrap();
+    let signed_statechain_id = coin
+        .signed_statechain_id
+        .as_ref()
+        .ok_or_else(|| anyhow!("coin.signed_statechain_id is None"))?;
+    let batch_id = uuid::Uuid::new_v4().to_string();
 
     let payment_hash_payload = PaymentHashRequestPayload {
         statechain_id: statechain_id.to_string(),
@@ -91,24 +81,17 @@ pub async fn confirm_pending_invoice(
     wallet_name: &str,
     statechain_id: &str,
 ) -> Result<()> {
-    let mut wallet: mercurylib::wallet::Wallet =
-        get_wallet(&client_config.pool, &wallet_name).await?;
-
+    let wallet: mercurylib::wallet::Wallet = get_wallet(&client_config.pool, &wallet_name).await?;
+    let current_owner =
+        get_current_bip448_owner(client_config, &wallet, wallet_name, statechain_id).await?;
     let coin = wallet
         .coins
-        .iter_mut()
-        .filter(|tx| tx.statechain_id == Some(statechain_id.to_string())) // Filter coins with the specified statechain_id
-        .min_by_key(|tx| tx.locktime.unwrap_or(u32::MAX)); // Find the one with the lowest locktime
-
-    if coin.is_none() {
-        return Err(anyhow!(
-            "No coins associated with this statechain ID were found"
-        ));
-    }
-
-    let coin = coin.unwrap();
-
-    let signed_statechain_id = coin.signed_statechain_id.as_ref().unwrap();
+        .get(current_owner.coin_index)
+        .ok_or_else(|| anyhow!("current BIP448 owner index is no longer present in the wallet"))?;
+    let signed_statechain_id = coin
+        .signed_statechain_id
+        .as_ref()
+        .ok_or_else(|| anyhow!("coin.signed_statechain_id is None"))?;
 
     let path = "transfer/unlock";
 
@@ -143,24 +126,15 @@ pub async fn retrieve_pre_image(
     statechain_id: &str,
     batch_id: &str,
 ) -> Result<String> {
-    let mut wallet: mercurylib::wallet::Wallet =
-        get_wallet(&client_config.pool, &wallet_name).await?;
-
+    let wallet: mercurylib::wallet::Wallet = get_wallet(&client_config.pool, &wallet_name).await?;
     let coin = wallet
         .coins
-        .iter_mut()
-        .filter(|tx| tx.statechain_id == Some(statechain_id.to_string())) // Filter coins with the specified statechain_id
-        .min_by_key(|tx| tx.locktime.unwrap_or(u32::MAX)); // Find the one with the lowest locktime
-
-    if coin.is_none() {
-        return Err(anyhow!(
-            "No coins associated with this statechain ID were found"
-        ));
-    }
-
-    let coin = coin.unwrap();
-
-    let signed_statechain_id = coin.signed_statechain_id.as_ref().unwrap();
+        .get(historical_latch_creator_coin_index(&wallet, statechain_id)?)
+        .ok_or_else(|| anyhow!("historical latch creator is no longer present in the wallet"))?;
+    let signed_statechain_id = coin
+        .signed_statechain_id
+        .as_ref()
+        .ok_or_else(|| anyhow!("coin.signed_statechain_id is None"))?;
 
     let path = "transfer/transfer_preimage";
 
@@ -211,4 +185,91 @@ pub async fn get_payment_hash(
         serde_json::from_str(value.as_str())?;
 
     Ok(Some(payment_hash_response_payload.hash))
+}
+
+fn ensure_create_pre_image_status(status: &CoinStatus) -> Result<()> {
+    if !matches!(status, CoinStatus::CONFIRMED | CoinStatus::IN_TRANSFER) {
+        return Err(anyhow!(
+            "Coin status must be CONFIRMED or IN_TRANSFER to transfer it. The current status is {}",
+            status
+        ));
+    }
+    Ok(())
+}
+
+// Preimage retrieval authenticates the wallet generation that created the
+// latch. It is intentionally historical cleanup after ownership may rotate,
+// unlike latch creation and confirmation, which require the current owner.
+fn historical_latch_creator_coin_index(
+    wallet: &mercurylib::wallet::Wallet,
+    statechain_id: &str,
+) -> Result<usize> {
+    wallet
+        .coins
+        .iter()
+        .enumerate()
+        .filter(|(_, coin)| coin.statechain_id.as_deref() == Some(statechain_id))
+        .min_by_key(|(_, coin)| coin.locktime.unwrap_or(u32::MAX))
+        .map(|(coin_index, _)| coin_index)
+        .ok_or_else(|| anyhow!("No coins associated with this statechain ID were found"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mercurylib::wallet::{Settings, Wallet};
+
+    fn wallet() -> Wallet {
+        Wallet {
+            name: "wallet".to_string(),
+            mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string(),
+            version: "0.1.0".to_string(),
+            state_entity_endpoint: "http://127.0.0.1:1".to_string(),
+            chain_backend: "core".to_string(),
+            chain_endpoint: "http://127.0.0.1:1".to_string(),
+            network: "regtest".to_string(),
+            blockheight: 0,
+            activities: Vec::new(),
+            coins: Vec::new(),
+            settings: Settings {
+                network: "regtest".to_string(),
+                block_explorerURL: None,
+                torProxyHost: None,
+                torProxyPort: None,
+                torProxyControlPassword: None,
+                torProxyControlPort: None,
+                statechainEntityApi: "http://127.0.0.1:1".to_string(),
+                torStatechainEntityApi: None,
+                chainBackend: "core".to_string(),
+                chainUrl: "http://127.0.0.1:1".to_string(),
+                chainType: None,
+                notifications: false,
+                tutorials: false,
+            },
+        }
+    }
+
+    #[test]
+    fn selected_owner_create_status_gate_is_preserved() {
+        assert!(ensure_create_pre_image_status(&CoinStatus::CONFIRMED).is_ok());
+        assert!(ensure_create_pre_image_status(&CoinStatus::IN_TRANSFER).is_ok());
+        assert!(ensure_create_pre_image_status(&CoinStatus::INITIALISED).is_err());
+    }
+
+    #[test]
+    fn retrieval_uses_the_historical_latch_creator_after_owner_rotation() {
+        let mut wallet = wallet();
+        let mut current_owner = wallet.get_new_coin().unwrap();
+        current_owner.statechain_id = Some("statechain".to_string());
+        current_owner.locktime = Some(200);
+        let mut latch_creator = wallet.get_new_coin().unwrap();
+        latch_creator.statechain_id = Some("statechain".to_string());
+        latch_creator.locktime = Some(100);
+        wallet.coins = vec![current_owner, latch_creator];
+
+        assert_eq!(
+            historical_latch_creator_coin_index(&wallet, "statechain").unwrap(),
+            1
+        );
+    }
 }

@@ -1,3 +1,4 @@
+pub mod bip448_owner;
 pub mod bip448_recovery;
 pub mod bip448_transfer_sender;
 pub mod bip448_withdraw;

@@ -9,11 +9,14 @@ use mercurylib::{
         deposit::{self as bip448_deposit, Bip448DepositError},
         storage::Bip448StatechainRecord,
     },
-    utils::is_enclave_pubkey_part_of_coin,
     wallet::{Activity, Coin, CoinStatus, Wallet},
 };
 
 use crate::{
+    bip448_owner::{
+        classify_bip448_owner_relation, get_bip448_statechain_presence, Bip448OwnerRelation,
+        Bip448StatechainPresence,
+    },
     chain::{ChainUtxo, DescriptorActivity},
     client_config::ClientConfig,
     deposit::create_bip448_deposit_state,
@@ -718,28 +721,44 @@ fn restore_bip448_deposit_state_from_record(
     Ok(())
 }
 
-async fn check_transfer(client_config: &ClientConfig, coin: &Coin) -> Result<bool> {
-    if coin.statechain_id.is_none() {
-        return Err(anyhow!("Coin does not have a statechain ID"));
+async fn check_transfer(client_config: &ClientConfig, coin: &mut Coin) -> Result<()> {
+    let statechain_id = coin
+        .statechain_id
+        .clone()
+        .ok_or_else(|| anyhow!("Coin does not have a statechain ID"))?;
+    let presence = get_bip448_statechain_presence(client_config, &statechain_id).await?;
+    apply_bip448_transfer_presence(coin, &presence, &statechain_id)
+}
+
+fn apply_bip448_transfer_presence(
+    coin: &mut Coin,
+    presence: &Bip448StatechainPresence,
+    statechain_id: &str,
+) -> Result<()> {
+    let aggregate_pubkey = coin
+        .aggregated_pubkey
+        .as_deref()
+        .ok_or_else(|| anyhow!("BIP448 in-transfer coin is missing aggregated_pubkey"))?;
+    let stored_server_pubkey = coin
+        .server_pubkey
+        .as_deref()
+        .ok_or_else(|| anyhow!("BIP448 in-transfer coin is missing server_pubkey"))?;
+    let relation = classify_bip448_owner_relation(
+        presence,
+        &coin.user_pubkey,
+        stored_server_pubkey,
+        aggregate_pubkey,
+    )?;
+    match relation {
+        Bip448OwnerRelation::Current => Ok(()),
+        Bip448OwnerRelation::Rotated => {
+            coin.status = CoinStatus::TRANSFERRED;
+            Ok(())
+        }
+        Bip448OwnerRelation::Missing => Err(anyhow!(
+            "BIP448 statechain {statechain_id} is missing; transfer ownership is closed or unknown and the coin remains IN_TRANSFER"
+        )),
     }
-
-    let statechain_id = coin.statechain_id.as_ref().unwrap();
-
-    let statechain_info = crate::utils::get_statechain_info(statechain_id, &client_config).await?;
-
-    // if the statechain info is not found, we assume the coin has been transferred
-    if statechain_info.is_none() {
-        return Ok(true);
-    }
-
-    let statechain_info = statechain_info.unwrap();
-
-    let enclave_public_key = statechain_info.enclave_public_key;
-
-    // if the enclave's public key is no longer part of the coin, the coin has been transferred
-    let is_transferred = !is_enclave_pubkey_part_of_coin(&coin, &enclave_public_key)?;
-
-    return Ok(is_transferred);
 }
 
 async fn check_withdrawal(client_config: &ClientConfig, coin: &mut Coin) -> Result<()> {
@@ -897,11 +916,7 @@ pub async fn update_coins(client_config: &ClientConfig, wallet_name: &str) -> Re
                 wallet.activities.push(deposit_result.activity);
             }
         } else if coin.status == CoinStatus::IN_TRANSFER {
-            let is_transferred = check_transfer(client_config, coin).await?;
-
-            if is_transferred {
-                coin.status = CoinStatus::TRANSFERRED;
-            }
+            check_transfer(client_config, coin).await?;
         } else if coin.status == CoinStatus::WITHDRAWING {
             check_withdrawal(client_config, coin).await?;
         }
@@ -927,7 +942,9 @@ mod tests {
         Bip448FundingOutpoint, Bip448LatestState, Bip448RecoveryTemplateRole,
         Bip448SigningMetadata, Bip448ValueSchedule,
     };
+    use mercurylib::transfer::receiver::StatechainInfoResponsePayload;
     use mercurylib::wallet::{Settings, Wallet};
+    use secp256k1::{PublicKey, Secp256k1, SecretKey};
     use sqlx::sqlite::SqlitePoolOptions;
 
     async fn test_client_config() -> Result<ClientConfig> {
@@ -1269,6 +1286,88 @@ mod tests {
 
         assert!(result.is_err());
         assert!(deferred_errors.is_empty());
+    }
+
+    #[test]
+    fn only_a_valid_positive_rotation_mutates_an_in_transfer_coin() {
+        fn public_key(byte: u8) -> PublicKey {
+            SecretKey::from_secret_bytes([byte; 32])
+                .unwrap()
+                .public_key(&Secp256k1::new())
+        }
+
+        fn present(server_pubkey: impl ToString) -> Bip448StatechainPresence {
+            Bip448StatechainPresence::Present(StatechainInfoResponsePayload {
+                enclave_public_key: server_pubkey.to_string(),
+                num_sigs: 2,
+                statechain_info: Vec::new(),
+                x1_pub: None,
+            })
+        }
+
+        let owner_user = public_key(3);
+        let stored_server = public_key(5);
+        let aggregate = owner_user.combine(&stored_server).unwrap();
+        let rotated_server = public_key(7);
+        let mut coin = sample_coin();
+        coin.status = CoinStatus::IN_TRANSFER;
+        coin.user_pubkey = owner_user.to_string();
+        coin.server_pubkey = Some(stored_server.to_string());
+        coin.aggregated_pubkey = Some(aggregate.to_string());
+
+        apply_bip448_transfer_presence(&mut coin, &present(stored_server), "statechain").unwrap();
+        assert_eq!(coin.status, CoinStatus::IN_TRANSFER);
+
+        let mut rotated = coin.clone();
+        apply_bip448_transfer_presence(&mut rotated, &present(rotated_server), "statechain")
+            .unwrap();
+        assert_eq!(rotated.status, CoinStatus::TRANSFERRED);
+
+        let mut corrupt_aggregate = coin.clone();
+        corrupt_aggregate.aggregated_pubkey = Some(public_key(11).to_string());
+        let error = apply_bip448_transfer_presence(
+            &mut corrupt_aggregate,
+            &present(stored_server),
+            "statechain",
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("stored BIP448 owner generation does not reproduce"));
+        assert_eq!(corrupt_aggregate.status, CoinStatus::IN_TRANSFER);
+
+        let mut corrupt_stored_tuple = coin.clone();
+        corrupt_stored_tuple.server_pubkey = Some(public_key(9).to_string());
+        let error = apply_bip448_transfer_presence(
+            &mut corrupt_stored_tuple,
+            &present(rotated_server),
+            "statechain",
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("stored BIP448 owner generation does not reproduce"));
+        assert_eq!(corrupt_stored_tuple.status, CoinStatus::IN_TRANSFER);
+
+        let mut missing = coin.clone();
+        let error = apply_bip448_transfer_presence(
+            &mut missing,
+            &Bip448StatechainPresence::Missing,
+            "statechain",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("closed or unknown"));
+        assert!(error.to_string().contains("remains IN_TRANSFER"));
+        assert_eq!(missing.status, CoinStatus::IN_TRANSFER);
+
+        let mut invalid_reported_key = coin;
+        assert!(apply_bip448_transfer_presence(
+            &mut invalid_reported_key,
+            &present("invalid"),
+            "statechain",
+        )
+        .is_err());
+        assert_eq!(invalid_reported_key.status, CoinStatus::IN_TRANSFER);
     }
 
     #[tokio::test]

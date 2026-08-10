@@ -17,6 +17,7 @@ use mercurylib::{
 use secp256k1::{rand, SecretKey};
 
 use crate::{
+    bip448_owner::get_current_bip448_owner,
     client_config::ClientConfig,
     deposit::{bip448_sign_first, bip448_sign_second},
     sqlite_manager::{
@@ -45,12 +46,20 @@ pub async fn execute(
     fee_rate: Option<f64>,
 ) -> Result<()> {
     let mut wallet = get_wallet(&client_config.pool, wallet_name).await?;
-    let coin_index = wallet
+    let has_statechain_coin = wallet
         .coins
         .iter()
-        .position(|coin| coin.statechain_id.as_deref() == Some(statechain_id))
-        .ok_or_else(|| anyhow!("No coins associated with this statechain ID were found"))?;
-    if !is_bip448_coin(&wallet.coins[coin_index]) {
+        .any(|coin| coin.statechain_id.as_deref() == Some(statechain_id));
+    if !has_statechain_coin {
+        return Err(anyhow!(
+            "No coins associated with this statechain ID were found"
+        ));
+    }
+    if !wallet
+        .coins
+        .iter()
+        .any(|coin| coin.statechain_id.as_deref() == Some(statechain_id) && is_bip448_coin(coin))
+    {
         return Err(anyhow!(
             "statechain {statechain_id} is not a BIP448 coin; BIP448 withdrawal requires an accepted BIP448 coin"
         ));
@@ -67,14 +76,14 @@ pub async fn execute(
         return Err(anyhow!("Invalid address"));
     }
 
+    let current_owner =
+        get_current_bip448_owner(client_config, &wallet, wallet_name, statechain_id).await?;
+    let coin_index = current_owner.coin_index;
     let record = get_bip448_statechain(&client_config.pool, wallet_name, statechain_id).await?;
-    let coin = &mut wallet.coins[coin_index];
-    if coin.status != CoinStatus::CONFIRMED && coin.status != CoinStatus::IN_TRANSFER {
-        return Err(anyhow!(
-            "Coin status must be CONFIRMED or IN_TRANSFER to withdraw it. The current status is {}",
-            coin.status
-        ));
-    }
+    let coin = wallet.coins.get_mut(coin_index).ok_or_else(|| {
+        anyhow!("selected BIP448 withdrawal owner index is absent from its wallet snapshot")
+    })?;
+    ensure_withdraw_status(&coin.status)?;
     if coin.aggregated_pubkey.as_deref() != Some(record.aggregate_pubkey.as_str())
         || record.network != wallet.network
         || record.amount_sats != record.funding_outpoint.value_sats
@@ -173,6 +182,16 @@ pub async fn execute(
     Ok(())
 }
 
+fn ensure_withdraw_status(status: &CoinStatus) -> Result<()> {
+    if !matches!(status, CoinStatus::CONFIRMED | CoinStatus::IN_TRANSFER) {
+        return Err(anyhow!(
+            "Coin status must be CONFIRMED or IN_TRANSFER to withdraw it. The current status is {}",
+            status
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,6 +269,13 @@ mod tests {
         let error =
             require_statechain_deleted(r#"{"message":"Statechain retained."}"#).unwrap_err();
         assert_eq!(error.to_string(), UNEXPECTED_COMPLETION_RESPONSE);
+    }
+
+    #[test]
+    fn selected_owner_status_gate_remains_operation_specific() {
+        assert!(ensure_withdraw_status(&CoinStatus::CONFIRMED).is_ok());
+        assert!(ensure_withdraw_status(&CoinStatus::IN_TRANSFER).is_ok());
+        assert!(ensure_withdraw_status(&CoinStatus::INITIALISED).is_err());
     }
 
     #[tokio::test]

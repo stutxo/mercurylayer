@@ -1,12 +1,20 @@
 use crate::{
+    bip448_owner::{
+        classify_bip448_owner_relation, current_server_public_key, get_bip448_statechain_presence,
+        get_current_bip448_owner, select_current_bip448_owner, validate_bip448_coin_local_auth,
+        Bip448OwnerRelation, Bip448StatechainPresence,
+    },
     client_config::ClientConfig,
     deposit::{bip448_sign_first, bip448_sign_second, bip448_signature_count},
     sqlite_manager::*,
     transfer_receiver::bip448_transfer_receiver::expected_server_pubkey,
-    utils,
 };
 use anyhow::{anyhow, Result};
-use bitcoin::{absolute, hashes::Hash, Address, Network, OutPoint, PrivateKey, Txid};
+use bitcoin::{
+    absolute,
+    hashes::{sha256, Hash},
+    Address, Network, OutPoint, PrivateKey, Txid,
+};
 use mercurylib::{
     bip448_statechain::{
         script::{checked_next_state_locktime, sample_future_state_stride},
@@ -27,7 +35,7 @@ use secp256k1::{
         new_musig_nonce_pair, BlindingFactor, MusigSessionId, PublicNonce,
         SecretNonce as MusigSecNonce,
     },
-    rand, KeyPair, Message, PublicKey, Scalar, Secp256k1, SecretKey,
+    rand, schnorr, KeyPair, Message, PublicKey, Scalar, Secp256k1, SecretKey,
 };
 use std::{future::Future, str::FromStr};
 const ELIGIBILITY_ERROR: &str =
@@ -118,86 +126,130 @@ pub async fn transfer_bip448_sender(
     let record = get_bip448_statechain_optional(&client_config.pool, wallet_name, statechain_id)
         .await?
         .ok_or_else(eligibility_error)?;
-    let coin_index = wallet
-        .coins
-        .iter()
-        .enumerate()
-        .filter(|(_, coin)| {
-            coin.statechain_id.as_deref() == Some(statechain_id)
-                && mercurylib::bip448_statechain::deposit::is_bip448_coin(coin)
-        })
-        .filter_map(|(index, coin)| {
-            transfer_status_priority(&coin.status).map(|priority| (priority, index))
-        })
-        .min_by_key(|(priority, _)| *priority)
-        .map(|(_, index)| index)
-        .ok_or_else(eligibility_error)?;
-    ensure_local_eligibility(record.latest_state_number, &wallet.coins[coin_index].status)?;
+    ensure_any_locally_eligible_coin(&wallet, statechain_id, record.latest_state_number)?;
     if !validate_address(recipient_address, &wallet.network)? {
         return Err(anyhow!("Invalid address"));
     }
     let (_, receiver_user_pubkey, recipient_auth_pubkey) =
         decode_transfer_address(recipient_address)?;
     let recipient_auth = recipient_auth_pubkey.to_string();
-    if let Some(transfer_msg) = get_bip448_transfer_msg(
+    if let Some(transfer_msg) = load_bip448_transfer_msg_optional(
         &client_config.pool,
         wallet_name,
         statechain_id,
         &recipient_auth,
     )
-    .await
-    .map(Some)
-    .or_else(|error| {
-        if matches!(
-            error.downcast_ref::<sqlx::Error>(),
-            Some(sqlx::Error::RowNotFound)
-        ) {
-            Ok(None)
-        } else {
-            Err(error)
-        }
-    })? {
-        if transfer_msg.statechain_id != statechain_id
-            || transfer_msg.receiver_user_public_key != receiver_user_pubkey.to_string()
-        {
-            return Err(anyhow!(
-                "BIP448 persisted transfer message does not match the recipient address"
-            ));
-        }
-        let coin = wallet.coins[coin_index].clone();
-        ensure_persisted_transfer_delivered(
-            || {
-                verify_persisted_transfer_completed(
-                    client_config,
-                    &transfer_msg,
-                    &receiver_user_pubkey,
-                )
-            },
-            || async {
-                let encrypted_transfer_msg = upload_transfer_msg(
-                    client_config,
-                    &coin,
-                    &recipient_auth_pubkey,
-                    &transfer_msg,
-                )
-                .await?;
-                bip448_process_checkpoint("transfer_msg_uploaded");
-                Ok(encrypted_transfer_msg)
-            },
-            |encrypted_transfer_msg| {
-                let recipient_auth = recipient_auth.as_str();
-                async move {
-                    transfer_message_is_stored(
-                        client_config,
-                        recipient_auth,
-                        &encrypted_transfer_msg,
-                    )
-                    .await
-                }
-            },
+    .await?
+    {
+        let sender_coin_index = validate_persisted_transfer_message(
+            &client_config.pool,
+            &wallet,
+            &record,
+            statechain_id,
+            &receiver_user_pubkey,
+            &transfer_msg,
         )
         .await?;
-        finish_transfer(client_config, &mut wallet, coin_index).await?;
+        let presence = get_bip448_statechain_presence(client_config, statechain_id).await?;
+        let relation = classify_bip448_owner_relation(
+            &presence,
+            &transfer_msg.sender_user_public_key,
+            &transfer_msg.server_public_key,
+            &record.aggregate_pubkey,
+        )?;
+        let coin_index = match relation {
+            Bip448OwnerRelation::Current => {
+                let owner = select_current_bip448_owner(
+                    &wallet,
+                    statechain_id,
+                    &record.aggregate_pubkey,
+                    presence,
+                )?;
+                if owner.coin_index != sender_coin_index {
+                    return Err(anyhow!(
+                        "persisted BIP448 transfer sender does not match the current owner generation"
+                    ));
+                }
+                ensure_local_eligibility(
+                    record.latest_state_number,
+                    &wallet
+                        .coins
+                        .get(owner.coin_index)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "selected BIP448 transfer owner index is absent from its wallet snapshot"
+                            )
+                        })?
+                        .status,
+                )?;
+                owner.coin_index
+            }
+            Bip448OwnerRelation::Rotated => {
+                let Bip448StatechainPresence::Present(statechain_info) = &presence else {
+                    unreachable!("Rotated requires a present statechain response")
+                };
+                let current_server = current_server_public_key(statechain_info)?;
+                let expected_receiver_server =
+                    expected_server_pubkey(&transfer_msg, &receiver_user_pubkey)?;
+                if current_server != expected_receiver_server {
+                    return Err(anyhow!(
+                        "BIP448 statechain rotated to an unrelated owner generation"
+                    ));
+                }
+                sender_coin_index
+            }
+            Bip448OwnerRelation::Missing => {
+                return Err(anyhow!(
+                    "BIP448 statechain is missing; persisted transfer ownership is closed or unknown"
+                ));
+            }
+        };
+        let coin = wallet
+            .coins
+            .get(coin_index)
+            .ok_or_else(|| {
+                anyhow!("selected BIP448 transfer owner index is absent from its wallet snapshot")
+            })?
+            .clone();
+        resume_persisted_transfer(
+            relation,
+            || async {
+                ensure_persisted_transfer_delivered(
+                    || {
+                        verify_persisted_transfer_completed(
+                            client_config,
+                            &transfer_msg,
+                            &receiver_user_pubkey,
+                        )
+                    },
+                    || async {
+                        let encrypted_transfer_msg = upload_transfer_msg(
+                            client_config,
+                            &coin,
+                            &recipient_auth_pubkey,
+                            &transfer_msg,
+                        )
+                        .await?;
+                        bip448_process_checkpoint("transfer_msg_uploaded");
+                        Ok(encrypted_transfer_msg)
+                    },
+                    |encrypted_transfer_msg| {
+                        let recipient_auth = recipient_auth.as_str();
+                        async move {
+                            transfer_message_is_stored(
+                                client_config,
+                                recipient_auth,
+                                &encrypted_transfer_msg,
+                            )
+                            .await
+                        }
+                    },
+                )
+                .await
+            },
+            || finish_transfer(client_config, &mut wallet, coin_index),
+        )
+        .await?;
         return Ok(());
     }
     let has_other_transfer_msg =
@@ -213,6 +265,19 @@ pub async fn transfer_bip448_sender(
     let existing_pending =
         get_bip448_pending_transfer_signing(&client_config.pool, wallet_name, statechain_id)
             .await?;
+    let current_owner =
+        get_current_bip448_owner(client_config, &wallet, wallet_name, statechain_id).await?;
+    let coin_index = current_owner.coin_index;
+    ensure_local_eligibility(
+        record.latest_state_number,
+        &wallet
+            .coins
+            .get(coin_index)
+            .ok_or_else(|| {
+                anyhow!("selected BIP448 transfer owner index is absent from its wallet snapshot")
+            })?
+            .status,
+    )?;
     let current_count = bip448_signature_count(client_config, statechain_id).await?;
     let pending_matches_recipient = !has_other_transfer_msg
         && existing_pending.as_ref().is_some_and(|pending| {
@@ -247,7 +312,13 @@ pub async fn transfer_bip448_sender(
     } else {
         None
     };
-    let coin = wallet.coins[coin_index].clone();
+    let coin = wallet
+        .coins
+        .get(coin_index)
+        .ok_or_else(|| {
+            anyhow!("selected BIP448 transfer owner index is absent from its wallet snapshot")
+        })?
+        .clone();
     if PublicKey::from_str(&coin.user_pubkey)?.combine(&PublicKey::from_str(
         coin.server_pubkey
             .as_deref()
@@ -375,6 +446,227 @@ pub async fn transfer_bip448_sender(
     }
     finish_transfer(client_config, &mut wallet, coin_index).await
 }
+
+async fn load_bip448_transfer_msg_optional(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    recipient_auth_pubkey: &str,
+) -> Result<Option<Bip448TransferMsg>> {
+    get_bip448_transfer_msg(pool, wallet_name, statechain_id, recipient_auth_pubkey)
+        .await
+        .map(Some)
+        .or_else(|error| {
+            if matches!(
+                error.downcast_ref::<sqlx::Error>(),
+                Some(sqlx::Error::RowNotFound)
+            ) {
+                Ok(None)
+            } else {
+                Err(error)
+            }
+        })
+}
+
+async fn validate_persisted_transfer_message(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    wallet: &Wallet,
+    record: &Bip448StatechainRecord,
+    statechain_id: &str,
+    receiver_user_pubkey: &PublicKey,
+    transfer_msg: &Bip448TransferMsg,
+) -> Result<usize> {
+    if transfer_msg.statechain_id != statechain_id
+        || transfer_msg.receiver_user_public_key != receiver_user_pubkey.to_string()
+    {
+        return Err(anyhow!(
+            "BIP448 persisted transfer message does not match the recipient address"
+        ));
+    }
+    let sender_user_pubkey = PublicKey::from_str(&transfer_msg.sender_user_public_key)
+        .map_err(|_| anyhow!("BIP448 persisted transfer message has an invalid sender key"))?;
+    let server_pubkey = PublicKey::from_str(&transfer_msg.server_public_key)
+        .map_err(|_| anyhow!("BIP448 persisted transfer message has an invalid server key"))?;
+    let aggregate_pubkey = PublicKey::from_str(&transfer_msg.aggregate_pubkey)
+        .map_err(|_| anyhow!("BIP448 persisted transfer message has an invalid aggregate key"))?;
+    if sender_user_pubkey.to_string() != transfer_msg.sender_user_public_key
+        || server_pubkey.to_string() != transfer_msg.server_public_key
+        || aggregate_pubkey.to_string() != transfer_msg.aggregate_pubkey
+    {
+        return Err(anyhow!(
+            "BIP448 persisted transfer message contains a non-canonical public key"
+        ));
+    }
+    let max_message_state = record
+        .latest_state_number
+        .checked_add(2)
+        .ok_or_else(|| anyhow!("BIP448 persisted transfer state number overflow"))?;
+    if transfer_msg.msg_version != 2
+        || transfer_msg.aggregate_pubkey != record.aggregate_pubkey
+        || transfer_msg.funding_outpoint != record.funding_outpoint
+        || transfer_msg.challenge_delay != record.challenge_delay
+        || transfer_msg.amount_sats != record.amount_sats
+        || transfer_msg.network != record.network
+        || transfer_msg.latest_state_number < record.latest_state_number
+        || transfer_msg.latest_state_number > max_message_state
+        || transfer_msg.latest_state_number < 2
+        || transfer_msg.latest_state_number != transfer_msg.latest_state.state_number
+        || transfer_msg.challenge_delay != transfer_msg.latest_state.challenge_delay
+        || transfer_msg.value_schedule != transfer_msg.latest_state.value_schedule
+        || transfer_msg.server_signature_count != u64::from(transfer_msg.latest_state_number)
+        || transfer_msg
+            .latest_state
+            .signing_metadata
+            .server_signature_count
+            != u64::from(transfer_msg.latest_state_number)
+        || !transfer_msg.latest_state.cpfp_child_templates.is_empty()
+        || sender_user_pubkey.combine(&server_pubkey)? != aggregate_pubkey
+    {
+        return Err(anyhow!(
+            "BIP448 persisted transfer message does not exactly match the accepted state and recipient"
+        ));
+    }
+    if transfer_msg.latest_state.verify_recovery_against_keys(
+        &Secp256k1::new(),
+        &sender_user_pubkey,
+        &server_pubkey,
+    )? != aggregate_pubkey
+    {
+        return Err(anyhow!(
+            "BIP448 persisted transfer message recovery key does not match its aggregate key"
+        ));
+    }
+
+    let history = get_bip448_state_history(pool, &wallet.name, statechain_id).await?;
+    if history != transfer_msg.state_history
+        || history.len() != transfer_msg.latest_state_number as usize
+        || history
+            .iter()
+            .enumerate()
+            .any(|(index, entry)| entry.state_number != index as u32 + 1)
+    {
+        return Err(anyhow!(
+            "BIP448 persisted transfer message does not exactly match local state history"
+        ));
+    }
+    let accepted_history_index = record
+        .latest_state_number
+        .checked_sub(1)
+        .ok_or_else(|| anyhow!("BIP448 accepted state number must be positive"))?
+        as usize;
+    let accepted_history = history
+        .get(accepted_history_index)
+        .ok_or_else(|| anyhow!("BIP448 persisted transfer history is incomplete"))?;
+    let accepted_owner = if transfer_msg.latest_state_number == record.latest_state_number {
+        receiver_user_pubkey.x_only_public_key().0.to_string()
+    } else {
+        sender_user_pubkey.x_only_public_key().0.to_string()
+    };
+    if accepted_history.owner_public_key != accepted_owner
+        || !history_entry_matches_latest_state(accepted_history, &record.latest_state)
+    {
+        return Err(anyhow!(
+            "BIP448 persisted transfer history does not contain the exact accepted state"
+        ));
+    }
+    let latest_history = history
+        .last()
+        .ok_or_else(|| anyhow!("BIP448 persisted transfer history is empty"))?;
+    if latest_history.owner_public_key != receiver_user_pubkey.x_only_public_key().0.to_string()
+        || !history_entry_matches_latest_state(latest_history, &transfer_msg.latest_state)
+    {
+        return Err(anyhow!(
+            "BIP448 persisted transfer latest state does not match its receiver history entry"
+        ));
+    }
+
+    let transfer_signature = schnorr::Signature::from_str(&transfer_msg.transfer_signature)
+        .map_err(|_| anyhow!("BIP448 persisted transfer signature is invalid"))?;
+    let funding_txid = Txid::from_str(&transfer_msg.funding_outpoint.txid)?;
+    let mut authorization = Vec::new();
+    authorization.extend_from_slice(&funding_txid[..]);
+    authorization.extend_from_slice(&transfer_msg.funding_outpoint.vout.to_le_bytes());
+    authorization.extend_from_slice(&receiver_user_pubkey.serialize());
+    let digest = sha256::Hash::hash(&authorization).to_byte_array();
+    schnorr::verify(
+        &transfer_signature,
+        &digest,
+        &sender_user_pubkey.x_only_public_key().0,
+    )
+    .map_err(|_| anyhow!("BIP448 persisted transfer signature is invalid"))?;
+
+    let mut matching_coin = None;
+    for (coin_index, coin) in wallet.coins.iter().enumerate().filter(|(_, coin)| {
+        coin.statechain_id.as_deref() == Some(statechain_id)
+            && mercurylib::bip448_statechain::deposit::is_bip448_coin(coin)
+            && coin.user_pubkey == transfer_msg.sender_user_public_key
+            && coin.server_pubkey.as_deref() == Some(transfer_msg.server_public_key.as_str())
+    }) {
+        if matching_coin.is_some() {
+            return Err(anyhow!(
+                "multiple wallet coins match the persisted BIP448 transfer sender generation"
+            ));
+        }
+        if coin.aggregated_pubkey.as_deref() != Some(record.aggregate_pubkey.as_str())
+            || coin.utxo_txid.as_deref() != Some(record.funding_outpoint.txid.as_str())
+            || coin.utxo_vout != Some(record.funding_outpoint.vout)
+            || coin.amount.map(u64::from) != Some(record.amount_sats)
+        {
+            return Err(anyhow!(
+                "persisted BIP448 transfer sender coin does not match the accepted funding record"
+            ));
+        }
+        let user_private = PrivateKey::from_wif(&coin.user_privkey)?;
+        if user_private.inner.public_key(&Secp256k1::new()) != sender_user_pubkey {
+            return Err(anyhow!(
+                "persisted BIP448 transfer sender private key does not match its public key"
+            ));
+        }
+        validate_bip448_coin_local_auth(coin, statechain_id)?;
+        matching_coin = Some(coin_index);
+    }
+    matching_coin.ok_or_else(|| {
+        anyhow!("no wallet coin exactly matches the persisted BIP448 transfer sender generation")
+    })
+}
+
+fn history_entry_matches_latest_state(
+    entry: &Bip448StateHistoryEntry,
+    latest_state: &Bip448LatestState,
+) -> bool {
+    entry.state_number == latest_state.state_number
+        && entry.state_locktime == latest_state.state_locktime
+        && entry.update_template_hash == latest_state.update_template_hash
+        && entry.settlement_template_hash == latest_state.settlement_template_hash
+        && entry.update_signature == latest_state.signing_metadata.update_signature
+        && entry.client_public_nonce == latest_state.signing_metadata.client_public_nonce
+        && entry.server_public_nonce == latest_state.signing_metadata.server_public_nonce
+        && entry.blinding_factor == latest_state.signing_metadata.blinding_factor
+}
+
+async fn resume_persisted_transfer<D, DF, F, FF>(
+    relation: Bip448OwnerRelation,
+    deliver: D,
+    finish_local: F,
+) -> Result<()>
+where
+    D: FnOnce() -> DF,
+    DF: Future<Output = Result<()>>,
+    F: FnOnce() -> FF,
+    FF: Future<Output = Result<()>>,
+{
+    match relation {
+        Bip448OwnerRelation::Current => deliver().await?,
+        Bip448OwnerRelation::Rotated => {}
+        Bip448OwnerRelation::Missing => {
+            return Err(anyhow!(
+                "BIP448 statechain is missing; persisted transfer ownership is closed or unknown"
+            ));
+        }
+    }
+    finish_local().await
+}
+
 async fn ensure_persisted_transfer_delivered<C, CF, U, UF, S, SF>(
     mut verify_completed: C,
     upload: U,
@@ -388,7 +680,7 @@ where
     S: FnOnce(String) -> SF,
     SF: Future<Output = Result<bool>>,
 {
-    if matches!(verify_completed().await, Ok(true)) {
+    if verify_completed().await? {
         return Ok(());
     }
 
@@ -402,7 +694,7 @@ where
         }
         Err(error) => error,
     };
-    if matches!(verify_completed().await, Ok(true)) {
+    if verify_completed().await? {
         Ok(())
     } else {
         Err(upload_error)
@@ -437,27 +729,50 @@ async fn verify_persisted_transfer_completed(
     transfer_msg: &Bip448TransferMsg,
     receiver_user_pubkey: &PublicKey,
 ) -> Result<bool> {
-    let Some(statechain_info) =
-        utils::get_statechain_info(&transfer_msg.statechain_id, client_config).await?
-    else {
-        return Ok(false);
+    let presence =
+        get_bip448_statechain_presence(client_config, &transfer_msg.statechain_id).await?;
+    let Bip448StatechainPresence::Present(statechain_info) = presence else {
+        return Err(anyhow!(
+            "BIP448 statechain is missing; persisted transfer ownership is closed or unknown"
+        ));
     };
-    let current_server = PublicKey::from_str(&statechain_info.enclave_public_key)?;
-    Ok(expected_server_pubkey(transfer_msg, receiver_user_pubkey)
-        .is_ok_and(|expected| current_server == expected))
+    let current_server = current_server_public_key(&statechain_info)?;
+    let expected_receiver_server = expected_server_pubkey(transfer_msg, receiver_user_pubkey)?;
+    if current_server == expected_receiver_server {
+        return Ok(true);
+    }
+    let sender_server = PublicKey::from_str(&transfer_msg.server_public_key)?;
+    if current_server == sender_server {
+        Ok(false)
+    } else {
+        Err(anyhow!(
+            "BIP448 statechain rotated to an unrelated owner generation"
+        ))
+    }
 }
 fn ensure_local_eligibility(latest_state_number: u32, status: &CoinStatus) -> Result<()> {
-    if latest_state_number < 1 || transfer_status_priority(status).is_none() {
+    if latest_state_number < 1 || !matches!(status, CoinStatus::CONFIRMED | CoinStatus::IN_TRANSFER)
+    {
         return Err(eligibility_error());
     }
     Ok(())
 }
-fn transfer_status_priority(status: &CoinStatus) -> Option<u8> {
-    match status {
-        CoinStatus::CONFIRMED => Some(0),
-        CoinStatus::IN_TRANSFER => Some(1),
-        _ => None,
+
+fn ensure_any_locally_eligible_coin(
+    wallet: &Wallet,
+    statechain_id: &str,
+    latest_state_number: u32,
+) -> Result<()> {
+    if latest_state_number < 1
+        || !wallet.coins.iter().any(|coin| {
+            coin.statechain_id.as_deref() == Some(statechain_id)
+                && mercurylib::bip448_statechain::deposit::is_bip448_coin(coin)
+                && matches!(coin.status, CoinStatus::CONFIRMED | CoinStatus::IN_TRANSFER)
+        })
+    {
+        return Err(eligibility_error());
     }
+    Ok(())
 }
 fn transfer_state_plan(
     count: u64,
@@ -938,7 +1253,12 @@ async fn finish_transfer(
     coin_index: usize,
 ) -> Result<()> {
     let wallet_name = wallet.name.clone();
-    let statechain_id = wallet.coins[coin_index]
+    let statechain_id = wallet
+        .coins
+        .get(coin_index)
+        .ok_or_else(|| {
+            anyhow!("selected BIP448 transfer owner index is absent from its wallet snapshot")
+        })?
         .statechain_id
         .clone()
         .ok_or_else(|| anyhow!("BIP448 transfer coin missing statechain_id"))?;
@@ -954,7 +1274,13 @@ async fn finish_transfer(
         )
         .await?;
     }
-    wallet.coins[coin_index].status = CoinStatus::IN_TRANSFER;
+    wallet
+        .coins
+        .get_mut(coin_index)
+        .ok_or_else(|| {
+            anyhow!("selected BIP448 transfer owner index is absent from its wallet snapshot")
+        })?
+        .status = CoinStatus::IN_TRANSFER;
     update_wallet(&client_config.pool, wallet).await
 }
 fn musig_secret_nonce(value: &str) -> Result<MusigSecNonce> {
@@ -1011,10 +1337,10 @@ mod tests {
     }
 
     #[test]
-    fn coin_selection_status_gate_accepts_confirmed_and_in_transfer() {
-        assert_eq!(transfer_status_priority(&CoinStatus::CONFIRMED), Some(0));
-        assert_eq!(transfer_status_priority(&CoinStatus::IN_TRANSFER), Some(1));
-        assert_eq!(transfer_status_priority(&CoinStatus::INITIALISED), None);
+    fn selected_owner_status_gate_accepts_confirmed_and_in_transfer() {
+        assert!(ensure_local_eligibility(2, &CoinStatus::CONFIRMED).is_ok());
+        assert!(ensure_local_eligibility(2, &CoinStatus::IN_TRANSFER).is_ok());
+        assert!(ensure_local_eligibility(2, &CoinStatus::INITIALISED).is_err());
     }
 
     #[test]
@@ -1132,6 +1458,27 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(error.to_string(), "original upload error");
+        assert_eq!(error.to_string(), "completion evidence unavailable");
+    }
+
+    #[tokio::test]
+    async fn rotated_persisted_transfer_runs_only_local_cleanup() {
+        let deliveries = Cell::new(0);
+        let cleanups = Cell::new(0);
+        resume_persisted_transfer(
+            Bip448OwnerRelation::Rotated,
+            || {
+                deliveries.set(deliveries.get() + 1);
+                std::future::ready(Err(anyhow!("delivery must not run")))
+            },
+            || {
+                cleanups.set(cleanups.get() + 1);
+                std::future::ready(Ok(()))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(deliveries.get(), 0);
+        assert_eq!(cleanups.get(), 1);
     }
 }
