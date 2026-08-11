@@ -148,6 +148,42 @@ impl CoreChainClient {
         }
     }
 
+    pub fn exact_transaction(&self, txid: &Txid) -> Result<Option<ChainTransaction>> {
+        match self.call::<RawTransactionWithHex>("getrawtransaction", &[json!(txid), json!(true)]) {
+            Ok(status) => {
+                let bytes = hex::decode(&status.hex)
+                    .with_context(|| format!("failed to decode raw tx {}", txid))?;
+                let transaction: bitcoin::Transaction = bitcoin::consensus::deserialize(&bytes)
+                    .with_context(|| format!("failed to deserialize raw tx {}", txid))?;
+                if bitcoin::consensus::serialize(&transaction) != bytes
+                    || transaction.txid() != *txid
+                {
+                    return Err(anyhow!(
+                        "Bitcoin Core returned different transaction bytes for {}",
+                        txid
+                    ));
+                }
+                let confirmations = status
+                    .confirmations
+                    .unwrap_or(0)
+                    .try_into()
+                    .context("Bitcoin Core returned negative transaction confirmations")?;
+                Ok(Some(ChainTransaction {
+                    bytes,
+                    confirmations,
+                }))
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<CoreRpcError>()
+                    .is_some_and(|error| error.code == -5) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn broadcast_tx(&self, tx_bytes: &[u8]) -> Result<Txid> {
         let tx_hex = hex::encode(tx_bytes);
         let txid: Txid = self.call("sendrawtransaction", &[json!(tx_hex)])?;
@@ -351,6 +387,18 @@ struct BlockchainInfoResponse {
 #[derive(Debug, Deserialize)]
 struct RawTransactionStatus {
     confirmations: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTransactionWithHex {
+    hex: String,
+    confirmations: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChainTransaction {
+    pub bytes: Vec<u8>,
+    pub confirmations: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]

@@ -8,7 +8,7 @@ use bitcoin::{
 use mercurylib::bip448_statechain::signing_api::{
     Bip448PartialSignatureRequestPayload, Bip448SignFirstRequestPayload,
 };
-use secp256k1::{PublicKey, SecretKey, XOnlyPublicKey};
+use secp256k1::{musig::Session as MusigSession, PublicKey, Scalar, SecretKey, XOnlyPublicKey};
 use serde::{
     de::{DeserializeOwned, Error as DeError, MapAccess, Visitor},
     Deserialize, Deserializer, Serialize,
@@ -16,6 +16,66 @@ use serde::{
 
 pub const BIP448_MAX_MONEY_SATS: u64 = 2_100_000_000_000_000;
 pub const BIP448_ONE_INPUT_ONE_OUTPUT_VBYTES: u64 = 112;
+
+const BIP448_MUSIG_SESSION_SERIALIZED_SIZE: usize = 133;
+const BIP448_MUSIG_SESSION_MAGIC: [u8; 4] = [0x9d, 0xed, 0xe9, 0x17];
+const BIP448_MUSIG_FINAL_NONCE_RANGE: std::ops::Range<usize> = 5..37;
+const BIP448_MUSIG_SCALAR_RANGES: [std::ops::Range<usize>; 3] = [37..69, 69..101, 101..133];
+
+fn decode_bip448_full_musig_session(encoded_session: &str) -> Result<MusigSession> {
+    require_canonical_hex(encoded_session, Some(BIP448_MUSIG_SESSION_SERIALIZED_SIZE))?;
+    let session_bytes: [u8; BIP448_MUSIG_SESSION_SERIALIZED_SIZE] = hex::decode(encoded_session)?
+        .try_into()
+        .map_err(|_| anyhow!("invalid BIP448 full MuSig session length"))?;
+
+    // `Session::from_slice` reconstructs the checked dependency's legacy
+    // typed representation from a fixed array. Validate that representation
+    // before invoking an operation that expects its internal cache marker.
+    if session_bytes[..BIP448_MUSIG_SESSION_MAGIC.len()] != BIP448_MUSIG_SESSION_MAGIC
+        || !matches!(session_bytes[4], 0 | 1)
+    {
+        return Err(anyhow!("invalid BIP448 full MuSig session encoding"));
+    }
+    let final_nonce: [u8; 32] = session_bytes[BIP448_MUSIG_FINAL_NONCE_RANGE]
+        .try_into()
+        .map_err(|_| anyhow!("invalid BIP448 full MuSig final nonce length"))?;
+    XOnlyPublicKey::from_byte_array(final_nonce)
+        .context("invalid BIP448 full MuSig final nonce")?;
+    for scalar_range in BIP448_MUSIG_SCALAR_RANGES {
+        let scalar: [u8; 32] = session_bytes[scalar_range]
+            .try_into()
+            .map_err(|_| anyhow!("invalid BIP448 full MuSig scalar length"))?;
+        Scalar::from_be_bytes(scalar)
+            .map_err(|_| anyhow!("invalid BIP448 full MuSig scalar encoding"))?;
+    }
+
+    let session = MusigSession::from_slice(session_bytes);
+    if session.serialize() != session_bytes {
+        return Err(anyhow!("BIP448 full MuSig session did not round-trip"));
+    }
+    Ok(session)
+}
+
+pub(crate) fn derive_bip448_blinded_session(encoded_session: &str) -> Result<String> {
+    let session = decode_bip448_full_musig_session(encoded_session)?;
+    Ok(hex::encode(
+        session.remove_fin_nonce_from_session().serialize(),
+    ))
+}
+
+pub(crate) fn require_bip448_session_relationship(
+    encoded_session: &str,
+    blinded_session: &str,
+) -> Result<()> {
+    let expected_blinded_session = derive_bip448_blinded_session(encoded_session)?;
+    require_canonical_hex(blinded_session, Some(BIP448_MUSIG_SESSION_SERIALIZED_SIZE))?;
+    if hex::decode(blinded_session)? != hex::decode(expected_blinded_session)? {
+        return Err(anyhow!(
+            "BIP448 blinded MuSig session does not derive from the persisted full session"
+        ));
+    }
+    Ok(())
+}
 
 pub fn bip448_one_output_fee_and_value(
     source_value_sats: u64,
@@ -726,16 +786,25 @@ pub(crate) fn validate_withdrawal_attempt(attempt: &Bip448WithdrawalAttempt) -> 
     if let Some(value) = &attempt.output_pubkey {
         require_canonical_public_key(value)?;
     }
-    if let Some(value) = &attempt.encoded_session {
-        require_canonical_hex(value, None)?;
-    }
+    let derived_blinded_session = attempt
+        .encoded_session
+        .as_deref()
+        .map(derive_bip448_blinded_session)
+        .transpose()?;
     if let Some(value) = &attempt.sign_second_payload_json {
         let sign_second = parse_canonical_sign_second_payload(value)?;
+        require_bip448_session_relationship(
+            attempt
+                .encoded_session
+                .as_deref()
+                .ok_or_else(|| anyhow!("post-nonce BIP448 attempt has no full MuSig session"))?,
+            &sign_second.session,
+        )?;
         if sign_second.statechain_id != attempt.statechain_id
             || sign_second.signed_statechain_id != attempt.signed_statechain_id
             || sign_second.signing_id != attempt.signing_id
             || attempt.server_public_nonce.as_deref() != Some(sign_second.server_pub_nonce.as_str())
-            || attempt.encoded_session.as_deref() != Some(sign_second.session.as_str())
+            || derived_blinded_session.as_deref() != Some(sign_second.session.as_str())
             || !matches!(sign_second.negate_seckey, 0 | 1)
         {
             return Err(anyhow!(
@@ -776,12 +845,17 @@ pub(crate) fn validate_withdrawal_attempt(attempt: &Bip448WithdrawalAttempt) -> 
             input.witness = bitcoin::Witness::default();
         }
         let witness = &signed_transaction.input[0].witness;
+        let expected_witness = aggregate_signature
+            .iter()
+            .copied()
+            .chain(std::iter::once(0x01))
+            .collect::<Vec<_>>();
         if stripped != unsigned_transaction
             || witness.len() != 1
             || witness
                 .iter()
                 .next()
-                .is_none_or(|item| item != aggregate_signature.as_slice())
+                .is_none_or(|item| item != expected_witness.as_slice())
         {
             return Err(anyhow!(
                 "BIP448 signed transaction does not exactly finalize the persisted unsigned bytes"

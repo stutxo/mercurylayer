@@ -1,5 +1,7 @@
 use crate::{
-    bip448_owner::get_current_bip448_owner, client_config::ClientConfig, sqlite_manager::get_wallet,
+    bip448_owner::get_current_bip448_owner,
+    client_config::ClientConfig,
+    sqlite_manager::{begin_bip448_mutation_guard, get_wallet},
 };
 use anyhow::{anyhow, Result};
 use bitcoin::PrivateKey;
@@ -32,17 +34,35 @@ pub async fn create_pre_image(
         .coins
         .get(current_owner.coin_index)
         .ok_or_else(|| anyhow!("current BIP448 owner index is no longer present in the wallet"))?;
+    let owner_user_pubkey = PublicKey::from_str(&coin.user_pubkey)?
+        .x_only_public_key()
+        .0
+        .to_string();
+    let expected_signed_statechain_id = coin
+        .signed_statechain_id
+        .as_ref()
+        .ok_or_else(|| anyhow!("coin.signed_statechain_id is None"))?
+        .clone();
 
+    // The guard is deliberately held across this short creation call. There
+    // is no latch journal, so the transaction is the local linearization point
+    // against attempt and transfer-intent creation.
+    let mut guard = begin_bip448_mutation_guard(&client_config.pool).await?;
+    let coin = guard
+        .latch_creation_coin(
+            wallet_name,
+            statechain_id,
+            &owner_user_pubkey,
+            &expected_signed_statechain_id,
+        )
+        .await?;
     if coin.amount.is_none() {
         return Err(anyhow::anyhow!("coin.amount is None"));
     }
-
     ensure_create_pre_image_status(&coin.status)?;
-
     if coin.locktime.is_none() {
         return Err(anyhow::anyhow!("coin.locktime is None"));
     }
-
     let signed_statechain_id = coin
         .signed_statechain_id
         .as_ref()
@@ -72,6 +92,8 @@ pub async fn create_pre_image(
 
     let payment_hash_response_payload: PaymentHashResponsePayload =
         serde_json::from_str(value.as_str())?;
+
+    guard.commit().await?;
 
     Ok(CreatePreImageResponse {
         hash: payment_hash_response_payload.hash,

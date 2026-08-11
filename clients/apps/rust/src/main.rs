@@ -1,6 +1,6 @@
 use std::{thread, time::Duration};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
@@ -61,6 +61,16 @@ enum Commands {
         /// Transaction fee rate in sats per byte
         fee_rate: Option<f64>,
     },
+    /// Sweep one stable-index BIP448 duplicate without closing the statechain
+    Bip448SweepDuplicate {
+        wallet_name: String,
+        statechain_id: String,
+        #[arg(value_parser = parse_decimal_u32)]
+        duplicate_index: u32,
+        to_address: String,
+        /// Transaction fee rate in sats per byte
+        fee_rate: Option<f64>,
+    },
     /// Generate a transfer address to receive funds
     NewTransferAddress {
         wallet_name: String,
@@ -103,9 +113,34 @@ enum Commands {
     GetPaymentHash { batch_id: String },
 }
 
+fn parse_decimal_u32(value: &str) -> std::result::Result<u32, String> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("duplicate_index must be a base-10 u32".to_owned());
+    }
+    value
+        .parse::<u32>()
+        .map_err(|_| "duplicate_index must be a base-10 u32".to_owned())
+}
+
+fn validate_command_before_io(command: &Commands) -> Result<()> {
+    if let Commands::Bip448SweepDuplicate {
+        duplicate_index: 0, ..
+    } = command
+    {
+        return Err(anyhow!(
+            "duplicate_index 0 is canonical and cannot be swept as a duplicate"
+        ));
+    }
+    Ok(())
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // This check intentionally precedes configuration loading, which opens the
+    // wallet database. The typed library entry point repeats the invariant.
+    validate_command_before_io(&cli.command)?;
 
     let client_config = mercuryrustlib::client_config::load().await;
 
@@ -227,6 +262,24 @@ async fn main() -> Result<()> {
                 fee_rate,
             )
             .await?;
+        }
+        Commands::Bip448SweepDuplicate {
+            wallet_name,
+            statechain_id,
+            duplicate_index,
+            to_address,
+            fee_rate,
+        } => {
+            let result = mercuryrustlib::bip448_withdraw::execute_duplicate_sweep(
+                &client_config,
+                &wallet_name,
+                &statechain_id,
+                duplicate_index,
+                &to_address,
+                fee_rate,
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Commands::NewTransferAddress {
             wallet_name,
@@ -466,6 +519,35 @@ mod tests {
             &format!("{}:0:20000", "11".repeat(32)),
         ]))
         .is_err());
+    }
+
+    #[test]
+    fn bip448_duplicate_index_cli_domain_and_zero_handler_are_exact() {
+        let invocation = |index: &str| {
+            Cli::try_parse_from([
+                "client-rust",
+                "bip448-sweep-duplicate",
+                "wallet",
+                "statechain",
+                index,
+                "bcrt1pdestination",
+            ])
+        };
+        let max = invocation("4294967295").expect("u32::MAX must parse");
+        match max.command {
+            Commands::Bip448SweepDuplicate {
+                duplicate_index, ..
+            } => assert_eq!(duplicate_index, u32::MAX),
+            _ => panic!("parsed the wrong command"),
+        }
+        for invalid in ["4294967296", "-1", "1.0", "one", "+1", "0x1"] {
+            assert!(
+                invocation(invalid).is_err(),
+                "unexpectedly parsed {invalid}"
+            );
+        }
+        let zero = invocation("0").expect("zero belongs to the Clap u32 domain");
+        assert!(validate_command_before_io(&zero.command).is_err());
     }
 
     #[test]

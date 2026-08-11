@@ -2,12 +2,12 @@ mod core;
 
 use std::str::FromStr;
 
-use anyhow::Result;
-use bitcoin::{BlockHash, Txid};
+use anyhow::{anyhow, Context, Result};
+use bitcoin::{BlockHash, Transaction, Txid};
 use serde_json::Value;
 
 use self::core::CoreChainClient;
-pub use self::core::{ChainTxOut, DescriptorActivity, ScanBlocksResult};
+pub use self::core::{ChainTransaction, ChainTxOut, DescriptorActivity, ScanBlocksResult};
 pub(crate) use self::core::{CoreRpcAuth, CoreRpcConfig};
 
 #[cfg(feature = "test-hooks")]
@@ -28,6 +28,11 @@ pub struct ChainUtxo {
 
 pub struct ChainClient {
     core: CoreChainClient,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BroadcastTxStatus {
+    Accepted { confirmations: u32 },
 }
 
 impl ChainClient {
@@ -113,12 +118,70 @@ impl ChainClient {
         self.core.transaction_confirmations(txid)
     }
 
+    pub fn exact_transaction(&self, txid: &Txid) -> Result<Option<ChainTransaction>> {
+        self.core.exact_transaction(txid)
+    }
+
     pub fn broadcast_tx(&self, tx_bytes: &[u8]) -> Result<Txid> {
         self.core.broadcast_tx(tx_bytes)
     }
 
     pub fn submit_package(&self, txs: &[Vec<u8>]) -> Result<Value> {
         self.core.submit_package(txs)
+    }
+}
+
+/// Reconciles one immutable signed transaction without interpreting Bitcoin
+/// Core's English error messages. A successful lookup is accepted only when
+/// Core returns the exact persisted consensus bytes.
+pub fn broadcast_or_reconcile_transaction(
+    chain_client: &ChainClient,
+    signed_tx_hex: &str,
+    stored_txid: &str,
+) -> Result<BroadcastTxStatus> {
+    let bytes = hex::decode(signed_tx_hex).context("invalid persisted signed transaction hex")?;
+    let transaction: Transaction = bitcoin::consensus::deserialize(&bytes)
+        .context("invalid persisted signed transaction bytes")?;
+    if bitcoin::consensus::serialize(&transaction) != bytes {
+        return Err(anyhow!(
+            "persisted signed transaction is not canonical consensus encoding"
+        ));
+    }
+    let txid = Txid::from_str(stored_txid).context("invalid persisted signed transaction txid")?;
+    if txid.to_string() != stored_txid || transaction.txid() != txid {
+        return Err(anyhow!(
+            "persisted signed transaction does not match its stored txid"
+        ));
+    }
+
+    if let Some(known) = chain_client.exact_transaction(&txid)? {
+        if known.bytes != bytes {
+            return Err(anyhow!(
+                "the stored txid resolves to different transaction bytes"
+            ));
+        }
+        return Ok(BroadcastTxStatus::Accepted {
+            confirmations: known.confirmations,
+        });
+    }
+
+    match chain_client.broadcast_tx(&bytes) {
+        Ok(returned_txid) if returned_txid == txid => {
+            Ok(BroadcastTxStatus::Accepted { confirmations: 0 })
+        }
+        Ok(returned_txid) => Err(anyhow!(
+            "Bitcoin Core accepted the persisted bytes as unexpected txid {} instead of {}",
+            returned_txid,
+            txid
+        )),
+        Err(send_error) => match chain_client.exact_transaction(&txid) {
+            Ok(Some(known)) if known.bytes == bytes => Ok(BroadcastTxStatus::Accepted {
+                confirmations: known.confirmations,
+            }),
+            Ok(Some(_)) => Err(send_error
+                .context("post-broadcast lookup resolved the stored txid to different bytes")),
+            Ok(None) | Err(_) => Err(send_error),
+        },
     }
 }
 
@@ -133,6 +196,64 @@ pub fn normalize_fee_rate_sats_per_byte(mut fee_rate_btc_per_kb: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{normalize_fee_rate_sats_per_byte, ChainClient, CoreRpcAuth, CoreRpcConfig};
+    use bitcoin::{absolute, hashes::Hash, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+    use serde_json::{json, Value};
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
+
+    fn sample_transaction(tag: u8) -> Transaction {
+        Transaction {
+            version: 2,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: bitcoin::OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([tag; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ZERO,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: 1_000,
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        }
+    }
+
+    fn rpc_sequence(responses: Vec<String>) -> (ChainClient, thread::JoinHandle<Vec<Value>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 32_768];
+                let size = stream.read(&mut request).unwrap();
+                let body = String::from_utf8_lossy(&request[..size]);
+                let body = body.split_once("\r\n\r\n").unwrap().1;
+                requests.push(serde_json::from_str(body).unwrap());
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.len(),
+                    response
+                );
+                stream.write_all(reply.as_bytes()).unwrap();
+            }
+            requests
+        });
+        (
+            ChainClient::new(CoreRpcConfig {
+                url,
+                auth: CoreRpcAuth::None,
+            })
+            .unwrap(),
+            server,
+        )
+    }
 
     #[test]
     fn normalize_fee_rate_uses_current_fallback_for_non_positive_estimates() {
@@ -152,5 +273,88 @@ mod tests {
         for txid in ["not-a-txid".to_string(), "AA".repeat(32)] {
             assert_eq!(client.get_stored_tx_out(&txid, 0, true).unwrap(), None);
         }
+    }
+
+    #[test]
+    fn exact_broadcast_reconciles_known_success_and_lost_response_without_text_matching() {
+        let transaction = sample_transaction(7);
+        let bytes = bitcoin::consensus::serialize(&transaction);
+        let encoded = hex::encode(&bytes);
+        let txid = transaction.txid().to_string();
+
+        let (known_client, known_server) = rpc_sequence(vec![json!({
+            "result": {"hex": encoded.clone(), "confirmations": 3}, "error": null
+        })
+        .to_string()]);
+        let known =
+            super::broadcast_or_reconcile_transaction(&known_client, &encoded, &txid).unwrap();
+        assert_eq!(
+            known,
+            super::BroadcastTxStatus::Accepted { confirmations: 3 }
+        );
+        let requests = known_server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["method"], "getrawtransaction");
+
+        let (lost_client, lost_server) = rpc_sequence(vec![
+            json!({"result": null, "error": {"code": -5, "message": "arbitrary missing text"}})
+                .to_string(),
+            json!({"result": null, "error": {"code": -26, "message": "arbitrary send text"}})
+                .to_string(),
+            json!({"result": {"hex": encoded.clone(), "confirmations": 0}, "error": null})
+                .to_string(),
+        ]);
+        let reconciled =
+            super::broadcast_or_reconcile_transaction(&lost_client, &encoded, &txid).unwrap();
+        assert_eq!(
+            reconciled,
+            super::BroadcastTxStatus::Accepted { confirmations: 0 }
+        );
+        assert_eq!(
+            lost_server
+                .join()
+                .unwrap()
+                .iter()
+                .map(|request| request["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "getrawtransaction",
+                "sendrawtransaction",
+                "getrawtransaction"
+            ]
+        );
+    }
+
+    #[test]
+    fn exact_broadcast_preserves_send_error_and_rejects_different_bytes() {
+        let transaction = sample_transaction(8);
+        let different = sample_transaction(9);
+        let encoded = hex::encode(bitcoin::consensus::serialize(&transaction));
+        let txid = transaction.txid().to_string();
+
+        let (failure_client, failure_server) = rpc_sequence(vec![
+            json!({"result": null, "error": {"code": -5, "message": "first lookup"}})
+                .to_string(),
+            json!({"result": null, "error": {"code": -26, "message": "original contextual send failure"}})
+                .to_string(),
+            json!({"result": null, "error": {"code": -5, "message": "second lookup"}})
+                .to_string(),
+        ]);
+        let error = super::broadcast_or_reconcile_transaction(&failure_client, &encoded, &txid)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("original contextual send failure"));
+        failure_server.join().unwrap();
+
+        let (collision_client, collision_server) = rpc_sequence(vec![json!({
+            "result": {"hex": hex::encode(bitcoin::consensus::serialize(&different))},
+            "error": null
+        })
+        .to_string()]);
+        assert!(
+            super::broadcast_or_reconcile_transaction(&collision_client, &encoded, &txid).is_err()
+        );
+        collision_server.join().unwrap();
     }
 }

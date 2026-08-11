@@ -1931,6 +1931,76 @@ impl Bip448MutationGuard {
         &mut self.transaction
     }
 
+    pub async fn withdrawal_signature_count_expectation(
+        &mut self,
+        wallet_name: &str,
+        statechain_id: &str,
+    ) -> Result<bip448_funding::Bip448SignatureCountExpectation> {
+        let (record, _) =
+            accepted_record_and_history_on(self.connection(), wallet_name, statechain_id).await?;
+        let attempts =
+            list_bip448_withdrawal_attempts_on(self.connection(), wallet_name, statechain_id)
+                .await?;
+        bip448_funding::bip448_signature_count_expectation(record.latest_state_number, &attempts)
+    }
+
+    pub async fn latch_creation_coin(
+        &mut self,
+        wallet_name: &str,
+        statechain_id: &str,
+        expected_owner_user_pubkey: &str,
+        expected_signed_statechain_id: &str,
+    ) -> Result<Coin> {
+        if !list_bip448_withdrawal_attempts_on(self.connection(), wallet_name, statechain_id)
+            .await?
+            .is_empty()
+        {
+            return Err(anyhow!(
+                "BIP448 withdrawal attempt blocks lightning-latch creation"
+            ));
+        }
+        let intents =
+            list_bip448_transfer_intents_on(self.connection(), wallet_name, statechain_id).await?;
+        if validate_bip448_transfer_intent_lineage(&intents)?.is_some() {
+            return Err(anyhow!(
+                "active BIP448 transfer intent blocks lightning-latch creation"
+            ));
+        }
+        let wallet_json = sqlx::query_scalar::<_, String>(
+            "SELECT wallet_json FROM wallet WHERE wallet_name = $1",
+        )
+        .bind(wallet_name)
+        .fetch_optional(self.connection())
+        .await?
+        .ok_or_else(|| anyhow!("BIP448 lightning-latch wallet is missing"))?;
+        let wallet: Wallet = serde_json::from_str(&wallet_json)?;
+        if wallet.name != wallet_name {
+            return Err(anyhow!("BIP448 lightning-latch wallet identity changed"));
+        }
+        let mut matches = wallet.coins.iter().filter_map(|coin| {
+            if coin.statechain_id.as_deref() != Some(statechain_id)
+                || coin.signed_statechain_id.as_deref() != Some(expected_signed_statechain_id)
+            {
+                return None;
+            }
+            let owner = PublicKey::from_str(&coin.user_pubkey)
+                .ok()?
+                .x_only_public_key()
+                .0
+                .to_string();
+            (owner == expected_owner_user_pubkey).then(|| coin.clone())
+        });
+        let coin = matches.next().ok_or_else(|| {
+            anyhow!("BIP448 lightning-latch current-owner Coin changed before creation")
+        })?;
+        if matches.next().is_some() {
+            return Err(anyhow!(
+                "multiple BIP448 lightning-latch current-owner Coins match"
+            ));
+        }
+        Ok(coin)
+    }
+
     pub async fn apply_scan_cache_and_cursor(
         &mut self,
         wallet_name: &str,
@@ -5095,16 +5165,15 @@ pub async fn store_bip448_withdrawal_nonce_session(
         message_hex,
         output_pubkey,
         client_partial_sig,
-        encoded_session,
     ] {
         bip448_funding::require_canonical_hex(value, None)?;
     }
     let sign_second =
         bip448_funding::parse_canonical_sign_second_payload(sign_second_payload_json)?;
+    bip448_funding::require_bip448_session_relationship(encoded_session, &sign_second.session)?;
     if sign_second.statechain_id != statechain_id
         || sign_second.signing_id != signing_id
         || sign_second.server_pub_nonce != server_public_nonce
-        || sign_second.session != encoded_session
         || !matches!(sign_second.negate_seckey, 0 | 1)
     {
         return Err(anyhow!(
@@ -8122,7 +8191,7 @@ mod tests {
             Bip448FeeBumpPolicy, Bip448FundingOutpoint, Bip448LatestState,
             Bip448RecoveryTemplateRole, Bip448SigningMetadata, Bip448ValueSchedule,
         },
-        withdraw::create_bip448_keypath_nonces,
+        withdraw::{build_bip448_withdrawal_signing_data, create_bip448_keypath_nonces},
     };
     use mercurylib::transfer::bip448::Bip448TransferMsg;
     use mercurylib::wallet::{CoinStatus, Settings};
@@ -8501,6 +8570,104 @@ mod tests {
         real_accepted_fixture_for(status, "statechain", &"34".repeat(32))
     }
 
+    fn real_keypath_session_pair(server_nonce_seed: u8) -> Result<(String, String)> {
+        let (mut wallet, record, _, _) = real_accepted_fixture(CoinStatus::CONFIRMED)?;
+        let coin = wallet
+            .coins
+            .first_mut()
+            .ok_or_else(|| anyhow!("real keypath session fixture Coin is missing"))?;
+        let nonce = create_bip448_keypath_nonces(coin)?;
+        coin.secret_nonce = Some(nonce.secret_nonce);
+        coin.public_nonce = Some(nonce.public_nonce);
+        coin.blinding_factor = Some(nonce.blinding_factor);
+
+        let secp = Secp256k1::new();
+        let server_secret = SecretKey::from_secret_bytes([7u8; 32])?;
+        let server_keypair = KeyPair::from_secret_key(&secp, &server_secret);
+        let (_, server_public_nonce) = new_musig_nonce_pair(
+            &secp,
+            MusigSessionId::assume_unique_per_nonce_gen([server_nonce_seed; 32]),
+            None,
+            Some(server_secret),
+            server_keypair.public_key(),
+            None,
+            None,
+        )?;
+        coin.server_public_nonce = Some(hex::encode(server_public_nonce.serialize()));
+        let destination = coin.backup_address.clone();
+        let signing = build_bip448_withdrawal_signing_data(
+            coin,
+            bitcoin::OutPoint {
+                txid: bitcoin::Txid::from_str(&record.funding_outpoint.txid)?,
+                vout: record.funding_outpoint.vout,
+            },
+            record.funding_outpoint.value_sats,
+            101,
+            1.0,
+            &destination,
+            Network::Regtest,
+        )?;
+        let blinded_session = signing.partial_signature_request_payload.session;
+        if signing.encoded_session == blinded_session {
+            return Err(anyhow!(
+                "real keypath session fixture lost the full/blinded distinction"
+            ));
+        }
+        Ok((signing.encoded_session, blinded_session))
+    }
+
+    fn mutate_session_byte(session: &str, byte_index: usize) -> Result<String> {
+        let mut bytes = hex::decode(session)?;
+        let byte = bytes
+            .get_mut(byte_index)
+            .ok_or_else(|| anyhow!("session mutation index is out of bounds"))?;
+        *byte ^= 1;
+        Ok(hex::encode(bytes))
+    }
+
+    fn sign_second_payload_for_attempt(
+        attempt: &Bip448WithdrawalAttempt,
+        server_public_nonce: &str,
+        blinded_session: &str,
+    ) -> Result<String> {
+        Ok(serde_json::to_string(
+            &mercurylib::bip448_statechain::signing_api::Bip448PartialSignatureRequestPayload {
+                statechain_id: attempt.statechain_id.clone(),
+                signed_statechain_id: attempt.signed_statechain_id.clone(),
+                signing_id: attempt.signing_id.clone(),
+                negate_seckey: 0,
+                session: blinded_session.to_owned(),
+                server_pub_nonce: server_public_nonce.to_owned(),
+            },
+        )?)
+    }
+
+    async fn raw_withdrawal_attempt_snapshot(
+        pool: &Pool<Sqlite>,
+        wallet_name: &str,
+        statechain_id: &str,
+        binding_index: u32,
+    ) -> Result<String> {
+        Ok(sqlx::query_scalar(
+            "SELECT json_array(wallet_name,statechain_id,binding_index,attempt_kind,\
+                owner_user_pubkey,owner_state_number,source_txid,source_vout,source_value_sats,\
+                source_script_pubkey,destination_address,destination_script_pubkey,\
+                fee_rate_sat_per_vbyte,fee_sats,lock_time,unsigned_tx_hex,signing_id,\
+                signed_statechain_id,sign_first_payload_json,client_secret_nonce,\
+                client_public_nonce,blinding_factor,server_public_nonce,message_hex,\
+                output_pubkey,client_partial_sig,encoded_session,sign_second_payload_json,\
+                server_partial_sig,aggregate_signature,signed_tx_hex,txid,phase,broadcast_status,\
+                completion_status,closing_tip_height,closing_tip_hash,closing_bindings_json,\
+                created_at,updated_at) FROM bip448_withdrawal_attempts \
+             WHERE wallet_name=$1 AND statechain_id=$2 AND binding_index=$3",
+        )
+        .bind(wallet_name)
+        .bind(statechain_id)
+        .bind(i64::from(binding_index))
+        .fetch_one(pool)
+        .await?)
+    }
+
     fn pre_materialized_initial_acceptance_fixture(
         retain_observed_outpoint: bool,
     ) -> Result<(
@@ -8798,6 +8965,40 @@ mod tests {
         }
     }
 
+    async fn current_duplicate_attempt_fixture(
+        pool: &Pool<Sqlite>,
+        duplicate_txid_byte: &str,
+    ) -> Result<(Bip448WithdrawalAttempt, String, String)> {
+        let (_, owner, script) = accepted_binding_fixture(pool).await?;
+        let binding = reconcile_bip448_funding_bindings(
+            pool,
+            "wallet",
+            "statechain",
+            &owner.to_string(),
+            1,
+            &[
+                sample_binding_observation("34", 0, 100_000, &script),
+                sample_binding_observation(duplicate_txid_byte, 1, 70_000, &script),
+            ],
+        )
+        .await?
+        .into_iter()
+        .find(|row| row.binding_index == 1)
+        .ok_or_else(|| anyhow!("duplicate fixture binding is missing"))?;
+        let wallet = get_wallet(pool, "wallet").await?;
+        let signed_statechain_id = wallet
+            .coins
+            .iter()
+            .find(|coin| coin.statechain_id.as_deref() == Some("statechain"))
+            .and_then(|coin| coin.signed_statechain_id.clone())
+            .ok_or_else(|| anyhow!("duplicate fixture signed statechain ID is missing"))?;
+        Ok((
+            sample_duplicate_attempt(&binding),
+            owner.to_string(),
+            signed_statechain_id,
+        ))
+    }
+
     fn refresh_attempt_sign_first_payload(attempt: &mut Bip448WithdrawalAttempt) {
         attempt.sign_first_payload_json = serde_json::to_string(
             &mercurylib::bip448_statechain::signing_api::Bip448SignFirstRequestPayload {
@@ -8973,14 +9174,14 @@ mod tests {
         )
         .await?;
         let server_public_nonce = "81".repeat(66);
-        let encoded_session = "85".repeat(32);
+        let (encoded_session, blinded_session) = real_keypath_session_pair(90)?;
         let sign_second_payload_json = serde_json::to_string(
             &mercurylib::bip448_statechain::signing_api::Bip448PartialSignatureRequestPayload {
                 statechain_id: attempt.statechain_id.clone(),
                 signed_statechain_id: attempt.signed_statechain_id.clone(),
                 signing_id: attempt.signing_id.clone(),
                 negate_seckey: 0,
-                session: encoded_session.clone(),
+                session: blinded_session,
                 server_pub_nonce: server_public_nonce.clone(),
             },
         )?;
@@ -9016,12 +9217,14 @@ mod tests {
         let aggregate_signature = "92".repeat(64);
         let mut signed_transaction: bitcoin::Transaction =
             bitcoin::consensus::deserialize(&hex::decode(&attempt.unsigned_tx_hex)?)?;
+        let mut keypath_witness = hex::decode(&aggregate_signature)?;
+        keypath_witness.push(0x01);
         signed_transaction
             .input
             .get_mut(0)
             .ok_or_else(|| anyhow!("sample BIP448 withdrawal has no input"))?
             .witness
-            .push(hex::decode(&aggregate_signature)?);
+            .push(keypath_witness);
         store_bip448_withdrawal_signed_artifacts(
             pool,
             &attempt.wallet_name,
@@ -11506,7 +11709,7 @@ mod tests {
             vec![Vec::new()],
             vec![hex::decode("93".repeat(64))?],
             vec![aggregate_signature.clone(), vec![1]],
-            vec![with_sighash_byte],
+            vec![aggregate_signature.clone()],
         ];
         for witness_items in invalid_witnesses {
             let mut transaction: bitcoin::Transaction =
@@ -11540,9 +11743,7 @@ mod tests {
 
         let mut transaction: bitcoin::Transaction =
             bitcoin::consensus::deserialize(&hex::decode(&armed.unsigned_tx_hex)?)?;
-        transaction.input[0]
-            .witness
-            .push(aggregate_signature.clone());
+        transaction.input[0].witness.push(with_sighash_byte);
         let stored = store_bip448_withdrawal_signed_artifacts(
             &pool,
             "wallet",
@@ -11557,6 +11758,259 @@ mod tests {
         )
         .await?;
         assert_eq!(stored.phase, Bip448WithdrawalPhase::Signed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bip448_withdrawal_session_relationship_is_typed_and_mutation_resistant() -> Result<()>
+    {
+        let pool = migrated_pool().await?;
+        let (_, owner, script) = accepted_binding_fixture(&pool).await?;
+        let binding = reconcile_bip448_funding_bindings(
+            &pool,
+            "wallet",
+            "statechain",
+            &owner.to_string(),
+            1,
+            &[
+                sample_binding_observation("34", 0, 100_000, &script),
+                sample_binding_observation("11", 1, 70_000, &script),
+            ],
+        )
+        .await?
+        .into_iter()
+        .find(|binding| binding.binding_index == 1)
+        .ok_or_else(|| anyhow!("duplicate session test binding is missing"))?;
+        let attempt = sample_duplicate_attempt(&binding);
+        insert_bip448_withdrawal_attempt_if_absent(&pool, &attempt).await?;
+        let first_armed =
+            arm_bip448_withdrawal_sign_first(&pool, "wallet", "statechain", 1, &attempt.signing_id)
+                .await?;
+
+        let server_public_nonce = "81".repeat(66);
+        let output_pubkey = sample_owner_key(4).0.to_string();
+        let (full_session, blinded_session) = real_keypath_session_pair(94)?;
+        let (_, other_blinded_session) = real_keypath_session_pair(95)?;
+        assert_ne!(full_session, blinded_session);
+        assert_ne!(blinded_session, other_blinded_session);
+        assert_eq!(
+            bip448_funding::derive_bip448_blinded_session(&full_session)?,
+            blinded_session
+        );
+
+        let mutated_full_session = mutate_session_byte(&full_session, 70)?;
+        let mutated_blinded_session = mutate_session_byte(&blinded_session, 70)?;
+        let truncated_full_session = full_session[..full_session.len() - 2].to_owned();
+        let extended_full_session = format!("{full_session}00");
+        let malformed_full_session = format!("g0{}", &full_session[2..]);
+        let noncanonical_full_session = full_session.to_uppercase();
+        let invalid_storage_cases = [
+            (
+                "mutated full",
+                mutated_full_session.clone(),
+                blinded_session.clone(),
+            ),
+            (
+                "mutated blinded",
+                full_session.clone(),
+                mutated_blinded_session.clone(),
+            ),
+            (
+                "truncated full",
+                truncated_full_session.clone(),
+                blinded_session.clone(),
+            ),
+            (
+                "extended full",
+                extended_full_session.clone(),
+                blinded_session.clone(),
+            ),
+            (
+                "malformed full",
+                malformed_full_session.clone(),
+                blinded_session.clone(),
+            ),
+            (
+                "noncanonical full",
+                noncanonical_full_session.clone(),
+                blinded_session.clone(),
+            ),
+            (
+                "different valid blinded",
+                full_session.clone(),
+                other_blinded_session.clone(),
+            ),
+        ];
+        let first_armed_snapshot =
+            raw_withdrawal_attempt_snapshot(&pool, "wallet", "statechain", 1).await?;
+        for (case, candidate_full, candidate_blinded) in invalid_storage_cases {
+            let payload = sign_second_payload_for_attempt(
+                &first_armed,
+                &server_public_nonce,
+                &candidate_blinded,
+            )?;
+            assert!(
+                store_bip448_withdrawal_nonce_session(
+                    &pool,
+                    "wallet",
+                    "statechain",
+                    1,
+                    &attempt.signing_id,
+                    &server_public_nonce,
+                    &"82".repeat(32),
+                    &output_pubkey,
+                    &"84".repeat(32),
+                    &candidate_full,
+                    &payload,
+                )
+                .await
+                .is_err(),
+                "invalid storage case {case} was accepted"
+            );
+            assert_eq!(
+                raw_withdrawal_attempt_snapshot(&pool, "wallet", "statechain", 1).await?,
+                first_armed_snapshot,
+                "invalid storage case {case} changed the exact journal row"
+            );
+            let expectation =
+                bip448_expected_signature_count(&pool, "wallet", "statechain").await?;
+            assert_eq!(expectation.settled_count, 1);
+            assert_eq!(expectation.second_armed_landed_count, None);
+        }
+
+        let valid_payload =
+            sign_second_payload_for_attempt(&first_armed, &server_public_nonce, &blinded_session)?;
+        let nonce_stored = store_bip448_withdrawal_nonce_session(
+            &pool,
+            "wallet",
+            "statechain",
+            1,
+            &attempt.signing_id,
+            &server_public_nonce,
+            &"82".repeat(32),
+            &output_pubkey,
+            &"84".repeat(32),
+            &full_session,
+            &valid_payload,
+        )
+        .await?;
+        assert_eq!(nonce_stored.phase, Bip448WithdrawalPhase::NonceStored);
+
+        let invalid_load_cases = [
+            (
+                "mutated full",
+                mutated_full_session,
+                blinded_session.clone(),
+            ),
+            (
+                "mutated blinded",
+                full_session.clone(),
+                mutated_blinded_session,
+            ),
+            (
+                "truncated full",
+                truncated_full_session,
+                blinded_session.clone(),
+            ),
+            (
+                "extended full",
+                extended_full_session,
+                blinded_session.clone(),
+            ),
+            (
+                "malformed full",
+                malformed_full_session,
+                blinded_session.clone(),
+            ),
+            (
+                "noncanonical full",
+                noncanonical_full_session,
+                blinded_session.clone(),
+            ),
+            (
+                "different valid blinded",
+                full_session.clone(),
+                other_blinded_session,
+            ),
+        ];
+        for (case, candidate_full, candidate_blinded) in invalid_load_cases {
+            let payload = sign_second_payload_for_attempt(
+                &nonce_stored,
+                &server_public_nonce,
+                &candidate_blinded,
+            )?;
+            sqlx::query(
+                "UPDATE bip448_withdrawal_attempts SET encoded_session=$1,\
+                    sign_second_payload_json=$2 WHERE wallet_name='wallet' \
+                    AND statechain_id='statechain' AND binding_index=1",
+            )
+            .bind(candidate_full)
+            .bind(payload)
+            .execute(&pool)
+            .await?;
+            let corrupted_snapshot =
+                raw_withdrawal_attempt_snapshot(&pool, "wallet", "statechain", 1).await?;
+            assert!(
+                get_bip448_withdrawal_attempt(&pool, "wallet", "statechain", 1)
+                    .await
+                    .is_err(),
+                "invalid load case {case} passed typed validation"
+            );
+            assert!(
+                arm_bip448_withdrawal_sign_second(
+                    &pool,
+                    "wallet",
+                    "statechain",
+                    1,
+                    &attempt.signing_id,
+                )
+                .await
+                .is_err(),
+                "invalid load case {case} reached SecondArmed"
+            );
+            assert_eq!(
+                raw_withdrawal_attempt_snapshot(&pool, "wallet", "statechain", 1).await?,
+                corrupted_snapshot,
+                "invalid load case {case} changed the exact journal row"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM bip448_withdrawal_attempts \
+                     WHERE wallet_name='wallet' AND statechain_id='statechain' \
+                       AND phase='SecondArmed'",
+                )
+                .fetch_one(&pool)
+                .await?,
+                0,
+                "invalid load case {case} armed sign/second"
+            );
+            sqlx::query(
+                "UPDATE bip448_withdrawal_attempts SET encoded_session=$1,\
+                    sign_second_payload_json=$2 WHERE wallet_name='wallet' \
+                    AND statechain_id='statechain' AND binding_index=1",
+            )
+            .bind(&full_session)
+            .bind(&valid_payload)
+            .execute(&pool)
+            .await?;
+            assert_eq!(
+                get_bip448_withdrawal_attempt(&pool, "wallet", "statechain", 1)
+                    .await?
+                    .ok_or_else(|| anyhow!("restored nonce row is missing"))?
+                    .phase,
+                Bip448WithdrawalPhase::NonceStored
+            );
+        }
+
+        let second_armed = arm_bip448_withdrawal_sign_second(
+            &pool,
+            "wallet",
+            "statechain",
+            1,
+            &attempt.signing_id,
+        )
+        .await?;
+        assert_eq!(second_armed.phase, Bip448WithdrawalPhase::SecondArmed);
         Ok(())
     }
 
@@ -11609,14 +12063,14 @@ mod tests {
         .is_err());
         let output_pubkey = sample_owner_key(4).0.to_string();
         let server_public_nonce = "81".repeat(66);
-        let encoded_session = "85".repeat(32);
+        let (encoded_session, blinded_session) = real_keypath_session_pair(91)?;
         let sign_second_payload_json = serde_json::to_string(
             &mercurylib::bip448_statechain::signing_api::Bip448PartialSignatureRequestPayload {
                 statechain_id: "statechain".into(),
                 signed_statechain_id: attempt.signed_statechain_id.clone(),
                 signing_id: attempt.signing_id.clone(),
                 negate_seckey: 0,
-                session: encoded_session.clone(),
+                session: blinded_session,
                 server_pub_nonce: server_public_nonce.clone(),
             },
         )?;
@@ -11668,9 +12122,9 @@ mod tests {
         let aggregate_signature = "92".repeat(64);
         let mut signed_transaction: bitcoin::Transaction =
             bitcoin::consensus::deserialize(&hex::decode(&attempt.unsigned_tx_hex)?)?;
-        signed_transaction.input[0]
-            .witness
-            .push(hex::decode(&aggregate_signature)?);
+        let mut keypath_witness = hex::decode(&aggregate_signature)?;
+        keypath_witness.push(0x01);
+        signed_transaction.input[0].witness.push(keypath_witness);
         let signed_tx_hex = hex::encode(bitcoin::consensus::serialize(&signed_transaction));
         let signed_txid = signed_transaction.txid().to_string();
         store_signed_bip448_withdrawal(
@@ -13539,6 +13993,183 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bip448_transfer_intent_and_duplicate_attempt_have_one_durable_winner() -> Result<()> {
+        {
+            let pools = independent_migrated_pools().await?;
+            let (attempt, _, _) = current_duplicate_attempt_fixture(&pools.first, "11").await?;
+            let mut intent = sample_transfer_intent("a9");
+            intent.acknowledge_cooperative_duplicates = true;
+
+            let mut attempt_guard = begin_bip448_mutation_guard(&pools.first).await?;
+            attempt_guard
+                .insert_withdrawal_attempt_if_absent(&attempt)
+                .await?;
+            let remote_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let task_remote_calls = remote_calls.clone();
+            let hook = Arc::new(Bip448BeginImmediateTestHook::default());
+            let task_hook = hook.clone();
+            let second_pool = pools.second.clone();
+            let task = tokio::spawn(BIP448_BEGIN_IMMEDIATE_TEST_HOOK.scope(
+                task_hook,
+                async move {
+                    let mut guard = begin_bip448_mutation_guard(&second_pool).await?;
+                    let stored = guard
+                        .prepare_or_supersede_transfer_intent(None, &intent)
+                        .await?;
+                    guard.commit().await?;
+                    task_remote_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok::<_, anyhow::Error>(stored)
+                },
+            ));
+            assert_begin_is_contested(&hook).await?;
+            attempt_guard.commit().await?;
+            hook.after_acquire.notified().await;
+            assert!(
+                task.await?.is_err(),
+                "attempt-first serialization must reject transfer intent creation"
+            );
+            assert_eq!(
+                remote_calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "losing transfer must make no remote call"
+            );
+            assert_eq!(
+                list_bip448_withdrawal_attempts(&pools.first, "wallet", "statechain")
+                    .await?
+                    .len(),
+                1
+            );
+            assert!(
+                list_bip448_transfer_intents(&pools.first, "wallet", "statechain")
+                    .await?
+                    .is_empty()
+            );
+        }
+
+        {
+            let pools = independent_migrated_pools().await?;
+            let (attempt, _, _) = current_duplicate_attempt_fixture(&pools.first, "12").await?;
+            let mut intent = sample_transfer_intent("aa");
+            intent.acknowledge_cooperative_duplicates = true;
+
+            let mut transfer_guard = begin_bip448_mutation_guard(&pools.first).await?;
+            transfer_guard
+                .prepare_or_supersede_transfer_intent(None, &intent)
+                .await?;
+            let hook = Arc::new(Bip448BeginImmediateTestHook::default());
+            let task_hook = hook.clone();
+            let second_pool = pools.second.clone();
+            let task = tokio::spawn(
+                BIP448_BEGIN_IMMEDIATE_TEST_HOOK.scope(task_hook, async move {
+                    insert_bip448_withdrawal_attempt_if_absent(&second_pool, &attempt).await
+                }),
+            );
+            assert_begin_is_contested(&hook).await?;
+            transfer_guard.commit().await?;
+            hook.after_acquire.notified().await;
+            assert!(
+                task.await?.is_err(),
+                "transfer-first serialization must reject attempt creation"
+            );
+            assert_eq!(
+                list_bip448_transfer_intents(&pools.first, "wallet", "statechain")
+                    .await?
+                    .len(),
+                1
+            );
+            assert!(
+                list_bip448_withdrawal_attempts(&pools.first, "wallet", "statechain")
+                    .await?
+                    .is_empty()
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bip448_latch_creation_and_duplicate_attempt_are_asymmetrically_linearized(
+    ) -> Result<()> {
+        {
+            let pools = independent_migrated_pools().await?;
+            let (attempt, owner, signed_statechain_id) =
+                current_duplicate_attempt_fixture(&pools.first, "13").await?;
+            let mut attempt_guard = begin_bip448_mutation_guard(&pools.first).await?;
+            attempt_guard
+                .insert_withdrawal_attempt_if_absent(&attempt)
+                .await?;
+            let remote_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let task_remote_calls = remote_calls.clone();
+            let hook = Arc::new(Bip448BeginImmediateTestHook::default());
+            let task_hook = hook.clone();
+            let second_pool = pools.second.clone();
+            let task = tokio::spawn(BIP448_BEGIN_IMMEDIATE_TEST_HOOK.scope(
+                task_hook,
+                async move {
+                    let mut guard = begin_bip448_mutation_guard(&second_pool).await?;
+                    let coin = guard
+                        .latch_creation_coin("wallet", "statechain", &owner, &signed_statechain_id)
+                        .await?;
+                    task_remote_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    guard.commit().await?;
+                    Ok::<_, anyhow::Error>(coin)
+                },
+            ));
+            assert_begin_is_contested(&hook).await?;
+            attempt_guard.commit().await?;
+            hook.after_acquire.notified().await;
+            assert!(
+                task.await?.is_err(),
+                "attempt-first serialization must reject latch creation"
+            );
+            assert_eq!(
+                remote_calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "attempt-first latch rejection must precede the remote call"
+            );
+        }
+
+        {
+            let pools = independent_migrated_pools().await?;
+            let (attempt, owner, signed_statechain_id) =
+                current_duplicate_attempt_fixture(&pools.first, "14").await?;
+            let mut latch_guard = begin_bip448_mutation_guard(&pools.first).await?;
+            let selected = latch_guard
+                .latch_creation_coin("wallet", "statechain", &owner, &signed_statechain_id)
+                .await?;
+            let remote_calls = std::sync::atomic::AtomicUsize::new(0);
+            remote_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+            let hook = Arc::new(Bip448BeginImmediateTestHook::default());
+            let task_hook = hook.clone();
+            let second_pool = pools.second.clone();
+            let task = tokio::spawn(
+                BIP448_BEGIN_IMMEDIATE_TEST_HOOK.scope(task_hook, async move {
+                    insert_bip448_withdrawal_attempt_if_absent(&second_pool, &attempt).await
+                }),
+            );
+            assert_begin_is_contested(&hook).await?;
+            latch_guard.commit().await?;
+            hook.after_acquire.notified().await;
+            let stored_attempt = task.await??;
+            assert_eq!(selected.statechain_id.as_deref(), Some("statechain"));
+            assert_eq!(stored_attempt.binding_index, 1);
+            assert_eq!(
+                remote_calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "latch-first may finish its one remote call while retaining the guard"
+            );
+            assert_eq!(
+                list_bip448_withdrawal_attempts(&pools.first, "wallet", "statechain")
+                    .await?
+                    .len(),
+                1,
+                "completed latch creation reserves no future transfer right"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn bip448_accepted_to_needs_rebroadcast_serializes_before_later_attempt() -> Result<()> {
         let pools = independent_migrated_pools().await?;
         let (_, owner, script) = accepted_binding_fixture(&pools.first).await?;
@@ -13909,14 +14540,14 @@ mod tests {
         );
         let output_pubkey = sample_owner_key(4).0.to_string();
         let server_public_nonce = "81".repeat(66);
-        let encoded_session = "85".repeat(32);
+        let (encoded_session, blinded_session) = real_keypath_session_pair(92)?;
         let sign_second_payload_json = serde_json::to_string(
             &mercurylib::bip448_statechain::signing_api::Bip448PartialSignatureRequestPayload {
                 statechain_id: "statechain".into(),
                 signed_statechain_id: armed.signed_statechain_id.clone(),
                 signing_id: armed.signing_id.clone(),
                 negate_seckey: 0,
-                session: encoded_session.clone(),
+                session: blinded_session,
                 server_pub_nonce: server_public_nonce.clone(),
             },
         )?;
@@ -13962,9 +14593,9 @@ mod tests {
         let aggregate_signature = "92".repeat(64);
         let mut signed_transaction: bitcoin::Transaction =
             bitcoin::consensus::deserialize(&hex::decode(&armed.unsigned_tx_hex)?)?;
-        signed_transaction.input[0]
-            .witness
-            .push(hex::decode(&aggregate_signature)?);
+        let mut keypath_witness = hex::decode(&aggregate_signature)?;
+        keypath_witness.push(0x01);
+        signed_transaction.input[0].witness.push(keypath_witness);
         let signed_tx_hex = hex::encode(bitcoin::consensus::serialize(&signed_transaction));
         let signed = store_bip448_withdrawal_signed_artifacts(
             &pool,
@@ -14180,14 +14811,14 @@ mod tests {
         )
         .await?;
         let server_public_nonce = "81".repeat(66);
-        let encoded_session = "85".repeat(32);
+        let (encoded_session, blinded_session) = real_keypath_session_pair(93)?;
         let sign_second_payload_json = serde_json::to_string(
             &mercurylib::bip448_statechain::signing_api::Bip448PartialSignatureRequestPayload {
                 statechain_id: "statechain".into(),
                 signed_statechain_id: canonical_attempt.signed_statechain_id.clone(),
                 signing_id: canonical_attempt.signing_id.clone(),
                 negate_seckey: 0,
-                session: encoded_session.clone(),
+                session: blinded_session,
                 server_pub_nonce: server_public_nonce.clone(),
             },
         )?;
@@ -14216,12 +14847,14 @@ mod tests {
         let aggregate_signature = "92".repeat(64);
         let mut signed_transaction: bitcoin::Transaction =
             bitcoin::consensus::deserialize(&hex::decode(&canonical_attempt.unsigned_tx_hex)?)?;
+        let mut keypath_witness = hex::decode(&aggregate_signature)?;
+        keypath_witness.push(0x01);
         signed_transaction
             .input
             .get_mut(0)
             .ok_or_else(|| anyhow!("sample canonical withdrawal has no input"))?
             .witness
-            .push(hex::decode(&aggregate_signature)?);
+            .push(keypath_witness);
         store_bip448_withdrawal_signed_artifacts(
             &pool,
             "wallet",
