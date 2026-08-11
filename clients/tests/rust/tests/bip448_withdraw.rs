@@ -6,6 +6,16 @@ use anyhow::{Context, Result};
 use bitcoin::{Address, Txid};
 use common::bip448_regtest::FUNDING_AMOUNT_SATS;
 use mercuryrustlib::{client_config::ClientConfig, CoinStatus, Wallet};
+use reqwest::StatusCode;
+
+async fn assert_lockbox_state_absent(statechain_id: &str) -> Result<()> {
+    let client = common::lockbox::http_client();
+    let response =
+        common::lockbox::get(&client, &format!("signature_count/{statechain_id}")).await?;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.text().await?, "Signature count not found.");
+    Ok(())
+}
 
 async fn wallet(config: &ClientConfig, name: &str) -> Result<Wallet> {
     let wallet = mercuryrustlib::wallet::create_wallet(name, config).await?;
@@ -53,6 +63,33 @@ async fn transfer(
 
 async fn withdraw_and_confirm(config: &ClientConfig, wallet: &Wallet, id: &str) -> Result<()> {
     let destination = common::bitcoin_core::getnewaddress()?;
+    let accepted_state_number =
+        mercuryrustlib::sqlite_manager::get_bip448_statechain(&config.pool, &wallet.name, id)
+            .await?
+            .latest_state_number;
+    let expected_count = accepted_state_number
+        .checked_add(1)
+        .context("canonical signature count overflow")?;
+    std::env::set_var("ML_BIP448_WITHDRAW_STOP_AFTER_SIGNATURE", "1");
+    let stopped =
+        mercuryrustlib::bip448_withdraw::execute(config, &wallet.name, id, &destination, None)
+            .await;
+    std::env::remove_var("ML_BIP448_WITHDRAW_STOP_AFTER_SIGNATURE");
+    assert_eq!(
+        stopped.unwrap_err().to_string(),
+        "BIP448 withdraw stopped after signature for test"
+    );
+    let signed_attempts = mercuryrustlib::sqlite_manager::list_bip448_withdrawal_attempts(
+        &config.pool,
+        &wallet.name,
+        id,
+    )
+    .await?;
+    assert_eq!(signed_attempts.len(), 1);
+    assert_eq!(
+        common::lockbox::get_signature_count(&common::lockbox::http_client(), id).await?,
+        expected_count
+    );
     mercuryrustlib::bip448_withdraw::execute(config, &wallet.name, id, &destination, None).await?;
     let stored = mercuryrustlib::sqlite_manager::get_wallet(&config.pool, &wallet.name).await?;
     let coin = stored
@@ -66,6 +103,43 @@ async fn withdraw_and_confirm(config: &ClientConfig, wallet: &Wallet, id: &str) 
             .as_deref()
             .context("withdraw txid is missing")?,
     )?;
+    let txid_text = txid.to_string();
+    let attempts = mercuryrustlib::sqlite_manager::list_bip448_withdrawal_attempts(
+        &config.pool,
+        &wallet.name,
+        id,
+    )
+    .await?;
+    assert_eq!(attempts.len(), 1);
+    let attempt = &attempts[0];
+    assert_eq!(attempt.binding_index, 0);
+    assert_eq!(
+        attempt.attempt_kind,
+        mercuryrustlib::bip448_funding::Bip448WithdrawalAttemptKind::Canonical
+    );
+    assert_eq!(
+        attempt.phase,
+        mercuryrustlib::bip448_funding::Bip448WithdrawalPhase::Signed
+    );
+    assert_eq!(
+        attempt.completion_status,
+        mercuryrustlib::bip448_funding::Bip448CompletionStatus::Closed
+    );
+    assert_eq!(attempt.txid.as_deref(), Some(txid_text.as_str()));
+    let signing_id = attempt.signing_id.clone();
+    let signed_tx_hex = attempt
+        .signed_tx_hex
+        .clone()
+        .context("canonical signed bytes are missing")?;
+    assert_eq!(
+        stored
+            .activities
+            .iter()
+            .filter(|activity| activity.utxo == txid_text)
+            .count(),
+        1
+    );
+    assert_lockbox_state_absent(id).await?;
     let output = config
         .chain_client
         .get_tx_out(&txid, 0, true)?
@@ -79,6 +153,35 @@ async fn withdraw_and_confirm(config: &ClientConfig, wallet: &Wallet, id: &str) 
     assert!(mercuryrustlib::utils::get_statechain_info(id, config)
         .await?
         .is_none());
+
+    mercuryrustlib::bip448_withdraw::execute(config, &wallet.name, id, &destination, None).await?;
+    let replayed_attempts = mercuryrustlib::sqlite_manager::list_bip448_withdrawal_attempts(
+        &config.pool,
+        &wallet.name,
+        id,
+    )
+    .await?;
+    assert_eq!(replayed_attempts.len(), 1);
+    assert_eq!(replayed_attempts[0].signing_id, signing_id);
+    assert_eq!(
+        replayed_attempts[0].signed_tx_hex.as_deref(),
+        Some(signed_tx_hex.as_str())
+    );
+    assert_eq!(
+        replayed_attempts[0].completion_status,
+        mercuryrustlib::bip448_funding::Bip448CompletionStatus::Closed
+    );
+    let replayed_wallet =
+        mercuryrustlib::sqlite_manager::get_wallet(&config.pool, &wallet.name).await?;
+    assert_eq!(
+        replayed_wallet
+            .activities
+            .iter()
+            .filter(|activity| activity.utxo == txid_text)
+            .count(),
+        1
+    );
+    assert_lockbox_state_absent(id).await?;
     common::bitcoin_core::mine_blocks(config.confirmation_target)?;
     mercuryrustlib::coin_status::update_coins(config, &wallet.name).await?;
     let stored = mercuryrustlib::sqlite_manager::get_wallet(&config.pool, &wallet.name).await?;

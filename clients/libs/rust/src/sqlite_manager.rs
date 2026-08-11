@@ -9,6 +9,7 @@ use bitcoin::{
     hashes::{sha256, Hash},
     Address, BlockHash, OutPoint, PrivateKey, Txid,
 };
+use chrono::Utc;
 use mercurylib::{
     bip448_statechain::{
         deposit::{
@@ -1484,6 +1485,25 @@ pub async fn has_bip448_transfer_msg_for_statechain(
 ) -> Result<bool> {
     Ok(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM bip448_transfer_messages WHERE wallet_name = $1 AND statechain_id = $2").bind(wallet_name).bind(statechain_id).fetch_one(pool).await? != 0)
 }
+
+pub(crate) async fn list_bip448_transfer_msg_raw_rows(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+) -> Result<Vec<(String, String)>> {
+    sqlx::query(
+        "SELECT recipient_auth_pubkey,transfer_msg_json FROM bip448_transfer_messages \
+         WHERE wallet_name=$1 AND statechain_id=$2 ORDER BY recipient_auth_pubkey",
+    )
+    .bind(wallet_name)
+    .bind(statechain_id)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|row| Ok((row.try_get(0)?, row.try_get(1)?)))
+    .collect()
+}
+
 pub async fn delete_bip448_transfer_msgs(
     pool: &Pool<Sqlite>,
     wallet_name: &str,
@@ -1924,6 +1944,11 @@ pub async fn begin_bip448_mutation_guard(pool: &Pool<Sqlite>) -> Result<Bip448Mu
 impl Bip448MutationGuard {
     pub async fn commit(self) -> Result<()> {
         self.transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn rollback(self) -> Result<()> {
+        self.transaction.rollback().await?;
         Ok(())
     }
 
@@ -2513,9 +2538,6 @@ impl Bip448MutationGuard {
                 Bip448ObservationStatus::SpentConfirmed => Bip448BroadcastStatus::Conflicted,
                 Bip448ObservationStatus::SpentMempool
                 | Bip448ObservationStatus::SpentUnconfirmed => Bip448BroadcastStatus::Conflicting,
-                _ if attempt.broadcast_status == Bip448BroadcastStatus::NotBroadcast => {
-                    Bip448BroadcastStatus::NotBroadcast
-                }
                 _ => Bip448BroadcastStatus::NeedsRebroadcast,
             };
             if next == attempt.broadcast_status {
@@ -2976,6 +2998,260 @@ impl Bip448MutationGuard {
         .await?
         .ok_or_else(|| anyhow!("BIP448 withdrawal attempt disappeared after insertion"))
     }
+
+    pub async fn persist_canonical_withdrawal_wallet(
+        &mut self,
+        wallet_name: &str,
+        statechain_id: &str,
+        signing_id: &str,
+    ) -> Result<Wallet> {
+        let attempt = self
+            .exact_attempt(wallet_name, statechain_id, 0)
+            .await?
+            .ok_or_else(|| anyhow!("canonical BIP448 withdrawal attempt is missing"))?;
+        if attempt.signing_id != signing_id
+            || attempt.attempt_kind != Bip448WithdrawalAttemptKind::Canonical
+            || attempt.phase != Bip448WithdrawalPhase::Signed
+            || !matches!(
+                attempt.broadcast_status,
+                Bip448BroadcastStatus::Accepted | Bip448BroadcastStatus::Confirmed
+            )
+        {
+            return Err(anyhow!(
+                "canonical BIP448 wallet persistence requires exact accepted signed bytes"
+            ));
+        }
+        self.require_attempt_binding_and_owner_identity(&attempt)
+            .await?;
+        let (record, history) =
+            accepted_record_and_history_on(self.connection(), wallet_name, statechain_id).await?;
+        let accepted_owner = history
+            .get(
+                usize::try_from(record.latest_state_number)?
+                    .checked_sub(1)
+                    .ok_or_else(|| anyhow!("BIP448 accepted state number must be positive"))?,
+            )
+            .ok_or_else(|| anyhow!("BIP448 accepted owner history is missing"))?;
+        if accepted_owner.owner_public_key != attempt.owner_user_pubkey {
+            return Err(anyhow!(
+                "canonical BIP448 wallet owner changed before persistence"
+            ));
+        }
+
+        let raw_wallet =
+            sqlx::query_scalar::<_, String>("SELECT wallet_json FROM wallet WHERE wallet_name=$1")
+                .bind(wallet_name)
+                .fetch_optional(self.connection())
+                .await?
+                .ok_or_else(|| anyhow!("canonical BIP448 withdrawal wallet is missing"))?;
+        let mut wallet: Wallet = serde_json::from_str(&raw_wallet)?;
+        if wallet.name != wallet_name || wallet.network != record.network {
+            return Err(anyhow!(
+                "canonical BIP448 withdrawal wallet identity changed"
+            ));
+        }
+        let owner = XOnlyPublicKey::from_str(&attempt.owner_user_pubkey)?;
+        let matches = wallet
+            .coins
+            .iter()
+            .enumerate()
+            .filter_map(|(index, coin)| {
+                let coin_owner = PublicKey::from_str(&coin.user_pubkey)
+                    .ok()?
+                    .x_only_public_key()
+                    .0;
+                (coin.statechain_id.as_deref() == Some(statechain_id) && coin_owner == owner)
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let [coin_index] = matches.as_slice() else {
+            return Err(anyhow!(
+                "canonical BIP448 withdrawal requires one exact wallet Coin"
+            ));
+        };
+        let txid = attempt
+            .txid
+            .as_deref()
+            .ok_or_else(|| anyhow!("canonical BIP448 signed attempt has no txid"))?;
+        let server_public_nonce = attempt
+            .server_public_nonce
+            .as_deref()
+            .ok_or_else(|| anyhow!("canonical BIP448 signed attempt has no server nonce"))?;
+        let activity_amount;
+        {
+            let coin = wallet
+                .coins
+                .get_mut(*coin_index)
+                .ok_or_else(|| anyhow!("canonical BIP448 withdrawal Coin disappeared"))?;
+            match coin.status {
+                CoinStatus::CONFIRMED => {
+                    validate_selected_bip448_coin(
+                        coin,
+                        &record,
+                        owner,
+                        Bip448WalletCoinRequirement::ConfirmedCanonicalAttempt,
+                    )?;
+                    coin.secret_nonce = Some(attempt.client_secret_nonce.clone());
+                    coin.public_nonce = Some(attempt.client_public_nonce.clone());
+                    coin.server_public_nonce = Some(server_public_nonce.to_owned());
+                    coin.blinding_factor = Some(attempt.blinding_factor.clone());
+                    coin.tx_withdraw = Some(txid.to_owned());
+                    coin.withdrawal_address = Some(attempt.destination_address.clone());
+                    coin.status = CoinStatus::WITHDRAWING;
+                }
+                CoinStatus::WITHDRAWING | CoinStatus::WITHDRAWN => {
+                    validate_selected_bip448_coin(
+                        coin,
+                        &record,
+                        owner,
+                        Bip448WalletCoinRequirement::PassiveBindingSync,
+                    )?;
+                    if coin.secret_nonce.as_deref() != Some(attempt.client_secret_nonce.as_str())
+                        || coin.public_nonce.as_deref()
+                            != Some(attempt.client_public_nonce.as_str())
+                        || coin.server_public_nonce.as_deref() != Some(server_public_nonce)
+                        || coin.blinding_factor.as_deref() != Some(attempt.blinding_factor.as_str())
+                        || coin.tx_withdraw.as_deref() != Some(txid)
+                        || coin.withdrawal_address.as_deref()
+                            != Some(attempt.destination_address.as_str())
+                    {
+                        return Err(anyhow!(
+                            "canonical BIP448 withdrawal wallet replay identity changed"
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(anyhow!(
+                        "canonical BIP448 withdrawal wallet has an illegal Coin status"
+                    ));
+                }
+            }
+            activity_amount = coin
+                .amount
+                .ok_or_else(|| anyhow!("canonical BIP448 withdrawal Coin has no amount"))?;
+            if u64::from(activity_amount) != record.amount_sats {
+                return Err(anyhow!(
+                    "canonical BIP448 withdrawal activity amount changed"
+                ));
+            }
+        }
+
+        let matching_activities = wallet
+            .activities
+            .iter()
+            .filter(|activity| activity.utxo == txid)
+            .collect::<Vec<_>>();
+        match matching_activities.as_slice() {
+            [] => wallet.activities.push(Activity {
+                utxo: txid.to_owned(),
+                amount: activity_amount,
+                action: "Withdraw".to_owned(),
+                date: Utc::now().to_rfc3339(),
+            }),
+            [activity] if activity.amount == activity_amount && activity.action == "Withdraw" => {}
+            _ => {
+                return Err(anyhow!(
+                    "canonical BIP448 withdrawal activity replay identity changed"
+                ));
+            }
+        }
+
+        let replacement = canonical_wallet_json(&wallet)?;
+        let updated =
+            sqlx::query("UPDATE wallet SET wallet_json=$1 WHERE wallet_name=$2 AND wallet_json=$3")
+                .bind(replacement)
+                .bind(wallet_name)
+                .bind(&raw_wallet)
+                .execute(self.connection())
+                .await?;
+        if updated.rows_affected() != 1 {
+            return Err(anyhow!(
+                "canonical BIP448 withdrawal wallet compare-and-set lost"
+            ));
+        }
+        Ok(wallet)
+    }
+
+    async fn validate_canonical_completion_request(
+        &mut self,
+        wallet_name: &str,
+        statechain_id: &str,
+        signing_id: &str,
+    ) -> Result<Bip448WithdrawalAttempt> {
+        validate_canonical_close_snapshot_on(self, wallet_name, statechain_id, signing_id).await?;
+        let canonical = self
+            .exact_attempt(wallet_name, statechain_id, 0)
+            .await?
+            .ok_or_else(|| anyhow!("canonical BIP448 completion attempt is missing"))?;
+        if canonical.phase != Bip448WithdrawalPhase::Signed
+            || canonical.completion_status != Bip448CompletionStatus::CloseArmed
+            || !matches!(
+                canonical.broadcast_status,
+                Bip448BroadcastStatus::Accepted | Bip448BroadcastStatus::Confirmed
+            )
+        {
+            return Err(anyhow!(
+                "canonical BIP448 completion requires exact accepted CloseArmed bytes"
+            ));
+        }
+        self.require_attempt_binding_and_owner_identity(&canonical)
+            .await?;
+        Ok(canonical)
+    }
+}
+
+/// Runs only the bounded canonical completion operation after the final
+/// guarded snapshot reload. Timeout and callback errors explicitly roll back
+/// the read-only fence before the caller performs journal-first reconciliation;
+/// cancellation or unwinding retains SQLx's rollback-on-drop behavior.
+pub(crate) async fn with_bip448_canonical_completion_fence<T, F, Fut>(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    signing_id: &str,
+    completion_timeout: std::time::Duration,
+    completion: F,
+) -> Result<(Bip448WithdrawalAttempt, Result<T>)>
+where
+    F: FnOnce(Bip448WithdrawalAttempt) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let canonical = guard
+        .validate_canonical_completion_request(wallet_name, statechain_id, signing_id)
+        .await?;
+    let completion_result = match tokio::time::timeout(
+        completion_timeout,
+        completion(canonical.clone()),
+    )
+    .await
+    {
+        Ok(Ok(value)) => match guard.commit().await {
+            Ok(()) => Ok(value),
+            Err(error) => Err(error.context(
+                "BIP448 canonical completion returned, but releasing its mutation fence failed",
+            )),
+        },
+        Ok(Err(error)) => match guard.rollback().await {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(error.context(format!(
+                "BIP448 canonical completion failed and its mutation-fence rollback also failed: {rollback_error}"
+            ))),
+        },
+        Err(_) => {
+            let timeout_error = anyhow!(
+                "BIP448 canonical completion timed out after {} seconds",
+                completion_timeout.as_secs_f64()
+            );
+            match guard.rollback().await {
+                Ok(()) => Err(timeout_error),
+                Err(rollback_error) => Err(timeout_error.context(format!(
+                    "BIP448 canonical completion timed out and its mutation-fence rollback also failed: {rollback_error}"
+                ))),
+            }
+        }
+    };
+    Ok((canonical, completion_result))
 }
 
 pub async fn insert_bip448_withdrawal_attempt_if_absent(
@@ -2986,6 +3262,20 @@ pub async fn insert_bip448_withdrawal_attempt_if_absent(
     let persisted = guard.insert_withdrawal_attempt_if_absent(attempt).await?;
     guard.commit().await?;
     Ok(persisted)
+}
+
+pub async fn persist_bip448_canonical_withdrawal_wallet(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+    signing_id: &str,
+) -> Result<Wallet> {
+    let mut guard = begin_bip448_mutation_guard(pool).await?;
+    let wallet = guard
+        .persist_canonical_withdrawal_wallet(wallet_name, statechain_id, signing_id)
+        .await?;
+    guard.commit().await?;
+    Ok(wallet)
 }
 
 fn history_entry_matches_latest_state(
@@ -3213,12 +3503,31 @@ fn validate_passive_bip448_withdrawal_lifecycle_coin(
         .withdrawal_address
         .as_deref()
         .ok_or_else(|| anyhow!("passive BIP448 withdrawal Coin is missing its address"))?;
-    let canonical_address = Address::from_str(withdrawal_address)?
-        .require_network(mercurylib::utils::get_network(&record.network)?)?;
-    if canonical_address.to_string() != withdrawal_address {
-        return Err(anyhow!(
-            "passive BIP448 withdrawal address is not canonical"
-        ));
+    if !mercurylib::validate_address(withdrawal_address, &record.network)? {
+        return Err(anyhow!("passive BIP448 withdrawal address is invalid"));
+    }
+    if withdrawal_address.starts_with("ml") || withdrawal_address.starts_with("tml") {
+        let (version, user, auth) =
+            std::panic::catch_unwind(|| mercurylib::decode_transfer_address(withdrawal_address))
+                .map_err(|_| anyhow!("invalid passive BIP448 withdrawal transfer address"))??;
+        let canonical = mercurylib::encode_sc_address(
+            &user,
+            &auth,
+            mercurylib::utils::get_network(&record.network)?,
+        )?;
+        if version != 0 || canonical != withdrawal_address {
+            return Err(anyhow!(
+                "passive BIP448 withdrawal transfer address is not canonical"
+            ));
+        }
+    } else {
+        let canonical_address = Address::from_str(withdrawal_address)?
+            .require_network(mercurylib::utils::get_network(&record.network)?)?;
+        if canonical_address.to_string() != withdrawal_address {
+            return Err(anyhow!(
+                "passive BIP448 withdrawal address is not canonical"
+            ));
+        }
     }
 
     let secret_nonce = coin
@@ -5456,6 +5765,23 @@ pub async fn transition_bip448_withdrawal_completion_status(
         ) {
             return Err(anyhow!(
                 "canonical BIP448 close can arm only while exact bytes are accepted"
+            ));
+        }
+    } else if expected == Bip448CompletionStatus::CloseArmed
+        && next == Bip448CompletionStatus::Closed
+    {
+        let canonical = guard
+            .exact_attempt(wallet_name, statechain_id, 0)
+            .await?
+            .ok_or_else(|| anyhow!("canonical BIP448 attempt is missing"))?;
+        if canonical.signing_id != signing_id
+            || !matches!(
+                canonical.broadcast_status,
+                Bip448BroadcastStatus::Accepted | Bip448BroadcastStatus::Confirmed
+            )
+        {
+            return Err(anyhow!(
+                "canonical BIP448 close can finish only while exact bytes are accepted"
             ));
         }
     }
@@ -9281,6 +9607,13 @@ mod tests {
         let mut attempt = sample_duplicate_attempt(&canonical);
         attempt.attempt_kind = Bip448WithdrawalAttemptKind::Canonical;
         attempt.completion_status = Bip448CompletionStatus::Open;
+        attempt.destination_address = get_wallet(pool, "wallet")
+            .await?
+            .coins
+            .first()
+            .ok_or_else(|| anyhow!("canonical destination fixture Coin is missing"))?
+            .backup_address
+            .clone();
         attempt.closing_tip_height = Some(20);
         attempt.closing_tip_hash = Some(close_tip_hash);
         attempt.closing_bindings_json = Some(closing_bindings_json);
@@ -14704,7 +15037,8 @@ mod tests {
 
     #[tokio::test]
     async fn bip448_canonical_attempt_requires_and_freezes_exact_close_snapshot() -> Result<()> {
-        let pool = migrated_pool().await?;
+        let pools = independent_migrated_pools().await?;
+        let pool = pools.first.clone();
         let (_, owner, script) = accepted_binding_fixture(&pool).await?;
         let bindings = reconcile_bip448_funding_bindings(
             &pool,
@@ -14762,6 +15096,16 @@ mod tests {
         let mut canonical_attempt = sample_duplicate_attempt(&canonical_binding);
         canonical_attempt.attempt_kind = Bip448WithdrawalAttemptKind::Canonical;
         canonical_attempt.completion_status = Bip448CompletionStatus::Open;
+        let wallet = get_wallet(&pool, "wallet").await?;
+        let coin = wallet
+            .coins
+            .first()
+            .ok_or_else(|| anyhow!("canonical destination fixture Coin is missing"))?;
+        canonical_attempt.destination_address = coin.backup_address.clone();
+        let nonce = create_bip448_keypath_nonces(coin)?;
+        canonical_attempt.client_secret_nonce = nonce.secret_nonce;
+        canonical_attempt.client_public_nonce = nonce.public_nonce;
+        canonical_attempt.blinding_factor = nonce.blinding_factor;
         canonical_attempt.closing_tip_height = Some(20);
         canonical_attempt.closing_tip_hash = Some(close_tip_hash.clone());
         canonical_attempt.closing_bindings_json = Some(snapshot.clone());
@@ -14810,7 +15154,18 @@ mod tests {
             &canonical_attempt.signing_id,
         )
         .await?;
-        let server_public_nonce = "81".repeat(66);
+        let secp = Secp256k1::new();
+        let server_nonce_key = SecretKey::from_secret_bytes([93u8; 32])?;
+        let (_, server_public_nonce) = new_musig_nonce_pair(
+            &secp,
+            MusigSessionId::assume_unique_per_nonce_gen([94u8; 32]),
+            None,
+            Some(server_nonce_key),
+            server_nonce_key.public_key(&secp),
+            None,
+            None,
+        )?;
+        let server_public_nonce = hex::encode(server_public_nonce.serialize());
         let (encoded_session, blinded_session) = real_keypath_session_pair(93)?;
         let sign_second_payload_json = serde_json::to_string(
             &mercurylib::bip448_statechain::signing_api::Bip448PartialSignatureRequestPayload {
@@ -14878,6 +15233,31 @@ mod tests {
             Bip448BroadcastStatus::Accepted,
         )
         .await?;
+        let persisted_wallet = persist_bip448_canonical_withdrawal_wallet(
+            &pool,
+            "wallet",
+            "statechain",
+            &canonical_attempt.signing_id,
+        )
+        .await?;
+        let persisted_coin = persisted_wallet
+            .coins
+            .iter()
+            .find(|coin| coin.statechain_id.as_deref() == Some("statechain"))
+            .ok_or_else(|| anyhow!("persisted canonical Coin is missing"))?;
+        assert_eq!(persisted_coin.status, CoinStatus::WITHDRAWING);
+        assert_eq!(
+            persisted_coin.tx_withdraw.as_deref(),
+            Some(signed_transaction.txid().to_string().as_str())
+        );
+        assert_eq!(
+            persisted_wallet
+                .activities
+                .iter()
+                .filter(|activity| activity.utxo == signed_transaction.txid().to_string())
+                .count(),
+            1
+        );
         update_bip448_withdrawal_completion_status(
             &pool,
             "wallet",
@@ -14906,8 +15286,396 @@ mod tests {
             )
             .await?;
             assert_eq!(row.completion_status, Bip448CompletionStatus::CloseArmed);
+            if matches!(
+                next,
+                Bip448BroadcastStatus::NeedsRebroadcast
+                    | Bip448BroadcastStatus::Conflicting
+                    | Bip448BroadcastStatus::Conflicted
+            ) {
+                assert!(update_bip448_withdrawal_completion_status(
+                    &pool,
+                    "wallet",
+                    "statechain",
+                    &canonical_attempt.signing_id,
+                    Bip448CompletionStatus::CloseArmed,
+                    Bip448CompletionStatus::Closed,
+                )
+                .await
+                .is_err());
+                assert_eq!(
+                    get_bip448_withdrawal_attempt(&pool, "wallet", "statechain", 0)
+                        .await?
+                        .unwrap()
+                        .completion_status,
+                    Bip448CompletionStatus::CloseArmed
+                );
+            }
             current = next;
         }
+
+        let live_duplicate = get_bip448_funding_binding(&pool, "wallet", "statechain", 1)
+            .await?
+            .ok_or_else(|| anyhow!("frozen independent-spend binding is missing"))?;
+        let conflict_observation = Bip448BindingObservation {
+            txid: live_duplicate.txid.clone(),
+            vout: live_duplicate.vout,
+            value_sats: live_duplicate.value_sats,
+            script_pubkey: live_duplicate.script_pubkey.clone(),
+            observation_status: Bip448ObservationStatus::SpentUnconfirmed,
+            funding_height: live_duplicate.funding_height,
+            spend_txid: live_duplicate.spend_txid.clone(),
+            spend_height: live_duplicate.spend_height,
+            last_scanned_height: live_duplicate.last_scanned_height,
+        };
+        let confirmed_observation = Bip448BindingObservation {
+            observation_status: Bip448ObservationStatus::SpentConfirmed,
+            ..conflict_observation.clone()
+        };
+        let completion_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // A passive conflict that linearizes before the final gate prevents
+        // the irreversible callback entirely.
+        let conflicted = update_bip448_funding_binding_observation(
+            &pool,
+            &live_duplicate,
+            &conflict_observation,
+        )
+        .await?;
+        let blocked_completion_calls = completion_calls.clone();
+        let blocked = with_bip448_canonical_completion_fence(
+            &pool,
+            "wallet",
+            "statechain",
+            &canonical_attempt.signing_id,
+            Duration::from_secs(5),
+            move |_| async move {
+                blocked_completion_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, anyhow::Error>(())
+            },
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "a committed frozen-binding conflict passed the final gate"
+        );
+        assert_eq!(
+            completion_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a committed frozen-binding conflict permitted completion"
+        );
+        let restored =
+            update_bip448_funding_binding_observation(&pool, &conflicted, &confirmed_observation)
+                .await?;
+
+        // At the exact post-validation/pre-completion interval, a second real
+        // pool connection tries to commit the same passive conflict. It must
+        // remain behind the retained mutation fence until the completion
+        // boundary has linearized.
+        let hook = Arc::new(Bip448BeginImmediateTestHook::default());
+        let task_hook = hook.clone();
+        let second_pool = pools.second.clone();
+        let writer_commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task_writer_commits = writer_commits.clone();
+        let fenced_hook = hook.clone();
+        let fenced_writer_commits = writer_commits.clone();
+        let fenced_completion_calls = completion_calls.clone();
+        let (completion_attempt, writer) = with_bip448_canonical_completion_fence(
+            &pool,
+            "wallet",
+            "statechain",
+            &canonical_attempt.signing_id,
+            Duration::from_secs(5),
+            move |_| async move {
+                let writer = tokio::spawn(BIP448_BEGIN_IMMEDIATE_TEST_HOOK.scope(
+                    task_hook,
+                    async move {
+                        let updated = update_bip448_funding_binding_observation(
+                            &second_pool,
+                            &restored,
+                            &conflict_observation,
+                        )
+                        .await?;
+                        task_writer_commits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok::<_, anyhow::Error>(updated)
+                    },
+                ));
+                assert_begin_is_contested(&fenced_hook).await?;
+                if fenced_writer_commits.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+                    return Err(anyhow!(
+                        "passive conflict committed before the completion boundary"
+                    ));
+                }
+                fenced_completion_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if fenced_hook
+                    .after_emitted
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(anyhow!(
+                        "passive writer acquired during the completion request"
+                    ));
+                }
+                Ok::<_, anyhow::Error>(writer)
+            },
+        )
+        .await?;
+        let writer = writer?;
+        assert_eq!(
+            completion_attempt.completion_status,
+            Bip448CompletionStatus::CloseArmed
+        );
+        hook.after_acquire.notified().await;
+        let conflicted_after_boundary = writer.await??;
+        assert_eq!(
+            writer_commits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "passive writer did not commit after the completion boundary"
+        );
+
+        // Once that later conflict is durable, a retry cannot cross the same
+        // gate or issue another completion request.
+        let retry_completion_calls = completion_calls.clone();
+        let retry = with_bip448_canonical_completion_fence(
+            &pool,
+            "wallet",
+            "statechain",
+            &canonical_attempt.signing_id,
+            Duration::from_secs(5),
+            move |_| async move {
+                retry_completion_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, anyhow::Error>(())
+            },
+        )
+        .await;
+        assert!(
+            retry.is_err(),
+            "late frozen-binding conflict passed the retry gate"
+        );
+        assert_eq!(
+            completion_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "late frozen-binding conflict permitted another completion"
+        );
+        let restored_after_boundary = update_bip448_funding_binding_observation(
+            &pool,
+            &conflicted_after_boundary,
+            &confirmed_observation,
+        )
+        .await?;
+
+        // A callback that never resolves is bounded while holding the same
+        // real BEGIN IMMEDIATE fence. The waiting writer cannot acquire until
+        // timeout rolls the guard back, and its durable mutation must then
+        // prevent a retry from invoking completion again.
+        let timeout_hook = Arc::new(Bip448BeginImmediateTestHook::default());
+        let timeout_task_hook = timeout_hook.clone();
+        let timeout_callback_started = Arc::new(tokio::sync::Notify::new());
+        let timeout_writer_started = timeout_callback_started.clone();
+        let timeout_second_pool = pools.second.clone();
+        let timeout_conflict_observation = Bip448BindingObservation {
+            observation_status: Bip448ObservationStatus::SpentUnconfirmed,
+            ..confirmed_observation.clone()
+        };
+        let timeout_restore_observation = confirmed_observation.clone();
+        let timeout_writer = tokio::spawn(BIP448_BEGIN_IMMEDIATE_TEST_HOOK.scope(
+            timeout_task_hook,
+            async move {
+                timeout_writer_started.notified().await;
+                update_bip448_funding_binding_observation(
+                    &timeout_second_pool,
+                    &restored_after_boundary,
+                    &timeout_conflict_observation,
+                )
+                .await
+            },
+        ));
+        let timeout_callback_hook = timeout_hook.clone();
+        let timeout_callback_signal = timeout_callback_started.clone();
+        let timeout_writer_contested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let timed_writer_contested = timeout_writer_contested.clone();
+        let timeout_completion_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let timed_completion_calls = timeout_completion_calls.clone();
+        let (timed_attempt, timed_result) = with_bip448_canonical_completion_fence(
+            &pool,
+            "wallet",
+            "statechain",
+            &canonical_attempt.signing_id,
+            Duration::from_secs(1),
+            move |_| async move {
+                timed_completion_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                timeout_callback_signal.notify_one();
+                assert_begin_is_contested(&timeout_callback_hook).await?;
+                timed_writer_contested.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::future::pending::<Result<()>>().await
+            },
+        )
+        .await?;
+        assert_eq!(
+            timed_attempt.completion_status,
+            Bip448CompletionStatus::CloseArmed
+        );
+        let timeout_error = timed_result.expect_err("never-resolving completion did not time out");
+        assert!(
+            timeout_error
+                .to_string()
+                .contains("canonical completion timed out"),
+            "unexpected completion-timeout error: {timeout_error:#}"
+        );
+        assert!(
+            timeout_writer_contested.load(std::sync::atomic::Ordering::SeqCst),
+            "writer did not contend while the never-resolving callback held the fence"
+        );
+        timeout_hook.after_acquire.notified().await;
+        let conflicted_after_timeout = timeout_writer.await??;
+        assert_eq!(
+            conflicted_after_timeout.observation_status,
+            Bip448ObservationStatus::SpentUnconfirmed,
+            "waiting writer did not commit its durable mutation after timeout"
+        );
+        let armed_after_timeout = get_bip448_withdrawal_attempt(&pool, "wallet", "statechain", 0)
+            .await?
+            .ok_or_else(|| anyhow!("canonical attempt disappeared after completion timeout"))?;
+        assert_eq!(
+            armed_after_timeout.completion_status,
+            Bip448CompletionStatus::CloseArmed,
+            "completion timeout changed the indeterminate journal to Closed"
+        );
+
+        let retry_after_timeout_calls = timeout_completion_calls.clone();
+        let retry_after_timeout = with_bip448_canonical_completion_fence(
+            &pool,
+            "wallet",
+            "statechain",
+            &canonical_attempt.signing_id,
+            Duration::from_secs(5),
+            move |_| async move {
+                retry_after_timeout_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, anyhow::Error>(())
+            },
+        )
+        .await;
+        assert!(
+            retry_after_timeout.is_err(),
+            "durable mutation after timeout passed the retry snapshot gate"
+        );
+        assert_eq!(
+            timeout_completion_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "retry invoked completion after the timeout writer changed frozen facts"
+        );
+        let restored_after_timeout = update_bip448_funding_binding_observation(
+            &pool,
+            &conflicted_after_timeout,
+            &timeout_restore_observation,
+        )
+        .await?;
+
+        // Callback errors explicitly roll back, while cancellation and panic
+        // exercise Transaction's rollback-on-drop path. Each case must release
+        // the writer lock without changing the CloseArmed journal.
+        let (error_attempt, callback_error) = with_bip448_canonical_completion_fence(
+            &pool,
+            "wallet",
+            "statechain",
+            &canonical_attempt.signing_id,
+            Duration::from_secs(5),
+            move |_| async move { Err::<(), _>(anyhow!("injected completion failure")) },
+        )
+        .await?;
+        assert_eq!(
+            error_attempt.completion_status,
+            Bip448CompletionStatus::CloseArmed
+        );
+        assert!(callback_error
+            .expect_err("completion callback error was discarded")
+            .to_string()
+            .contains("injected completion failure"));
+        let error_release_guard = tokio::time::timeout(
+            Duration::from_secs(2),
+            begin_bip448_mutation_guard(&pools.second),
+        )
+        .await
+        .context("callback error retained the BIP448 mutation fence")??;
+        error_release_guard.commit().await?;
+
+        let cancellation_started = Arc::new(tokio::sync::Notify::new());
+        let cancellation_signal = cancellation_started.clone();
+        let cancellation_pool = pool.clone();
+        let cancellation_signing_id = canonical_attempt.signing_id.clone();
+        let cancellation_task = tokio::spawn(async move {
+            with_bip448_canonical_completion_fence(
+                &cancellation_pool,
+                "wallet",
+                "statechain",
+                &cancellation_signing_id,
+                Duration::from_secs(5),
+                move |_| async move {
+                    cancellation_signal.notify_one();
+                    std::future::pending::<Result<()>>().await
+                },
+            )
+            .await
+        });
+        cancellation_started.notified().await;
+        cancellation_task.abort();
+        assert!(
+            cancellation_task.await.unwrap_err().is_cancelled(),
+            "completion-fence cancellation did not cancel its task"
+        );
+        let cancellation_release_guard = tokio::time::timeout(
+            Duration::from_secs(2),
+            begin_bip448_mutation_guard(&pools.second),
+        )
+        .await
+        .context("cancelled completion retained the BIP448 mutation fence")??;
+        cancellation_release_guard.commit().await?;
+
+        let panic_pool = pool.clone();
+        let panic_signing_id = canonical_attempt.signing_id.clone();
+        let panic_task = tokio::spawn(async move {
+            with_bip448_canonical_completion_fence(
+                &panic_pool,
+                "wallet",
+                "statechain",
+                &panic_signing_id,
+                Duration::from_secs(5),
+                move |_| async move {
+                    panic!("injected completion panic");
+                    #[allow(unreachable_code)]
+                    Ok::<(), anyhow::Error>(())
+                },
+            )
+            .await
+        });
+        assert!(
+            panic_task.await.unwrap_err().is_panic(),
+            "completion callback panic did not unwind its task"
+        );
+        let panic_release_guard = tokio::time::timeout(
+            Duration::from_secs(2),
+            begin_bip448_mutation_guard(&pools.second),
+        )
+        .await
+        .context("panicked completion retained the BIP448 mutation fence")??;
+        panic_release_guard.commit().await?;
+
+        assert_eq!(
+            get_bip448_funding_binding(&pool, "wallet", "statechain", 1)
+                .await?
+                .ok_or_else(|| anyhow!(
+                    "frozen binding disappeared after fence lifecycle checks"
+                ))?,
+            restored_after_timeout
+        );
+        assert_eq!(
+            get_bip448_withdrawal_attempt(&pool, "wallet", "statechain", 0)
+                .await?
+                .ok_or_else(|| anyhow!(
+                    "canonical attempt disappeared after fence lifecycle checks"
+                ))?
+                .completion_status,
+            Bip448CompletionStatus::CloseArmed
+        );
+
         update_bip448_withdrawal_completion_status(
             &pool,
             "wallet",
@@ -14927,6 +15695,22 @@ mod tests {
         )
         .await
         .is_err());
+
+        let live_bindings = list_bip448_funding_bindings(&pool, "wallet", "statechain").await?;
+        let mut guard = begin_bip448_mutation_guard(&pool).await?;
+        let observed = guard
+            .reconcile_withdrawal_attempt_observations("wallet", "statechain", &live_bindings)
+            .await?;
+        guard.commit().await?;
+        let closed = observed
+            .iter()
+            .find(|attempt| attempt.binding_index == 0)
+            .ok_or_else(|| anyhow!("closed canonical attempt is missing"))?;
+        assert_eq!(
+            closed.broadcast_status,
+            Bip448BroadcastStatus::NeedsRebroadcast
+        );
+        assert_eq!(closed.completion_status, Bip448CompletionStatus::Closed);
 
         let late = sample_binding_observation("12", 2, 60_000, &script);
         let rows = reconcile_bip448_funding_bindings(

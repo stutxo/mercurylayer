@@ -1116,6 +1116,7 @@ fn bip448_sync_retryable(error: &anyhow::Error) -> bool {
 async fn sync_bip448_funding_bindings_with_candidates(
     client_config: &ClientConfig,
     wallet_name: &str,
+    force_height_zero_replay: bool,
 ) -> Result<Bip448SyncOutcome> {
     for attempt in 1..=3 {
         let raw_wallet_json = get_bip448_raw_wallet_json(&client_config.pool, wallet_name).await?;
@@ -1136,7 +1137,7 @@ async fn sync_bip448_funding_bindings_with_candidates(
                 wallet_name,
                 &raw_wallet_json,
                 plan,
-                false,
+                force_height_zero_replay,
             )
             .await
             {
@@ -1258,7 +1259,18 @@ pub async fn sync_bip448_funding_bindings(
     wallet_name: &str,
 ) -> Result<Bip448SyncReport> {
     Ok(
-        sync_bip448_funding_bindings_with_candidates(client_config, wallet_name)
+        sync_bip448_funding_bindings_with_candidates(client_config, wallet_name, false)
+            .await?
+            .report,
+    )
+}
+
+pub async fn sync_bip448_funding_bindings_from_height_zero(
+    client_config: &ClientConfig,
+    wallet_name: &str,
+) -> Result<Bip448SyncReport> {
+    Ok(
+        sync_bip448_funding_bindings_with_candidates(client_config, wallet_name, true)
             .await?
             .report,
     )
@@ -1907,7 +1919,7 @@ pub async fn update_coins(client_config: &ClientConfig, wallet_name: &str) -> Re
             return Ok(());
         }
         let mut sync =
-            sync_bip448_funding_bindings_with_candidates(client_config, wallet_name).await?;
+            sync_bip448_funding_bindings_with_candidates(client_config, wallet_name, false).await?;
         if live_raw_wallet_json != sync.raw_wallet_json {
             if update_attempt == 3 {
                 return Err(anyhow!(
@@ -1990,7 +2002,8 @@ pub async fn update_coins(client_config: &ClientConfig, wallet_name: &str) -> Re
             }
             wallet_cas_base = adopted_raw_wallet_json;
             let post_acceptance =
-                sync_bip448_funding_bindings_with_candidates(client_config, wallet_name).await?;
+                sync_bip448_funding_bindings_with_candidates(client_config, wallet_name, false)
+                    .await?;
             if post_acceptance.raw_wallet_json != wallet_cas_base {
                 if update_attempt == 3 {
                     return Err(anyhow!(
