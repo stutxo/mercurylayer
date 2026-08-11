@@ -2,10 +2,7 @@ use std::{future::Future, str::FromStr};
 
 use anyhow::{anyhow, Result};
 use bitcoin::{
-    absolute,
-    consensus::deserialize,
-    hashes::{sha256, Hash},
-    Address, Network, OutPoint, PrivateKey, Transaction, Txid,
+    absolute, consensus::deserialize, Address, Network, OutPoint, PrivateKey, Transaction, Txid,
 };
 use chrono::Utc;
 use mercurylib::{
@@ -74,6 +71,7 @@ impl ReceiverPostError {
 struct Bip448VerifiedTransfer {
     msg: Bip448TransferMsg,
     chain_facts: Bip448TransferChainFacts,
+    x1_generation: PublicKey,
 }
 
 impl Bip448VerifiedTransfer {
@@ -83,7 +81,21 @@ impl Bip448VerifiedTransfer {
         chain_facts: Bip448TransferChainFacts,
     ) -> Result<Self> {
         verify_bip448_transfer_msg(&msg, statechain_info, &chain_facts)?;
-        Ok(Self { msg, chain_facts })
+        let x1_generation_text = statechain_info
+            .x1_pub
+            .as_deref()
+            .ok_or_else(|| anyhow!("BIP448 transfer statechain response has no x1 generation"))?;
+        let x1_generation = PublicKey::from_str(x1_generation_text)?;
+        if x1_generation.to_string() != x1_generation_text {
+            return Err(anyhow!(
+                "BIP448 transfer statechain response has a noncanonical x1 generation"
+            ));
+        }
+        Ok(Self {
+            msg,
+            chain_facts,
+            x1_generation,
+        })
     }
 }
 
@@ -205,11 +217,17 @@ async fn transfer_bip448_receiver(
                 .await;
             }
         };
-    let unlock_signature =
-        mercurylib::transfer::receiver::sign_message(&verified.msg.statechain_id, coin)?;
+    let unlock_digest = mercurylib::transfer::receiver::bip448_transfer_unlock_auth_digest(
+        mercurylib::transfer::receiver::Bip448TransferUnlockRole::Recipient,
+        &verified.msg.statechain_id,
+        &verified.x1_generation,
+    )?;
+    let auth_secret = PrivateKey::from_wif(&coin.auth_privkey)?.inner;
+    let auth_keypair = KeyPair::from_secret_key(&Secp256k1::new(), &auth_secret);
+    let unlock_signature = schnorr::sign(&unlock_digest, &auth_keypair).to_string();
     let unlock_statechain_id = verified.msg.statechain_id.clone();
-    let auth_pubkey = coin.auth_pubkey.clone();
-    let receiver_request = create_receiver_request(&verified.msg, coin)?;
+    let x1_generation = verified.x1_generation.to_string();
+    let receiver_request = create_receiver_request(&verified.msg, coin, &verified.x1_generation)?;
 
     execute_receiver_attempt(
         || std::future::ready(Ok(verified)),
@@ -219,7 +237,7 @@ async fn transfer_bip448_receiver(
                 client_config,
                 &unlock_statechain_id,
                 &unlock_signature,
-                &auth_pubkey,
+                &x1_generation,
             )
         },
         || async {
@@ -387,20 +405,26 @@ pub(crate) fn expected_server_pubkey(
 fn create_receiver_request(
     msg: &Bip448TransferMsg,
     coin: &Coin,
+    x1_generation: &PublicKey,
 ) -> Result<TransferReceiverRequestPayload> {
     let receiver_secret = PrivateKey::from_wif(&coin.user_privkey)?.inner;
     let t1 = Scalar::from_be_bytes(msg.t1)?;
     let t2 = receiver_secret.negate().add_tweak(&t1)?;
-    let t2 = hex::encode(t2.to_secret_bytes());
+    let t2_bytes = t2.to_secret_bytes();
+    let t2 = hex::encode(t2_bytes);
     let auth_secret = PrivateKey::from_wif(&coin.auth_privkey)?.inner;
     let secp = Secp256k1::new();
     let auth_keypair = KeyPair::from_secret_key(&secp, &auth_secret);
-    let auth_message = sha256::Hash::hash(t2.as_bytes()).to_byte_array();
+    let auth_message = mercurylib::transfer::receiver::bip448_transfer_receiver_auth_digest(
+        &msg.statechain_id,
+        &t2_bytes,
+        x1_generation,
+    )?;
     let auth_sig = schnorr::sign(&auth_message, &auth_keypair);
 
     Ok(TransferReceiverRequestPayload {
         statechain_id: msg.statechain_id.clone(),
-        batch_data: None,
+        batch_data: Some(x1_generation.to_string()),
         t2,
         auth_sig: auth_sig.to_string(),
     })
@@ -622,8 +646,10 @@ mod tests {
     fn mirrored_t2_satisfies_continuity_equation() {
         let secp = Secp256k1::new();
         let msg: Bip448TransferMsg = serde_json::from_str(MSG).unwrap();
+        let info: StatechainInfoResponsePayload = serde_json::from_str(INFO).unwrap();
+        let generation = PublicKey::from_str(info.x1_pub.as_deref().unwrap()).unwrap();
         let coin = test_coin(5, 8);
-        let request = create_receiver_request(&msg, &coin).unwrap();
+        let request = create_receiver_request(&msg, &coin, &generation).unwrap();
         let t2_bytes: [u8; 32] = hex::decode(request.t2).unwrap().try_into().unwrap();
         let t2_g = SecretKey::from_secret_bytes(t2_bytes)
             .unwrap()
@@ -674,9 +700,19 @@ mod tests {
             Err(_) if current_server == expected => return Err(anyhow!(ALREADY_UPDATED_ERROR)),
             Err(error) => return Err(error),
         };
-        let request = create_receiver_request(&verified.msg, coin)?;
+        let request = create_receiver_request(
+            &verified.msg,
+            coin,
+            &verified.x1_generation,
+        )?;
         assert_eq!(request.t2, hex::encode([4u8; 32]));
-        let digest = sha256::Hash::hash(request.t2.as_bytes()).to_byte_array();
+        assert_eq!(request.batch_data.as_deref(), Some(verified.x1_generation.to_string().as_str()));
+        let t2_bytes: [u8; 32] = hex::decode(&request.t2)?.try_into().map_err(|_| anyhow!("invalid t2"))?;
+        let digest = mercurylib::transfer::receiver::bip448_transfer_receiver_auth_digest(
+            &verified.msg.statechain_id,
+            &t2_bytes,
+            &verified.x1_generation,
+        )?;
         schnorr::verify(&schnorr::Signature::from_str(&request.auth_sig)?, &digest, &PublicKey::from_str(&coin.auth_pubkey)?.x_only_public_key().0)?;
         assert!(!mercurylib::transfer::receiver::sign_message(&verified.msg.statechain_id, coin)?.is_empty());
         let checkpoint_transport = Rc::clone(&transport);

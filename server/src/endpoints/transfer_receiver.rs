@@ -1,13 +1,12 @@
 use std::str::FromStr;
 
-use bitcoin::hashes::sha256;
 use mercurylib::transfer::receiver::{
     GetMsgAddrResponsePayload, StatechainInfoResponsePayload, TransferReceiverError,
     TransferReceiverErrorResponsePayload, TransferReceiverPostResponsePayload,
     TransferReceiverRequestPayload, TransferUnlockRequestPayload,
 };
 use rocket::{http::Status, response::status, serde::json::Json, State};
-use secp256k1::{schnorr::Signature, Message, PublicKey, Secp256k1};
+use secp256k1::{PublicKey, Secp256k1};
 use serde_json::{json, Value};
 
 use crate::server::StateChainEntity;
@@ -70,6 +69,22 @@ fn parse_lockbox_keyupdate_response(
 ) -> Result<TransferReceiverPostResponsePayload, String> {
     serde_json::from_str(value)
         .map_err(|err| format!("failed to parse lockbox keyupdate response: {err}"))
+}
+
+fn parse_bip448_generation_tag(value: Option<&str>) -> Option<PublicKey> {
+    let value = value?;
+    let key = PublicKey::from_str(value).ok()?;
+    (key.to_string() == value).then_some(key)
+}
+
+fn parse_bip448_receiver_t2(value: &str) -> Option<[u8; 32]> {
+    let bytes = hex::decode(value).ok()?;
+    if bytes.len() != 32 || hex::encode(&bytes) != value {
+        return None;
+    }
+    let bytes: [u8; 32] = bytes.try_into().ok()?;
+    secp256k1::SecretKey::from_slice(&bytes).ok()?;
+    Some(bytes)
 }
 
 #[get("/info/statechain/<statechain_id>")]
@@ -213,186 +228,52 @@ pub async fn transfer_unlock(
     transfer_unlock_request_payload: Json<TransferUnlockRequestPayload>,
 ) -> status::Custom<Json<Value>> {
     let statechain_id = transfer_unlock_request_payload.0.statechain_id.clone();
-    let signed_statechain_id = transfer_unlock_request_payload.0.auth_sig.clone();
-    let auth_pub_key = transfer_unlock_request_payload.0.auth_pub_key.clone();
-
-    let is_current_owner_signature = match crate::endpoints::utils::try_validate_signature(
-        &statechain_entity.pool,
-        &signed_statechain_id,
-        &statechain_id,
-    )
-    .await
-    {
-        Ok(is_valid) => is_valid,
-        Err(_) => {
-            let response_body = json!({
-                "message": "Signature does not match authentication key."
-            });
-
-            return status::Custom(Status::InternalServerError, Json(response_body));
+    let generation = match parse_bip448_generation_tag(
+        transfer_unlock_request_payload.0.auth_pub_key.as_deref(),
+    ) {
+        Some(key) => key,
+        None => {
+            return status::Custom(
+                Status::InternalServerError,
+                Json(json!({"message": "Transfer generation does not match current row."})),
+            );
         }
     };
 
-    let durable_recipient_auth_key = if is_current_owner_signature {
-        None
-    } else {
-        crate::database::transfer_receiver::get_auth_pubkey_and_x1(
-            &statechain_entity.pool,
-            &statechain_id,
-        )
-        .await
-        .map(|(auth_key, _)| auth_key)
-    };
-
-    let is_authorized = match is_transfer_unlock_authorized(
-        is_current_owner_signature,
-        auth_pub_key.as_deref(),
-        durable_recipient_auth_key.as_ref(),
-        &signed_statechain_id,
-        &statechain_id,
-    )
-    .await
-    {
-        Ok(is_authorized) => is_authorized,
-        Err(_) => {
-            let response_body = json!({
-                "message": "Signature does not match authentication key."
-            });
-
-            return status::Custom(Status::InternalServerError, Json(response_body));
-        }
-    };
-
-    if !is_authorized {
-        let response_body = json!({
-            "message": "Signature does not match authentication key."
-        });
-
-        return status::Custom(Status::Forbidden, Json(response_body));
-    }
-
-    crate::database::transfer_receiver::update_unlock_transfer(
+    let result = crate::database::transfer_receiver::unlock_transfer_generation(
         &statechain_entity.pool,
-        is_current_owner_signature,
         &statechain_id,
+        &transfer_unlock_request_payload.0.auth_sig,
+        &generation,
     )
     .await;
 
-    let response_body = json!({
-        "message": "Success"
-    });
-
-    status::Custom(Status::Ok, Json(response_body))
-}
-
-async fn is_transfer_unlock_authorized(
-    is_current_owner_signature: bool,
-    _caller_auth_pub_key: Option<&str>,
-    durable_recipient_auth_key: Option<&PublicKey>,
-    auth_sig: &str,
-    statechain_id: &str,
-) -> Result<bool, crate::endpoints::utils::SignatureValidationError> {
-    if is_current_owner_signature {
-        return Ok(true);
+    match result {
+        Ok(crate::database::transfer_receiver::UnlockTransferResult::Success) => {
+            status::Custom(Status::Ok, Json(json!({"message": "Success"})))
+        }
+        Ok(crate::database::transfer_receiver::UnlockTransferResult::AuthenticationFailed) => {
+            status::Custom(
+                Status::Forbidden,
+                Json(json!({"message": "Signature does not match authentication key."})),
+            )
+        }
+        Ok(crate::database::transfer_receiver::UnlockTransferResult::GenerationMismatch) => {
+            status::Custom(
+                Status::InternalServerError,
+                Json(json!({"message": "Transfer generation does not match current row."})),
+            )
+        }
+        Err(_) => status::Custom(
+            Status::InternalServerError,
+            Json(json!({"message": "Failed to unlock transfer generation."})),
+        ),
     }
-
-    let Some(durable_recipient_auth_key) = durable_recipient_auth_key else {
-        return Ok(false);
-    };
-
-    crate::endpoints::utils::try_validate_signature_given_public_key(
-        auth_sig,
-        statechain_id,
-        &durable_recipient_auth_key.to_string(),
-    )
-    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rocket::tokio::runtime::Builder;
-    use secp256k1::{KeyPair, SecretKey};
-
-    fn block_on<F: std::future::Future>(future: F) -> F::Output {
-        Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(future)
-    }
-
-    fn auth_material(secret_byte: u8, statechain_id: &str) -> (PublicKey, String) {
-        let secp = Secp256k1::new();
-        let secret_key = SecretKey::from_slice(&[secret_byte; 32]).unwrap();
-        let keypair = KeyPair::from_seckey_slice(&secp, secret_key.as_ref()).unwrap();
-        let public_key = secret_key.public_key(&secp);
-        let message = Message::from_hashed_data::<sha256::Hash>(statechain_id.as_bytes());
-        let signature = secp.sign_schnorr(message.as_ref(), &keypair);
-
-        (public_key, signature.to_string())
-    }
-
-    #[test]
-    fn transfer_unlock_rejects_no_key_and_invalid_signature() {
-        let statechain_id = "statechain-1";
-        let (durable_key, _) = auth_material(1, statechain_id);
-        let (_, invalid_signature) = auth_material(2, statechain_id);
-
-        assert!(!block_on(is_transfer_unlock_authorized(
-            false,
-            None,
-            Some(&durable_key),
-            &invalid_signature,
-            statechain_id,
-        ))
-        .unwrap());
-    }
-
-    #[test]
-    fn transfer_unlock_rejects_attacker_supplied_key() {
-        let statechain_id = "statechain-1";
-        let (durable_key, _) = auth_material(3, statechain_id);
-        let (attacker_key, attacker_signature) = auth_material(4, statechain_id);
-        let attacker_key = attacker_key.to_string();
-
-        assert!(!block_on(is_transfer_unlock_authorized(
-            false,
-            Some(&attacker_key),
-            Some(&durable_key),
-            &attacker_signature,
-            statechain_id,
-        ))
-        .unwrap());
-    }
-
-    #[test]
-    fn transfer_unlock_authorizes_stored_recipient_key() {
-        let statechain_id = "statechain-1";
-        let (durable_key, recipient_signature) = auth_material(5, statechain_id);
-        let supplied_key = durable_key.to_string();
-
-        assert!(block_on(is_transfer_unlock_authorized(
-            false,
-            Some(&supplied_key),
-            Some(&durable_key),
-            &recipient_signature,
-            statechain_id,
-        ))
-        .unwrap());
-    }
-
-    #[test]
-    fn transfer_unlock_authorizes_current_owner() {
-        assert!(block_on(is_transfer_unlock_authorized(
-            true,
-            None,
-            None,
-            "unused",
-            "statechain-1",
-        ))
-        .unwrap());
-    }
 
     #[test]
     fn parse_lockbox_signature_count_accepts_valid_json() {
@@ -467,55 +348,63 @@ mod tests {
 
         assert!(err.contains("failed to parse lockbox keyupdate response"));
     }
-}
 
-pub enum BatchTransferReceiveValidationResult {
-    /// The statecoin batch is locked (not expired yet and not all coins are unlocked)
-    StatecoinBatchLockedError(String),
-    /// The batch_id sent by the user is expired
-    ExpiredBatchTimeError(String),
-    /// Success means there is no batch_id for the statecoin or all the coins of the batch are unlocked.
-    Success,
-}
-
-pub async fn validate_batch(
-    statechain_entity: &State<StateChainEntity>,
-    statechain_id: &str,
-) -> BatchTransferReceiveValidationResult {
-    let batch_info = crate::database::transfer::get_batch_id_and_time_by_statechain_id(
-        &statechain_entity.pool,
-        statechain_id,
-    )
-    .await;
-
-    // batch exists
-    if batch_info.is_some() {
-        let (batch_id, batch_time) = batch_info.unwrap();
-
-        if is_batch_expired(batch_time) {
-            // the batch time has not expired. It is possible to add a new coin to the batch.
-            return BatchTransferReceiveValidationResult::ExpiredBatchTimeError(
-                "Batch time has expired".to_string(),
-            );
-        } else {
-            // batch not expired. Check if all coins are unlocked.
-            let all_coins_unlocked = crate::database::transfer::is_all_coins_unlocked(
-                &statechain_entity.pool,
-                &batch_id,
-            )
-            .await;
-
-            if all_coins_unlocked {
-                return BatchTransferReceiveValidationResult::Success;
-            } else {
-                return BatchTransferReceiveValidationResult::StatecoinBatchLockedError(
-                    "Statecoin batch is locked".to_string(),
-                );
-            }
-        }
+    #[test]
+    fn bip448_generation_tag_requires_present_canonical_compressed_key() {
+        let key = secp256k1::SecretKey::from_slice(&[7; 32])
+            .unwrap()
+            .public_key(&Secp256k1::new());
+        let canonical = key.to_string();
+        assert_eq!(parse_bip448_generation_tag(Some(&canonical)), Some(key));
+        assert!(parse_bip448_generation_tag(None).is_none());
+        assert!(parse_bip448_generation_tag(Some("not-a-key")).is_none());
+        assert!(parse_bip448_generation_tag(Some(&canonical.to_uppercase())).is_none());
     }
 
-    BatchTransferReceiveValidationResult::Success
+    #[test]
+    fn bip448_receiver_t2_requires_lowercase_valid_scalar() {
+        let canonical = "ab".repeat(32);
+        assert_eq!(parse_bip448_receiver_t2(&canonical), Some([0xab; 32]));
+        assert!(parse_bip448_receiver_t2(&canonical.to_uppercase()).is_none());
+        assert!(parse_bip448_receiver_t2(&"07".repeat(31)).is_none());
+        assert!(parse_bip448_receiver_t2(&"00".repeat(32)).is_none());
+    }
+
+    #[test]
+    fn bip448_generation_substitution_changes_the_locked_point() {
+        let first = secp256k1::SecretKey::from_slice(&[8; 32])
+            .unwrap()
+            .public_key(&Secp256k1::new());
+        let second = secp256k1::SecretKey::from_slice(&[9; 32])
+            .unwrap()
+            .public_key(&Secp256k1::new());
+        assert_ne!(
+            parse_bip448_generation_tag(Some(&first.to_string())),
+            parse_bip448_generation_tag(Some(&second.to_string()))
+        );
+    }
+
+    #[test]
+    fn bip448_generation_error_envelopes_keep_the_existing_status_sets() {
+        let unlock_generation = status::Custom(
+            Status::InternalServerError,
+            Json(json!({"message": "Transfer generation does not match current row."})),
+        );
+        let unlock_auth = status::Custom(
+            Status::Forbidden,
+            Json(json!({"message": "Signature does not match authentication key."})),
+        );
+        assert_eq!(unlock_generation.0, Status::InternalServerError);
+        assert_eq!(unlock_auth.0, Status::Forbidden);
+        assert_eq!(
+            unlock_generation.1 .0,
+            json!({"message": "Transfer generation does not match current row."})
+        );
+        assert_eq!(
+            unlock_auth.1 .0,
+            json!({"message": "Signature does not match authentication key."})
+        );
+    }
 }
 
 #[post(
@@ -527,111 +416,188 @@ pub async fn transfer_receiver(
     statechain_entity: &State<StateChainEntity>,
     transfer_receiver_request_payload: Json<TransferReceiverRequestPayload>,
 ) -> status::Custom<Json<Value>> {
-    // TODO: check if the statechain_id is within a batch and if it is, check if the batch is still open or expired.
-    // If open, check all coins are unlocked. If not, return 400 error.
-    // If expired, return 400 error.
-    let batch_validation_result = validate_batch(
-        &statechain_entity,
-        &transfer_receiver_request_payload.statechain_id,
-    )
-    .await;
-
-    match batch_validation_result {
-        BatchTransferReceiveValidationResult::StatecoinBatchLockedError(msg) => {
-            let response_body = json!(TransferReceiverErrorResponsePayload {
-                code: TransferReceiverError::StatecoinBatchLockedError,
-                message: msg
-            });
-
-            return status::Custom(Status::BadRequest, Json(response_body));
-        }
-        BatchTransferReceiveValidationResult::ExpiredBatchTimeError(msg) => {
-            let response_body = json!(TransferReceiverErrorResponsePayload {
-                code: TransferReceiverError::ExpiredBatchTimeError,
-                message: msg
-            });
-
-            return status::Custom(Status::BadRequest, Json(response_body));
-        }
-        BatchTransferReceiveValidationResult::Success => {}
-    }
-
-    let auth_pubkey_x1 = crate::database::transfer_receiver::get_auth_pubkey_and_x1(
-        &statechain_entity.pool,
-        &transfer_receiver_request_payload.statechain_id,
-    )
-    .await;
-
-    if auth_pubkey_x1.is_none() {
-        let response_body = json!({
-            "message": "No transfer messages found for this statechain_id"
-        });
-
-        return status::Custom(Status::NotFound, Json(response_body));
-    }
-
-    let auth_pubkey_x1 = auth_pubkey_x1.unwrap();
-    let auth_pubkey = auth_pubkey_x1.0;
-    let x1 = auth_pubkey_x1.1;
-
-    let auth_pubkey = auth_pubkey.x_only_public_key().0;
-
     let statechain_id = transfer_receiver_request_payload.statechain_id.clone();
     let t2 = transfer_receiver_request_payload.t2.clone();
-    let auth_sign = transfer_receiver_request_payload.auth_sig.clone();
+    let generation_error = || {
+        status::Custom(
+            Status::InternalServerError,
+            Json(json!({"message": "Transfer generation does not match current row."})),
+        )
+    };
 
-    let signed_message = Signature::from_str(&auth_sign).unwrap();
-    let msg = Message::from_hashed_data::<sha256::Hash>(t2.as_bytes());
-
-    let secp = Secp256k1::new();
-
-    if !secp
-        .verify_schnorr(&signed_message, msg.as_ref(), &auth_pubkey)
-        .is_ok()
-    {
-        let response_body = json!({
-            "message": "Signature does not match authentication key."
-        });
-
-        return status::Custom(Status::InternalServerError, Json(response_body));
-    }
-
-    if crate::database::transfer_receiver::is_key_already_updated(
-        &statechain_entity.pool,
+    let mut transaction = match statechain_entity.pool.begin().await {
+        Ok(transaction) => transaction,
+        Err(_) => {
+            return internal_server_error_response(
+                "Failed to lock transfer generation.".to_string(),
+            );
+        }
+    };
+    let statechain = match crate::database::transfer_receiver::lock_statechain_generation(
+        &mut *transaction,
         &statechain_id,
     )
     .await
     {
-        let server_public_key = crate::database::transfer_receiver::get_server_public_key(
-            &statechain_entity.pool,
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            let _ = transaction.rollback().await;
+            return statechain_data_not_found_response();
+        }
+        Err(_) => {
+            let _ = transaction.rollback().await;
+            return internal_server_error_response(
+                "Failed to lock transfer generation.".to_string(),
+            );
+        }
+    };
+    let transfer =
+        match crate::database::transfer_receiver::load_bip448_transfer_generation_for_update(
+            &mut *transaction,
             &statechain_id,
         )
-        .await;
+        .await
+        {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                let _ = transaction.rollback().await;
+                return status::Custom(
+                    Status::NotFound,
+                    Json(json!({"message": "No transfer messages found for this statechain_id"})),
+                );
+            }
+            Err(_) => {
+                let _ = transaction.rollback().await;
+                return internal_server_error_response(
+                    "Failed to lock transfer generation.".to_string(),
+                );
+            }
+        };
 
-        if server_public_key.is_none() {
-            let response_body = json!({
-                "message": "Server public key not found."
-            });
-
-            return status::Custom(Status::InternalServerError, Json(response_body));
+    let batch_info = match crate::database::transfer::get_batch_id_and_time_by_statechain_id_in_tx(
+        &mut *transaction,
+        &statechain_id,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(_) => {
+            let _ = transaction.rollback().await;
+            return internal_server_error_response(
+                "Failed to validate transfer batch.".to_string(),
+            );
         }
-
-        let server_public_key = server_public_key.unwrap();
-
-        // Idempotent replay: the coin was already transferred to this owner and
-        // the previous owner's signing guards were cleared transactionally
-        // during that first key update (see `update_statechain`). Do NOT clear
-        // guards here: a duplicate or re-synced transfer/receiver request must
-        // not destroy the current owner's live signing round (their stored
-        // BIP448 replay record and nonce lease).
-        let response_body = json!({
-            "server_pubkey": server_public_key.to_string(),
-        });
-
-        return status::Custom(Status::Ok, Json(response_body));
+    };
+    if let Some((batch_id, batch_time)) = batch_info {
+        if is_batch_expired(batch_time) {
+            let _ = transaction.rollback().await;
+            return status::Custom(
+                Status::BadRequest,
+                Json(json!(TransferReceiverErrorResponsePayload {
+                    code: TransferReceiverError::ExpiredBatchTimeError,
+                    message: "Batch time has expired".to_string(),
+                })),
+            );
+        }
+        let all_unlocked = match crate::database::transfer::is_all_coins_unlocked_in_tx(
+            &mut *transaction,
+            &batch_id,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(_) => {
+                let _ = transaction.rollback().await;
+                return internal_server_error_response(
+                    "Failed to validate transfer batch.".to_string(),
+                );
+            }
+        };
+        if !all_unlocked {
+            let _ = transaction.rollback().await;
+            return status::Custom(
+                Status::BadRequest,
+                Json(json!(TransferReceiverErrorResponsePayload {
+                    code: TransferReceiverError::StatecoinBatchLockedError,
+                    message: "Statecoin batch is locked".to_string(),
+                })),
+            );
+        }
     }
 
-    let x1_hex = hex::encode(x1);
+    let x1_secret = match secp256k1::SecretKey::from_slice(&transfer.x1) {
+        Ok(value) => value,
+        Err(_) => {
+            let _ = transaction.rollback().await;
+            return generation_error();
+        }
+    };
+    let x1_generation = x1_secret.public_key(&Secp256k1::new());
+    let supplied_generation = match parse_bip448_generation_tag(
+        transfer_receiver_request_payload.batch_data.as_deref(),
+    ) {
+        Some(key) if key == x1_generation => key,
+        _ => {
+            let _ = transaction.rollback().await;
+            return generation_error();
+        }
+    };
+    let t2_bytes = match parse_bip448_receiver_t2(&t2) {
+        Some(bytes) => bytes,
+        None => {
+            let _ = transaction.rollback().await;
+            return generation_error();
+        }
+    };
+    let recipient_auth = match PublicKey::from_slice(&transfer.recipient_auth_public_key) {
+        Ok(key) => key,
+        Err(_) => {
+            let _ = transaction.rollback().await;
+            return generation_error();
+        }
+    };
+    let digest = match mercurylib::transfer::receiver::bip448_transfer_receiver_auth_digest(
+        &statechain_id,
+        &t2_bytes,
+        &supplied_generation,
+    ) {
+        Ok(digest) => digest,
+        Err(_) => {
+            let _ = transaction.rollback().await;
+            return generation_error();
+        }
+    };
+    let signature_matches = crate::endpoints::utils::try_verify_digest_signature(
+        &transfer_receiver_request_payload.auth_sig,
+        &digest,
+        &recipient_auth.x_only_public_key().0,
+    )
+    .unwrap_or(false);
+    if !signature_matches {
+        let _ = transaction.rollback().await;
+        return generation_error();
+    }
+
+    if transfer.key_updated {
+        let server_public_key = match PublicKey::from_slice(&statechain.server_public_key) {
+            Ok(key) => key,
+            Err(_) => {
+                let _ = transaction.rollback().await;
+                return internal_server_error_response("Server public key not found.".to_string());
+            }
+        };
+        if transaction.commit().await.is_err() {
+            return internal_server_error_response("Failed to finish receiver replay.".to_string());
+        }
+        return status::Custom(
+            Status::Ok,
+            Json(json!(TransferReceiverPostResponsePayload {
+                server_pubkey: server_public_key.to_string(),
+            })),
+        );
+    }
+
+    let x1_hex = hex::encode(transfer.x1);
 
     let key_update_response_payload = mercurylib::transfer::receiver::KeyUpdateResponsePayload {
         statechain_id: statechain_id.clone(),
@@ -641,26 +607,22 @@ pub async fn transfer_receiver(
 
     let config = crate::server_config::ServerConfig::load();
 
-    let enclave_index = crate::database::utils::get_enclave_index_from_database(
-        &statechain_entity.pool,
-        &statechain_id,
-    )
-    .await;
-
-    let enclave_index = match enclave_index {
-        Some(index) => index,
-        None => {
-            let response_body = json!({
-                "message": format!("Enclave index for statechain {} ID not found.", statechain_id)
-            });
-
-            return status::Custom(Status::InternalServerError, Json(response_body));
+    let enclave_index = match usize::try_from(statechain.enclave_index) {
+        Ok(index) => index,
+        Err(_) => {
+            let _ = transaction.rollback().await;
+            return internal_server_error_response(
+                "Enclave index for statechain ID not found.".to_string(),
+            );
         }
     };
-
-    let enclave_index = enclave_index as usize;
-
-    let lockbox_endpoint = config.enclaves.get(enclave_index).unwrap().url.clone();
+    let Some(enclave) = config.enclaves.get(enclave_index) else {
+        let _ = transaction.rollback().await;
+        return internal_server_error_response(
+            "Enclave index for statechain ID not found.".to_string(),
+        );
+    };
+    let lockbox_endpoint = enclave.url.clone();
     let path = "keyupdate";
 
     let client = statechain_entity.inner().http_client.clone();
@@ -673,10 +635,14 @@ pub async fn transfer_receiver(
             let response_status = response.status();
             let text = match response.text().await {
                 Ok(text) => text,
-                Err(err) => return internal_server_error_response(err.to_string()),
+                Err(err) => {
+                    let _ = transaction.rollback().await;
+                    return internal_server_error_response(err.to_string());
+                }
             };
 
             if !response_status.is_success() {
+                let _ = transaction.rollback().await;
                 return internal_server_error_response(format!(
                     "lockbox keyupdate returned {}: {}",
                     response_status.as_u16(),
@@ -687,6 +653,7 @@ pub async fn transfer_receiver(
             text
         }
         Err(err) => {
+            let _ = transaction.rollback().await;
             return internal_server_error_response(err.to_string());
         }
     };
@@ -694,7 +661,10 @@ pub async fn transfer_receiver(
     let response: TransferReceiverPostResponsePayload =
         match parse_lockbox_keyupdate_response(value.as_str()) {
             Ok(response) => response,
-            Err(err) => return internal_server_error_response(err),
+            Err(err) => {
+                let _ = transaction.rollback().await;
+                return internal_server_error_response(err);
+            }
         };
 
     let mut server_pubkey_hex = response.server_pubkey.clone();
@@ -703,15 +673,35 @@ pub async fn transfer_receiver(
         server_pubkey_hex = server_pubkey_hex[2..].to_string();
     }
 
-    let server_pubkey = PublicKey::from_str(&server_pubkey_hex).unwrap();
+    let server_pubkey = match PublicKey::from_str(&server_pubkey_hex) {
+        Ok(key) => key,
+        Err(_) => {
+            let _ = transaction.rollback().await;
+            return internal_server_error_response(
+                "Lockbox returned an invalid server public key.".to_string(),
+            );
+        }
+    };
 
-    crate::database::transfer_receiver::update_statechain(
-        &statechain_entity.pool,
-        &auth_pubkey,
-        &server_pubkey,
+    if crate::database::transfer_receiver::commit_bip448_transfer_generation_update(
+        &mut *transaction,
         &statechain_id,
+        &statechain,
+        &transfer,
+        &recipient_auth.x_only_public_key().0,
+        &server_pubkey,
     )
-    .await;
+    .await
+    .is_err()
+    {
+        let _ = transaction.rollback().await;
+        return internal_server_error_response("Failed to commit transfer generation.".to_string());
+    }
+    if transaction.commit().await.is_err() {
+        // The existing lockbox-success/Mercury-commit failure boundary remains
+        // a known prototype limitation.
+        return internal_server_error_response("Failed to commit transfer generation.".to_string());
+    }
 
     let response_body = json!(TransferReceiverPostResponsePayload {
         server_pubkey: server_pubkey.to_string(),

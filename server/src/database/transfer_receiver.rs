@@ -1,4 +1,8 @@
+use chrono::{DateTime, Utc};
 use mercurylib::transfer::receiver::StatechainInfo;
+use mercurylib::transfer::receiver::{
+    bip448_transfer_unlock_auth_digest, Bip448TransferUnlockRole,
+};
 use secp256k1::{PublicKey, Secp256k1, SecretKey, XOnlyPublicKey};
 
 use sqlx::Row;
@@ -25,6 +29,320 @@ const GET_STATECHAIN_INFO_QUERY: &str = "\
               AND server_partial_sig IS NOT NULL\
         ) AS completed_signatures \
         ORDER BY tx_n ASC";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LockedStatechainGeneration {
+    pub auth_xonly_public_key: Vec<u8>,
+    pub server_public_key: Vec<u8>,
+    pub enclave_index: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LockedTransferGeneration {
+    pub recipient_auth_public_key: Vec<u8>,
+    pub x1: [u8; 32],
+    pub batch_id: Option<String>,
+    pub batch_time: Option<DateTime<Utc>>,
+    pub encrypted_transfer_msg: Option<Vec<u8>>,
+    pub key_updated: bool,
+    pub locked: bool,
+    pub locked2: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnlockTransferResult {
+    Success,
+    AuthenticationFailed,
+    GenerationMismatch,
+}
+
+fn integrity_error(message: &str) -> sqlx::Error {
+    sqlx::Error::Protocol(message.to_string())
+}
+
+pub async fn lock_statechain_generation(
+    connection: &mut sqlx::PgConnection,
+    statechain_id: &str,
+) -> Result<Option<LockedStatechainGeneration>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT auth_xonly_public_key, server_public_key, enclave_index \
+         FROM statechain_data \
+         WHERE statechain_id = $1 \
+         FOR UPDATE",
+    )
+    .bind(statechain_id)
+    .fetch_optional(connection)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let Some(auth_xonly_public_key) = row.get::<Option<Vec<u8>>, _>(0) else {
+        return Err(integrity_error(
+            "statechain owner authentication key is null",
+        ));
+    };
+    let Some(server_public_key) = row.get::<Option<Vec<u8>>, _>(1) else {
+        return Err(integrity_error("statechain server public key is null"));
+    };
+    Ok(Some(LockedStatechainGeneration {
+        auth_xonly_public_key,
+        server_public_key,
+        enclave_index: row.get(2),
+    }))
+}
+
+pub async fn load_bip448_transfer_generation_for_update(
+    connection: &mut sqlx::PgConnection,
+    statechain_id: &str,
+) -> Result<Option<LockedTransferGeneration>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT new_user_auth_public_key, x1, batch_id, batch_time, \
+                encrypted_transfer_msg, key_updated, locked, locked2 \
+         FROM statechain_transfer \
+         WHERE statechain_id = $1 \
+         FOR UPDATE",
+    )
+    .bind(statechain_id)
+    .fetch_optional(connection)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let Some(recipient_auth_public_key) = row.get::<Option<Vec<u8>>, _>(0) else {
+        return Err(integrity_error(
+            "transfer recipient authentication key is null",
+        ));
+    };
+    let Some(x1_bytes) = row.get::<Option<Vec<u8>>, _>(1) else {
+        return Err(integrity_error("transfer generation x1 is null"));
+    };
+    let x1 = x1_bytes
+        .try_into()
+        .map_err(|_| integrity_error("transfer generation x1 is not exactly 32 bytes"))?;
+
+    Ok(Some(LockedTransferGeneration {
+        recipient_auth_public_key,
+        x1,
+        batch_id: row.get(2),
+        batch_time: row.get(3),
+        encrypted_transfer_msg: row.get(4),
+        key_updated: row.get(5),
+        locked: row.get(6),
+        locked2: row.get(7),
+    }))
+}
+
+pub async fn unlock_transfer_generation(
+    pool: &sqlx::PgPool,
+    statechain_id: &str,
+    auth_sig: &str,
+    x1_generation_pubkey: &PublicKey,
+) -> Result<UnlockTransferResult, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    let Some(statechain) = lock_statechain_generation(&mut *transaction, statechain_id).await?
+    else {
+        transaction.rollback().await?;
+        return Ok(UnlockTransferResult::GenerationMismatch);
+    };
+    let Some(mut transfer) =
+        load_bip448_transfer_generation_for_update(&mut *transaction, statechain_id).await?
+    else {
+        transaction.rollback().await?;
+        return Ok(UnlockTransferResult::GenerationMismatch);
+    };
+
+    let current_owner_auth = XOnlyPublicKey::from_slice(&statechain.auth_xonly_public_key)
+        .map_err(|_| integrity_error("statechain owner authentication key is malformed"))?;
+    let recipient_key = PublicKey::from_slice(&transfer.recipient_auth_public_key)
+        .map_err(|_| integrity_error("transfer recipient authentication key is malformed"))?;
+    let x1_secret = SecretKey::from_slice(&transfer.x1)
+        .map_err(|_| integrity_error("transfer generation x1 is not a valid scalar"))?;
+    let row_generation = x1_secret.public_key(&Secp256k1::new());
+    if transfer.key_updated || row_generation != *x1_generation_pubkey {
+        transaction.rollback().await?;
+        return Ok(UnlockTransferResult::GenerationMismatch);
+    }
+
+    let current_digest = bip448_transfer_unlock_auth_digest(
+        Bip448TransferUnlockRole::CurrentOwner,
+        statechain_id,
+        x1_generation_pubkey,
+    )
+    .map_err(|_| integrity_error("invalid current-owner unlock digest input"))?;
+    let recipient_digest = bip448_transfer_unlock_auth_digest(
+        Bip448TransferUnlockRole::Recipient,
+        statechain_id,
+        x1_generation_pubkey,
+    )
+    .map_err(|_| integrity_error("invalid recipient unlock digest input"))?;
+    let current_matches = crate::endpoints::utils::try_verify_digest_signature(
+        auth_sig,
+        &current_digest,
+        &current_owner_auth,
+    )
+    .unwrap_or(false);
+    let recipient_matches = crate::endpoints::utils::try_verify_digest_signature(
+        auth_sig,
+        &recipient_digest,
+        &recipient_key.x_only_public_key().0,
+    )
+    .unwrap_or(false);
+    let role = match (current_matches, recipient_matches) {
+        (true, false) => Bip448TransferUnlockRole::CurrentOwner,
+        (false, true) => Bip448TransferUnlockRole::Recipient,
+        (false, false) => {
+            transaction.rollback().await?;
+            return Ok(UnlockTransferResult::AuthenticationFailed);
+        }
+        (true, true) => {
+            transaction.rollback().await?;
+            return Ok(UnlockTransferResult::GenerationMismatch);
+        }
+    };
+
+    (transfer.locked, transfer.locked2) =
+        set_bip448_transfer_generation_unlocked(&mut *transaction, statechain_id, role, &transfer)
+            .await?;
+
+    if !transfer.locked && !transfer.locked2 {
+        if let Some(batch_id) = &transfer.batch_id {
+            use crate::database::lightning_latch::UnlockBip448LightningLatchResult;
+            match crate::database::lightning_latch::unlock_bip448_lightning_latch_in_tx(
+                &mut *transaction,
+                statechain_id,
+                batch_id,
+                &current_owner_auth,
+            )
+            .await?
+            {
+                UnlockBip448LightningLatchResult::ConflictingOwner => {
+                    return Err(integrity_error(
+                        "lightning latch owner differs from locked statechain owner",
+                    ));
+                }
+                UnlockBip448LightningLatchResult::Absent
+                | UnlockBip448LightningLatchResult::AlreadyUnlocked
+                | UnlockBip448LightningLatchResult::Unlocked => {}
+            }
+        }
+    }
+
+    transaction.commit().await?;
+    Ok(UnlockTransferResult::Success)
+}
+
+pub async fn set_bip448_transfer_generation_unlocked(
+    connection: &mut sqlx::PgConnection,
+    statechain_id: &str,
+    role: Bip448TransferUnlockRole,
+    transfer: &LockedTransferGeneration,
+) -> Result<(bool, bool), sqlx::Error> {
+    let (assignment, target_predicate) = match role {
+        Bip448TransferUnlockRole::CurrentOwner => ("locked2 = false", "locked2 = true"),
+        Bip448TransferUnlockRole::Recipient => ("locked = false", "locked = true"),
+    };
+    let query = format!(
+        "UPDATE statechain_transfer \
+         SET {assignment}, updated_at = NOW() \
+         WHERE statechain_id = $1 \
+           AND x1 = $2 \
+           AND new_user_auth_public_key = $3 \
+           AND batch_id IS NOT DISTINCT FROM $4 \
+           AND encrypted_transfer_msg IS NOT DISTINCT FROM $5 \
+           AND key_updated = false \
+           AND {target_predicate}"
+    );
+    let result = sqlx::query(&query)
+        .bind(statechain_id)
+        .bind(transfer.x1)
+        .bind(&transfer.recipient_auth_public_key)
+        .bind(&transfer.batch_id)
+        .bind(&transfer.encrypted_transfer_msg)
+        .execute(&mut *connection)
+        .await?;
+    if result.rows_affected() > 1 {
+        return Err(integrity_error(
+            "generation-fenced transfer unlock affected a non-unit row count",
+        ));
+    }
+
+    let flags = sqlx::query(
+        "SELECT locked, locked2 \
+         FROM statechain_transfer \
+         WHERE statechain_id = $1 \
+           AND x1 = $2 \
+           AND new_user_auth_public_key = $3 \
+           AND batch_id IS NOT DISTINCT FROM $4 \
+           AND encrypted_transfer_msg IS NOT DISTINCT FROM $5 \
+           AND key_updated = false",
+    )
+    .bind(statechain_id)
+    .bind(transfer.x1)
+    .bind(&transfer.recipient_auth_public_key)
+    .bind(&transfer.batch_id)
+    .bind(&transfer.encrypted_transfer_msg)
+    .fetch_optional(connection)
+    .await?
+    .ok_or_else(|| integrity_error("transfer generation disappeared while locked"))?;
+    Ok((flags.get(0), flags.get(1)))
+}
+
+pub async fn commit_bip448_transfer_generation_update(
+    connection: &mut sqlx::PgConnection,
+    statechain_id: &str,
+    statechain: &LockedStatechainGeneration,
+    transfer: &LockedTransferGeneration,
+    recipient_auth_key: &XOnlyPublicKey,
+    new_server_public_key: &PublicKey,
+) -> Result<(), sqlx::Error> {
+    let statechain_result = sqlx::query(
+        "UPDATE statechain_data \
+         SET auth_xonly_public_key = $1, server_public_key = $2 \
+         WHERE statechain_id = $3 AND auth_xonly_public_key = $4",
+    )
+    .bind(recipient_auth_key.serialize())
+    .bind(new_server_public_key.serialize())
+    .bind(statechain_id)
+    .bind(&statechain.auth_xonly_public_key)
+    .execute(&mut *connection)
+    .await?;
+    if statechain_result.rows_affected() != 1 {
+        return Err(integrity_error(
+            "receiver owner-key update affected a non-unit row count",
+        ));
+    }
+
+    let transfer_result = sqlx::query(
+        "UPDATE statechain_transfer \
+         SET key_updated = true, updated_at = NOW() \
+         WHERE statechain_id = $1 \
+           AND new_user_auth_public_key = $2 \
+           AND x1 = $3 \
+           AND batch_id IS NOT DISTINCT FROM $4 \
+           AND encrypted_transfer_msg IS NOT DISTINCT FROM $5 \
+           AND key_updated = false",
+    )
+    .bind(statechain_id)
+    .bind(&transfer.recipient_auth_public_key)
+    .bind(transfer.x1)
+    .bind(&transfer.batch_id)
+    .bind(&transfer.encrypted_transfer_msg)
+    .execute(&mut *connection)
+    .await?;
+    if transfer_result.rows_affected() != 1 {
+        return Err(integrity_error(
+            "receiver transfer-consume update affected a non-unit row count",
+        ));
+    }
+
+    sqlx::query(DELETE_SIGNING_GUARDS_AFTER_TRANSFER_QUERY)
+        .bind(statechain_id)
+        .execute(connection)
+        .await?;
+    Ok(())
+}
 
 pub async fn get_statechain_info(pool: &sqlx::PgPool, statechain_id: &str) -> Vec<StatechainInfo> {
     let mut result = Vec::<StatechainInfo>::new();
@@ -131,169 +449,6 @@ pub async fn get_statechain_transfer_messages(
     }
 
     result
-}
-
-pub async fn get_auth_pubkey_and_x1(
-    pool: &sqlx::PgPool,
-    statechain_id: &str,
-) -> Option<(PublicKey, Vec<u8>)> {
-    let query = "\
-        SELECT new_user_auth_public_key, x1 \
-        FROM statechain_transfer \
-        WHERE statechain_id = $1";
-
-    let row = sqlx::query(query)
-        .bind(statechain_id)
-        .fetch_optional(pool)
-        .await
-        .unwrap();
-
-    let row = row?;
-
-    let new_user_auth_public_key_bytes = row.get::<Vec<u8>, _>(0);
-    let new_user_auth_public_key = PublicKey::from_slice(&new_user_auth_public_key_bytes).unwrap();
-
-    let x1_bytes = row.get::<Vec<u8>, _>(1);
-
-    Some((new_user_auth_public_key, x1_bytes))
-}
-
-pub async fn is_key_already_updated(pool: &sqlx::PgPool, statechain_id: &str) -> bool {
-    let query = "\
-        SELECT key_updated \
-        FROM statechain_transfer \
-        WHERE statechain_id = $1";
-
-    let row = sqlx::query(query)
-        .bind(statechain_id)
-        .fetch_one(pool)
-        .await
-        .unwrap();
-
-    let key_updated: bool = row.get(0);
-
-    key_updated
-}
-
-pub async fn get_server_public_key(pool: &sqlx::PgPool, statechain_id: &str) -> Option<PublicKey> {
-    let query = "\
-        SELECT server_public_key \
-        FROM statechain_data \
-        WHERE statechain_id = $1";
-
-    let row = sqlx::query(query)
-        .bind(statechain_id)
-        .fetch_one(pool)
-        .await
-        .unwrap();
-
-    let server_public_key_bytes: Vec<u8> = row.get(0);
-
-    if server_public_key_bytes.len() == 0 {
-        return None;
-    }
-
-    let server_public_key = PublicKey::from_slice(&server_public_key_bytes).unwrap();
-
-    Some(server_public_key)
-}
-
-pub async fn update_statechain(
-    pool: &sqlx::PgPool,
-    auth_key: &XOnlyPublicKey,
-    server_public_key: &PublicKey,
-    statechain_id: &str,
-) {
-    let mut transaction = pool.begin().await.unwrap();
-
-    let query = "UPDATE statechain_data \
-        SET auth_xonly_public_key = $1, server_public_key = $2 \
-        WHERE statechain_id = $3";
-
-    let _ = sqlx::query(query)
-        .bind(&auth_key.serialize())
-        .bind(&server_public_key.serialize())
-        .bind(statechain_id)
-        .execute(&mut *transaction)
-        .await
-        .unwrap();
-
-    let query = "UPDATE statechain_transfer \
-        SET key_updated = true \
-        WHERE statechain_id = $1";
-
-    let _ = sqlx::query(query)
-        .bind(statechain_id)
-        .execute(&mut *transaction)
-        .await
-        .unwrap();
-
-    // Ownership has moved to a new key share. Any incomplete signing guard
-    // state from the previous owner must not block the new owner. Preserve
-    // completed BIP448 signature rows because transfer does not reset the
-    // shared signature count.
-    let _ = sqlx::query(DELETE_SIGNING_GUARDS_AFTER_TRANSFER_QUERY)
-        .bind(statechain_id)
-        .execute(&mut *transaction)
-        .await
-        .unwrap();
-
-    transaction.commit().await.unwrap();
-}
-
-pub async fn update_unlock_transfer(
-    pool: &sqlx::PgPool,
-    is_current_owner: bool,
-    statechain_id: &str,
-) {
-    let locked_field = if is_current_owner {
-        "locked2"
-    } else {
-        "locked"
-    };
-
-    let query = format!(
-        "UPDATE statechain_transfer \
-        SET {} = false, updated_at = NOW() \
-        WHERE statechain_id = $1",
-        locked_field
-    );
-
-    let _ = sqlx::query(&query)
-        .bind(statechain_id)
-        .execute(pool)
-        .await
-        .unwrap();
-
-    let query = "SELECT locked, locked2, batch_id \
-            FROM statechain_transfer \
-            WHERE statechain_id = $1";
-
-    let row = sqlx::query(query)
-        .bind(statechain_id)
-        .fetch_one(pool)
-        .await
-        .unwrap();
-
-    let locked: bool = row.get(0);
-    let locked2: bool = row.get(1);
-    let batch_id: Option<String> = row.get(2);
-
-    // if there is no lightning latch operation, the update below will have no effect
-
-    if batch_id.is_some() && !locked && !locked2 {
-        let query = "UPDATE lightning_latch \
-                SET locked = false, updated_at = NOW() \
-                WHERE statechain_id = $1
-                AND batch_id = $2";
-
-        let _ = sqlx::query(query)
-            .bind(statechain_id)
-            .bind(batch_id.unwrap())
-            .execute(pool)
-            .await
-            .unwrap();
-    }
 }
 
 #[cfg(test)]

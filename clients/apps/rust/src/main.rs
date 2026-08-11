@@ -206,21 +206,8 @@ async fn main() -> Result<()> {
                 mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet_name)
                     .await?;
 
-            let mut coins_json = Vec::new();
-
-            for coin in wallet.coins.iter() {
-                let obj = json!({
-                    "coin.user_pubkey": coin.user_pubkey,
-                    "coin.aggregated_address": coin.aggregated_address.as_ref().unwrap_or(&"".to_string()),
-                    "coin.address": coin.address,
-                    "coin.statechain_id": coin.statechain_id.as_ref().unwrap_or(&"".to_string()),
-                    "coin.amount": coin.amount.unwrap_or(0),
-                    "coin.status": coin.status,
-                    "coin.locktime": coin.locktime.unwrap_or(0),
-                });
-
-                coins_json.push(obj);
-            }
+            let coins_json =
+                mercuryrustlib::coin_status::statecoin_list_json(&client_config, &wallet).await?;
 
             let coins_json_string = serde_json::to_string_pretty(&coins_json).unwrap();
             println!("{}", coins_json_string);
@@ -383,6 +370,79 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mercuryrustlib::{
+        bip448_funding::{
+            Bip448BindingRole, Bip448FundingBinding, Bip448ObservationStatus, Bip448OwnershipStatus,
+        },
+        Coin, CoinStatus,
+    };
+
+    fn list_coin() -> Coin {
+        Coin {
+            index: 0,
+            user_privkey: String::new(),
+            user_pubkey: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+                .into(),
+            auth_privkey: String::new(),
+            auth_pubkey: String::new(),
+            derivation_path: String::new(),
+            fingerprint: String::new(),
+            address: "transfer-address".into(),
+            backup_address: "recovery-address".into(),
+            server_pubkey: None,
+            aggregated_pubkey: None,
+            aggregated_address: Some("aggregate-address".into()),
+            statechain_protocol: Some("bip448".into()),
+            utxo_txid: None,
+            utxo_vout: None,
+            amount: Some(100_000),
+            statechain_id: Some("statechain".into()),
+            signed_statechain_id: None,
+            locktime: None,
+            secret_nonce: None,
+            public_nonce: None,
+            blinding_factor: None,
+            server_public_nonce: None,
+            tx_withdraw: None,
+            withdrawal_address: None,
+            status: CoinStatus::CONFIRMED,
+        }
+    }
+
+    fn list_binding(
+        index: u32,
+        value_sats: u64,
+        observation_status: Bip448ObservationStatus,
+        ownership_status: Bip448OwnershipStatus,
+    ) -> Bip448FundingBinding {
+        Bip448FundingBinding {
+            wallet_name: "wallet".into(),
+            statechain_id: "statechain".into(),
+            binding_index: index,
+            txid: format!("{:02x}", index + 1).repeat(32),
+            vout: index,
+            value_sats,
+            script_pubkey: "51".into(),
+            role: if index == 0 {
+                Bip448BindingRole::Canonical
+            } else {
+                Bip448BindingRole::Duplicate
+            },
+            observation_status,
+            funding_height: Some(1),
+            spend_txid: (observation_status == Bip448ObservationStatus::SpentConfirmed)
+                .then(|| "44".repeat(32)),
+            spend_height: (observation_status == Bip448ObservationStatus::SpentConfirmed)
+                .then_some(2),
+            last_scanned_height: 3,
+            owner_user_pubkey: "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+                .into(),
+            owner_state_number: 1,
+            ownership_status,
+            first_seen_at: "first".into(),
+            last_seen_at: "last".into(),
+        }
+    }
 
     #[test]
     fn bip448_recovery_requires_exactly_one_fee_source() {
@@ -475,5 +535,120 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(invocation).is_ok());
         }
+    }
+
+    #[test]
+    fn list_statecoins_has_exact_nested_duplicate_shape_and_identity() -> Result<()> {
+        let coin = list_coin();
+        let bindings = vec![
+            list_binding(
+                2,
+                u64::from(u32::MAX) + 9,
+                Bip448ObservationStatus::Confirmed,
+                Bip448OwnershipStatus::Previous,
+            ),
+            list_binding(
+                0,
+                100_000,
+                Bip448ObservationStatus::Confirmed,
+                Bip448OwnershipStatus::Current,
+            ),
+            list_binding(
+                3,
+                7,
+                Bip448ObservationStatus::SpentConfirmed,
+                Bip448OwnershipStatus::Current,
+            ),
+            list_binding(
+                1,
+                546,
+                Bip448ObservationStatus::Mempool,
+                Bip448OwnershipStatus::Current,
+            ),
+        ];
+        let value = mercuryrustlib::coin_status::statecoin_list_entry_json(
+            "wallet",
+            &coin,
+            &bindings,
+            &[],
+        )?;
+        let keys = value
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("list entry is not an object"))?
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            [
+                "coin.address",
+                "coin.address_retired",
+                "coin.aggregated_address",
+                "coin.amount",
+                "coin.close_tip_hash",
+                "coin.close_tip_height",
+                "coin.duplicates",
+                "coin.exit_only",
+                "coin.locktime",
+                "coin.statechain_id",
+                "coin.statechain_protocol",
+                "coin.status",
+                "coin.user_pubkey",
+                "coin.utxo_txid",
+                "coin.utxo_vout",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        );
+        assert_eq!(value["coin.amount"], 100_000);
+        assert!(value["coin.utxo_txid"].is_null());
+        assert!(value["coin.utxo_vout"].is_null());
+        assert!(value["coin.close_tip_height"].is_null());
+        assert!(value["coin.close_tip_hash"].is_null());
+        let duplicates = value["coin.duplicates"].as_array().unwrap();
+        assert_eq!(
+            duplicates
+                .iter()
+                .map(|duplicate| duplicate["duplicate_index"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(duplicates[0]["amount_sats"], 546_u64);
+        assert!(duplicates[0]["sweep_phase"].is_null());
+        assert!(duplicates[0]["broadcast_status"].is_null());
+        assert_eq!(duplicates[0]["cooperative_only"], true);
+        assert_eq!(duplicates[0]["server_dependent"], true);
+        assert_eq!(duplicates[1]["amount_sats"], u64::from(u32::MAX) + 9);
+        assert_eq!(duplicates[1]["server_dependent"], false);
+        assert_eq!(duplicates[2]["cooperative_only"], false);
+        assert_eq!(duplicates[2]["server_dependent"], false);
+        let duplicate_keys = duplicates[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(duplicate_keys.len(), 11);
+        assert_eq!(
+            duplicate_keys,
+            [
+                "amount_sats",
+                "broadcast_status",
+                "cooperative_only",
+                "duplicate_index",
+                "observation_status",
+                "ownership_status",
+                "server_dependent",
+                "spend_txid",
+                "sweep_phase",
+                "txid",
+                "vout",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        );
+        Ok(())
     }
 }

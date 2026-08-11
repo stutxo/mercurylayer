@@ -280,8 +280,8 @@ pub(crate) fn tx0_status_for_confirmations(
 async fn unlock_statecoin(
     client_config: &ClientConfig,
     statechain_id: &str,
-    signed_statechain_id: &str,
-    auth_pubkey: &str,
+    auth_sig: &str,
+    x1_generation_pubkey: &str,
 ) -> Result<()> {
     let path = "transfer/unlock";
 
@@ -291,8 +291,8 @@ async fn unlock_statecoin(
     let transfer_unlock_request_payload =
         mercurylib::transfer::receiver::TransferUnlockRequestPayload {
             statechain_id: statechain_id.to_string(),
-            auth_sig: signed_statechain_id.to_string(),
-            auth_pub_key: Some(auth_pubkey.to_string()),
+            auth_sig: auth_sig.to_string(),
+            auth_pub_key: Some(x1_generation_pubkey.to_string()),
         };
 
     let status = request

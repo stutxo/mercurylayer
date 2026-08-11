@@ -2,6 +2,7 @@ use crate::{
     bip448_owner::get_current_bip448_owner, client_config::ClientConfig, sqlite_manager::get_wallet,
 };
 use anyhow::{anyhow, Result};
+use bitcoin::PrivateKey;
 use mercurylib::{
     transfer::sender::{
         PaymentHashRequestPayload, PaymentHashResponsePayload, TransferPreimageRequestPayload,
@@ -9,7 +10,9 @@ use mercurylib::{
     },
     wallet::CoinStatus,
 };
+use secp256k1::{schnorr, KeyPair, PublicKey, Secp256k1};
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 
 #[derive(Serialize, Deserialize)]
 pub struct CreatePreImageResponse {
@@ -88,10 +91,25 @@ pub async fn confirm_pending_invoice(
         .coins
         .get(current_owner.coin_index)
         .ok_or_else(|| anyhow!("current BIP448 owner index is no longer present in the wallet"))?;
-    let signed_statechain_id = coin
-        .signed_statechain_id
-        .as_ref()
-        .ok_or_else(|| anyhow!("coin.signed_statechain_id is None"))?;
+    let generation_text = current_owner
+        .statechain_info
+        .x1_pub
+        .as_deref()
+        .ok_or_else(|| anyhow!("current BIP448 transfer generation is missing"))?;
+    let generation = PublicKey::from_str(generation_text)?;
+    if generation.to_string() != generation_text {
+        return Err(anyhow!(
+            "current BIP448 transfer generation is noncanonical"
+        ));
+    }
+    let digest = mercurylib::transfer::receiver::bip448_transfer_unlock_auth_digest(
+        mercurylib::transfer::receiver::Bip448TransferUnlockRole::CurrentOwner,
+        statechain_id,
+        &generation,
+    )?;
+    let auth_secret = PrivateKey::from_wif(&coin.auth_privkey)?.inner;
+    let auth_keypair = KeyPair::from_secret_key(&Secp256k1::new(), &auth_secret);
+    let auth_sig = schnorr::sign(&digest, &auth_keypair).to_string();
 
     let path = "transfer/unlock";
 
@@ -101,8 +119,8 @@ pub async fn confirm_pending_invoice(
     let transfer_unlock_request_payload =
         mercurylib::transfer::receiver::TransferUnlockRequestPayload {
             statechain_id: statechain_id.to_string(),
-            auth_sig: signed_statechain_id.to_string(),
-            auth_pub_key: None,
+            auth_sig,
+            auth_pub_key: Some(generation.to_string()),
         };
 
     let status = request

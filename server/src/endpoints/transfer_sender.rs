@@ -4,98 +4,10 @@ use mercurylib::transfer::sender::{
     TransferSenderRequestPayload, TransferSenderResponsePayload, TransferUpdateMsgRequestPayload,
 };
 use rocket::{http::Status, response::status, serde::json::Json, State};
-use secp256k1::{PublicKey, Scalar, SecretKey};
+use secp256k1::PublicKey;
 use serde_json::{json, Value};
 
 use crate::server::StateChainEntity;
-
-use super::is_batch_expired;
-
-/// Enun to represent the possible results of the batch transfer validation
-pub enum BatchTransferValidationResult {
-    /// The statecoin batch is locked (not expired yet)
-    StatecoinBatchLockedError(String),
-    /// The batch_id sent by the user is expired
-    ExpiredBatchTimeError(String),
-    /// Success means there is no batch_id for the statecoin,
-    /// or the batch is complete or expired and the batch_id is different from the new_batch_id (or null)
-    Success,
-}
-
-pub async fn validate_batch_transfer(
-    statechain_entity: &State<StateChainEntity>,
-    statechain_id: &str,
-    new_batch_id: &Option<String>,
-) -> BatchTransferValidationResult {
-    // get an extistent batch according to the statecoin, in case the user sent a repeated statecoin
-    let batch_info = crate::database::transfer::get_batch_id_and_time_by_statechain_id(
-        &statechain_entity.pool,
-        &statechain_id,
-    )
-    .await;
-
-    if batch_info.is_some() {
-        let (batch_id, batch_time) = batch_info.unwrap();
-
-        if !is_batch_expired(batch_time) {
-            let all_coins_unlocked = crate::database::transfer::is_all_coins_unlocked(
-                &statechain_entity.pool,
-                &batch_id,
-            )
-            .await;
-
-            if all_coins_unlocked {
-                return BatchTransferValidationResult::Success;
-            }
-
-            // the batch time has not expired
-            return BatchTransferValidationResult::StatecoinBatchLockedError(
-                "Statecoin batch locked (the batch time has not expired).".to_string(),
-            );
-        } else {
-            // the batch time has expired
-            if new_batch_id.is_some() && new_batch_id.as_ref().unwrap().to_string() == batch_id {
-                // if the new_batch_id is the same should return error
-                return BatchTransferValidationResult::ExpiredBatchTimeError(
-                    "Batch time has expired. Try a new batch id.".to_string(),
-                );
-            } else {
-                // // if the new_batch_id is None or different should return success
-                return BatchTransferValidationResult::Success;
-            }
-        }
-    }
-
-    // here the statecoin has no batch_id
-    // then we check if the user sends a existing batch_id, trying to add a new transfer to this batch.
-    if new_batch_id.is_some() {
-        let new_batch_id = new_batch_id.as_ref().unwrap();
-
-        let batch_time = crate::database::transfer_sender::get_batch_time_by_batch_id(
-            &statechain_entity.pool,
-            new_batch_id,
-        )
-        .await;
-
-        // if the batch_id exists
-        if batch_time.is_some() {
-            let batch_time = batch_time.unwrap();
-
-            if !is_batch_expired(batch_time) {
-                // the batch time has not expired. It is possible to add a new coin to the batch.
-                return BatchTransferValidationResult::Success;
-            } else {
-                // the batch time has expired. New coins not allowed.
-                return BatchTransferValidationResult::ExpiredBatchTimeError(
-                    "Batch time has expired. Try a new batch id.".to_string(),
-                );
-            }
-        }
-    }
-
-    // if the statecoin has no batch_id should return success
-    BatchTransferValidationResult::Success
-}
 
 #[post(
     "/transfer/sender",
@@ -110,83 +22,47 @@ pub async fn transfer_sender(
     let signed_statechain_id = transfer_sender_request_payload.0.auth_sig.clone();
     let batch_id = transfer_sender_request_payload.0.batch_id.clone();
 
-    let signature_failure_status = match crate::endpoints::utils::try_validate_signature(
+    let new_user_auth_key =
+        match PublicKey::from_str(&transfer_sender_request_payload.0.new_user_auth_key) {
+            Ok(key) => key,
+            Err(_) => {
+                return status::Custom(
+                    Status::BadRequest,
+                    Json(json!({"message": "Invalid new_user_auth_key."})),
+                );
+            }
+        };
+
+    let result = crate::database::transfer_sender::insert_new_transfer_or_replay_exact(
         &statechain_entity.pool,
         &signed_statechain_id,
         &statechain_id,
-    )
-    .await
-    {
-        Ok(true) => None,
-        Ok(false) => Some(Status::InternalServerError),
-        Err(_) => Some(Status::InternalServerError),
-    };
-
-    if let Some(signature_failure_status) = signature_failure_status {
-        let response_body = json!({
-            "message": "Signature does not match authentication key."
-        });
-
-        return status::Custom(signature_failure_status, Json(response_body));
-    }
-
-    let batch_transfer_validation_result =
-        validate_batch_transfer(&statechain_entity, &statechain_id, &batch_id).await;
-
-    match batch_transfer_validation_result {
-        BatchTransferValidationResult::StatecoinBatchLockedError(message)
-        | BatchTransferValidationResult::ExpiredBatchTimeError(message) => {
-            let response_body = json!({
-                "message": message
-            });
-
-            return status::Custom(Status::BadRequest, Json(response_body));
-        }
-        BatchTransferValidationResult::Success => {
-            // nothing to do. continue.
-        }
-    }
-
-    let new_user_auth_key =
-        PublicKey::from_str(&transfer_sender_request_payload.0.new_user_auth_key).unwrap();
-
-    if crate::database::transfer_sender::exists_msg_for_same_statechain_id_and_new_user_auth_key(
-        &statechain_entity.pool,
         &new_user_auth_key,
-        &statechain_id,
-        &batch_id,
-    )
-    .await
-    {
-        let message = if batch_id.is_some() {
-            "Transfer message already exists for this statechain_id, new_user_auth_key and batch_id."
-        } else {
-            "Transfer message already exists for this statechain_id and new_user_auth_key."
-        };
-
-        let response_body = json!({
-            "message": message
-        });
-
-        return status::Custom(Status::BadRequest, Json(response_body));
-    }
-
-    let secret_x1 = {
-        let mut rng = secp256k1::rand::rng();
-        SecretKey::new(&mut rng)
-    };
-
-    let s_x1 = Scalar::from(secret_x1);
-    let x1 = s_x1.to_be_bytes();
-
-    crate::database::transfer_sender::insert_new_transfer(
-        &statechain_entity.pool,
-        &new_user_auth_key,
-        &x1,
-        &statechain_id,
         &batch_id,
     )
     .await;
+
+    let x1 = match result {
+        Ok(crate::database::transfer_sender::InsertTransferResult::Success(x1)) => x1,
+        Ok(crate::database::transfer_sender::InsertTransferResult::AuthenticationFailed) => {
+            return status::Custom(
+                Status::InternalServerError,
+                Json(json!({"message": "Signature does not match authentication key."})),
+            );
+        }
+        Ok(crate::database::transfer_sender::InsertTransferResult::StatecoinBatchLocked(
+            message,
+        ))
+        | Ok(crate::database::transfer_sender::InsertTransferResult::ExpiredBatchTime(message)) => {
+            return status::Custom(Status::BadRequest, Json(json!({"message": message})));
+        }
+        Err(_) => {
+            return status::Custom(
+                Status::InternalServerError,
+                Json(json!({"message": "Failed to initialize transfer."})),
+            );
+        }
+    };
 
     let transfer_sender_response_payload = TransferSenderResponsePayload {
         x1: hex::encode(x1),
@@ -207,41 +83,68 @@ pub async fn transfer_update_msg(
     transfer_update_msg_request_payload: Json<TransferUpdateMsgRequestPayload>,
 ) -> status::Custom<Json<Value>> {
     let statechain_id = transfer_update_msg_request_payload.0.statechain_id.clone();
-    let signed_statechain_id = transfer_update_msg_request_payload.0.auth_sig.clone();
-
-    let signature_failure_status = match crate::endpoints::utils::try_validate_signature(
-        &statechain_entity.pool,
-        &signed_statechain_id,
-        &statechain_id,
-    )
-    .await
-    {
-        Ok(true) => None,
-        Ok(false) => Some(Status::InternalServerError),
-        Err(_) => Some(Status::InternalServerError),
+    let generation_error = || {
+        status::Custom(
+            Status::InternalServerError,
+            Json(json!({
+                "error": "Internal Server Error",
+                "message": "Transfer message generation does not match current state."
+            })),
+        )
     };
-
-    if let Some(signature_failure_status) = signature_failure_status {
-        let response_body = json!({
-            "error": "Internal Server Error",
-            "message": "Signature does not match authentication key."
-        });
-
-        return status::Custom(signature_failure_status, Json(response_body));
-    }
-
     let new_user_auth_key =
-        PublicKey::from_str(&transfer_update_msg_request_payload.0.new_user_auth_key).unwrap();
-    let enc_transfer_msg_hex = transfer_update_msg_request_payload.0.enc_transfer_msg;
-    let enc_transfer_msg = hex::decode(enc_transfer_msg_hex).unwrap();
+        match PublicKey::from_str(&transfer_update_msg_request_payload.0.new_user_auth_key) {
+            Ok(key)
+                if key.to_string() == transfer_update_msg_request_payload.0.new_user_auth_key =>
+            {
+                key
+            }
+            _ => return generation_error(),
+        };
+    let x1_pub = match PublicKey::from_str(&transfer_update_msg_request_payload.0.x1_pub) {
+        Ok(key) if key.to_string() == transfer_update_msg_request_payload.0.x1_pub => key,
+        _ => return generation_error(),
+    };
+    let enc_transfer_msg =
+        match hex::decode(&transfer_update_msg_request_payload.0.enc_transfer_msg) {
+            Ok(bytes) => bytes,
+            Err(_) => return generation_error(),
+        };
 
-    crate::database::transfer_sender::update_transfer_msg(
+    let result = crate::database::transfer_sender::update_transfer_msg_for_generation_exact(
         &statechain_entity.pool,
-        &new_user_auth_key,
-        &enc_transfer_msg,
         &statechain_id,
+        &transfer_update_msg_request_payload.0.auth_sig,
+        &new_user_auth_key,
+        &x1_pub,
+        &enc_transfer_msg,
     )
     .await;
+
+    match result {
+        Ok(crate::database::transfer_sender::UpdateTransferMessageResult::Success) => {}
+        Ok(crate::database::transfer_sender::UpdateTransferMessageResult::AuthenticationFailed) => {
+            return status::Custom(
+                Status::InternalServerError,
+                Json(json!({
+                    "error": "Internal Server Error",
+                    "message": "Signature does not match authentication key."
+                })),
+            );
+        }
+        Ok(crate::database::transfer_sender::UpdateTransferMessageResult::GenerationMismatch) => {
+            return generation_error();
+        }
+        Err(_) => {
+            return status::Custom(
+                Status::InternalServerError,
+                Json(json!({
+                    "error": "Internal Server Error",
+                    "message": "Failed to update transfer message."
+                })),
+            );
+        }
+    }
 
     let response_body = json!({
         "updated": true,

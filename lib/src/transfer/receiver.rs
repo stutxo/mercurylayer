@@ -1,4 +1,7 @@
-use bitcoin::{hashes::sha256, PrivateKey, Txid};
+use bitcoin::{
+    hashes::{sha256, Hash},
+    PrivateKey, Txid,
+};
 use secp256k1::{
     schnorr::Signature, KeyPair, Message, PublicKey, Secp256k1, SecretKey, Verification,
 };
@@ -12,8 +15,11 @@ use crate::{
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TransferUnlockRequestPayload {
     pub statechain_id: String,
-    pub auth_sig: String,             // signed_statechain_id
-    pub auth_pub_key: Option<String>, // public key for verification
+    pub auth_sig: String,
+    /// For BIP448 this is the canonical compressed public key derived from
+    /// the locked transfer row's `x1`. It is a generation tag, not an
+    /// authentication identity.
+    pub auth_pub_key: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -67,6 +73,61 @@ pub struct StatechainInfoResponsePayload {
     pub num_sigs: u32,
     pub statechain_info: Vec<StatechainInfo>,
     pub x1_pub: Option<String>,
+}
+
+const BIP448_TRANSFER_UNLOCK_DOMAIN: &[u8] = b"BIP448/transfer-unlock/v1\0";
+const BIP448_TRANSFER_RECEIVER_DOMAIN: &[u8] = b"BIP448/transfer-receiver/v1\0";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Bip448TransferUnlockRole {
+    CurrentOwner,
+    Recipient,
+}
+
+impl Bip448TransferUnlockRole {
+    fn as_byte(self) -> u8 {
+        match self {
+            Self::CurrentOwner => 0x00,
+            Self::Recipient => 0x01,
+        }
+    }
+}
+
+fn append_statechain_id(preimage: &mut Vec<u8>, statechain_id: &str) -> Result<(), MercuryError> {
+    let statechain_id_len = u32::try_from(statechain_id.len())
+        .map_err(|_| MercuryError::InvalidStatechainAddressError)?;
+    preimage.extend_from_slice(&statechain_id_len.to_be_bytes());
+    preimage.extend_from_slice(statechain_id.as_bytes());
+    Ok(())
+}
+
+pub fn bip448_transfer_unlock_auth_digest(
+    role: Bip448TransferUnlockRole,
+    statechain_id: &str,
+    x1_generation_pubkey: &PublicKey,
+) -> Result<[u8; 32], MercuryError> {
+    let mut preimage =
+        Vec::with_capacity(BIP448_TRANSFER_UNLOCK_DOMAIN.len() + 1 + 4 + statechain_id.len() + 33);
+    preimage.extend_from_slice(BIP448_TRANSFER_UNLOCK_DOMAIN);
+    preimage.push(role.as_byte());
+    append_statechain_id(&mut preimage, statechain_id)?;
+    preimage.extend_from_slice(&x1_generation_pubkey.serialize());
+    Ok(sha256::Hash::hash(&preimage).to_byte_array())
+}
+
+pub fn bip448_transfer_receiver_auth_digest(
+    statechain_id: &str,
+    t2: &[u8; 32],
+    x1_generation_pubkey: &PublicKey,
+) -> Result<[u8; 32], MercuryError> {
+    let mut preimage = Vec::with_capacity(
+        BIP448_TRANSFER_RECEIVER_DOMAIN.len() + 4 + statechain_id.len() + 32 + 33,
+    );
+    preimage.extend_from_slice(BIP448_TRANSFER_RECEIVER_DOMAIN);
+    append_statechain_id(&mut preimage, statechain_id)?;
+    preimage.extend_from_slice(t2);
+    preimage.extend_from_slice(&x1_generation_pubkey.serialize());
+    Ok(sha256::Hash::hash(&preimage).to_byte_array())
 }
 
 pub fn clone_transfer_address_coin_to_initialized_state(
@@ -165,6 +226,7 @@ pub fn sign_message(message: &str, coin: &Coin) -> Result<String, MercuryError> 
 mod tests {
     use super::*;
     use crate::wallet::Settings;
+    use std::str::FromStr;
 
     fn sample_wallet() -> Wallet {
         Wallet {
@@ -248,5 +310,91 @@ mod tests {
         assert!(cloned.tx_withdraw.is_none());
         assert!(cloned.withdrawal_address.is_none());
         assert_eq!(cloned.status, CoinStatus::INITIALISED);
+    }
+
+    #[test]
+    fn bip448_unlock_digest_is_domain_role_and_generation_bound() {
+        let generation = PublicKey::from_str(
+            "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+        )
+        .unwrap();
+        let other_generation = PublicKey::from_str(
+            "02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+        )
+        .unwrap();
+        let digest = bip448_transfer_unlock_auth_digest(
+            Bip448TransferUnlockRole::CurrentOwner,
+            "statechain-vector",
+            &generation,
+        )
+        .unwrap();
+
+        assert_eq!(
+            hex::encode(digest),
+            "d3fdde0c6e031931fd5cac33e5f8070fd19f07a41fce544a776117aa10516b97"
+        );
+        assert_ne!(
+            digest,
+            bip448_transfer_unlock_auth_digest(
+                Bip448TransferUnlockRole::Recipient,
+                "statechain-vector",
+                &generation
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            digest,
+            bip448_transfer_unlock_auth_digest(
+                Bip448TransferUnlockRole::CurrentOwner,
+                "statechain-vector-2",
+                &generation
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            digest,
+            bip448_transfer_unlock_auth_digest(
+                Bip448TransferUnlockRole::CurrentOwner,
+                "statechain-vector",
+                &other_generation
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn bip448_receiver_digest_is_domain_state_t2_and_generation_bound() {
+        let generation = PublicKey::from_str(
+            "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+        )
+        .unwrap();
+        let other_generation = PublicKey::from_str(
+            "02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+        )
+        .unwrap();
+        let t2 = [0x42; 32];
+        let digest =
+            bip448_transfer_receiver_auth_digest("statechain-vector", &t2, &generation).unwrap();
+
+        assert_eq!(
+            hex::encode(digest),
+            "e8185081251d8a4b31f3e4d90eb4eb063bf19a6bda669fb8380beefefa87d81b"
+        );
+        assert_ne!(
+            digest,
+            bip448_transfer_receiver_auth_digest("statechain-vector-2", &t2, &generation).unwrap()
+        );
+        let mut other_t2 = t2;
+        other_t2[0] ^= 1;
+        assert_ne!(
+            digest,
+            bip448_transfer_receiver_auth_digest("statechain-vector", &other_t2, &generation)
+                .unwrap()
+        );
+        assert_ne!(
+            digest,
+            bip448_transfer_receiver_auth_digest("statechain-vector", &t2, &other_generation)
+                .unwrap()
+        );
     }
 }

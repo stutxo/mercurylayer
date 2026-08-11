@@ -1,6 +1,6 @@
 use std::{error::Error, fmt, str::FromStr};
 
-use bitcoin::hashes::sha256;
+use bitcoin::hashes::{sha256, Hash};
 use rocket::{http::Status, response::status, serde::json::Json};
 use secp256k1::PublicKey;
 use secp256k1::{schnorr::Signature, Message, Secp256k1, XOnlyPublicKey};
@@ -61,19 +61,27 @@ pub async fn get_auth_key_by_statechain_id(
     };
 }
 
-fn try_verify_statechain_signature(
+pub(crate) fn try_verify_digest_signature(
     signed_message_hex: &str,
-    statechain_id: &str,
+    digest: &[u8; 32],
     auth_key: &XOnlyPublicKey,
 ) -> Result<bool, SignatureValidationError> {
     let signed_message = Signature::from_str(signed_message_hex)
         .map_err(|_| SignatureValidationError::InvalidSignature)?;
-    let msg = Message::from_hashed_data::<sha256::Hash>(statechain_id.to_string().as_bytes());
+    let msg = Message::from_digest(*digest);
 
-    let secp = Secp256k1::new();
-    Ok(secp
+    Ok(Secp256k1::new()
         .verify_schnorr(&signed_message, msg.as_ref(), auth_key)
         .is_ok())
+}
+
+pub(crate) fn try_verify_statechain_signature(
+    signed_message_hex: &str,
+    statechain_id: &str,
+    auth_key: &XOnlyPublicKey,
+) -> Result<bool, SignatureValidationError> {
+    let digest = sha256::Hash::hash(statechain_id.as_bytes()).to_byte_array();
+    try_verify_digest_signature(signed_message_hex, &digest, auth_key)
 }
 
 pub async fn try_validate_signature_given_public_key(

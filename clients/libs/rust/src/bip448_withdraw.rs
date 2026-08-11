@@ -17,8 +17,10 @@ use mercurylib::{
 use secp256k1::{rand, SecretKey};
 
 use crate::{
+    bip448_funding::Bip448BindingRole,
     bip448_owner::get_current_bip448_owner,
     client_config::ClientConfig,
+    coin_status::sync_bip448_funding_bindings,
     deposit::{bip448_sign_first, bip448_sign_second},
     sqlite_manager::{
         get_bip448_pending_transfer_signing, get_bip448_statechain, get_wallet, update_wallet,
@@ -70,6 +72,14 @@ pub async fn execute(
     {
         return Err(anyhow!(
             "cancel or complete the in-flight transfer before withdrawing"
+        ));
+    }
+    let sync = sync_bip448_funding_bindings(client_config, wallet_name).await?;
+    if sync.bindings.iter().any(|binding| {
+        binding.statechain_id == statechain_id && binding.role == Bip448BindingRole::Duplicate
+    }) {
+        return Err(anyhow!(
+            "BIP448 canonical withdrawal is blocked while any duplicate funding binding exists"
         ));
     }
     if !mercurylib::validate_address(to_address, &wallet.network)? {
