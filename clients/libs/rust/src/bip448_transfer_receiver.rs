@@ -1,4 +1,4 @@
-use std::{future::Future, str::FromStr};
+use std::{fmt, future::Future, str::FromStr};
 
 use anyhow::{anyhow, Result};
 use bitcoin::{
@@ -36,6 +36,44 @@ use crate::{
 use super::Bip448ReceiveOutcome;
 
 const ALREADY_UPDATED_ERROR: &str = "key update already completed; manual completion required";
+
+#[derive(Debug)]
+pub struct Bip448PostAcceptanceSyncError {
+    accepted_statechain_ids: Vec<String>,
+    source: anyhow::Error,
+}
+
+impl Bip448PostAcceptanceSyncError {
+    pub(crate) fn new(mut accepted_statechain_ids: Vec<String>, source: anyhow::Error) -> Self {
+        accepted_statechain_ids.sort();
+        accepted_statechain_ids.dedup();
+        Self {
+            accepted_statechain_ids,
+            source,
+        }
+    }
+
+    pub fn accepted_statechain_ids(&self) -> &[String] {
+        &self.accepted_statechain_ids
+    }
+}
+
+impl fmt::Display for Bip448PostAcceptanceSyncError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "BIP448 transfer/key update already accepted for {}; duplicate rescan pending and the next update/list will retry: {}",
+            self.accepted_statechain_ids.join(","),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for Bip448PostAcceptanceSyncError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
 
 enum ReceiverPostError {
     LostResponse(anyhow::Error),

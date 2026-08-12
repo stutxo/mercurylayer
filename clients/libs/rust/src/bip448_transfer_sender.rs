@@ -2584,52 +2584,94 @@ pub async fn cancel_bip448_transfer(
             .ok_or_else(|| anyhow!("BIP448 cancellation sender deleted its intent"))?;
     }
     if cancellation.phase == Bip448TransferIntentPhase::SenderFinished {
-        let received = crate::transfer_receiver::execute(client_config, wallet_name).await?;
+        let received = match crate::transfer_receiver::execute(client_config, wallet_name).await {
+            Ok(received) => received,
+            Err(error)
+                if error
+                    .downcast_ref::<crate::transfer_receiver::Bip448PostAcceptanceSyncError>()
+                    .is_some_and(|accepted| {
+                        accepted
+                            .accepted_statechain_ids()
+                            .iter()
+                            .any(|accepted_id| accepted_id == statechain_id)
+                    }) =>
+            {
+                mark_bip448_cancellation_receiver_accepted(
+                    &client_config.pool,
+                    wallet_name,
+                    statechain_id,
+                    &cancellation.intent_id,
+                )
+                .await
+                .context(
+                    "BIP448 cancellation key update was accepted but its durable receiver proof failed",
+                )?;
+                if let Err(retry_error) =
+                    crate::coin_status::update_coins(client_config, wallet_name).await
+                {
+                    return Err(retry_error
+                        .context("BIP448 cancellation accepted; duplicate rescan pending"));
+                }
+                return Ok(
+                    get_bip448_statechain(&client_config.pool, wallet_name, statechain_id)
+                        .await?
+                        .latest_state_number,
+                );
+            }
+            Err(error) => return Err(error),
+        };
         if received.is_there_batch_locked {
             return Err(anyhow!(BATCHED_PENDING_ERROR));
         }
-        cancellation = mark_bip448_cancellation_receiver_accepted(
-            &client_config.pool,
-            wallet_name,
-            statechain_id,
-            &cancellation.intent_id,
-        )
-        .await
-        .map_err(|error| {
-            if received
-                .received_statechain_ids
-                .iter()
-                .any(|id| id == statechain_id)
-            {
-                error.context("BIP448 cancellation receiver accepted but local proof failed")
-            } else {
-                error.context("BIP448 transfer cancellation did not receive the replacement state")
+        match get_active_bip448_transfer_intent(&client_config.pool, wallet_name, statechain_id)
+            .await?
+        {
+            None => {
+                return Ok(
+                    get_bip448_statechain(&client_config.pool, wallet_name, statechain_id)
+                        .await?
+                        .latest_state_number,
+                );
             }
-        })?;
-        bip448_process_checkpoint("transfer_receiver_accepted");
+            Some(live) => {
+                if live.intent_id != cancellation.intent_id {
+                    return Err(anyhow!(
+                        "BIP448 cancellation receiver changed its active intent"
+                    ));
+                }
+                cancellation = mark_bip448_cancellation_receiver_accepted(
+                    &client_config.pool,
+                    wallet_name,
+                    statechain_id,
+                    &cancellation.intent_id,
+                )
+                .await
+                .map_err(|error| {
+                    if received
+                        .received_statechain_ids
+                        .iter()
+                        .any(|id| id == statechain_id)
+                    {
+                        error
+                            .context("BIP448 cancellation receiver accepted but local proof failed")
+                    } else {
+                        error.context(
+                            "BIP448 transfer cancellation did not receive the replacement state",
+                        )
+                    }
+                })?;
+                bip448_process_checkpoint("transfer_receiver_accepted");
+            }
+        }
     }
     if cancellation.phase != Bip448TransferIntentPhase::ReceiverAccepted {
         return Err(anyhow!(
             "BIP448 cancellation did not reach ReceiverAccepted"
         ));
     }
-    sync_bip448_funding_bindings(client_config, wallet_name)
+    crate::coin_status::update_coins(client_config, wallet_name)
         .await
         .context("BIP448 cancellation accepted; duplicate rescan pending")?;
-    let (_, message_json) = get_bip448_transfer_msg_raw_optional(
-        &client_config.pool,
-        wallet_name,
-        statechain_id,
-        Some(&cancellation.recipient_auth_pubkey),
-    )
-    .await?
-    .ok_or_else(|| anyhow!("BIP448 cancellation accepted message is missing"))?;
-    delete_bip448_cancellation_artifacts_after_sync(
-        &client_config.pool,
-        &cancellation,
-        &message_json,
-    )
-    .await?;
     Ok(
         get_bip448_statechain(&client_config.pool, wallet_name, statechain_id)
             .await?

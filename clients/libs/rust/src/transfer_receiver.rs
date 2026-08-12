@@ -3,10 +3,16 @@ use std::{
     str::FromStr,
 };
 
+#[cfg(feature = "test-hooks")]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::{
     chain::ChainClient,
     client_config::ClientConfig,
-    sqlite_manager::{get_wallet, update_wallet},
+    sqlite_manager::{
+        get_active_bip448_transfer_intent, get_wallet, mark_bip448_cancellation_receiver_accepted,
+        update_wallet,
+    },
 };
 use anyhow::Result;
 use bitcoin::{Address, Transaction, Txid};
@@ -19,6 +25,42 @@ use reqwest::StatusCode;
 
 #[path = "bip448_transfer_receiver.rs"]
 pub(crate) mod bip448_transfer_receiver;
+
+pub use bip448_transfer_receiver::Bip448PostAcceptanceSyncError;
+
+#[cfg(feature = "test-hooks")]
+static BIP448_POST_ACCEPTANCE_SYNC_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "test-hooks")]
+pub fn inject_bip448_post_acceptance_sync_failures_for_test(count: usize) {
+    BIP448_POST_ACCEPTANCE_SYNC_FAILURES.store(count, Ordering::SeqCst);
+}
+
+#[cfg(feature = "test-hooks")]
+fn take_bip448_post_acceptance_sync_failure() -> bool {
+    BIP448_POST_ACCEPTANCE_SYNC_FAILURES
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            remaining.checked_sub(1)
+        })
+        .is_ok()
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn take_bip448_post_acceptance_sync_failure() -> bool {
+    false
+}
+
+#[cfg(feature = "test-hooks")]
+fn bip448_post_acceptance_checkpoint() {
+    if std::env::var("ML_BIP448_RESTART_CHILD").as_deref() == Ok("1")
+        && std::env::var("ML_BIP448_TEST_CHECKPOINT").as_deref() == Ok("transfer_receiver_accepted")
+    {
+        std::process::exit(86);
+    }
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn bip448_post_acceptance_checkpoint() {}
 
 pub async fn new_transfer_address(
     client_config: &ClientConfig,
@@ -186,6 +228,63 @@ pub async fn execute(
     wallet.activities = temp_activities.clone();
 
     update_wallet(&client_config.pool, &wallet).await?;
+
+    received_statechain_ids.sort();
+    received_statechain_ids.dedup();
+
+    for statechain_id in &received_statechain_ids {
+        if let Some(intent) =
+            get_active_bip448_transfer_intent(&client_config.pool, wallet_name, statechain_id)
+                .await?
+        {
+            if intent.intent_kind != crate::bip448_funding::Bip448TransferIntentKind::Cancellation {
+                return Err(anyhow::anyhow!(
+                    "accepted BIP448 receive conflicts with an active local UserTransfer intent"
+                ));
+            }
+            mark_bip448_cancellation_receiver_accepted(
+                &client_config.pool,
+                wallet_name,
+                statechain_id,
+                &intent.intent_id,
+            )
+            .await?;
+        }
+    }
+
+    if !received_statechain_ids.is_empty() {
+        bip448_post_acceptance_checkpoint();
+    }
+
+    for statechain_id in &received_statechain_ids {
+        let sync_result = if take_bip448_post_acceptance_sync_failure() {
+            Err(anyhow::anyhow!(
+                "injected BIP448 post-acceptance synchronization failure"
+            ))
+        } else {
+            crate::coin_status::sync_bip448_funding_bindings_for_statechain_from_height_zero(
+                client_config,
+                wallet_name,
+                statechain_id,
+            )
+            .await
+            .map(|_| ())
+        };
+        if let Err(source) = sync_result {
+            return Err(Bip448PostAcceptanceSyncError::new(
+                received_statechain_ids.clone(),
+                source,
+            )
+            .into());
+        }
+    }
+
+    crate::coin_status::reconcile_bip448_post_sync_transfer_artifacts(
+        &client_config.pool,
+        wallet_name,
+        &received_statechain_ids,
+    )
+    .await?;
 
     Ok(TransferReceiveResult {
         is_there_batch_locked,
@@ -393,6 +492,33 @@ mod tests {
         assert!(matches!(success, Bip448MessageDisposition::Processed));
         assert!(matches!(failure, Bip448MessageDisposition::Rejected));
         assert_eq!(received_statechain_ids, vec!["accepted-statechain"]);
+    }
+
+    #[test]
+    fn bip448_post_acceptance_sync_error_is_typed_and_sorts_accepted_ids() {
+        let error: anyhow::Error = Bip448PostAcceptanceSyncError::new(
+            vec![
+                "statechain-b".to_string(),
+                "statechain-a".to_string(),
+                "statechain-b".to_string(),
+            ],
+            anyhow!("Bitcoin RPC unavailable"),
+        )
+        .into();
+        let typed = error
+            .downcast_ref::<Bip448PostAcceptanceSyncError>()
+            .expect("post-acceptance error must remain downcastable");
+
+        assert_eq!(
+            typed.accepted_statechain_ids(),
+            &["statechain-a".to_string(), "statechain-b".to_string()]
+        );
+        assert!(typed.to_string().contains("already accepted"));
+        assert!(typed.to_string().contains("next update/list will retry"));
+        assert!(std::error::Error::source(typed)
+            .expect("typed error must retain its synchronization source")
+            .to_string()
+            .contains("Bitcoin RPC unavailable"));
     }
 
     #[test]

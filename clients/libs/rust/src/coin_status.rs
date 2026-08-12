@@ -14,8 +14,8 @@ use mercurylib::{
 
 use crate::bip448_funding::{
     Bip448BindingObservation, Bip448BindingRole, Bip448FundingBinding, Bip448ObservationStatus,
-    Bip448OwnershipStatus, Bip448SyncBase, Bip448SyncReport, Bip448WithdrawalAttempt,
-    Bip448WithdrawalPhase,
+    Bip448OwnershipStatus, Bip448SyncBase, Bip448SyncReport, Bip448TransferIntentKind,
+    Bip448TransferIntentPhase, Bip448WithdrawalAttempt, Bip448WithdrawalPhase,
 };
 use crate::{
     bip448_owner::{
@@ -27,11 +27,14 @@ use crate::{
     deposit::create_bip448_deposit_state,
     sqlite_manager::{
         begin_bip448_sync_base_guard, capture_bip448_sync_base,
-        compare_and_set_wallet_after_bip448_scan, delete_bip448_pending_deposit_signing,
+        compare_and_set_wallet_after_bip448_scan, delete_bip448_cancellation_artifacts_after_sync,
+        delete_bip448_pending_deposit_signing, get_active_bip448_transfer_intent,
         get_bip448_pending_deposit_signing, get_bip448_raw_wallet_json, get_bip448_state_history,
-        get_bip448_statechain_optional, list_bip448_funding_bindings, load_bip448_scan_state,
-        persist_bip448_scan_state, recover_bip448_initial_acceptance_wallet,
-        Bip448InitialAcceptanceRecovery, Bip448ScanCursor,
+        get_bip448_statechain_optional, get_bip448_transfer_msg_raw_optional,
+        list_bip448_funding_bindings, load_bip448_scan_state, persist_bip448_scan_state,
+        reconcile_bip448_accepted_local_outgoing_messages,
+        recover_bip448_initial_acceptance_wallet, Bip448InitialAcceptanceRecovery,
+        Bip448ScanCursor,
     },
 };
 
@@ -666,6 +669,7 @@ fn require_stable_authoritative_replay_base(
 async fn build_bip448_script_sync_plans(
     client_config: &ClientConfig,
     wallet: &Wallet,
+    statechain_filter: Option<&str>,
 ) -> Result<Vec<Bip448ScriptSyncPlan>> {
     let mut plans = BTreeMap::<String, Bip448ScriptSyncPlan>::new();
     for coin in &wallet.coins {
@@ -678,6 +682,9 @@ async fn build_bip448_script_sync_plans(
         ) else {
             continue;
         };
+        if statechain_filter.is_some_and(|expected| expected != statechain_id) {
+            continue;
+        }
         let address = Address::from_str(address)?.require_network(client_config.network)?;
         let script_pubkey = address.script_pubkey();
         let script_hex = hex::encode(script_pubkey.as_bytes());
@@ -1117,6 +1124,7 @@ async fn sync_bip448_funding_bindings_with_candidates(
     client_config: &ClientConfig,
     wallet_name: &str,
     force_height_zero_replay: bool,
+    statechain_filter: Option<&str>,
 ) -> Result<Bip448SyncOutcome> {
     for attempt in 1..=3 {
         let raw_wallet_json = get_bip448_raw_wallet_json(&client_config.pool, wallet_name).await?;
@@ -1124,7 +1132,13 @@ async fn sync_bip448_funding_bindings_with_candidates(
         if wallet.name != wallet_name {
             return Err(anyhow!("BIP448 synchronization wallet identity mismatch"));
         }
-        let plans = build_bip448_script_sync_plans(client_config, &wallet).await?;
+        let plans =
+            build_bip448_script_sync_plans(client_config, &wallet, statechain_filter).await?;
+        if statechain_filter.is_some() && plans.is_empty() {
+            return Err(anyhow!(
+                "BIP448 post-acceptance synchronization has no persisted receiver Coin"
+            ));
+        }
         let mut bindings = Vec::new();
         let mut attempts = Vec::new();
         let mut applied_scan_revisions = Vec::new();
@@ -1259,10 +1273,98 @@ pub async fn sync_bip448_funding_bindings(
     wallet_name: &str,
 ) -> Result<Bip448SyncReport> {
     Ok(
-        sync_bip448_funding_bindings_with_candidates(client_config, wallet_name, false)
+        sync_bip448_funding_bindings_with_candidates(client_config, wallet_name, false, None)
             .await?
             .report,
     )
+}
+
+pub(crate) async fn sync_bip448_funding_bindings_for_statechain_from_height_zero(
+    client_config: &ClientConfig,
+    wallet_name: &str,
+    statechain_id: &str,
+) -> Result<Bip448SyncReport> {
+    let report = sync_bip448_funding_bindings_with_candidates(
+        client_config,
+        wallet_name,
+        true,
+        Some(statechain_id),
+    )
+    .await?
+    .report;
+    if !report
+        .bindings
+        .iter()
+        .any(|binding| binding.statechain_id == statechain_id)
+    {
+        return Err(anyhow!(
+            "BIP448 post-acceptance synchronization did not reconcile the accepted statechain"
+        ));
+    }
+    Ok(report)
+}
+
+pub(crate) async fn reconcile_bip448_post_sync_transfer_artifacts(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    wallet_name: &str,
+    statechain_ids: &[String],
+) -> Result<()> {
+    let mut statechain_ids = statechain_ids.to_vec();
+    statechain_ids.sort();
+    statechain_ids.dedup();
+
+    for statechain_id in &statechain_ids {
+        let Some(intent) =
+            get_active_bip448_transfer_intent(pool, wallet_name, statechain_id).await?
+        else {
+            continue;
+        };
+        if intent.intent_kind != Bip448TransferIntentKind::Cancellation
+            || intent.phase != Bip448TransferIntentPhase::ReceiverAccepted
+        {
+            continue;
+        }
+        let (_, message_json) = get_bip448_transfer_msg_raw_optional(
+            pool,
+            wallet_name,
+            statechain_id,
+            Some(&intent.recipient_auth_pubkey),
+        )
+        .await?
+        .ok_or_else(|| anyhow!("BIP448 ReceiverAccepted cancellation message is missing"))?;
+        delete_bip448_cancellation_artifacts_after_sync(pool, &intent, &message_json).await?;
+    }
+
+    for statechain_id in &statechain_ids {
+        reconcile_bip448_accepted_local_outgoing_messages(pool, wallet_name, statechain_id).await?;
+    }
+    Ok(())
+}
+
+async fn accepted_bip448_statechain_ids(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    wallet: &Wallet,
+) -> Result<Vec<String>> {
+    let mut statechain_ids = wallet
+        .coins
+        .iter()
+        .filter(|coin| {
+            coin.statechain_protocol.as_deref() == Some(bip448_deposit::BIP448_COIN_PROTOCOL)
+        })
+        .filter_map(|coin| coin.statechain_id.clone())
+        .collect::<Vec<_>>();
+    statechain_ids.sort();
+    statechain_ids.dedup();
+    let mut accepted = Vec::new();
+    for statechain_id in statechain_ids {
+        if get_bip448_statechain_optional(pool, &wallet.name, &statechain_id)
+            .await?
+            .is_some()
+        {
+            accepted.push(statechain_id);
+        }
+    }
+    Ok(accepted)
 }
 
 pub async fn sync_bip448_funding_bindings_from_height_zero(
@@ -1270,7 +1372,7 @@ pub async fn sync_bip448_funding_bindings_from_height_zero(
     wallet_name: &str,
 ) -> Result<Bip448SyncReport> {
     Ok(
-        sync_bip448_funding_bindings_with_candidates(client_config, wallet_name, true)
+        sync_bip448_funding_bindings_with_candidates(client_config, wallet_name, true, None)
             .await?
             .report,
     )
@@ -1919,7 +2021,8 @@ pub async fn update_coins(client_config: &ClientConfig, wallet_name: &str) -> Re
             return Ok(());
         }
         let mut sync =
-            sync_bip448_funding_bindings_with_candidates(client_config, wallet_name, false).await?;
+            sync_bip448_funding_bindings_with_candidates(client_config, wallet_name, false, None)
+                .await?;
         if live_raw_wallet_json != sync.raw_wallet_json {
             if update_attempt == 3 {
                 return Err(anyhow!(
@@ -2001,9 +2104,13 @@ pub async fn update_coins(client_config: &ClientConfig, wallet_name: &str) -> Re
                 continue;
             }
             wallet_cas_base = adopted_raw_wallet_json;
-            let post_acceptance =
-                sync_bip448_funding_bindings_with_candidates(client_config, wallet_name, false)
-                    .await?;
+            let post_acceptance = sync_bip448_funding_bindings_with_candidates(
+                client_config,
+                wallet_name,
+                false,
+                None,
+            )
+            .await?;
             if post_acceptance.raw_wallet_json != wallet_cas_base {
                 if update_attempt == 3 {
                     return Err(anyhow!(
@@ -2031,6 +2138,14 @@ pub async fn update_coins(client_config: &ClientConfig, wallet_name: &str) -> Re
             }
             continue;
         }
+        let accepted_statechain_ids =
+            accepted_bip448_statechain_ids(&client_config.pool, &wallet).await?;
+        reconcile_bip448_post_sync_transfer_artifacts(
+            &client_config.pool,
+            wallet_name,
+            &accepted_statechain_ids,
+        )
+        .await?;
         deferred_bip448_deposit_error(deferred_bip448_deposit_errors)?;
         return Ok(());
     }
