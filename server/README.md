@@ -44,7 +44,7 @@ field shown is required by the shared Serde DTO.
 | `POST /transfer/paymenthash` | `statechain_id`, `auth_sig`, `batch_id` | `hash` |
 | `POST /transfer/transfer_preimage` | `statechain_id`, `auth_sig`, `previous_user_auth_key`, `batch_id` | `preimage` |
 | `POST /transfer/sender` | `statechain_id`, `auth_sig`, `new_user_auth_key`, optional `batch_id` | `x1` |
-| `POST /transfer/update_msg` | `statechain_id`, `auth_sig`, `new_user_auth_key`, `enc_transfer_msg` | `updated` |
+| `POST /transfer/update_msg` | `statechain_id`, `auth_sig`, `new_user_auth_key`, `x1_pub`, `enc_transfer_msg` | `updated` |
 | `GET /transfer/get_msg_addr/<new_auth_key>` | path `new_auth_key` | `list_enc_transfer_msg` |
 | `GET /info/statechain/<statechain_id>` | path `statechain_id` | `enclave_public_key`, `num_sigs`, `statechain_info`, `x1_pub` |
 | `POST /transfer/unlock` | `statechain_id`, `auth_sig`, optional `auth_pub_key` | `message` |
@@ -58,19 +58,87 @@ opaque 32-byte hexadecimal string; it is normalized to lowercase. The
 `negate_seckey` wire value must be `0` or `1`. The complete response and error
 schema is in [OpenAPI](../docs/openapi.yaml).
 
-## Prototype boundaries
+## Transfer-generation fencing and close
 
-- Exact legacy duplicate-deposit behavior is not reproduced: paying one
-  BIP448 deposit address more than once does not create another wallet coin.
-- There is no chain watcher and no automatic selection of a stale state's
-  funding source.
-- The stale-state end-to-end proof manually selects, rebinds, submits, and
-  mines transactions from test code; the running services do not orchestrate
-  it.
-- BIP448 consensus execution requires the Bitcoin Inquisition revision pinned
-  by this repository.
-- This is not software for Bitcoin mainnet or production use.
-- Start with fresh Mercury and lockbox databases and a fresh client wallet
-  database; old data is not migrated.
-- Passing tests establish only the assertions and paths that those tests
-  execute.
+The client persists a transfer intent before its first sender mutation. Under
+the locked current-owner authentication row, an exact active
+`/transfer/sender` request replays the stored `x1` after response loss instead
+of allocating another share. That guarantee applies while no different
+authenticated request has replaced the server's one-row transfer generation;
+a consumed `key_updated = true` generation is not replayed.
+
+The three later transfer mutations bind to that exact generation:
+
+- `/transfer/update_msg` requires canonical compressed `x1_pub`. Its owner
+  signature covers the domain-separated digest of statechain ID, recipient
+  authentication key, `x1_pub`, and the SHA-256 of decoded ciphertext bytes.
+- For BIP448 `/transfer/unlock`, existing `auth_pub_key` is required and carries
+  the canonical compressed public key derived from `x1`. It is a generation
+  tag, not the authentication key. `auth_sig` covers the domain-separated
+  statechain/generation digest and the authenticated `CurrentOwner` (`0x00`) or
+  `Recipient` (`0x01`) role; each role clears only its own flag.
+- For BIP448 `/transfer/receiver`, existing `batch_data` is required and
+  carries the same canonical `x1` public key. The recipient signature covers
+  the domain-separated digest of statechain ID, the exact 32-byte `t2`, and
+  that generation. Batch validation, authentication, the lockbox call, and
+  conditional Mercury updates run while the generation rows are locked.
+
+These operations share the `statechain_data` then `statechain_transfer` lock
+order, so a stale generation cannot mutate its successor. The receiver's
+lockbox-success/Mercury-commit crash boundary remains unrepaired.
+
+`/withdraw/complete` accepts only a successful lockbox delete with the exact
+body `Statechain deleted.` before running all Mercury deletes in one fallible
+transaction. Duplicate sweeps do not call this route; only an accepted
+canonical withdrawal can close the statechain.
+
+## Cooperative duplicate-sweep boundaries
+
+- Once canonical funding is pinned, the wallet keeps one logical `Coin` and
+  canonical amount while normalized bindings record every observed
+  same-script value. Duplicate indices are stable only inside that wallet
+  database and are nested under `coin.duplicates`; passive binding
+  synchronization does not sign.
+- The exact command `bip448-sweep-duplicate <WALLET_NAME> <STATECHAIN_ID>
+  <DUPLICATE_INDEX> <TO_ADDRESS> [FEE_RATE]` sweeps one confirmed duplicate in
+  one one-input/one-output transaction. Its checked fee is
+  `ceil(112 * fee_rate_sat_per_vbyte)`; a nonpositive/nonfinite rate, fee not
+  smaller than the input, or dust output is rejected before signing. Each
+  output has its own transaction, fee, and signing count.
+- Attempt artifacts and phases are durable and retries reuse the exact request
+  and transaction. `SecondArmed` is persisted before a possibly delivered
+  `sign/second`, making the statechain permanently exit-only. A duplicate sweep
+  never deletes server state; canonical withdrawal is last and requires every
+  known current-owner duplicate to be handled. Dust and unresolved bindings
+  remain visible and can block that close.
+- The client durably records a transfer intent before sender mutation. With no
+  intervening different authenticated request, exact same-request
+  `/transfer/sender` response-loss replay returns one stored `x1` for the
+  active unconsumed owner generation; authentication and generation changes
+  are checked against locked rows. BIP448 update-message `x1_pub`, unlock
+  `auth_pub_key`, and receiver `batch_data` carry the canonical compressed
+  `x1` public generation key. Their signatures respectively bind
+  statechain/recipient/generation/ciphertext hash,
+  role/statechain/generation, and statechain/`t2`/generation.
+- `--force-send-with-duplicates` acknowledges only the cooperative-value
+  warning. The receiver rescans independently from height 0, assigns its own
+  local indices, and decides whether and when to sweep; the sender receives no
+  notification or sweep guarantee. A completed latch creation does not reserve
+  future transfer rights against a later durable sweep attempt.
+- Live unresolved arbitrary-value duplicates of the current owner remain
+  cooperatively server-dependent until exact signed sweep bytes exist or an
+  independent spend confirms. Previous-owner and retired late rows stay
+  visible but are not actionable. Canonical `U`/`S` packages are the only
+  claimed unilateral recovery; the emergency recovery commands can strand
+  cooperative-only duplicates.
+- There is no multi-input batching, equal-value recovery forest, arbitrary-value
+  duplicate unilateral recovery, or exact legacy parity. A canonical attempt
+  retires and freezes the address: a duplicate first found afterward blocks
+  completion while server state remains, and one found only after deletion may
+  be unrecoverable. The receiver key-update crash boundary remains unrepaired.
+- Use fresh databases: the client schema has twelve application tables;
+  Mercury has six and lockbox has two. The CLI has sixteen commands, including
+  exact flag `--force-send-with-duplicates`; the intended ignored matrix has
+  58 direct entries in eight binaries. This is an Inquisition-dependent proof
+  of concept, with no automatic stale-state watcher, Bitcoin mainnet support,
+  or production-use claim. Tests establish only their direct assertions.

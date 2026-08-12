@@ -5,6 +5,12 @@ server or a free local token for a non-mainnet development network. A token is
 consumed when `/deposit/init/pod` successfully initializes a statechain; it is
 not the statecoin funding output.
 
+The token is consumed creating one logical statechain; it does not bind a
+funding amount. The client later pins the canonical funding amount. Paying the
+resulting aggregate Bitcoin script again does not consume another token or
+create a second statechain; those later same-script outputs are client-side
+cooperative bindings described below.
+
 ## Token-server configuration
 
 The token Rocket service reads these settings keys and environment variables:
@@ -119,19 +125,53 @@ spent boolean DEFAULT false
 The exact API schemas are in [openapi.yaml](openapi.yaml), and the literal
 table definition is in [server_db.md](server_db.md).
 
-## Prototype boundaries
+## Cooperative duplicate-sweep boundaries
 
-- Exact legacy duplicate-deposit behavior is not reproduced: paying one
-  BIP448 deposit address more than once does not create another wallet coin.
-- There is no chain watcher and no automatic selection of a stale state's
-  funding source.
-- The stale-state end-to-end proof manually selects, rebinds, submits, and
-  mines transactions from test code; the running services do not orchestrate
-  it.
-- BIP448 consensus execution requires the Bitcoin Inquisition revision pinned
-  by this repository.
-- This is not software for Bitcoin mainnet or production use.
-- Start with fresh Mercury and lockbox databases and a fresh client wallet
-  database; old data is not migrated.
-- Passing tests establish only the assertions and paths that those tests
-  execute.
+- Once canonical funding is pinned, the wallet keeps one logical `Coin` and
+  canonical amount while normalized bindings record every observed
+  same-script value. Duplicate indices are stable only inside that wallet
+  database and are nested under `coin.duplicates`; passive binding
+  synchronization does not sign.
+- The exact command `bip448-sweep-duplicate <WALLET_NAME> <STATECHAIN_ID>
+  <DUPLICATE_INDEX> <TO_ADDRESS> [FEE_RATE]` sweeps one confirmed duplicate in
+  one one-input/one-output transaction. Its checked fee is
+  `ceil(112 * fee_rate_sat_per_vbyte)`; a nonpositive/nonfinite rate, fee not
+  smaller than the input, or dust output is rejected before signing. Each
+  output has its own transaction, fee, and signing count.
+- Attempt artifacts and phases are durable and retries reuse the exact request
+  and transaction. `SecondArmed` is persisted before a possibly delivered
+  `sign/second`, making the statechain permanently exit-only. A duplicate sweep
+  never deletes server state; canonical withdrawal is last and requires every
+  known current-owner duplicate to be handled. Dust and unresolved bindings
+  remain visible and can block that close.
+- The client durably records a transfer intent before sender mutation. With no
+  intervening different authenticated request, exact same-request
+  `/transfer/sender` response-loss replay returns one stored `x1` for the
+  active unconsumed owner generation; authentication and generation changes
+  are checked against locked rows. BIP448 update-message `x1_pub`, unlock
+  `auth_pub_key`, and receiver `batch_data` carry the canonical compressed
+  `x1` public generation key. Their signatures respectively bind
+  statechain/recipient/generation/ciphertext hash,
+  role/statechain/generation, and statechain/`t2`/generation.
+- `--force-send-with-duplicates` acknowledges only the cooperative-value
+  warning. The receiver rescans independently from height 0, assigns its own
+  local indices, and decides whether and when to sweep; the sender receives no
+  notification or sweep guarantee. A completed latch creation does not reserve
+  future transfer rights against a later durable sweep attempt.
+- Live unresolved arbitrary-value duplicates of the current owner remain
+  cooperatively server-dependent until exact signed sweep bytes exist or an
+  independent spend confirms. Previous-owner and retired late rows stay
+  visible but are not actionable. Canonical `U`/`S` packages are the only
+  claimed unilateral recovery; the emergency recovery commands can strand
+  cooperative-only duplicates.
+- There is no multi-input batching, equal-value recovery forest, arbitrary-value
+  duplicate unilateral recovery, or exact legacy parity. A canonical attempt
+  retires and freezes the address: a duplicate first found afterward blocks
+  completion while server state remains, and one found only after deletion may
+  be unrecoverable. The receiver key-update crash boundary remains unrepaired.
+- Use fresh databases: the client schema has twelve application tables;
+  Mercury has six and lockbox has two. The CLI has sixteen commands, including
+  exact flag `--force-send-with-duplicates`; the intended ignored matrix has
+  58 direct entries in eight binaries. This is an Inquisition-dependent proof
+  of concept, with no automatic stale-state watcher, Bitcoin mainnet support,
+  or production-use claim. Tests establish only their direct assertions.

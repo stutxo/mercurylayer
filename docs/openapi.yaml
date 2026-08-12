@@ -6,17 +6,52 @@ info:
     This contract describes the functional Rocket routes mounted by the
     Mercury server and token server in this repository.
 
-    Prototype boundaries:
-    - Exact legacy duplicate-deposit behavior is not reproduced; another
-      payment to one BIP448 deposit address does not become another wallet coin.
-    - No chain watcher or automatic stale-state source selection is implemented.
-    - The stale-state end-to-end proof is manually orchestrated by test code.
-    - BIP448 consensus execution requires the repository-pinned Bitcoin
-      Inquisition environment.
-    - The repository makes no Bitcoin mainnet or production-use claim.
-    - Fresh Mercury and lockbox databases and a fresh client wallet database
-      are required; old data is not migrated.
-    - Passing tests establish only the assertions and paths they execute.
+    Cooperative duplicate-sweep boundaries:
+    - The client retains one logical Coin and canonical amount. Normalized
+      bindings expose every same-script value separately through nested
+      coin.duplicates with stable wallet-database-local indices. Passive
+      discovery does not sign.
+    - Exact CLI command bip448-sweep-duplicate selects one confirmed duplicate
+      and creates one one-input/one-output transaction. Its checked fee is
+      ceil(112 * fee_rate_sat_per_vbyte), and a dust result is rejected before
+      signing. Each output has its own transaction, fee, and signing count.
+      Dust and unresolved bindings remain visible and can block canonical
+      close.
+    - Attempt artifacts and phases are durable and exact retry reuses them.
+      SecondArmed is persisted before a possibly delivered sign/second and
+      permanently makes the statechain exit-only. Duplicate sweeps never
+      delete statechain server rows; canonical close is last and requires every
+      known current-owner duplicate to be handled.
+    - The client durably stores a transfer intent before sender mutation. With
+      no different authenticated request intervening, exact same-request
+      /transfer/sender response-loss replay returns one stored x1 for the
+      active unconsumed owner generation; authentication and generation
+      changes use locked rows. Update x1_pub, unlock auth_pub_key, and receiver
+      batch_data carry that canonical compressed x1 generation public key and
+      their signatures bind recipient/ciphertext, role, and t2 respectively.
+    - The exact --force-send-with-duplicates flag acknowledges only the
+      duplicate warning. A receiver independently rescans from height 0,
+      assigns its own local indices, and decides whether and when to sweep; the
+      sender receives no notification or sweep guarantee. The receiver
+      key-update crash boundary remains unrepaired.
+    - Current-owner live or unresolved duplicates remain cooperatively
+      server-dependent until exact signed bytes exist or an independent spend
+      confirms. Previous-owner and retired late rows remain visible but are not
+      actionable. Only canonical U/S recovery is claimed unilateral;
+      emergency recovery can strand duplicates.
+    - There is no multi-input batching, equal-value recovery forest,
+      arbitrary-value duplicate unilateral recovery, or exact legacy parity.
+    - Completed latch creation does not reserve future transfer rights against
+      a later durable sweep attempt. A canonical freeze blocks completion if a
+      new binding is discovered while server state remains; discovery after
+      deletion can be unrecoverable.
+    - Fresh databases are required: client twelve application tables, Mercury
+      six, and lockbox two. The CLI has sixteen commands and the intended
+      ignored matrix contains 58 direct entries in eight binaries.
+    - No chain watcher, automatic stale-state source selection, Bitcoin
+      mainnet support, or production-use claim is provided. BIP448 requires the
+      repository-pinned Bitcoin Inquisition environment and remains a proof of
+      concept. Tests establish only their direct assertions.
 servers:
   - url: http://127.0.0.1:8000
     description: Mercury Rocket service
@@ -215,6 +250,12 @@ paths:
     post:
       tags: [Transfer]
       summary: Create server transfer state for a recipient
+      description: |
+        Authentication, owner-generation checks, batch validation, replay, and
+        insertion use the locked current-owner row. With no intervening
+        different authenticated request, an exact same-request retry returns
+        the stored x1 after response loss; a consumed key_updated generation is
+        not replayed.
       requestBody:
         required: true
         content:
@@ -237,6 +278,10 @@ paths:
     post:
       tags: [Transfer]
       summary: Store the encrypted transfer message
+      description: |
+        BIP448 requires the exact x1 public generation key and a
+        domain-separated signature binding the statechain, recipient,
+        generation, and hash of the decoded ciphertext.
       requestBody:
         required: true
         content:
@@ -295,6 +340,10 @@ paths:
     post:
       tags: [Latch]
       summary: Unlock a transfer for the current owner or stored recipient
+      description: |
+        BIP448 unlock is fenced to the locked active generation and the
+        authenticated current-owner or recipient role. Stale-generation
+        requests cannot unlock a replacement row or its latch.
       requestBody:
         required: true
         content:
@@ -317,6 +366,10 @@ paths:
     post:
       tags: [Transfer]
       summary: Rotate the lockbox share to an authorized recipient
+      description: |
+        BIP448 receiver authorization is fenced to the locked active x1
+        generation, recipient, and t2. The client independently performs its
+        passive duplicate rescan after accepted key update and persistence.
       requestBody:
         required: true
         content:
@@ -609,14 +662,25 @@ components:
 
     TransferUpdateMsgRequest:
       type: object
-      required: [statechain_id, auth_sig, new_user_auth_key, enc_transfer_msg]
+      required: [statechain_id, auth_sig, new_user_auth_key, x1_pub, enc_transfer_msg]
       properties:
         statechain_id:
           type: string
         auth_sig:
           type: string
+          description: |
+            BIP448 current-owner signature over SHA256(domain ||
+            u32_be(statechain_id_utf8_len) || statechain_id_utf8 ||
+            recipient_key_compressed || x1_pub_compressed ||
+            SHA256(decoded_ciphertext_bytes)), where domain is
+            "BIP448/transfer-update-msg/v1\0".
         new_user_auth_key:
           type: string
+        x1_pub:
+          type: string
+          description: |
+            Canonical compressed public key derived from this transfer row's
+            x1.
         enc_transfer_msg:
           type: string
 
@@ -677,9 +741,21 @@ components:
           type: string
         auth_sig:
           type: string
+          description: |
+            For BIP448, the authenticated current-owner or recipient signature
+            over SHA256(domain || role_byte ||
+            u32_be(statechain_id_utf8_len) || statechain_id_utf8 ||
+            x1_pub_compressed), where domain is
+            "BIP448/transfer-unlock/v1\0" and role_byte is 0x00 for the
+            current owner or 0x01 for the recipient.
         auth_pub_key:
           type: string
           nullable: true
+          description: |
+            Required for BIP448: the canonical compressed public key derived
+            from the active transfer row's x1. This is a generation tag, not
+            the authentication key; auth_sig supplies the role-bound
+            authorization.
 
     TransferReceiverRequest:
       type: object
@@ -690,10 +766,20 @@ components:
         batch_data:
           type: string
           nullable: true
+          description: |
+            Required for BIP448: the canonical compressed public key derived
+            from the active transfer row's x1, used as the generation tag for
+            recipient authorization.
         t2:
           type: string
         auth_sig:
           type: string
+          description: |
+            For BIP448, the recipient signature over SHA256(domain ||
+            u32_be(statechain_id_utf8_len) || statechain_id_utf8 || t2_bytes ||
+            x1_pub_compressed), where domain is
+            "BIP448/transfer-receiver/v1\0" and x1_pub is carried by
+            batch_data.
 
     TransferReceiverResponse:
       type: object
