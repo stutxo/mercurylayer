@@ -1,13 +1,14 @@
 use crate::{
     bip448_funding::{
-        Bip448ObservationStatus, Bip448OwnershipStatus, Bip448TransferIntent,
-        Bip448TransferIntentActivityStatus, Bip448TransferIntentKind, Bip448TransferIntentPhase,
-        Bip448TransferStateSigningPhase,
+        Bip448BindingRole, Bip448FundingBinding, Bip448ObservationStatus, Bip448OwnershipStatus,
+        Bip448TransferIntent, Bip448TransferIntentActivityStatus, Bip448TransferIntentKind,
+        Bip448TransferIntentPhase, Bip448TransferStateSigningPhase, Bip448WithdrawalAttempt,
+        Bip448WithdrawalPhase,
     },
     bip448_owner::{
         classify_bip448_owner_relation, current_server_public_key, get_bip448_statechain_presence,
-        get_current_bip448_owner, select_current_bip448_owner, validate_bip448_coin_local_auth,
-        Bip448OwnerRelation, Bip448StatechainPresence,
+        get_current_bip448_owner, validate_bip448_coin_local_auth, Bip448OwnerRelation,
+        Bip448StatechainPresence,
     },
     client_config::ClientConfig,
     coin_status::sync_bip448_funding_bindings,
@@ -57,6 +58,20 @@ const SIGNATURE_COUNT_ERROR: &str =
     "BIP448 signature count does not match any supported transfer state";
 const BATCHED_PENDING_ERROR: &str =
     "BIP448 batched pending transfers cannot be cancelled or retargeted";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Bip448TransferOptions {
+    pub acknowledge_cooperative_duplicates: bool,
+    pub intent: Bip448TransferIntentKind,
+}
+
+struct FreshTransferPreflight {
+    raw_wallet_json: String,
+    wallet: Wallet,
+    record: Bip448StatechainRecord,
+    current_owner_coin_index: usize,
+    unresolved_duplicates: Vec<Bip448FundingBinding>,
+}
 
 #[derive(Debug)]
 enum GetNewX1Error {
@@ -214,6 +229,28 @@ pub async fn transfer_bip448_sender(
     statechain_id: &str,
     batch_id: Option<String>,
 ) -> Result<()> {
+    transfer_bip448_sender_with_options(
+        client_config,
+        recipient_address,
+        wallet_name,
+        statechain_id,
+        batch_id,
+        Bip448TransferOptions {
+            acknowledge_cooperative_duplicates: false,
+            intent: Bip448TransferIntentKind::UserTransfer,
+        },
+    )
+    .await
+}
+
+pub async fn transfer_bip448_sender_with_options(
+    client_config: &ClientConfig,
+    recipient_address: &str,
+    wallet_name: &str,
+    statechain_id: &str,
+    batch_id: Option<String>,
+    options: Bip448TransferOptions,
+) -> Result<()> {
     let wallet = get_wallet(&client_config.pool, wallet_name).await?;
     let record = get_bip448_statechain_optional(&client_config.pool, wallet_name, statechain_id)
         .await?
@@ -275,38 +312,66 @@ pub async fn transfer_bip448_sender(
         }
     }
     require_local_accepted_history_prefix(client_config, &record).await?;
-    require_fresh_transfer_duplicate_safety(client_config, wallet_name, statechain_id).await?;
-    let wallet = get_wallet(&client_config.pool, wallet_name).await?;
-    let record = get_bip448_statechain(&client_config.pool, wallet_name, statechain_id).await?;
-    ensure_any_locally_eligible_coin(&wallet, statechain_id, record.latest_state_number)?;
+    let preflight = fresh_transfer_preflight(client_config, wallet_name, statechain_id).await?;
 
     if let Some(existing) = active.clone() {
-        let same_invocation = existing.intent_kind == Bip448TransferIntentKind::UserTransfer
-            && existing.recipient_address == recipient_address
+        let same_invocation_identity = existing.recipient_address == recipient_address
             && existing.receiver_user_pubkey == receiver_user_pubkey.to_string()
             && existing.recipient_auth_pubkey == recipient_auth
-            && existing.batch_id == batch_id
-            && !existing.acknowledge_cooperative_duplicates;
-        if same_invocation {
+            && existing.batch_id == batch_id;
+        if same_invocation_identity
+            && (existing.intent_kind != options.intent
+                || existing.acknowledge_cooperative_duplicates
+                    != options.acknowledge_cooperative_duplicates)
+        {
+            return Err(anyhow!(
+                "BIP448 transfer options do not match the immutable persisted intent"
+            ));
+        }
+        require_duplicate_acknowledgement(&preflight.unresolved_duplicates, options)?;
+        if same_invocation_identity {
+            let (sender_coin_index, _) = sender_coin_for_intent(&preflight.wallet, &existing)?;
+            if sender_coin_index != preflight.current_owner_coin_index {
+                return Err(anyhow!(
+                    "persisted BIP448 transfer sender is not the proven current owner generation"
+                ));
+            }
             drive_bip448_transfer_intent(client_config, existing).await?;
             return Ok(());
+        }
+        if options.intent != Bip448TransferIntentKind::UserTransfer
+            || existing.intent_kind != Bip448TransferIntentKind::UserTransfer
+        {
+            return Err(anyhow!(
+                "BIP448 cancellation must resume its exact atomically prepared intent"
+            ));
         }
         recover_bip448_intent_for_successor(client_config, &existing).await?;
         active = get_active_bip448_transfer_intent(&client_config.pool, wallet_name, statechain_id)
             .await?;
+    } else {
+        require_duplicate_acknowledgement(&preflight.unresolved_duplicates, options)?;
+        if options.intent != Bip448TransferIntentKind::UserTransfer {
+            return Err(anyhow!(
+                "BIP448 cancellation must be prepared with its generated Coin atomically"
+            ));
+        }
     }
 
     let intent = build_bip448_user_transfer_intent(
         client_config,
-        &wallet,
-        &record,
+        &preflight.wallet,
+        &preflight.record,
+        preflight.current_owner_coin_index,
         recipient_address,
         &receiver_user_pubkey,
         &recipient_auth_pubkey,
         batch_id,
+        options,
         active.as_ref(),
     )
     .await?;
+    bip448_test_barrier("transfer_preflight_before_intent")?;
     let intent = match active {
         Some(predecessor) => {
             supersede_bip448_transfer_intent(&client_config.pool, &predecessor.intent_id, &intent)
@@ -350,20 +415,114 @@ async fn require_local_accepted_history_prefix(
     Ok(())
 }
 
-async fn require_fresh_transfer_duplicate_safety(
+async fn fresh_transfer_preflight(
     client_config: &ClientConfig,
     wallet_name: &str,
     statechain_id: &str,
-) -> Result<()> {
+) -> Result<FreshTransferPreflight> {
     let report = sync_bip448_funding_bindings(client_config, wallet_name).await?;
-    if report.bindings.iter().any(|binding| {
-        binding.statechain_id == statechain_id
-            && binding.role == crate::bip448_funding::Bip448BindingRole::Duplicate
-            && binding.ownership_status == Bip448OwnershipStatus::Current
-            && binding.observation_status != Bip448ObservationStatus::SpentConfirmed
+    let raw_wallet_json = get_bip448_raw_wallet_json(&client_config.pool, wallet_name).await?;
+    let wallet: Wallet = serde_json::from_str(&raw_wallet_json)?;
+    let record = get_bip448_statechain(&client_config.pool, wallet_name, statechain_id).await?;
+    require_local_accepted_history_prefix(client_config, &record).await?;
+    ensure_any_locally_eligible_coin(&wallet, statechain_id, record.latest_state_number)?;
+    let owner =
+        get_current_bip448_owner(client_config, &wallet, wallet_name, statechain_id).await?;
+    let coin = wallet
+        .coins
+        .get(owner.coin_index)
+        .ok_or_else(|| anyhow!("proven current BIP448 owner Coin is missing"))?;
+    ensure_local_eligibility(record.latest_state_number, &coin.status)?;
+    let has_active_transfer_intent =
+        get_active_bip448_transfer_intent(&client_config.pool, wallet_name, statechain_id)
+            .await?
+            .is_some();
+    let statechain_attempts = report
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.statechain_id == statechain_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    let diagnose_canonical_signed_count_first = statechain_attempts.len() == 1
+        && statechain_attempts[0].binding_index == 0
+        && statechain_attempts[0].phase == Bip448WithdrawalPhase::Signed;
+    if !has_active_transfer_intent && diagnose_canonical_signed_count_first {
+        let pending =
+            get_bip448_pending_transfer_signing(&client_config.pool, wallet_name, statechain_id)
+                .await?;
+        let prior_message = get_bip448_transfer_msg_raw_optional(
+            &client_config.pool,
+            wallet_name,
+            statechain_id,
+            None,
+        )
+        .await?;
+        transfer_state_plan(
+            u64::from(owner.statechain_info.num_sigs),
+            record.latest_state_number,
+            false,
+            pending.is_some() || prior_message.is_some(),
+            None,
+        )?;
+    }
+    require_no_transfer_attempts(&statechain_attempts)?;
+    let unresolved_duplicates = report
+        .bindings
+        .into_iter()
+        .filter(|binding| {
+            binding.statechain_id == statechain_id
+                && binding.role == Bip448BindingRole::Duplicate
+                && binding.ownership_status == Bip448OwnershipStatus::Current
+                && binding.observation_status != Bip448ObservationStatus::SpentConfirmed
+        })
+        .collect();
+    Ok(FreshTransferPreflight {
+        raw_wallet_json,
+        wallet,
+        record,
+        current_owner_coin_index: owner.coin_index,
+        unresolved_duplicates,
+    })
+}
+
+fn require_no_transfer_attempts(attempts: &[Bip448WithdrawalAttempt]) -> Result<()> {
+    if let Some(attempt) = attempts.iter().find(|attempt| {
+        matches!(
+            attempt.phase,
+            Bip448WithdrawalPhase::SecondArmed | Bip448WithdrawalPhase::Signed
+        )
     }) {
         return Err(anyhow!(
-            "BIP448 current-owner duplicate funding must be spent-confirmed before transfer"
+            "exit-only BIP448 withdrawal attempt {} blocks transfer",
+            attempt.binding_index
+        ));
+    }
+    if let Some(attempt) = attempts.first() {
+        return Err(anyhow!(
+            "active BIP448 withdrawal attempt {} blocks transfer",
+            attempt.binding_index
+        ));
+    }
+    Ok(())
+}
+
+fn require_duplicate_acknowledgement(
+    unresolved_duplicates: &[Bip448FundingBinding],
+    options: Bip448TransferOptions,
+) -> Result<()> {
+    if !unresolved_duplicates.is_empty() && !options.acknowledge_cooperative_duplicates {
+        let details = unresolved_duplicates
+            .iter()
+            .map(|binding| {
+                format!(
+                    "{}={}:{}:{}sat",
+                    binding.binding_index, binding.txid, binding.vout, binding.value_sats
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(anyhow!(
+            "BIP448 cooperative duplicate acknowledgement is required ({details}). Duplicate values are not part of the verified canonical statechain amount, have no arbitrary-value unilateral backup under this solution, and remain server-dependent until the receiver chooses to sweep them. For an explicit user transfer, retry with --force-send-with-duplicates"
         ));
     }
     Ok(())
@@ -416,16 +575,17 @@ async fn resume_unintended_persisted_transfer(
     )?;
     let coin_index = match relation {
         Bip448OwnerRelation::Current => {
-            require_fresh_transfer_duplicate_safety(client_config, &wallet.name, &statechain_id)
-                .await?;
-            wallet = get_wallet(&client_config.pool, &wallet.name).await?;
-            let owner = select_current_bip448_owner(
-                &wallet,
-                &statechain_id,
-                &record.aggregate_pubkey,
-                presence,
+            let preflight =
+                fresh_transfer_preflight(client_config, &wallet.name, &statechain_id).await?;
+            require_duplicate_acknowledgement(
+                &preflight.unresolved_duplicates,
+                Bip448TransferOptions {
+                    acknowledge_cooperative_duplicates: false,
+                    intent: Bip448TransferIntentKind::UserTransfer,
+                },
             )?;
-            if owner.coin_index != sender_coin_index {
+            wallet = preflight.wallet;
+            if preflight.current_owner_coin_index != sender_coin_index {
                 return Err(anyhow!(
                     "persisted BIP448 transfer sender does not match the current owner generation"
                 ));
@@ -434,13 +594,13 @@ async fn resume_unintended_persisted_transfer(
                 record.latest_state_number,
                 &wallet
                     .coins
-                    .get(owner.coin_index)
+                    .get(preflight.current_owner_coin_index)
                     .ok_or_else(|| {
                         anyhow!("selected BIP448 transfer owner index is absent from its wallet snapshot")
                     })?
                     .status,
             )?;
-            owner.coin_index
+            preflight.current_owner_coin_index
         }
         Bip448OwnerRelation::Rotated => {
             let Bip448StatechainPresence::Present(statechain_info) = &presence else {
@@ -517,21 +677,20 @@ async fn build_bip448_user_transfer_intent(
     client_config: &ClientConfig,
     wallet: &Wallet,
     record: &Bip448StatechainRecord,
+    current_owner_coin_index: usize,
     recipient_address: &str,
     receiver_user_pubkey: &PublicKey,
     recipient_auth_pubkey: &PublicKey,
     batch_id: Option<String>,
+    options: Bip448TransferOptions,
     predecessor: Option<&Bip448TransferIntent>,
 ) -> Result<Bip448TransferIntent> {
     if predecessor.is_some_and(|intent| intent.batch_id.is_some()) {
         return Err(anyhow!(BATCHED_PENDING_ERROR));
     }
-    let owner =
-        get_current_bip448_owner(client_config, wallet, &wallet.name, &record.statechain_id)
-            .await?;
     let coin = wallet
         .coins
-        .get(owner.coin_index)
+        .get(current_owner_coin_index)
         .ok_or_else(|| anyhow!("selected BIP448 transfer owner Coin is missing"))?;
     ensure_local_eligibility(record.latest_state_number, &coin.status)?;
     let server = PublicKey::from_str(
@@ -606,8 +765,8 @@ async fn build_bip448_user_transfer_intent(
         intent_id: hex::encode(SecretKey::new(&mut rand::rng()).to_secret_bytes()),
         predecessor_intent_id: predecessor.map(|intent| intent.intent_id.clone()),
         activity_status: Bip448TransferIntentActivityStatus::Active,
-        intent_kind: Bip448TransferIntentKind::UserTransfer,
-        acknowledge_cooperative_duplicates: false,
+        intent_kind: options.intent,
+        acknowledge_cooperative_duplicates: options.acknowledge_cooperative_duplicates,
         recipient_address: recipient_address.to_owned(),
         receiver_user_pubkey: receiver_user_pubkey.to_string(),
         recipient_auth_pubkey: recipient_auth_pubkey.to_string(),
@@ -2474,6 +2633,74 @@ fn transfer_x1_from_message(coin: &Coin, transfer_msg: &Bip448TransferMsg) -> Re
     let x1 = t1.add_tweak(&Scalar::from(sender_secret.negate()))?;
     Ok(hex::encode(x1.to_secret_bytes()))
 }
+
+async fn prepare_bip448_cancellation_intent(
+    client_config: &ClientConfig,
+    wallet_name: &str,
+    statechain_id: &str,
+    predecessor: Option<&Bip448TransferIntent>,
+) -> Result<Bip448TransferIntent> {
+    let options = Bip448TransferOptions {
+        acknowledge_cooperative_duplicates: true,
+        intent: Bip448TransferIntentKind::Cancellation,
+    };
+    let preflight = fresh_transfer_preflight(client_config, wallet_name, statechain_id).await?;
+    require_duplicate_acknowledgement(&preflight.unresolved_duplicates, options)?;
+    let generated_coin = preflight.wallet.get_new_coin()?;
+    let recipient_address = generated_coin.address.clone();
+    let (_, receiver_user_pubkey, recipient_auth_pubkey) =
+        decode_transfer_address(&recipient_address)?;
+    if receiver_user_pubkey.to_string() != generated_coin.user_pubkey
+        || recipient_auth_pubkey.to_string() != generated_coin.auth_pubkey
+    {
+        return Err(anyhow!(
+            "BIP448 cancellation generated Coin address does not match its keys"
+        ));
+    }
+    let mut intent = build_bip448_user_transfer_intent(
+        client_config,
+        &preflight.wallet,
+        &preflight.record,
+        preflight.current_owner_coin_index,
+        &recipient_address,
+        &receiver_user_pubkey,
+        &recipient_auth_pubkey,
+        None,
+        options,
+        predecessor,
+    )
+    .await?;
+    intent.generated_coin_user_pubkey = Some(generated_coin.user_pubkey.clone());
+    intent.generated_coin_auth_pubkey = Some(generated_coin.auth_pubkey.clone());
+    intent.generated_coin_address = Some(generated_coin.address.clone());
+    let mut replacement_wallet = preflight.wallet;
+    replacement_wallet.coins.push(generated_coin);
+    bip448_test_barrier("cancellation_preflight_before_coin_intent")?;
+    let stored = match predecessor {
+        Some(predecessor) => {
+            supersede_bip448_transfer_intent_with_cancellation_wallet(
+                &client_config.pool,
+                &predecessor.intent_id,
+                &intent,
+                &preflight.raw_wallet_json,
+                &replacement_wallet,
+            )
+            .await?
+        }
+        None => {
+            insert_bip448_cancellation_intent_with_wallet(
+                &client_config.pool,
+                &intent,
+                &preflight.raw_wallet_json,
+                &replacement_wallet,
+            )
+            .await?
+        }
+    };
+    bip448_process_checkpoint("transfer_intent_prepared");
+    Ok(stored)
+}
+
 pub async fn cancel_bip448_transfer(
     client_config: &ClientConfig,
     wallet_name: &str,
@@ -2513,64 +2740,13 @@ pub async fn cancel_bip448_transfer(
     let mut cancellation = match active {
         Some(intent) if intent.intent_kind == Bip448TransferIntentKind::Cancellation => intent,
         predecessor => {
-            require_fresh_transfer_duplicate_safety(client_config, wallet_name, statechain_id)
-                .await?;
-            let raw_wallet = get_bip448_raw_wallet_json(&client_config.pool, wallet_name).await?;
-            let wallet: Wallet = serde_json::from_str(&raw_wallet)?;
-            let record =
-                get_bip448_statechain(&client_config.pool, wallet_name, statechain_id).await?;
-            ensure_any_locally_eligible_coin(&wallet, statechain_id, record.latest_state_number)?;
-            let generated_coin = wallet.get_new_coin()?;
-            let recipient_address = generated_coin.address.clone();
-            let (_, receiver_user_pubkey, recipient_auth_pubkey) =
-                decode_transfer_address(&recipient_address)?;
-            if receiver_user_pubkey.to_string() != generated_coin.user_pubkey
-                || recipient_auth_pubkey.to_string() != generated_coin.auth_pubkey
-            {
-                return Err(anyhow!(
-                    "BIP448 cancellation generated Coin address does not match its keys"
-                ));
-            }
-            let mut intent = build_bip448_user_transfer_intent(
+            prepare_bip448_cancellation_intent(
                 client_config,
-                &wallet,
-                &record,
-                &recipient_address,
-                &receiver_user_pubkey,
-                &recipient_auth_pubkey,
-                None,
+                wallet_name,
+                statechain_id,
                 predecessor.as_ref(),
             )
-            .await?;
-            intent.intent_kind = Bip448TransferIntentKind::Cancellation;
-            intent.generated_coin_user_pubkey = Some(generated_coin.user_pubkey.clone());
-            intent.generated_coin_auth_pubkey = Some(generated_coin.auth_pubkey.clone());
-            intent.generated_coin_address = Some(generated_coin.address.clone());
-            let mut replacement_wallet = wallet;
-            replacement_wallet.coins.push(generated_coin);
-            let stored = match predecessor {
-                Some(predecessor) => {
-                    supersede_bip448_transfer_intent_with_cancellation_wallet(
-                        &client_config.pool,
-                        &predecessor.intent_id,
-                        &intent,
-                        &raw_wallet,
-                        &replacement_wallet,
-                    )
-                    .await?
-                }
-                None => {
-                    insert_bip448_cancellation_intent_with_wallet(
-                        &client_config.pool,
-                        &intent,
-                        &raw_wallet,
-                        &replacement_wallet,
-                    )
-                    .await?
-                }
-            };
-            bip448_process_checkpoint("transfer_intent_prepared");
-            stored
+            .await?
         }
     };
 
@@ -2578,10 +2754,34 @@ pub async fn cancel_bip448_transfer(
         cancellation.phase,
         Bip448TransferIntentPhase::SenderFinished | Bip448TransferIntentPhase::ReceiverAccepted
     ) {
-        require_fresh_transfer_duplicate_safety(client_config, wallet_name, statechain_id).await?;
-        cancellation = drive_bip448_transfer_intent(client_config, cancellation)
-            .await?
-            .ok_or_else(|| anyhow!("BIP448 cancellation sender deleted its intent"))?;
+        transfer_bip448_sender_with_options(
+            client_config,
+            &cancellation.recipient_address,
+            wallet_name,
+            statechain_id,
+            None,
+            Bip448TransferOptions {
+                acknowledge_cooperative_duplicates: true,
+                intent: Bip448TransferIntentKind::Cancellation,
+            },
+        )
+        .await?;
+        let Some(live) =
+            get_active_bip448_transfer_intent(&client_config.pool, wallet_name, statechain_id)
+                .await?
+        else {
+            return Ok(
+                get_bip448_statechain(&client_config.pool, wallet_name, statechain_id)
+                    .await?
+                    .latest_state_number,
+            );
+        };
+        if live.intent_id != cancellation.intent_id {
+            return Err(anyhow!(
+                "BIP448 cancellation sender changed its active intent"
+            ));
+        }
+        cancellation = live;
     }
     if cancellation.phase == Bip448TransferIntentPhase::SenderFinished {
         let received = match crate::transfer_receiver::execute(client_config, wallet_name).await {
@@ -2606,17 +2806,7 @@ pub async fn cancel_bip448_transfer(
                 .context(
                     "BIP448 cancellation key update was accepted but its durable receiver proof failed",
                 )?;
-                if let Err(retry_error) =
-                    crate::coin_status::update_coins(client_config, wallet_name).await
-                {
-                    return Err(retry_error
-                        .context("BIP448 cancellation accepted; duplicate rescan pending"));
-                }
-                return Ok(
-                    get_bip448_statechain(&client_config.pool, wallet_name, statechain_id)
-                        .await?
-                        .latest_state_number,
-                );
+                return Err(error.context("BIP448 cancellation accepted; duplicate rescan pending"));
             }
             Err(error) => return Err(error),
         };

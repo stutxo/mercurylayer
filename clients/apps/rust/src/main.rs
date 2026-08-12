@@ -85,6 +85,9 @@ enum Commands {
         to_address: String,
         /// Batch id for atomic transfers
         batch_id: Option<String>,
+        /// Acknowledge that duplicate values need independent cooperative sweeps
+        #[arg(long)]
+        force_send_with_duplicates: bool,
     },
     /// Cancel an in-flight BIP448 transfer by transferring back to this wallet
     Bip448TransferCancel {
@@ -307,14 +310,19 @@ async fn main() -> Result<()> {
             statechain_id,
             to_address,
             batch_id,
+            force_send_with_duplicates,
         } => {
             mercuryrustlib::coin_status::update_coins(&client_config, &wallet_name).await?;
-            mercuryrustlib::bip448_transfer_sender::transfer_bip448_sender(
+            mercuryrustlib::bip448_transfer_sender::transfer_bip448_sender_with_options(
                 &client_config,
                 &to_address,
                 &wallet_name,
                 &statechain_id,
                 batch_id,
+                mercuryrustlib::bip448_transfer_sender::Bip448TransferOptions {
+                    acknowledge_cooperative_duplicates: force_send_with_duplicates,
+                    intent: mercuryrustlib::bip448_funding::Bip448TransferIntentKind::UserTransfer,
+                },
             )
             .await?;
             println!(
@@ -616,6 +624,110 @@ mod tests {
             vec!["client-rust", "transfer-receive", "wallet"],
         ] {
             assert!(Cli::try_parse_from(invocation).is_ok());
+        }
+    }
+
+    #[test]
+    fn duplicate_transfer_acknowledgement_flag_is_exactly_scoped() {
+        let base = [
+            "client-rust",
+            "bip448-transfer-send",
+            "wallet",
+            "statechain",
+            "transfer-address",
+        ];
+        let omitted = Cli::try_parse_from(base).expect("safe default transfer must parse");
+        match omitted.command {
+            Commands::Bip448TransferSend {
+                force_send_with_duplicates,
+                ..
+            } => assert!(!force_send_with_duplicates),
+            _ => panic!("parsed the wrong command"),
+        }
+        let forced = Cli::try_parse_from(base.into_iter().chain(["--force-send-with-duplicates"]))
+            .expect("exact duplicate acknowledgement flag must parse");
+        match forced.command {
+            Commands::Bip448TransferSend {
+                force_send_with_duplicates,
+                ..
+            } => assert!(force_send_with_duplicates),
+            _ => panic!("parsed the wrong command"),
+        }
+        for misspelling in [
+            "--force_send_with_duplicates",
+            "--force-send",
+            "--force_send",
+            "--force-send-duplicates",
+        ] {
+            assert!(
+                Cli::try_parse_from(base.into_iter().chain([misspelling])).is_err(),
+                "legacy or misspelled flag unexpectedly parsed: {misspelling}"
+            );
+        }
+        for mut invocation in [
+            vec!["client-rust", "create-wallet", "wallet"],
+            vec!["client-rust", "new-token"],
+            vec![
+                "client-rust",
+                "new-bip448-deposit-address",
+                "wallet",
+                "token",
+                "1000",
+            ],
+            vec!["client-rust", "bip448-recovery-fee-address", "wallet"],
+            vec![
+                "client-rust",
+                "broadcast-bip448-recovery-package",
+                "wallet",
+                "statechain",
+                "funding_update",
+                "--fund-from-wallet",
+            ],
+            vec!["client-rust", "list-statecoins", "wallet"],
+            vec![
+                "client-rust",
+                "bip448-withdraw",
+                "wallet",
+                "statechain",
+                "bcrt1qdestination",
+            ],
+            vec![
+                "client-rust",
+                "bip448-sweep-duplicate",
+                "wallet",
+                "statechain",
+                "1",
+                "bcrt1qdestination",
+            ],
+            vec!["client-rust", "new-transfer-address", "wallet"],
+            vec![
+                "client-rust",
+                "bip448-transfer-cancel",
+                "wallet",
+                "statechain",
+            ],
+            vec!["client-rust", "transfer-receive", "wallet"],
+            vec!["client-rust", "payment-hash", "wallet", "statechain"],
+            vec![
+                "client-rust",
+                "confirm-pending-invoice",
+                "wallet",
+                "statechain",
+            ],
+            vec![
+                "client-rust",
+                "retrieve-pre-image",
+                "wallet",
+                "statechain",
+                "batch",
+            ],
+            vec!["client-rust", "get-payment-hash", "batch"],
+        ] {
+            invocation.push("--force-send-with-duplicates");
+            assert!(
+                Cli::try_parse_from(invocation.clone()).is_err(),
+                "force flag escaped transfer-send scope: {invocation:?}"
+            );
         }
     }
 
