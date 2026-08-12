@@ -6,6 +6,9 @@ The active documentation describes the BIP448-only prototype in this tree:
   and state trees, duplicate bindings and sweeps, durable retry, transfers,
   validation, recovery packages, and the manually orchestrated stale-state
   proof.
+- [BIP448 client architecture](bip448_client_architecture.md) — the review map
+  for domain, storage, passive sync, transfer, withdrawal, receiver, mutation
+  guards, and crash/replay boundaries.
 - [Client guide](client_guide.md) — current settings, lifecycle, commands, and
   command output, including nested duplicate inventory and one-by-one sweeps.
 - [Batch and lightning latch](atomic_transfer.md) — the retained one-coin latch
