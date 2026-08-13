@@ -1,8 +1,10 @@
 mod accepted;
+mod bindings;
 mod guard;
 mod initial_acceptance;
 mod rows;
 mod scan;
+mod sync;
 
 pub use accepted::{
     delete_bip448_pending_deposit_signing, delete_bip448_pending_transfer_signing,
@@ -17,6 +19,13 @@ pub use accepted::{
 pub(crate) use accepted::{
     history_entry, insert_or_update_bip448_statechain,
     insert_or_update_bip448_statechain_from_transfer, list_bip448_transfer_msg_raw_rows,
+};
+
+pub(super) use bindings::accepted_funding_script;
+pub use bindings::{
+    finish_bip448_rotated_outgoing_transfer, mark_bip448_funding_bindings_previous,
+    reassign_bip448_funding_bindings_owner, reconcile_bip448_funding_bindings,
+    update_bip448_funding_binding_observation,
 };
 
 pub use guard::{begin_bip448_mutation_guard, Bip448MutationGuard};
@@ -53,6 +62,11 @@ pub use scan::{
     get_bip448_package_attempt, set_bip448_package_attempt_status, Bip448FeeInputRecord,
     Bip448PackageAttempt, Bip448PackageAttemptStatus, Bip448ScanCursor,
     BIP448_FEE_RESERVATION_TTL_SECONDS,
+};
+
+pub use sync::{
+    begin_bip448_sync_base_guard, capture_bip448_sync_base,
+    compare_and_set_wallet_after_bip448_scan,
 };
 
 #[cfg(test)]
