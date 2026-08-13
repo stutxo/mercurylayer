@@ -5,6 +5,7 @@ mod initial_acceptance;
 mod rows;
 mod scan;
 mod sync;
+mod withdrawals;
 
 pub use accepted::{
     delete_bip448_pending_deposit_signing, delete_bip448_pending_transfer_signing,
@@ -69,9 +70,25 @@ pub use sync::{
     compare_and_set_wallet_after_bip448_scan,
 };
 
+pub(crate) use withdrawals::with_bip448_canonical_completion_fence;
+pub use withdrawals::{
+    arm_bip448_withdrawal_sign_first, arm_bip448_withdrawal_sign_second,
+    bip448_active_withdrawal_attempt, bip448_expected_signature_count,
+    bip448_statechain_is_exit_only, classify_bip448_close_gate,
+    delete_prepared_bip448_withdrawal_attempt_for_confirmed_spend,
+    insert_bip448_withdrawal_attempt_if_absent, persist_bip448_canonical_withdrawal_wallet,
+    store_bip448_withdrawal_nonce_artifacts, store_bip448_withdrawal_nonce_session,
+    store_bip448_withdrawal_signed_artifacts, store_signed_bip448_withdrawal,
+    transition_bip448_withdrawal_broadcast_status, transition_bip448_withdrawal_completion_status,
+    transition_bip448_withdrawal_phase, update_bip448_withdrawal_broadcast_status,
+    update_bip448_withdrawal_completion_status, validate_bip448_canonical_close_snapshot,
+};
+
 #[cfg(test)]
 pub(super) use accepted::upsert_bip448_statechain_record;
 #[cfg(test)]
 pub(super) use guard::{Bip448BeginImmediateTestHook, BIP448_BEGIN_IMMEDIATE_TEST_HOOK};
 #[cfg(test)]
 pub(super) use scan::clear_bip448_scan_state;
+#[cfg(test)]
+pub(super) use withdrawals::legal_broadcast_transition;
