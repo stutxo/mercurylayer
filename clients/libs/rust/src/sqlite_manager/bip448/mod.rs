@@ -5,6 +5,9 @@ mod initial_acceptance;
 mod rows;
 mod scan;
 mod sync;
+mod transfer_completion;
+mod transfer_intents;
+mod transfer_signing;
 mod withdrawals;
 
 pub use accepted::{
@@ -70,6 +73,37 @@ pub use sync::{
     compare_and_set_wallet_after_bip448_scan,
 };
 
+pub(super) use transfer_completion::transfer_message_matches_history_prefix;
+pub use transfer_completion::{
+    cleanup_bip448_cancellation_after_acceptance, delete_bip448_cancellation_artifacts_after_sync,
+    finish_bip448_cancellation_sender, finish_bip448_transfer_sender,
+    finish_bip448_user_transfer_and_delete_intent, mark_bip448_cancellation_receiver_accepted,
+    reconcile_bip448_accepted_local_outgoing_messages,
+};
+
+pub use transfer_intents::{
+    arm_bip448_transfer_sender, get_active_bip448_transfer_intent,
+    insert_bip448_cancellation_intent_with_wallet, insert_bip448_transfer_intent_if_absent,
+    reactivate_bip448_transfer_intent_predecessor_after_definitive_rejection,
+    reject_bip448_transfer_intent_and_reactivate_predecessor, store_bip448_transfer_intent_x1,
+    store_bip448_transfer_server_x1, supersede_bip448_transfer_intent,
+    supersede_bip448_transfer_intent_with_cancellation_wallet,
+    transition_bip448_transfer_intent_phase,
+};
+pub(super) use transfer_intents::{
+    require_materialized_signed_transfer_intent_on, validate_bip448_successor_plan_on,
+    validate_bip448_transfer_intent_lineage,
+};
+
+pub(super) use transfer_signing::pending_transfer_on;
+pub use transfer_signing::{
+    arm_bip448_transfer_state_sign_second, install_bip448_transfer_target_pending,
+    install_bip448_transfer_target_pending_signing, install_reused_signed_bip448_transfer_state,
+    materialize_bip448_signed_transfer_intent, store_bip448_transfer_state_nonce,
+    store_bip448_transfer_state_signed_artifacts, store_signed_bip448_transfer_state,
+    transition_bip448_transfer_state_signing_phase,
+};
+
 pub(crate) use withdrawals::with_bip448_canonical_completion_fence;
 pub use withdrawals::{
     arm_bip448_withdrawal_sign_first, arm_bip448_withdrawal_sign_second,
@@ -90,5 +124,7 @@ pub(super) use accepted::upsert_bip448_statechain_record;
 pub(super) use guard::{Bip448BeginImmediateTestHook, BIP448_BEGIN_IMMEDIATE_TEST_HOOK};
 #[cfg(test)]
 pub(super) use scan::clear_bip448_scan_state;
+#[cfg(test)]
+pub(super) use transfer_intents::{insert_transfer_intent_on, intent_is_directly_supersedable};
 #[cfg(test)]
 pub(super) use withdrawals::legal_broadcast_transition;
