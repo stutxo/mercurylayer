@@ -46,10 +46,7 @@ One orchestration state machine does not become another state machine's implemen
 
 The concrete `chain` and `utils` modules remain adapters; this series adds no repository, unit-of-work, generic transaction, or adapter-trait layer.
 
-### Target layout for this refactor series
-
-The approved parent still has flat facade implementations; the new child paths in this
-behavior-preserving target layout do not yet exist in this commit.
+### Current layout
 
 Domain ownership keeps `clients/libs/rust/src/bip448_funding.rs` as the stable facade:
 
@@ -137,7 +134,6 @@ Test ownership becomes explicit without changing root test identities:
 | `clients/libs/rust/src/sqlite_manager/bip448/tests/transfer_intents.rs` | transfer-intent tests |
 | `clients/libs/rust/src/sqlite_manager/bip448/tests/synchronization.rs` | synchronization tests |
 | `clients/libs/rust/src/sqlite_manager/bip448/tests/concurrency.rs` | concurrency tests |
-| `clients/libs/rust/src/coin_status/test_support.rs` | exact shared coin-status test support |
 | `clients/tests/rust/tests/bip448_duplicates/support.rs` | duplicate-scenario shared support |
 | `clients/tests/rust/tests/bip448_duplicates/repeated_funding.rs` | repeated funding scenario |
 | `clients/tests/rust/tests/bip448_duplicates/inventory.rs` | inventory scenario |
@@ -162,6 +158,7 @@ Test ownership becomes explicit without changing root test identities:
 | `clients/tests/rust/tests/lockbox_compatibility/validation.rs` | validation scenarios |
 | `clients/tests/rust/tests/lockbox_compatibility/signing.rs` | signing scenarios |
 | `clients/tests/rust/tests/lockbox_compatibility/keyupdate.rs` | key-update scenarios |
+| `clients/tests/rust/tests/lockbox_compatibility/keyupdate_fences.rs` | private generation-fence carriers, snapshots, and assertion helpers for the key-update scenario |
 | `clients/tests/rust/tests/lockbox_compatibility/deletion.rs` | deletion scenarios |
 | `clients/tests/rust/tests/lockbox_compatibility/deterministic.rs` | deterministic-vector scenario |
 | `clients/tests/rust/tests/lockbox_compatibility/concurrency.rs` | concurrency scenarios |
