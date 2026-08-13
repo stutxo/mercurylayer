@@ -346,7 +346,7 @@ impl Bip448MutationGuard {
     }
 }
 
-pub(in crate::sqlite_manager) async fn insert_transfer_intent_on(
+pub(super) async fn insert_transfer_intent_on(
     connection: &mut SqliteConnection,
     intent: &Bip448TransferIntent,
 ) -> Result<()> {
@@ -631,9 +631,7 @@ pub async fn insert_bip448_cancellation_intent_with_wallet(
     Ok(stored)
 }
 
-pub(in crate::sqlite_manager) fn intent_is_directly_supersedable(
-    intent: &Bip448TransferIntent,
-) -> bool {
+pub(super) fn intent_is_directly_supersedable(intent: &Bip448TransferIntent) -> bool {
     intent.phase == Bip448TransferIntentPhase::Prepared
         || (intent.phase == Bip448TransferIntentPhase::X1Stored
             && matches!(

@@ -355,7 +355,7 @@ pub(crate) async fn persist_bip448_scan_state(
 }
 
 #[cfg(test)]
-pub(in crate::sqlite_manager) async fn clear_bip448_scan_state(
+pub(super) async fn clear_bip448_scan_state(
     pool: &Pool<Sqlite>,
     wallet_name: &str,
     script_pubkey: &str,

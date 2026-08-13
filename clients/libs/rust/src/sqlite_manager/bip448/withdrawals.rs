@@ -1265,7 +1265,7 @@ pub async fn store_bip448_withdrawal_signed_artifacts(
     .await
 }
 
-pub(in crate::sqlite_manager) fn legal_broadcast_transition(
+pub(super) fn legal_broadcast_transition(
     from: Bip448BroadcastStatus,
     to: Bip448BroadcastStatus,
 ) -> bool {

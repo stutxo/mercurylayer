@@ -10,6 +10,11 @@ mod transfer_intents;
 mod transfer_signing;
 mod withdrawals;
 
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+pub(crate) use accepted::insert_or_update_bip448_statechain;
 pub use accepted::{
     delete_bip448_pending_deposit_signing, delete_bip448_pending_transfer_signing,
     delete_bip448_transfer_msgs, get_bip448_pending_deposit_signing,
@@ -21,8 +26,8 @@ pub use accepted::{
     update_bip448_pending_transfer_server_public_nonce, Bip448PendingDepositSigning,
 };
 pub(crate) use accepted::{
-    history_entry, insert_or_update_bip448_statechain,
-    insert_or_update_bip448_statechain_from_transfer, list_bip448_transfer_msg_raw_rows,
+    history_entry, insert_or_update_bip448_statechain_from_transfer,
+    list_bip448_transfer_msg_raw_rows,
 };
 
 pub(super) use bindings::accepted_funding_script;
@@ -117,14 +122,3 @@ pub use withdrawals::{
     transition_bip448_withdrawal_phase, update_bip448_withdrawal_broadcast_status,
     update_bip448_withdrawal_completion_status, validate_bip448_canonical_close_snapshot,
 };
-
-#[cfg(test)]
-pub(super) use accepted::upsert_bip448_statechain_record;
-#[cfg(test)]
-pub(super) use guard::{Bip448BeginImmediateTestHook, BIP448_BEGIN_IMMEDIATE_TEST_HOOK};
-#[cfg(test)]
-pub(super) use scan::clear_bip448_scan_state;
-#[cfg(test)]
-pub(super) use transfer_intents::{insert_transfer_intent_on, intent_is_directly_supersedable};
-#[cfg(test)]
-pub(super) use withdrawals::legal_broadcast_transition;

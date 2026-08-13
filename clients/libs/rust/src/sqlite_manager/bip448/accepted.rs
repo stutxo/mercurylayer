@@ -78,7 +78,7 @@ pub(super) fn validated_bip448_record_json(record: &Bip448StatechainRecord) -> R
     Ok(serde_json::to_string(record)?)
 }
 
-pub(in crate::sqlite_manager) async fn upsert_bip448_statechain_record(
+pub(super) async fn upsert_bip448_statechain_record(
     pool: &Pool<Sqlite>,
     record: &Bip448StatechainRecord,
 ) -> Result<()> {

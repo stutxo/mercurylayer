@@ -7,16 +7,16 @@ pub struct Bip448MutationGuard {
 
 #[cfg(test)]
 #[derive(Default)]
-pub(in crate::sqlite_manager) struct Bip448BeginImmediateTestHook {
-    pub(in crate::sqlite_manager) before_acquire: tokio::sync::Notify,
-    pub(in crate::sqlite_manager) after_acquire: tokio::sync::Notify,
-    pub(in crate::sqlite_manager) before_emitted: std::sync::atomic::AtomicBool,
-    pub(in crate::sqlite_manager) after_emitted: std::sync::atomic::AtomicBool,
+pub(super) struct Bip448BeginImmediateTestHook {
+    pub(super) before_acquire: tokio::sync::Notify,
+    pub(super) after_acquire: tokio::sync::Notify,
+    pub(super) before_emitted: std::sync::atomic::AtomicBool,
+    pub(super) after_emitted: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
 tokio::task_local! {
-    pub(in crate::sqlite_manager) static BIP448_BEGIN_IMMEDIATE_TEST_HOOK:
+    pub(super) static BIP448_BEGIN_IMMEDIATE_TEST_HOOK:
         std::sync::Arc<Bip448BeginImmediateTestHook>;
 }
 
@@ -54,12 +54,12 @@ impl Bip448MutationGuard {
         Ok(())
     }
 
-    pub(in crate::sqlite_manager) async fn rollback(self) -> Result<()> {
+    pub(super) async fn rollback(self) -> Result<()> {
         self.transaction.rollback().await?;
         Ok(())
     }
 
-    pub(in crate::sqlite_manager) fn connection(&mut self) -> &mut SqliteConnection {
+    pub(super) fn connection(&mut self) -> &mut SqliteConnection {
         &mut self.transaction
     }
 }
