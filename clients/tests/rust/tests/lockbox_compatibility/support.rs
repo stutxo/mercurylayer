@@ -1,8 +1,5 @@
 use super::*;
 
-pub(super) const MERCURY_DATABASE_URL: &str = "postgres://postgres:postgres@127.0.0.1:5432/mercury";
-pub(super) const LOCKBOX_DATABASE_URL: &str = "postgres://postgres:postgres@127.0.0.1:5433/enclave";
-
 pub(super) fn generation_bound_receiver_request(
     statechain_id: &str,
     recipient_secret: &SecretKey,
@@ -36,7 +33,7 @@ pub(super) async fn unlock_recipient_transfer_generation(
     )?;
     let keypair = KeyPair::from_secret_key(&secp, recipient_secret);
     let response = client
-        .post(format!("{}/transfer/unlock", mercury::MERCURY_URL))
+        .post(format!("{}/transfer/unlock", mercury::url()))
         .json(&TransferUnlockRequestPayload {
             statechain_id: statechain_id.to_owned(),
             auth_sig: schnorr::sign(&digest, &keypair).to_string(),

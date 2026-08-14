@@ -34,7 +34,7 @@ async fn post_mercury_json(
     payload: &Value,
 ) -> Result<(StatusCode, String)> {
     let response = client
-        .post(format!("{}/{path}", mercury::MERCURY_URL))
+        .post(format!("{}/{path}", mercury::url()))
         .json(payload)
         .send()
         .await

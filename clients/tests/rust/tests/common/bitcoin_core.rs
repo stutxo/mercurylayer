@@ -6,30 +6,12 @@ use bitcoin::{
 use serde_json::Value;
 use std::{process::Command, str::FromStr, thread};
 
-const BITCOIN_CONTAINER_NAME: &str = "mercurylayer-inquisition-1";
-const BITCOIN_WALLET_NAME: &str = "mercury_test";
+use super::stack;
+
 const BITCOIN_CLI: &str = "bitcoin-cli -regtest -rpcuser=mercury -rpcpassword=mercury";
 
 pub fn get_container_id() -> Result<String> {
-    // First, get the container ID by running the docker ps command
-    let output = Command::new("docker")
-        .arg("ps")
-        .arg("-qf")
-        .arg(format!("name={}", BITCOIN_CONTAINER_NAME))
-        .output()
-        .expect("Failed to execute docker ps command");
-
-    // Convert the output to a string and trim whitespace
-    let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-    if container_id.is_empty() {
-        return Err(anyhow!(
-            "No container found with the name {}",
-            BITCOIN_CONTAINER_NAME
-        ));
-    }
-
-    Ok(container_id)
+    stack::current().service_container_id("inquisition")
 }
 
 pub fn execute_bitcoin_command(bitcoin_command: &str) -> Result<String> {
@@ -59,19 +41,21 @@ pub fn execute_bitcoin_command(bitcoin_command: &str) -> Result<String> {
 
 pub fn sendtoaddress(amount_in_sats: u32, address: &str) -> Result<String> {
     let amount = amount_in_sats as f64 / 100_000_000.0;
+    let wallet_name = stack::current().wallet_name();
 
     let bitcoin_command = format!(
         "{} -rpcwallet={} sendtoaddress {} {}",
-        BITCOIN_CLI, BITCOIN_WALLET_NAME, address, amount
+        BITCOIN_CLI, wallet_name, address, amount
     );
 
     execute_bitcoin_command(&bitcoin_command)
 }
 
 pub fn ensure_wallet_loaded() -> Result<()> {
+    let wallet_name = stack::current().wallet_name();
     execute_bitcoin_command(&format!(
-        "{BITCOIN_CLI} createwallet {BITCOIN_WALLET_NAME} >/dev/null 2>&1 || \
-         {BITCOIN_CLI} loadwallet {BITCOIN_WALLET_NAME} >/dev/null 2>&1 || true"
+        "{BITCOIN_CLI} createwallet {wallet_name} >/dev/null 2>&1 || \
+         {BITCOIN_CLI} loadwallet {wallet_name} >/dev/null 2>&1 || true"
     ))?;
 
     Ok(())
@@ -121,10 +105,8 @@ pub fn generatetoaddress(num_blocks: u32, address: &str) -> Result<String> {
 }
 
 pub fn getnewaddress() -> Result<String> {
-    let bitcoin_command = format!(
-        "{} -rpcwallet={} getnewaddress",
-        BITCOIN_CLI, BITCOIN_WALLET_NAME
-    );
+    let wallet_name = stack::current().wallet_name();
+    let bitcoin_command = format!("{} -rpcwallet={} getnewaddress", BITCOIN_CLI, wallet_name);
 
     execute_bitcoin_command(&bitcoin_command)
 }
@@ -134,8 +116,9 @@ pub fn regtest_address(address: &str) -> Result<Address> {
 }
 
 pub fn wallet_transaction(txid: &Txid) -> Result<Transaction> {
+    let wallet_name = stack::current().wallet_name();
     let tx_json = execute_bitcoin_command(&format!(
-        "{BITCOIN_CLI} -rpcwallet={BITCOIN_WALLET_NAME} gettransaction {txid}"
+        "{BITCOIN_CLI} -rpcwallet={wallet_name} gettransaction {txid}"
     ))?;
     let tx_json: Value = serde_json::from_str(&tx_json)?;
     let tx_hex = tx_json
@@ -171,8 +154,9 @@ pub fn spend_wallet_outpoint(outpoint: OutPoint, value_sats: u64) -> Result<Txid
          '{{\"{}\":{}}}'",
         outpoint.txid, outpoint.vout, destination, amount
     ))?;
+    let wallet_name = stack::current().wallet_name();
     let signed = execute_bitcoin_command(&format!(
-        "{BITCOIN_CLI} -rpcwallet={BITCOIN_WALLET_NAME} \
+        "{BITCOIN_CLI} -rpcwallet={wallet_name} \
          signrawtransactionwithwallet {unsigned}"
     ))?;
     let signed: Value = serde_json::from_str(&signed)?;
@@ -191,8 +175,9 @@ pub fn spend_wallet_outpoint(outpoint: OutPoint, value_sats: u64) -> Result<Txid
 }
 
 pub fn set_wallet_outpoint_locked(outpoint: OutPoint, locked: bool) -> Result<()> {
+    let wallet_name = stack::current().wallet_name();
     execute_bitcoin_command(&format!(
-        "{BITCOIN_CLI} -rpcwallet={BITCOIN_WALLET_NAME} lockunspent {} \
+        "{BITCOIN_CLI} -rpcwallet={wallet_name} lockunspent {} \
          '[{{\"txid\":\"{}\",\"vout\":{}}}]'",
         !locked, outpoint.txid, outpoint.vout
     ))?;

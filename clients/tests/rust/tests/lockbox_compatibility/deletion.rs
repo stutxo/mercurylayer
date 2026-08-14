@@ -125,7 +125,7 @@ async fn mercury_withdraw_complete_response(
         .context("deposited coin missing signed_statechain_id")?;
 
     client
-        .post(format!("{}/withdraw/complete", mercury::MERCURY_URL))
+        .post(format!("{}/withdraw/complete", mercury::url()))
         .json(&WithdrawCompletePayload {
             statechain_id: statechain_id.clone(),
             signed_statechain_id: signed_statechain_id.clone(),
@@ -156,7 +156,7 @@ async fn wait_until_lockbox_database_ready() -> Result<()> {
             let pool = PgPoolOptions::new()
                 .max_connections(1)
                 .acquire_timeout(Duration::from_secs(1))
-                .connect(LOCKBOX_DATABASE_URL)
+                .connect(lockbox::database_url())
                 .await?;
             sqlx::query("SELECT 1").execute(&pool).await?;
             Ok::<(), sqlx::Error>(())
@@ -293,7 +293,7 @@ pub(super) async fn mercury_withdraw_complete_preserves_rows_when_lockbox_delete
 
     let mercury_pool = PgPoolOptions::new()
         .max_connections(1)
-        .connect(MERCURY_DATABASE_URL)
+        .connect(mercury::database_url())
         .await
         .context("failed to connect to mercury postgres")?;
     let outage_coin =
@@ -404,7 +404,7 @@ pub(super) async fn mercury_withdraw_complete_preserves_rows_when_lockbox_delete
     let initial_info = mercury_client
         .get(format!(
             "{}/info/statechain/{partial_failure_statechain_id}",
-            mercury::MERCURY_URL
+            mercury::url()
         ))
         .send()
         .await
@@ -440,7 +440,7 @@ pub(super) async fn mercury_withdraw_complete_preserves_rows_when_lockbox_delete
     let lockbox_missing_info = mercury_client
         .get(format!(
             "{}/info/statechain/{partial_failure_statechain_id}",
-            mercury::MERCURY_URL
+            mercury::url()
         ))
         .send()
         .await
@@ -483,7 +483,7 @@ pub(super) async fn mercury_withdraw_complete_preserves_rows_when_lockbox_delete
     let final_info = mercury_client
         .get(format!(
             "{}/info/statechain/{partial_failure_statechain_id}",
-            mercury::MERCURY_URL
+            mercury::url()
         ))
         .send()
         .await

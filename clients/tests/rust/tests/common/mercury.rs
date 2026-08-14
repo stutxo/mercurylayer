@@ -23,12 +23,18 @@ use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
 use tokio::time::sleep;
 
-use crate::common::{bitcoin_core, lockbox};
+use crate::common::{bitcoin_core, lockbox, stack};
 
-pub const MERCURY_URL: &str = "http://127.0.0.1:8000";
-const MERCURY_DATABASE_URL: &str = "postgres://postgres:postgres@127.0.0.1:5432/mercury";
 const READY_TIMEOUT_SECONDS: u64 = 180;
 static NEXT_MERCURY_COIN_INDEX: AtomicU32 = AtomicU32::new(0);
+
+pub fn url() -> &'static str {
+    stack::current().mercury_url()
+}
+
+pub fn database_url() -> &'static str {
+    stack::current().mercury_database_url()
+}
 
 pub fn http_client() -> Client {
     Client::builder()
@@ -39,11 +45,7 @@ pub fn http_client() -> Client {
 
 pub async fn wait_until_ready(client: &Client) -> Result<()> {
     for _ in 0..READY_TIMEOUT_SECONDS {
-        if let Ok(response) = client
-            .get(format!("{}/info/config", MERCURY_URL))
-            .send()
-            .await
-        {
+        if let Ok(response) = client.get(format!("{}/info/config", url())).send().await {
             if response.status() == StatusCode::OK {
                 return Ok(());
             }
@@ -59,7 +61,7 @@ pub async fn wait_until_ready(client: &Client) -> Result<()> {
 
 pub async fn get_token(client: &Client) -> Result<TokenResponse> {
     let response = client
-        .get(format!("{}/deposit/get_token", MERCURY_URL))
+        .get(format!("{}/deposit/get_token", url()))
         .send()
         .await
         .context("failed to call mercury deposit/get_token")?;
@@ -69,7 +71,7 @@ pub async fn get_token(client: &Client) -> Result<TokenResponse> {
 
 pub async fn deposit_init(client: &Client, payload: &DepositMsg1) -> Result<DepositMsg1Response> {
     let response = client
-        .post(format!("{}/deposit/init/pod", MERCURY_URL))
+        .post(format!("{}/deposit/init/pod", url()))
         .json(payload)
         .send()
         .await
@@ -83,7 +85,7 @@ pub async fn bip448_sign_first(
     payload: &Bip448SignFirstRequestPayload,
 ) -> Result<Bip448SignFirstResponsePayload> {
     let response = client
-        .post(format!("{}/bip448-statechain/sign/first", MERCURY_URL))
+        .post(format!("{}/bip448-statechain/sign/first", url()))
         .json(payload)
         .send()
         .await
@@ -101,7 +103,7 @@ pub async fn bip448_sign_second(
     payload: &Bip448PartialSignatureRequestPayload,
 ) -> Result<Bip448PartialSignatureResponsePayload> {
     let response = client
-        .post(format!("{}/bip448-statechain/sign/second", MERCURY_URL))
+        .post(format!("{}/bip448-statechain/sign/second", url()))
         .json(payload)
         .send()
         .await
@@ -119,7 +121,7 @@ pub async fn statechain_info(
     statechain_id: &str,
 ) -> Result<StatechainInfoResponsePayload> {
     let response = client
-        .get(format!("{}/info/statechain/{}", MERCURY_URL, statechain_id))
+        .get(format!("{}/info/statechain/{}", url(), statechain_id))
         .send()
         .await
         .with_context(|| format!("failed to call mercury info/statechain/{}", statechain_id))?;
@@ -132,7 +134,7 @@ pub async fn transfer_receiver(
     payload: &TransferReceiverRequestPayload,
 ) -> Result<TransferReceiverPostResponsePayload> {
     let response = client
-        .post(format!("{}/transfer/receiver", MERCURY_URL))
+        .post(format!("{}/transfer/receiver", url()))
         .json(payload)
         .send()
         .await
@@ -202,7 +204,7 @@ pub async fn insert_statechain_transfer_row(
 ) -> Result<()> {
     let pool = PgPoolOptions::new()
         .max_connections(1)
-        .connect(MERCURY_DATABASE_URL)
+        .connect(database_url())
         .await
         .context("failed to connect to mercury postgres")?;
 
@@ -234,7 +236,7 @@ pub async fn clear_bip448_server_partial_signature(
 ) -> Result<()> {
     let pool = PgPoolOptions::new()
         .max_connections(1)
-        .connect(MERCURY_DATABASE_URL)
+        .connect(database_url())
         .await
         .context("failed to connect to mercury postgres")?;
 

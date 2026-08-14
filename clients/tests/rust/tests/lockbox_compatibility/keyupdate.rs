@@ -150,12 +150,12 @@ pub(super) async fn mercury_transfer_receiver_routes_keyupdate_to_lockbox() -> R
     lockbox::wait_until_ready(&lockbox_client).await?;
     let mercury_pool = PgPoolOptions::new()
         .max_connections(16)
-        .connect(MERCURY_DATABASE_URL)
+        .connect(mercury::database_url())
         .await
         .context("failed to connect generation-fence tests to Mercury postgres")?;
     let lockbox_pool = PgPoolOptions::new()
         .max_connections(4)
-        .connect(LOCKBOX_DATABASE_URL)
+        .connect(lockbox::database_url())
         .await
         .context("failed to connect generation-fence tests to lockbox postgres")?;
 

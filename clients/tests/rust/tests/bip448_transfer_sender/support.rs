@@ -180,7 +180,7 @@ pub(super) async fn get_encrypted_msgs(
     Ok(client
         .get(format!(
             "{}/transfer/get_msg_addr/{auth_pubkey}",
-            common::mercury::MERCURY_URL
+            common::mercury::url()
         ))
         .send()
         .await?

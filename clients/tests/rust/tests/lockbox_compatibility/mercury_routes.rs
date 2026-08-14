@@ -15,7 +15,7 @@ async fn insert_completed_bip448_signature_row(
 ) -> Result<()> {
     let pool = PgPoolOptions::new()
         .max_connections(1)
-        .connect(MERCURY_DATABASE_URL)
+        .connect(mercury::database_url())
         .await
         .context("failed to connect to mercury postgres")?;
     sqlx::query(
@@ -194,7 +194,7 @@ pub(super) async fn mercury_statechain_info_returns_ordered_bip448_rows_and_tran
 
     let pool = PgPoolOptions::new()
         .max_connections(1)
-        .connect(MERCURY_DATABASE_URL)
+        .connect(mercury::database_url())
         .await
         .context("failed to connect to mercury postgres")?;
     assert!(

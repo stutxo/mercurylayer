@@ -93,8 +93,7 @@ async fn assert_predecessor_wins_prepared_barrier() -> Result<()> {
         &statechain_id,
     )
     .await?;
-    let server_pool =
-        sqlx::PgPool::connect("postgres://postgres:postgres@127.0.0.1:5432/mercury").await?;
+    let server_pool = sqlx::PgPool::connect(common::mercury::database_url()).await?;
     let remote_before = sqlx::query_as::<_, (Vec<u8>, Vec<u8>, Option<Vec<u8>>, bool)>(
         "SELECT x1,new_user_auth_public_key,encrypted_transfer_msg,key_updated \
          FROM statechain_transfer WHERE statechain_id=$1",

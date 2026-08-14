@@ -1,4 +1,4 @@
-use std::{path::PathBuf, process::Command, str::FromStr, time::Duration};
+use std::{process::Command, str::FromStr, time::Duration};
 
 use anyhow::{anyhow, Context, Result};
 use bitcoin::{hashes::Hash, sighash::TemplateHash};
@@ -22,8 +22,17 @@ use serde_json::{json, Value};
 use tokio::time::sleep;
 use uuid::Uuid;
 
-pub const LOCKBOX_URL: &str = "http://127.0.0.1:18080";
+use super::stack::{self, ComposeFile};
+
 const READY_TIMEOUT_SECONDS: u64 = 180;
+
+pub fn url() -> &'static str {
+    stack::current().lockbox_url()
+}
+
+pub fn database_url() -> &'static str {
+    stack::current().lockbox_database_url()
+}
 
 #[derive(Debug, Deserialize)]
 pub struct ServerPubkeyResponse {
@@ -92,7 +101,7 @@ pub fn normalize_hex(value: &str) -> String {
 
 pub async fn wait_until_ready(client: &Client) -> Result<()> {
     for _ in 0..READY_TIMEOUT_SECONDS {
-        if let Ok(response) = client.get(format!("{}/", LOCKBOX_URL)).send().await {
+        if let Ok(response) = client.get(format!("{}/", url())).send().await {
             if response.status() == StatusCode::OK {
                 let body = response.text().await.unwrap_or_default();
                 if body.contains("Hello, Crow!") {
@@ -109,7 +118,7 @@ pub async fn wait_until_ready(client: &Client) -> Result<()> {
 
 pub async fn post_json(client: &Client, path: &str, body: Value) -> Result<Response> {
     client
-        .post(format!("{}/{}", LOCKBOX_URL, path))
+        .post(format!("{}/{}", url(), path))
         .json(&body)
         .send()
         .await
@@ -118,7 +127,7 @@ pub async fn post_json(client: &Client, path: &str, body: Value) -> Result<Respo
 
 pub async fn get(client: &Client, path: &str) -> Result<Response> {
     client
-        .get(format!("{}/{}", LOCKBOX_URL, path))
+        .get(format!("{}/{}", url(), path))
         .send()
         .await
         .with_context(|| format!("failed GET {}", path))
@@ -126,7 +135,7 @@ pub async fn get(client: &Client, path: &str) -> Result<Response> {
 
 pub async fn delete(client: &Client, path: &str) -> Result<Response> {
     client
-        .delete(format!("{}/{}", LOCKBOX_URL, path))
+        .delete(format!("{}/{}", url(), path))
         .send()
         .await
         .with_context(|| format!("failed DELETE {}", path))
@@ -185,9 +194,8 @@ pub async fn delete_statechain(client: &Client, statechain_id: &str) -> Result<(
 }
 
 pub async fn restart_lockbox_service(client: &Client) -> Result<()> {
-    run_docker_compose(
-        "docker-compose-lockbox.yml",
-        &["restart", "lockbox"],
+    run_docker_command(
+        stack::current().compose_command(ComposeFile::Lockbox, &["restart", "lockbox"]),
         "restart lockbox service",
     )?;
 
@@ -195,17 +203,18 @@ pub async fn restart_lockbox_service(client: &Client) -> Result<()> {
 }
 
 pub async fn stop_token_stack_lockbox_service() -> Result<()> {
-    run_docker_compose(
-        "docker-compose-token-servers.yml",
-        &["stop", "lockbox"],
+    run_docker_command(
+        stack::current().compose_command(ComposeFile::TokenServers, &["stop", "lockbox"]),
         "stop token-stack lockbox service",
     )
 }
 
 pub async fn start_token_stack_lockbox_service(client: &Client) -> Result<()> {
-    run_docker_compose(
-        "docker-compose-token-servers.yml",
-        &["up", "-d", "--no-deps", "lockbox"],
+    run_docker_command(
+        stack::current().compose_command(
+            ComposeFile::TokenServers,
+            &["up", "-d", "--no-deps", "lockbox"],
+        ),
         "start token-stack lockbox service",
     )?;
 
@@ -213,37 +222,22 @@ pub async fn start_token_stack_lockbox_service(client: &Client) -> Result<()> {
 }
 
 pub async fn stop_token_stack_lockbox_database() -> Result<()> {
-    run_docker_compose(
-        "docker-compose-token-servers.yml",
-        &["stop", "db_lockbox"],
+    run_docker_command(
+        stack::current().compose_command(ComposeFile::TokenServers, &["stop", "db_lockbox"]),
         "stop token-stack lockbox database",
     )
 }
 
 pub async fn start_token_stack_lockbox_database(client: &Client) -> Result<()> {
-    run_docker_compose(
-        "docker-compose-token-servers.yml",
-        &["up", "-d", "--no-deps", "db_lockbox"],
+    run_docker_command(
+        stack::current().compose_command(
+            ComposeFile::TokenServers,
+            &["up", "-d", "--no-deps", "db_lockbox"],
+        ),
         "start token-stack lockbox database",
     )?;
 
     wait_until_ready(client).await
-}
-
-fn run_docker_compose(compose_file: &str, args: &[&str], context: &str) -> Result<()> {
-    let command = docker_compose_command(compose_file, args);
-    run_docker_command(command, context)
-}
-
-fn docker_compose_command(compose_file: &str, args: &[&str]) -> Command {
-    let mut command = Command::new("docker");
-    command
-        .arg("compose")
-        .arg("-f")
-        .arg(compose_file)
-        .args(args)
-        .current_dir(repo_root());
-    command
 }
 
 fn run_docker_command(mut command: Command, context: &str) -> Result<()> {
@@ -277,8 +271,8 @@ pub fn recreate_lockbox_service_with_production_rng() -> Result<()> {
 }
 
 fn run_recreate_lockbox_service_with_rng_seed(rng_seed_hex: Option<&str>) -> Result<()> {
-    let mut command = docker_compose_command(
-        "docker-compose-lockbox.yml",
+    let mut command = stack::current().compose_command(
+        ComposeFile::Lockbox,
         &["up", "-d", "--build", "--force-recreate", "lockbox"],
     );
 
@@ -452,18 +446,15 @@ async fn ensure_success<T: DeserializeOwned>(response: Response, context: &str) 
         .with_context(|| format!("failed to decode {} response body {}", context, body))
 }
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..")
-}
-
 pub fn sample_wallet() -> Wallet {
+    let stack = stack::current();
     Wallet {
         name: "lockbox-compat".to_string(),
         mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string(),
         version: "0.1.0".to_string(),
-        state_entity_endpoint: "http://statechain".to_string(),
+        state_entity_endpoint: stack.mercury_url().to_string(),
         chain_backend: "core".to_string(),
-        chain_endpoint: "http://127.0.0.1:18443".to_string(),
+        chain_endpoint: stack.core_rpc_url().to_string(),
         network: "regtest".to_string(),
         blockheight: 0,
         activities: Vec::new(),
@@ -475,10 +466,10 @@ pub fn sample_wallet() -> Wallet {
             torProxyPort: None,
             torProxyControlPassword: None,
             torProxyControlPort: None,
-            statechainEntityApi: "http://statechain".to_string(),
+            statechainEntityApi: stack.mercury_url().to_string(),
             torStatechainEntityApi: None,
             chainBackend: "core".to_string(),
-            chainUrl: "http://127.0.0.1:18443".to_string(),
+            chainUrl: stack.core_rpc_url().to_string(),
             chainType: None,
             notifications: false,
             tutorials: false,

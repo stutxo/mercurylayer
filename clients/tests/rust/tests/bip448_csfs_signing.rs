@@ -209,7 +209,7 @@ async fn bip448_sign_second_recovers_missing_mercury_partial_from_lockbox_replay
     let conflict = client
         .post(format!(
             "{}/bip448-statechain/sign/second",
-            common::mercury::MERCURY_URL
+            common::mercury::url()
         ))
         .json(&conflicting_payload)
         .send()
@@ -313,7 +313,7 @@ async fn bip448_sign_second_fails_closed_while_lockbox_status_is_unavailable() -
     let unavailable_result = client
         .post(format!(
             "{}/bip448-statechain/sign/second",
-            common::mercury::MERCURY_URL
+            common::mercury::url()
         ))
         .json(&second_payload)
         .send()
@@ -321,7 +321,7 @@ async fn bip448_sign_second_fails_closed_while_lockbox_status_is_unavailable() -
     let exact_retry_while_unavailable = client
         .post(format!(
             "{}/bip448-statechain/sign/second",
-            common::mercury::MERCURY_URL
+            common::mercury::url()
         ))
         .json(&second_payload)
         .send()
@@ -329,7 +329,7 @@ async fn bip448_sign_second_fails_closed_while_lockbox_status_is_unavailable() -
     let conflict_while_unavailable = client
         .post(format!(
             "{}/bip448-statechain/sign/second",
-            common::mercury::MERCURY_URL
+            common::mercury::url()
         ))
         .json(&conflicting_payload)
         .send()

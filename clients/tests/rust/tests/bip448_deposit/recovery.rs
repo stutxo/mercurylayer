@@ -711,15 +711,11 @@ async fn assert_server_persistence_excludes_locktime(
 ) -> Result<()> {
     let databases = [
         (
-            std::env::var("MERCURY_TEST_DATABASE_URL").unwrap_or_else(|_| {
-                "postgres://postgres:postgres@127.0.0.1:5432/mercury".to_string()
-            }),
+            common::mercury::database_url(),
             &["bip448_signature_data", "signing_nonce_leases"][..],
         ),
         (
-            std::env::var("LOCKBOX_TEST_DATABASE_URL").unwrap_or_else(|_| {
-                "postgres://postgres:postgres@127.0.0.1:5433/enclave".to_string()
-            }),
+            common::lockbox::database_url(),
             &["bip448_nonce_state", "generated_public_key"][..],
         ),
     ];
@@ -773,7 +769,7 @@ async fn assert_server_persistence_excludes_locktime(
     for (database_url, tables) in databases {
         let pool = PgPoolOptions::new()
             .max_connections(1)
-            .connect(&database_url)
+            .connect(database_url)
             .await?;
         let columns = sqlx::query(
             "SELECT table_name, column_name FROM information_schema.columns \

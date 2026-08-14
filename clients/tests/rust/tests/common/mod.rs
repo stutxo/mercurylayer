@@ -1,10 +1,11 @@
 use std::fs;
 use std::io::ErrorKind;
-use std::path::Path;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use mercuryrustlib::client_config::ClientConfig;
+
+pub use rust::stack;
 
 pub mod bip448_activation;
 pub mod bip448_regtest;
@@ -17,6 +18,12 @@ pub mod utils;
 static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub fn test_guard() -> MutexGuard<'static, ()> {
+    let _ = (
+        mercury::url(),
+        mercury::database_url(),
+        lockbox::url(),
+        lockbox::database_url(),
+    );
     TEST_MUTEX
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -30,14 +37,22 @@ pub async fn prepare_test_env() -> Result<ClientConfig> {
 }
 
 fn cleanup_wallet_db() -> Result<()> {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-
-    for file_name in ["wallet.db", "wallet.db-shm", "wallet.db-wal"] {
-        let path = manifest_dir.join(file_name);
-
-        if let Err(err) = fs::remove_file(&path) {
-            if err.kind() != ErrorKind::NotFound {
-                return Err(err.into());
+    for path in stack::current().wallet_artifact_paths() {
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                let file_type = metadata.file_type();
+                if file_type.is_symlink() || !file_type.is_file() {
+                    bail!(
+                        "refusing to remove non-regular wallet artifact {}",
+                        path.display()
+                    );
+                }
+                fs::remove_file(&path)?;
+            }
+            Err(error) => {
+                if error.kind() != ErrorKind::NotFound {
+                    return Err(error.into());
+                }
             }
         }
     }

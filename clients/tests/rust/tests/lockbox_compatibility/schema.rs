@@ -1,4 +1,3 @@
-use super::support::*;
 use super::*;
 
 pub(super) async fn fresh_lockbox_schema_has_only_bip448_nonce_state_columns() -> Result<()> {
@@ -8,7 +7,7 @@ pub(super) async fn fresh_lockbox_schema_has_only_bip448_nonce_state_columns() -
 
     let pool = PgPoolOptions::new()
         .max_connections(1)
-        .connect(LOCKBOX_DATABASE_URL)
+        .connect(lockbox::database_url())
         .await
         .context("failed to connect to lockbox postgres")?;
     let tables: Vec<(String,)> = sqlx::query_as(
@@ -82,7 +81,7 @@ pub(super) async fn fresh_mercury_schema_has_exact_bip448_tables_and_lease_colum
 
     let pool = PgPoolOptions::new()
         .max_connections(1)
-        .connect(MERCURY_DATABASE_URL)
+        .connect(mercury::database_url())
         .await
         .context("failed to connect to mercury postgres")?;
     let tables = sqlx::query_scalar::<_, String>(

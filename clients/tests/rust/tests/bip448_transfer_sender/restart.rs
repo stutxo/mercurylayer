@@ -40,8 +40,7 @@ pub(super) async fn bip448_transfer_survives_signing_and_upload_restarts() -> Re
     let lockbox = common::lockbox::http_client();
     common::lockbox::wait_until_ready(&lockbox).await?;
     common::prepare_test_env().await?.pool.close().await;
-    let server_pool =
-        sqlx::PgPool::connect("postgres://postgres:postgres@127.0.0.1:5432/mercury").await?;
+    let server_pool = sqlx::PgPool::connect(common::mercury::database_url()).await?;
     let checkpoints = [
         ("transfer_intent_prepared", 1u32, 1i64, false, None),
         ("transfer_sender_armed", 1, 1, false, None),

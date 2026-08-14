@@ -3,8 +3,6 @@ use super::*;
 pub(super) const DUPLICATE_AMOUNT_SATS: u32 = 73_421;
 pub(super) const SMALL_DUPLICATE_AMOUNT_SATS: u32 = 12_345;
 pub(super) const DUST_DUPLICATE_AMOUNT_SATS: u32 = 400;
-pub(super) const MERCURY_DATABASE_URL: &str = "postgres://postgres:postgres@127.0.0.1:5432/mercury";
-
 pub(super) async fn run_commit10_child_if_requested() -> Result<bool> {
     let Ok(operation) = std::env::var("ML_BIP448_COMMIT10_CHILD") else {
         return Ok(false);
@@ -129,7 +127,7 @@ pub(super) fn release_commit10_barrier(
 }
 
 pub(super) async fn mercury_transfer_side_effect_counts(statechain_id: &str) -> Result<(i64, i64)> {
-    let pool = sqlx::PgPool::connect(MERCURY_DATABASE_URL).await?;
+    let pool = sqlx::PgPool::connect(common::mercury::database_url()).await?;
     Ok(sqlx::query_as(
         "SELECT COUNT(*), COUNT(*) FILTER (WHERE encrypted_transfer_msg IS NOT NULL) \
          FROM statechain_transfer WHERE statechain_id=$1",
@@ -140,7 +138,7 @@ pub(super) async fn mercury_transfer_side_effect_counts(statechain_id: &str) -> 
 }
 
 pub(super) async fn mercury_state_bytes(statechain_id: &str) -> Result<(String, String, String)> {
-    let pool = sqlx::PgPool::connect(MERCURY_DATABASE_URL).await?;
+    let pool = sqlx::PgPool::connect(common::mercury::database_url()).await?;
     let statechain_data = sqlx::query_scalar(
         "SELECT COALESCE(jsonb_agg(to_jsonb(row_data)), '[]'::jsonb)::text FROM (\
          SELECT * FROM statechain_data WHERE statechain_id = $1 ORDER BY statechain_id\
