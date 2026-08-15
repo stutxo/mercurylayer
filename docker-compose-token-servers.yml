@@ -7,10 +7,9 @@ services:
       args:
         BITCOIN_INQUISITION_COMMIT: f5365867662091c2dbf1b2d438b8bb477a3dcb6f
     image: mercurylayer/bitcoin-inquisition:f536586
-    container_name: mercurylayer-inquisition-1
     ports:
-      - "18443:18443"
-      - "18444:18444"
+      - "${ML_TEST_CORE_RPC_PORT:-18443}:18443"
+      - "${ML_TEST_CORE_P2P_PORT:-18444}:18444"
     volumes:
       - bitcoin_inquisition_data:/data
     command:
@@ -38,7 +37,7 @@ services:
     environment:
       - VAULT_DEV_ROOT_TOKEN_ID=2bbz80mr1zm0tfrjwxyq7f48ofgky848
     ports:
-      - "8200:8200"
+      - "${ML_TEST_VAULT_PORT:-8200}:8200"
 
   vault-init:
     image: curlimages/curl
@@ -65,6 +64,7 @@ services:
     build:
       context: lockbox
       dockerfile: ./Dockerfile
+    image: "${ML_TEST_LOCKBOX_IMAGE:-mercurylayer/lockbox:bip448-test-local}"
     depends_on:
       - db_lockbox
       - vault-init
@@ -78,13 +78,13 @@ services:
       - HASHICORP_CONTAINER_MOUNT_POINT=secret
       - HASHICORP_CONTAINER_KEY_NAME=seed
     ports:
-      - "18080:18080"
+      - "${ML_TEST_LOCKBOX_PORT:-18080}:18080"
 
   token-server-v2:
     build:
       context: .
       dockerfile: ./token-server-v2/Dockerfile
-    container_name: mercurylayer-token-server-v2-1
+    image: "${ML_TEST_TOKEN_IMAGE:-mercurylayer/token-server-v2:bip448-test-local}"
     environment:
       PUBLIC_KEY_DESCRIPTOR: wpkh([656a457c/84'/1'/0']tpubDCTXiLu1wcqUwQK6QMPPUTBzbRjsqMABzCvd5vG22KGoA95cTG1VkszQQJyx24UP8KEJVKrKRDRtUPodHVV59CfNqUkXjKUagowHJVSWq4C/0/*)#vn0n5xcd
       BITCOIN_NETWORK: regtest
@@ -102,7 +102,7 @@ services:
       DB_PORT: 5432
       DB_NAME: mercury
     ports:
-      - "8001:8001"
+      - "${ML_TEST_TOKEN_PORT:-8001}:8001"
     depends_on:
       db_server:
         condition: service_started
@@ -113,7 +113,7 @@ services:
     build:
       context: .
       dockerfile: server/Dockerfile
-    container_name: mercurylayer-mercury-server-1
+    image: "${ML_TEST_MERCURY_IMAGE:-mercurylayer/mercury-server:bip448-test-local}"
     depends_on:
       - db_server
       - lockbox
@@ -129,7 +129,7 @@ services:
       ENCLAVES: '[{"url": "http://lockbox:18080", "allow_deposit": true}]'
       TOKEN_SERVER_URL: http://token-server-v2:8001
     ports:
-      - "8000:8000"
+      - "${ML_TEST_MERCURY_PORT:-8000}:8000"
 
   db_lockbox:
     image: postgres:16.2
@@ -137,7 +137,7 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: enclave
     ports:
-      - "5433:5432"
+      - "${ML_TEST_LOCKBOX_DB_PORT:-5433}:5432"
     volumes:
       - postgres_lockbox_data:/var/lib/postgresql/data
 
@@ -147,7 +147,7 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: mercury
     ports:
-      - "5432:5432"
+      - "${ML_TEST_MERCURY_DB_PORT:-5432}:5432"
     volumes:
       - postgres_server_data:/var/lib/postgresql/data
 

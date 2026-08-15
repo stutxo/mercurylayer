@@ -13,8 +13,8 @@ use std::io::{self, Write};
 pub use error::{WorkflowError, EXIT_FAILURE, EXIT_SUCCESS, EXIT_USAGE};
 pub use matrix::{MatrixTarget, MATRIX};
 pub use model::{
-    ComponentConfig, EndpointMap, ImageRole, LifecycleState, PortMap, PortRole, Project, RunPaths,
-    StackMetadata, COMPONENTS,
+    ComponentConfig, EndpointMap, ImageMap, ImageRole, LifecycleState, PortMap, PortRole, Project,
+    ProjectSpec, RunPaths, StackMetadata, COMPONENTS,
 };
 
 pub const USAGE: &str = "Usage:\n  bip448-test --help\n  bip448-test doctor\n  bip448-test configure --project <PROJECT> --base-port <PORT>\n  bip448-test status --project <PROJECT>";

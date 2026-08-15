@@ -194,6 +194,192 @@ pub enum ImageRole {
     LockboxRng,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageMap {
+    mercury: String,
+    token: String,
+    lockbox: String,
+    lockbox_rng: String,
+}
+
+impl ImageMap {
+    pub fn new(
+        project: &Project,
+        mercury: &str,
+        token: &str,
+        lockbox: &str,
+        lockbox_rng: &str,
+    ) -> Result<Self> {
+        validate_image(mercury, "mercurylayer/mercury-server:bip448-test-")?;
+        validate_image(token, "mercurylayer/token-server-v2:bip448-test-")?;
+        let lockbox_fingerprint = validate_image(lockbox, "mercurylayer/lockbox:bip448-test-")?;
+        ensure!(
+            lockbox_rng
+                == format!("mercurylayer/lockbox:bip448-test-{lockbox_fingerprint}-rng-{project}"),
+            "lockbox RNG image must match the lockbox fingerprint and Compose project"
+        );
+        Ok(Self {
+            mercury: mercury.to_owned(),
+            token: token.to_owned(),
+            lockbox: lockbox.to_owned(),
+            lockbox_rng: lockbox_rng.to_owned(),
+        })
+    }
+
+    pub fn mercury(&self) -> &str {
+        &self.mercury
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    pub fn lockbox(&self) -> &str {
+        &self.lockbox
+    }
+
+    pub fn lockbox_rng(&self) -> &str {
+        &self.lockbox_rng
+    }
+}
+
+fn validate_image<'a>(value: &'a str, prefix: &str) -> Result<&'a str> {
+    let fingerprint = value
+        .strip_prefix(prefix)
+        .context("image does not have the required component prefix")?;
+    ensure!(
+        fingerprint.len() == 16
+            && fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "image must end in a 16-character lowercase hex fingerprint"
+    );
+    Ok(fingerprint)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectSpec {
+    project: Project,
+    repo_root: PathBuf,
+    paths: RunPaths,
+    ports: PortMap,
+    endpoints: EndpointMap,
+    images: ImageMap,
+}
+
+impl ProjectSpec {
+    fn from_metadata(metadata: &StackMetadata, images: ImageMap) -> Self {
+        Self {
+            project: metadata.project.clone(),
+            repo_root: metadata.repo_root.clone(),
+            paths: metadata.paths.clone(),
+            ports: metadata.ports,
+            endpoints: metadata.endpoints.clone(),
+            images,
+        }
+    }
+
+    pub fn project(&self) -> &Project {
+        &self.project
+    }
+
+    pub fn repo_root(&self) -> &Path {
+        &self.repo_root
+    }
+
+    pub fn paths(&self) -> &RunPaths {
+        &self.paths
+    }
+
+    pub fn ports(&self) -> PortMap {
+        self.ports
+    }
+
+    pub fn endpoints(&self) -> &EndpointMap {
+        &self.endpoints
+    }
+
+    pub fn images(&self) -> &ImageMap {
+        &self.images
+    }
+
+    pub fn managed_environment(&self) -> Result<BTreeMap<String, String>> {
+        let wallet_database = self
+            .paths
+            .wallet_database
+            .to_str()
+            .context("wallet database path is not UTF-8")?;
+        let settings_file = self
+            .paths
+            .settings_file
+            .to_str()
+            .context("settings path is not UTF-8")?;
+
+        Ok(BTreeMap::from([
+            ("COMPOSE_PROJECT_NAME".into(), self.project.to_string()),
+            ("ML_TEST_PROJECT".into(), self.project.to_string()),
+            (
+                "ML_TEST_MERCURY_URL".into(),
+                self.endpoints.mercury_url.clone(),
+            ),
+            (
+                "ML_TEST_LOCKBOX_URL".into(),
+                self.endpoints.lockbox_url.clone(),
+            ),
+            (
+                "ML_TEST_CORE_RPC_URL".into(),
+                self.endpoints.core_rpc_url.clone(),
+            ),
+            (
+                "ML_TEST_MERCURY_DATABASE_URL".into(),
+                self.endpoints.mercury_database_url.clone(),
+            ),
+            (
+                "ML_TEST_LOCKBOX_DATABASE_URL".into(),
+                self.endpoints.lockbox_database_url.clone(),
+            ),
+            ("ML_TEST_WALLET_NAME".into(), "mercury_test".into()),
+            ("ML_TEST_WALLET_DB".into(), wallet_database.into()),
+            (
+                "ML_TEST_CORE_RPC_PORT".into(),
+                self.ports.core_rpc.to_string(),
+            ),
+            (
+                "ML_TEST_CORE_P2P_PORT".into(),
+                self.ports.core_p2p.to_string(),
+            ),
+            ("ML_TEST_VAULT_PORT".into(), self.ports.vault.to_string()),
+            (
+                "ML_TEST_LOCKBOX_PORT".into(),
+                self.ports.lockbox.to_string(),
+            ),
+            ("ML_TEST_TOKEN_PORT".into(), self.ports.token.to_string()),
+            (
+                "ML_TEST_MERCURY_PORT".into(),
+                self.ports.mercury.to_string(),
+            ),
+            (
+                "ML_TEST_LOCKBOX_DB_PORT".into(),
+                self.ports.lockbox_database.to_string(),
+            ),
+            (
+                "ML_TEST_MERCURY_DB_PORT".into(),
+                self.ports.mercury_database.to_string(),
+            ),
+            ("ML_TEST_MERCURY_IMAGE".into(), self.images.mercury.clone()),
+            ("ML_TEST_TOKEN_IMAGE".into(), self.images.token.clone()),
+            ("ML_TEST_LOCKBOX_IMAGE".into(), self.images.lockbox.clone()),
+            (
+                "ML_TEST_LOCKBOX_RNG_IMAGE".into(),
+                self.images.lockbox_rng.clone(),
+            ),
+            ("ML_SETTINGS_FILE".into(), settings_file.into()),
+            ("ML_NETWORK".into(), "regtest".into()),
+            ("RUSTUP_TOOLCHAIN".into(), "1.92.0".into()),
+        ]))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ComponentConfig {
     pub service: &'static str,
@@ -398,6 +584,10 @@ impl StackMetadata {
 
     pub fn endpoints(&self) -> &EndpointMap {
         &self.endpoints
+    }
+
+    pub fn project_spec(&self, images: ImageMap) -> ProjectSpec {
+        ProjectSpec::from_metadata(self, images)
     }
 
     pub fn settings_contents(&self) -> Result<String> {
@@ -681,5 +871,117 @@ mod tests {
                 ImageRole::Mercury,
             ]
         );
+    }
+
+    #[test]
+    fn explicit_images_and_managed_environment_round_trip_through_stack_config() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .canonicalize()
+            .unwrap();
+        let project = Project::parse("workflow_roundtrip").unwrap();
+        let metadata = StackMetadata::new(
+            &repo_root,
+            project.clone(),
+            PortMap::from_base(23000).unwrap(),
+        );
+        let images = ImageMap::new(
+            &project,
+            "mercurylayer/mercury-server:bip448-test-0123456789abcdef",
+            "mercurylayer/token-server-v2:bip448-test-1111111111111111",
+            "mercurylayer/lockbox:bip448-test-abcdef0123456789",
+            "mercurylayer/lockbox:bip448-test-abcdef0123456789-rng-workflow_roundtrip",
+        )
+        .unwrap();
+        let spec = metadata.project_spec(images);
+        let environment = spec.managed_environment().unwrap();
+
+        assert_eq!(environment.len(), 24);
+        assert_eq!(environment["COMPOSE_PROJECT_NAME"], "workflow_roundtrip");
+        assert_eq!(environment["ML_TEST_MERCURY_PORT"], "23000");
+        assert_eq!(environment["ML_TEST_TOKEN_PORT"], "23001");
+        assert_eq!(environment["ML_TEST_LOCKBOX_PORT"], "23002");
+        assert_eq!(environment["ML_TEST_MERCURY_DB_PORT"], "23003");
+        assert_eq!(environment["ML_TEST_LOCKBOX_DB_PORT"], "23004");
+        assert_eq!(environment["ML_TEST_CORE_RPC_PORT"], "23005");
+        assert_eq!(environment["ML_TEST_CORE_P2P_PORT"], "23006");
+        assert_eq!(environment["ML_TEST_VAULT_PORT"], "23007");
+        assert_eq!(spec.repo_root(), repo_root);
+
+        let stack = crate::stack::StackConfig::from_env_map(&environment).unwrap();
+        assert_eq!(stack.project(), spec.project().as_str());
+        assert_eq!(stack.mercury_url(), spec.endpoints().mercury_url);
+        assert_eq!(stack.wallet_db(), spec.paths().wallet_database);
+        assert_eq!(stack.mercury_image(), spec.images().mercury());
+        assert_eq!(stack.token_image(), spec.images().token());
+        assert_eq!(stack.lockbox_image(), spec.images().lockbox());
+        assert_eq!(stack.lockbox_rng_image(), spec.images().lockbox_rng());
+
+        let command = stack.compose_command(ComposeFile::TokenServers, &["config"]);
+        let compose_environment = command
+            .get_envs()
+            .filter_map(|(key, value)| {
+                value.map(|value| {
+                    (
+                        key.to_str().unwrap().to_owned(),
+                        value.to_str().unwrap().to_owned(),
+                    )
+                })
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(compose_environment.len(), 12);
+        for key in [
+            "ML_TEST_CORE_RPC_PORT",
+            "ML_TEST_CORE_P2P_PORT",
+            "ML_TEST_VAULT_PORT",
+            "ML_TEST_LOCKBOX_PORT",
+            "ML_TEST_TOKEN_PORT",
+            "ML_TEST_MERCURY_PORT",
+            "ML_TEST_LOCKBOX_DB_PORT",
+            "ML_TEST_MERCURY_DB_PORT",
+            "ML_TEST_MERCURY_IMAGE",
+            "ML_TEST_TOKEN_IMAGE",
+            "ML_TEST_LOCKBOX_IMAGE",
+            "ML_TEST_LOCKBOX_RNG_IMAGE",
+        ] {
+            assert_eq!(
+                compose_environment[key], environment[key],
+                "mismatch for {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn image_values_are_explicit_and_project_bound() {
+        let project = Project::parse("images_1").unwrap();
+        let valid = ImageMap::new(
+            &project,
+            "mercurylayer/mercury-server:bip448-test-0123456789abcdef",
+            "mercurylayer/token-server-v2:bip448-test-1111111111111111",
+            "mercurylayer/lockbox:bip448-test-abcdef0123456789",
+            "mercurylayer/lockbox:bip448-test-abcdef0123456789-rng-images_1",
+        )
+        .unwrap();
+        assert_eq!(
+            valid.lockbox_rng(),
+            "mercurylayer/lockbox:bip448-test-abcdef0123456789-rng-images_1"
+        );
+
+        assert!(ImageMap::new(
+            &project,
+            "mercurylayer/mercury-server:bip448-test-ABCDEF0123456789",
+            valid.token(),
+            valid.lockbox(),
+            valid.lockbox_rng(),
+        )
+        .is_err());
+        assert!(ImageMap::new(
+            &project,
+            valid.mercury(),
+            valid.token(),
+            valid.lockbox(),
+            "mercurylayer/lockbox:bip448-test-abcdef0123456789-rng-other",
+        )
+        .is_err());
     }
 }

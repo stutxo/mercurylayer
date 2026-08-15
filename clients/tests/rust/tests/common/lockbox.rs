@@ -213,7 +213,15 @@ pub async fn start_token_stack_lockbox_service(client: &Client) -> Result<()> {
     run_docker_command(
         stack::current().compose_command(
             ComposeFile::TokenServers,
-            &["up", "-d", "--no-deps", "lockbox"],
+            &[
+                "up",
+                "-d",
+                "--no-deps",
+                "--no-build",
+                "--pull",
+                "never",
+                "lockbox",
+            ],
         ),
         "start token-stack lockbox service",
     )?;
@@ -232,7 +240,15 @@ pub async fn start_token_stack_lockbox_database(client: &Client) -> Result<()> {
     run_docker_command(
         stack::current().compose_command(
             ComposeFile::TokenServers,
-            &["up", "-d", "--no-deps", "db_lockbox"],
+            &[
+                "up",
+                "-d",
+                "--no-deps",
+                "--no-build",
+                "--pull",
+                "never",
+                "db_lockbox",
+            ],
         ),
         "start token-stack lockbox database",
     )?;
@@ -271,23 +287,71 @@ pub fn recreate_lockbox_service_with_production_rng() -> Result<()> {
 }
 
 fn run_recreate_lockbox_service_with_rng_seed(rng_seed_hex: Option<&str>) -> Result<()> {
-    let mut command = stack::current().compose_command(
-        ComposeFile::Lockbox,
-        &["up", "-d", "--build", "--force-recreate", "lockbox"],
-    );
-
     match rng_seed_hex {
         Some(seed) => {
-            command.env("LOCKBOX_ENABLE_TEST_RNG", "ON");
-            command.env("LOCKBOX_TEST_RNG_SEED", seed);
+            if seed.len() != 64
+                || !seed
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(anyhow!(
+                    "deterministic lockbox RNG seed must match ^[0-9a-f]{{64}}$"
+                ));
+            }
+
+            let stack = stack::current();
+            let mut build = stack.compose_command(ComposeFile::Lockbox, &["build", "lockbox"]);
+            build
+                .env("ML_TEST_LOCKBOX_IMAGE", stack.lockbox_rng_image())
+                .env("LOCKBOX_ENABLE_TEST_RNG", "ON")
+                .env("LOCKBOX_TEST_RNG_SEED", seed);
+            run_docker_command(build, "build deterministic lockbox service")?;
+
+            let mut recreate = stack.compose_command(
+                ComposeFile::Lockbox,
+                &[
+                    "up",
+                    "-d",
+                    "--no-deps",
+                    "--no-build",
+                    "--pull",
+                    "never",
+                    "--force-recreate",
+                    "lockbox",
+                ],
+            );
+            recreate
+                .env("ML_TEST_LOCKBOX_IMAGE", stack.lockbox_rng_image())
+                .env("LOCKBOX_ENABLE_TEST_RNG", "ON")
+                .env("LOCKBOX_TEST_RNG_SEED", seed);
+            run_docker_command(recreate, "recreate deterministic lockbox service")
         }
         None => {
-            command.env_remove("LOCKBOX_ENABLE_TEST_RNG");
-            command.env_remove("LOCKBOX_TEST_RNG_SEED");
+            let stack = stack::current();
+            let mut inspect = Command::new("docker");
+            inspect.args(["image", "inspect", stack.lockbox_image()]);
+            run_docker_command(inspect, "inspect lockbox production image")?;
+
+            let mut recreate = stack.compose_command(
+                ComposeFile::Lockbox,
+                &[
+                    "up",
+                    "-d",
+                    "--no-deps",
+                    "--no-build",
+                    "--pull",
+                    "never",
+                    "--force-recreate",
+                    "lockbox",
+                ],
+            );
+            recreate
+                .env("ML_TEST_LOCKBOX_IMAGE", stack.lockbox_image())
+                .env("LOCKBOX_ENABLE_TEST_RNG", "OFF")
+                .env("LOCKBOX_TEST_RNG_SEED", "");
+            run_docker_command(recreate, "restore lockbox production service")
         }
     }
-
-    run_docker_command(command, "recreate lockbox service")
 }
 
 pub async fn keyupdate(

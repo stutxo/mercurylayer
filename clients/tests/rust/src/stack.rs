@@ -35,6 +35,8 @@ const REQUIRED_NON_TEST_KEYS: [&str; 4] = [
     "RUSTUP_TOOLCHAIN",
 ];
 
+const RUSTUP_CANONICAL_TOOLCHAIN_1_92_0: &str = "1.92.0-x86_64-unknown-linux-gnu";
+
 const SERVICES: [&str; 8] = [
     "db_server",
     "db_lockbox",
@@ -114,7 +116,7 @@ impl StackConfig {
         Self::from_env_map(&env)
     }
 
-    fn from_env_map(env: &BTreeMap<String, String>) -> Result<Self> {
+    pub(crate) fn from_env_map(env: &BTreeMap<String, String>) -> Result<Self> {
         for name in env.keys().filter(|name| name.starts_with("ML_TEST_")) {
             if !MANAGED_KEYS.contains(&name.as_str()) {
                 bail!("unknown managed stack variable {name}");
@@ -419,7 +421,10 @@ fn validate_project(project: &str) -> Result<()> {
 }
 
 fn require_value(env: &BTreeMap<String, String>, name: &str, expected: &str) -> Result<()> {
-    if env.get(name).map(String::as_str) != Some(expected) {
+    let actual = env.get(name).map(String::as_str);
+    if actual != Some(expected)
+        && !(name == "RUSTUP_TOOLCHAIN" && actual == Some(RUSTUP_CANONICAL_TOOLCHAIN_1_92_0))
+    {
         bail!("{name} must equal {expected:?}");
     }
     Ok(())
@@ -465,10 +470,8 @@ fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
 #[rustfmt::skip]
 mod tests {
     use super::*;
-
     fn managed(project: &str) -> BTreeMap<String, String> {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../..").canonicalize().unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..").canonicalize().unwrap();
         let run = root.join("target/bip448-runs").join(project);
         BTreeMap::from([
             ("COMPOSE_PROJECT_NAME".into(), project.into()),
@@ -497,7 +500,6 @@ mod tests {
             ("RUSTUP_TOOLCHAIN".into(), "1.92.0".into()),
         ])
     }
-
     #[test]
     fn unmanaged_defaults_are_exact() {
         let c = StackConfig::from_env_map(&BTreeMap::new()).unwrap();
@@ -510,7 +512,6 @@ mod tests {
         assert_eq!((c.mercury_image(), c.token_image(), c.lockbox_image(), c.lockbox_rng_image()), ("mercurylayer/mercury-server:bip448-test-local", "mercurylayer/token-server-v2:bip448-test-local", "mercurylayer/lockbox:bip448-test-local", "mercurylayer/lockbox:bip448-test-local-rng-mercurylayer"));
         assert!(c.token_compose_file().is_absolute() && c.lockbox_compose_file().is_absolute());
     }
-
     #[test]
     fn unmanaged_project_override_preserves_every_default() {
         let mut expected = StackConfig::from_env_map(&BTreeMap::new()).unwrap();
@@ -518,7 +519,6 @@ mod tests {
         let env = BTreeMap::from([("COMPOSE_PROJECT_NAME".into(), "manual_1".into())]);
         assert_eq!(StackConfig::from_env_map(&env).unwrap(), expected);
     }
-
     #[test]
     fn complete_managed_values_round_trip_to_getters() {
         let env = managed("roundtrip");
@@ -532,7 +532,25 @@ mod tests {
         assert_eq!(c.token_compose_file(), c.repo_root().join("docker-compose-token-servers.yml"));
         assert_eq!(c.lockbox_compose_file(), c.repo_root().join("docker-compose-lockbox.yml"));
     }
-
+    #[test]
+    fn managed_rustup_toolchain_is_exactly_version_1_92_0() {
+        let mut canonical = managed("canonical_toolchain");
+        canonical.insert("RUSTUP_TOOLCHAIN".into(), RUSTUP_CANONICAL_TOOLCHAIN_1_92_0.into());
+        assert!(StackConfig::from_env_map(&canonical).is_ok());
+        for rejected in [
+            "stable-x86_64-unknown-linux-gnu",
+            "nightly-x86_64-unknown-linux-gnu",
+            "1.93.1-x86_64-unknown-linux-gnu",
+            "1.92.0-aarch64-unknown-linux-gnu",
+        ] {
+            let mut env = managed("wrong_toolchain");
+            env.insert("RUSTUP_TOOLCHAIN".into(), rejected.into());
+            assert!(
+                StackConfig::from_env_map(&env).is_err(),
+                "accepted {rejected:?}"
+            );
+        }
+    }
     #[test]
     fn project_validation_is_exact() {
         for project in ["a".to_owned(), "a".repeat(63)] {
@@ -548,35 +566,24 @@ mod tests {
             &"a".repeat(64),
         ] {
             let env = BTreeMap::from([("COMPOSE_PROJECT_NAME".into(), project.into())]);
-            assert!(
-                StackConfig::from_env_map(&env).is_err(),
-                "accepted {project:?}"
-            );
+            assert!(StackConfig::from_env_map(&env).is_err(), "accepted {project:?}");
         }
     }
-
     #[test]
     fn partial_or_mismatched_managed_environment_is_rejected() {
-        let partial = BTreeMap::from([(
-            "ML_TEST_MERCURY_URL".into(),
-            "http://127.0.0.1:23000".into(),
-        )]);
+        let partial = BTreeMap::from([("ML_TEST_MERCURY_URL".into(), "http://127.0.0.1:23000".into(),)]);
         assert!(StackConfig::from_env_map(&partial).is_err());
         let unknown = BTreeMap::from([("ML_TEST_UNKNOWN".into(), "value".into())]);
         assert!(StackConfig::from_env_map(&unknown).is_err());
         for missing in MANAGED_KEYS.into_iter().chain(REQUIRED_NON_TEST_KEYS) {
             let mut env = managed("partial");
             env.remove(missing);
-            assert!(
-                StackConfig::from_env_map(&env).is_err(),
-                "accepted missing {missing}"
-            );
+            assert!(StackConfig::from_env_map(&env).is_err(), "accepted missing {missing}");
         }
         let mut env = managed("one");
         env.insert("COMPOSE_PROJECT_NAME".into(), "two".into());
         assert!(StackConfig::from_env_map(&env).is_err());
     }
-
     #[test]
     fn invalid_ports_endpoints_and_database_urls_are_rejected() {
         let mut port = managed("ports");
@@ -599,7 +606,6 @@ mod tests {
             assert!(StackConfig::from_env_map(&env).is_err(), "accepted {key}");
         }
     }
-
     #[test]
     fn invalid_images_and_run_paths_are_rejected() {
         for (key, value) in [
@@ -634,7 +640,6 @@ mod tests {
             assert!(StackConfig::from_env_map(&env).is_err(), "accepted {key}");
         }
     }
-
     #[test]
     fn artifact_paths_are_unambiguous() {
         let c = StackConfig::from_env_map(&managed("artifacts")).unwrap();
@@ -648,7 +653,6 @@ mod tests {
             ]
         );
     }
-
     #[test]
     fn compose_command_is_explicit_and_ordered() {
         let c = StackConfig::from_env_map(&managed("command")).unwrap();
@@ -681,10 +685,9 @@ mod tests {
         assert_eq!(explicit.len(), 12);
         assert_eq!(explicit["ML_TEST_MERCURY_PORT"], "23000");
         assert_eq!(explicit["ML_TEST_LOCKBOX_DB_PORT"], "23004");
-        assert_eq!(explicit["ML_TEST_MERCURY_IMAGE"], c.mercury_image());
+        assert_eq!((explicit["ML_TEST_MERCURY_IMAGE"], explicit["ML_TEST_TOKEN_IMAGE"], explicit["ML_TEST_LOCKBOX_IMAGE"]), (c.mercury_image(), c.token_image(), c.lockbox_image()));
         assert_eq!(explicit["ML_TEST_LOCKBOX_RNG_IMAGE"], c.lockbox_rng_image());
     }
-
     #[test]
     fn unknown_service_is_rejected_before_docker() {
         let c = StackConfig::from_env_map(&BTreeMap::new()).unwrap();
