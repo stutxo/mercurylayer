@@ -105,6 +105,19 @@ pub fn test_count() -> usize {
     MATRIX.iter().map(|entry| entry.tests.len()).sum()
 }
 
+pub(super) fn select(target: &str, identity: &str) -> Result<&'static MatrixTarget, String> {
+    let entry = MATRIX
+        .iter()
+        .find(|entry| entry.target == target)
+        .ok_or_else(|| format!("test binary {target:?} is not in the frozen BIP448 matrix"))?;
+    if !entry.tests.contains(&identity) {
+        return Err(format!(
+            "test identity {identity:?} is not frozen for BIP448 binary {target:?}"
+        ));
+    }
+    Ok(entry)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -156,5 +169,17 @@ mod tests {
             }
         }
         assert_eq!(identities.len(), 58);
+    }
+
+    #[test]
+    fn selection_requires_an_exact_matrix_pair() {
+        let selected = select(
+            "bip448_primitive_spike",
+            "bip448_template_signature_rebinds_prevout_on_inquisition",
+        )
+        .unwrap();
+        assert_eq!(selected, &MATRIX[1]);
+        assert!(select("not_a_binary", selected.tests[0]).is_err());
+        assert!(select(selected.target, "substring").is_err());
     }
 }

@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 
 use super::error::WorkflowError;
+use super::matrix;
 use super::model::{PortMap, Project};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,6 +28,15 @@ pub enum Command {
     },
     Down {
         project: Project,
+    },
+    Bootstrap {
+        project: Project,
+        require_zero: bool,
+    },
+    Test {
+        project: Project,
+        target: String,
+        test: String,
     },
 }
 
@@ -83,10 +93,70 @@ where
         "ready" => parse_project_command(&args[1..], |project| Command::Ready { project }),
         "status" => parse_project_command(&args[1..], |project| Command::Status { project }),
         "down" => parse_project_command(&args[1..], |project| Command::Down { project }),
+        "bootstrap" => parse_bootstrap(&args[1..]),
+        "test" => parse_test(&args[1..]),
         other => Err(WorkflowError::usage(format!(
             "unknown or malformed command {other:?}"
         ))),
     }
+}
+
+fn parse_bootstrap(args: &[String]) -> Result<Command, WorkflowError> {
+    if args == ["--help"] {
+        return Ok(Command::Help);
+    }
+    let mut project = None;
+    let mut require_zero = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--project" => {
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with("--"))
+                    .ok_or_else(|| WorkflowError::usage("--project requires a value"))?;
+                if project.replace(value.clone()).is_some() {
+                    return Err(WorkflowError::usage("--project may be specified only once"));
+                }
+                index += 2;
+            }
+            "--require-zero" => {
+                if require_zero {
+                    return Err(WorkflowError::usage(
+                        "--require-zero may be specified only once",
+                    ));
+                }
+                require_zero = true;
+                index += 1;
+            }
+            name => {
+                return Err(WorkflowError::usage(format!(
+                    "unknown bootstrap option {name:?}"
+                )));
+            }
+        }
+    }
+    let project =
+        project.ok_or_else(|| WorkflowError::usage("required option --project is missing"))?;
+    Ok(Command::Bootstrap {
+        project: Project::parse(&project).map_err(WorkflowError::usage)?,
+        require_zero,
+    })
+}
+
+fn parse_test(args: &[String]) -> Result<Command, WorkflowError> {
+    if args == ["--help"] {
+        return Ok(Command::Help);
+    }
+    let options = parse_options(args, &["--project", "--target", "--test"])?;
+    let target = options["--target"].clone();
+    let test = options["--test"].clone();
+    matrix::select(&target, &test).map_err(WorkflowError::usage)?;
+    Ok(Command::Test {
+        project: required_project(&options)?,
+        target,
+        test,
+    })
 }
 
 fn parse_build(args: &[String]) -> Result<Command, WorkflowError> {
@@ -196,6 +266,36 @@ mod tests {
             }
         );
         assert_eq!(
+            parse(args(&[
+                "bootstrap",
+                "--require-zero",
+                "--project",
+                "matrix_1",
+            ]))
+            .unwrap(),
+            Command::Bootstrap {
+                project: Project::parse("matrix_1").unwrap(),
+                require_zero: true,
+            }
+        );
+        assert_eq!(
+            parse(args(&[
+                "test",
+                "--test",
+                "bip448_template_signature_rebinds_prevout_on_inquisition",
+                "--project",
+                "matrix_1",
+                "--target",
+                "bip448_primitive_spike",
+            ]))
+            .unwrap(),
+            Command::Test {
+                project: Project::parse("matrix_1").unwrap(),
+                target: "bip448_primitive_spike".into(),
+                test: "bip448_template_signature_rebinds_prevout_on_inquisition".into(),
+            }
+        );
+        assert_eq!(
             parse(args(&["status", "--project", "matrix_1"])).unwrap(),
             Command::Status {
                 project: Project::parse("matrix_1").unwrap()
@@ -270,6 +370,33 @@ mod tests {
             vec!["status", "--project", "has.dot"],
             vec!["build", "--project", "ok", "--service", "unknown"],
             vec!["build", "--project", "ok"],
+            vec![
+                "bootstrap",
+                "--project",
+                "ok",
+                "--require-zero",
+                "--require-zero",
+            ],
+            vec!["bootstrap", "--project", "ok", "unexpected"],
+            vec!["bootstrap", "--project", "--require-zero", "ok"],
+            vec![
+                "test",
+                "--project",
+                "ok",
+                "--target",
+                "unknown",
+                "--test",
+                "nope",
+            ],
+            vec![
+                "test",
+                "--project",
+                "ok",
+                "--target",
+                "bip448_primitive_spike",
+                "--test",
+                "nope",
+            ],
         ] {
             let error = parse(args(&values)).unwrap_err();
             assert!(error.is_usage(), "accepted or misclassified {values:?}");

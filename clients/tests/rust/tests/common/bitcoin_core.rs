@@ -10,6 +10,44 @@ use super::stack;
 
 const BITCOIN_CLI: &str = "bitcoin-cli -regtest -rpcuser=mercury -rpcpassword=mercury";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WalletReadinessBalanceDecision {
+    NeedsBootstrap,
+    Ready,
+}
+
+fn wallet_readiness_balance_decision(output: &str) -> Result<WalletReadinessBalanceDecision> {
+    let value = output.trim_matches(|character: char| character.is_ascii_whitespace());
+    if value.is_empty() {
+        return Err(anyhow!(
+            "Bitcoin Core returned an empty confirmed spendable wallet balance"
+        ));
+    }
+    let balance = value.parse::<f64>().map_err(|error| {
+        anyhow!(
+            "Bitcoin Core returned invalid confirmed spendable wallet balance {value:?}: {error}"
+        )
+    })?;
+    if !balance.is_finite() || balance.is_sign_negative() {
+        return Err(anyhow!(
+            "Bitcoin Core returned invalid confirmed spendable wallet balance {value:?}"
+        ));
+    }
+    if balance == 0.0 {
+        Ok(WalletReadinessBalanceDecision::NeedsBootstrap)
+    } else {
+        Ok(WalletReadinessBalanceDecision::Ready)
+    }
+}
+
+fn confirmed_spendable_wallet_balance() -> Result<WalletReadinessBalanceDecision> {
+    let wallet_name = stack::current().wallet_name();
+    let output = execute_bitcoin_command(&format!(
+        "{BITCOIN_CLI} -rpcwallet={wallet_name} getbalance \"*\" 1 false"
+    ))?;
+    wallet_readiness_balance_decision(&output)
+}
+
 pub fn get_container_id() -> Result<String> {
     stack::current().service_container_id("inquisition")
 }
@@ -63,7 +101,18 @@ pub fn ensure_wallet_loaded() -> Result<()> {
 
 pub fn ensure_wallet_ready() -> Result<()> {
     ensure_wallet_loaded()?;
-    mine_blocks(101)
+    if confirmed_spendable_wallet_balance()? == WalletReadinessBalanceDecision::Ready {
+        return Ok(());
+    }
+
+    mine_blocks(101)?;
+    if confirmed_spendable_wallet_balance()? != WalletReadinessBalanceDecision::Ready {
+        return Err(anyhow!(
+            "Bitcoin Core wallet has no positive confirmed spendable balance after mining 101 blocks"
+        ));
+    }
+
+    Ok(())
 }
 
 pub fn mine_block() -> Result<()> {
@@ -235,4 +284,33 @@ pub fn assert_confirmed(txid: &Txid) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wallet_readiness_balance_decision_is_exact() {
+        for value in ["0", "0.0", " \t0.00000000\r\n"] {
+            assert_eq!(
+                wallet_readiness_balance_decision(value).unwrap(),
+                WalletReadinessBalanceDecision::NeedsBootstrap,
+                "zero balance {value:?} must require bootstrap"
+            );
+        }
+        for value in ["1", "0.00000001", " \t1.25000000\r\n"] {
+            assert_eq!(
+                wallet_readiness_balance_decision(value).unwrap(),
+                WalletReadinessBalanceDecision::Ready,
+                "positive balance {value:?} must be ready"
+            );
+        }
+        for value in ["", " \t\r\n", "-1", "-0", "alphabetic", "NaN", "inf"] {
+            assert!(
+                wallet_readiness_balance_decision(value).is_err(),
+                "invalid balance {value:?} must fail"
+            );
+        }
+    }
 }

@@ -22,7 +22,7 @@ use anyhow::{bail, ensure, Context, Result};
 
 use super::argv::{CommandRunner, SystemCommandRunner};
 use super::build::{self, VerifiedBuild};
-use super::model::StackMetadata;
+use super::model::{ProjectSpec, StackMetadata};
 use contract::{
     expected_from_metadata, expected_from_verified, image_map, image_map_from_metadata,
 };
@@ -80,6 +80,10 @@ pub(super) fn down(repo_root: &Path, metadata: &StackMetadata) -> Result<StatusR
     let mut runner = SystemCommandRunner;
     let mut host = SystemHostProbe::new();
     down_with(repo_root, metadata, &mut runner, &mut host)
+}
+
+pub(super) fn project_spec(metadata: &StackMetadata) -> Result<ProjectSpec> {
+    Ok(metadata.project_spec(image_map_from_metadata(metadata)?))
 }
 
 fn up_with<R, H, V>(

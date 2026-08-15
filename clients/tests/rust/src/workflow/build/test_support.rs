@@ -116,6 +116,7 @@ impl MockRunner {
         CommandOutput {
             success: true,
             code: Some(0),
+            signal: None,
             stdout: stdout.into(),
             stderr: Vec::new(),
         }
@@ -125,6 +126,7 @@ impl MockRunner {
         CommandOutput {
             success: false,
             code: Some(1),
+            signal: None,
             stdout: Vec::new(),
             stderr: stderr.into(),
         }

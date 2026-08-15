@@ -1,5 +1,6 @@
 use anyhow::Context;
 
+use super::bootstrap;
 use super::build::{self, SystemCommandRunner};
 use super::cli::Command;
 use super::doctor;
@@ -8,6 +9,7 @@ use super::lifecycle;
 use super::model::canonical_json;
 use super::repository;
 use super::storage;
+use super::test_runner;
 use super::USAGE;
 
 pub async fn execute(command: Command) -> Result<String, WorkflowError> {
@@ -57,6 +59,25 @@ pub async fn execute(command: Command) -> Result<String, WorkflowError> {
             let metadata = storage::status(&root, &project)
                 .context("read configured BIP448 lifecycle metadata")?;
             canonical_json(&lifecycle::down(&root, &metadata)?).map_err(WorkflowError::from)
+        }
+        Command::Bootstrap {
+            project,
+            require_zero,
+        } => {
+            let root = repository::active_root()?;
+            let metadata = storage::status(&root, &project)
+                .context("read configured BIP448 bootstrap metadata")?;
+            bootstrap::execute(&root, &metadata, require_zero)
+        }
+        Command::Test {
+            project,
+            target,
+            test,
+        } => {
+            let root = repository::active_root()?;
+            let metadata =
+                storage::status(&root, &project).context("read configured BIP448 test metadata")?;
+            test_runner::execute(&root, &metadata, &target, &test)
         }
     }
 }

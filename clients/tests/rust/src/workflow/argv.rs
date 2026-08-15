@@ -5,6 +5,9 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
+
 use anyhow::{Context, Result};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -13,6 +16,7 @@ pub(super) struct ArgvCommand {
     pub(super) args: Vec<OsString>,
     pub(super) current_dir: PathBuf,
     pub(super) environment: BTreeMap<OsString, OsString>,
+    pub(super) clear_environment: bool,
 }
 
 impl ArgvCommand {
@@ -22,6 +26,7 @@ impl ArgvCommand {
             args: Vec::new(),
             current_dir: current_dir.to_path_buf(),
             environment: BTreeMap::new(),
+            clear_environment: false,
         }
     }
 
@@ -44,6 +49,25 @@ impl ArgvCommand {
         self
     }
 
+    pub(super) fn envs<I, K, V>(mut self, environment: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<OsString>,
+        V: Into<OsString>,
+    {
+        self.environment.extend(
+            environment
+                .into_iter()
+                .map(|(name, value)| (name.into(), value.into())),
+        );
+        self
+    }
+
+    pub(super) fn clear_environment(mut self) -> Self {
+        self.clear_environment = true;
+        self
+    }
+
     #[cfg(test)]
     pub(super) fn program(&self) -> &OsStr {
         &self.program
@@ -53,12 +77,18 @@ impl ArgvCommand {
     pub(super) fn args_slice(&self) -> &[OsString] {
         &self.args
     }
+
+    #[cfg(test)]
+    pub(super) fn environment_is_cleared(&self) -> bool {
+        self.clear_environment
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct CommandOutput {
     pub(super) success: bool,
     pub(super) code: Option<i32>,
+    pub(super) signal: Option<i32>,
     pub(super) stdout: Vec<u8>,
     pub(super) stderr: Vec<u8>,
 }
@@ -69,6 +99,7 @@ impl CommandOutput {
         Self {
             success: true,
             code: Some(0),
+            signal: None,
             stdout: stdout.into(),
             stderr: Vec::new(),
         }
@@ -79,6 +110,7 @@ impl CommandOutput {
         Self {
             success: false,
             code: Some(code),
+            signal: None,
             stdout: Vec::new(),
             stderr: stderr.into(),
         }
@@ -93,15 +125,24 @@ pub(super) struct SystemCommandRunner;
 
 impl CommandRunner for SystemCommandRunner {
     fn run(&mut self, command: &ArgvCommand) -> Result<CommandOutput> {
-        let output = Command::new(&command.program)
+        let mut process = Command::new(&command.program);
+        process
             .args(&command.args)
-            .current_dir(&command.current_dir)
+            .current_dir(&command.current_dir);
+        if command.clear_environment {
+            process.env_clear();
+        }
+        let output = process
             .envs(&command.environment)
             .output()
             .with_context(|| format!("execute argv command {command:?}"))?;
         Ok(CommandOutput {
             success: output.status.success(),
             code: output.status.code(),
+            #[cfg(unix)]
+            signal: output.status.signal(),
+            #[cfg(not(unix))]
+            signal: None,
             stdout: output.stdout,
             stderr: output.stderr,
         })

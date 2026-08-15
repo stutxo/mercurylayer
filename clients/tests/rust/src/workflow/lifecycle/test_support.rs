@@ -362,6 +362,7 @@ impl CommandRunner for MockDocker {
                 Ok(CommandOutput {
                     success: false,
                     code: Some(2),
+                    signal: None,
                     stdout: b"127.0.0.1:5432 - no response\n".to_vec(),
                     stderr: Vec::new(),
                 })
