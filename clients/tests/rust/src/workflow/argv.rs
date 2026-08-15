@@ -3,14 +3,19 @@ use std::collections::BTreeMap;
 #[cfg(test)]
 use std::ffi::OsStr;
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::Duration;
 
 #[cfg(unix)]
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+use super::supervision;
 
 thread_local! {
     static FAILURE_CAPTURE: RefCell<Option<Option<ChildFailure>>> = const { RefCell::new(None) };
@@ -190,24 +195,186 @@ impl CommandRunner for SystemCommandRunner {
         let mut process = Command::new(&command.program);
         process
             .args(&command.args)
-            .current_dir(&command.current_dir);
+            .current_dir(&command.current_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
         if command.clear_environment {
             process.env_clear();
         }
-        let output = process
+        let child = process
             .envs(&command.environment)
-            .output()
+            .spawn()
             .with_context(|| format!("execute argv command {command:?}"))?;
+        let mut child = SupervisedChild::new(child)?;
+        let stdout = child
+            .child
+            .stdout
+            .take()
+            .context("supervised child stdout was not piped")?;
+        let stderr = child
+            .child
+            .stderr
+            .take()
+            .context("supervised child stderr was not piped")?;
+        let stdout = thread::Builder::new()
+            .name("bip448-child-stdout".into())
+            .spawn(move || drain(stdout))
+            .context("spawn supervised stdout drain")?;
+        let stderr = thread::Builder::new()
+            .name("bip448-child-stderr".into())
+            .spawn(move || drain(stderr))
+            .context("spawn supervised stderr drain")?;
+        let process_group = child.process_group;
+        let state = supervision::active();
+        let (status, forwarded) = wait(&mut child.child, process_group, state.as_deref())
+            .with_context(|| format!("wait for supervised argv command {command:?}"))?;
+        wait_for_process_group_exit(process_group)?;
+        child.complete = true;
+        let stdout = join_drain(stdout, "stdout")?;
+        let stderr = join_drain(stderr, "stderr")?;
         let output = CommandOutput {
-            success: output.status.success(),
-            code: output.status.code(),
+            success: forwarded.is_none() && status.success(),
+            code: if forwarded.is_some() {
+                None
+            } else {
+                status.code()
+            },
             #[cfg(unix)]
-            signal: output.status.signal(),
+            signal: forwarded.or_else(|| status.signal()),
             #[cfg(not(unix))]
             signal: None,
-            stdout: output.stdout,
-            stderr: output.stderr,
+            stdout,
+            stderr,
         };
+        if forwarded.is_some() {
+            record_failure(command, &output);
+        }
         Ok(output)
     }
+}
+
+struct SupervisedChild {
+    child: Child,
+    process_group: i32,
+    complete: bool,
+}
+
+impl SupervisedChild {
+    fn new(mut child: Child) -> Result<Self> {
+        let process_group = match i32::try_from(child.id()) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error).context("supervised child PID exceeds i32");
+            }
+        };
+        Ok(Self {
+            child,
+            process_group,
+            complete: false,
+        })
+    }
+}
+
+impl Drop for SupervisedChild {
+    fn drop(&mut self) {
+        if self.complete {
+            return;
+        }
+        // Fail closed after an internal supervision error. An incoming SIGKILL
+        // cannot be handled, forwarded, or represented as durable evidence.
+        unsafe {
+            kill(-self.process_group, SIGKILL);
+        }
+        let _ = self.child.wait();
+        let _ = wait_for_process_group_exit(self.process_group);
+    }
+}
+
+fn wait(
+    child: &mut std::process::Child,
+    process_group: i32,
+    state: Option<&supervision::SignalState>,
+) -> Result<(ExitStatus, Option<i32>)> {
+    let mut forwarded = None;
+    loop {
+        forward_received(state, process_group, &mut forwarded)?;
+        if let Some(status) = child.try_wait().context("poll supervised child")? {
+            forward_received(state, process_group, &mut forwarded)?;
+            return Ok((status, forwarded));
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn forward_received(
+    state: Option<&supervision::SignalState>,
+    process_group: i32,
+    forwarded: &mut Option<i32>,
+) -> Result<()> {
+    if forwarded.is_some() {
+        return Ok(());
+    }
+    let Some((state, signal)) =
+        state.and_then(|state| state.received().map(|signal| (state, signal)))
+    else {
+        return Ok(());
+    };
+    signal_process_group(process_group, signal)?;
+    state.mark_forwarded(signal);
+    *forwarded = Some(signal);
+    Ok(())
+}
+
+fn drain(mut pipe: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    pipe.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn join_drain(handle: thread::JoinHandle<std::io::Result<Vec<u8>>>, name: &str) -> Result<Vec<u8>> {
+    handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("supervised {name} drain panicked"))?
+        .with_context(|| format!("drain supervised child {name}"))
+}
+
+fn signal_process_group(process_group: i32, signal: i32) -> Result<()> {
+    let result = unsafe { kill(-process_group, signal) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(ESRCH) {
+        return Ok(());
+    }
+    Err(error).with_context(|| {
+        format!("forward signal {signal} to supervised process group {process_group}")
+    })
+}
+
+fn wait_for_process_group_exit(process_group: i32) -> Result<()> {
+    loop {
+        let result = unsafe { kill(-process_group, 0) };
+        if result == 0 {
+            thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(ESRCH) {
+            return Ok(());
+        }
+        return Err(error).with_context(|| {
+            format!("verify supervised process group {process_group} has exited")
+        });
+    }
+}
+
+const ESRCH: i32 = 3;
+const SIGKILL: i32 = 9;
+
+unsafe extern "C" {
+    fn kill(pid: i32, signal: i32) -> i32;
 }

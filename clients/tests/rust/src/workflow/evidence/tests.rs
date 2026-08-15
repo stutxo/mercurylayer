@@ -386,6 +386,85 @@ fn child_exit_uses_matching_signal_or_exit_and_falls_back_to_propagated_status()
     }
 }
 
+#[test]
+fn incomplete_operations_block_five_mutations_but_down_is_separate_and_allowed() {
+    let root = Temp::new();
+    let project = Project::parse("incomplete_gate_1").unwrap();
+    let later = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let earlier = "11111111-2222-4333-8444-555555555555";
+    crash_after_started(&root.0, &project, later, true);
+    crash_after_started(&root.0, &project, earlier, false);
+
+    let expected_ids = format!("{earlier},{later}");
+    for command in ["configure", "build", "up", "bootstrap", "test"] {
+        let error = super::incomplete::reject_mutation(&root.0, &project, command).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(&format!("blocks {command}")));
+        assert!(message.contains(&expected_ids));
+    }
+    super::incomplete::reject_mutation(&root.0, &project, "down").unwrap();
+
+    let down = Operation::start_with(
+        &root.0,
+        &project,
+        "down",
+        vec!["--project".into(), project.to_string()],
+        source(),
+        false,
+        &mut FixedClock(VecDeque::from(["2026-08-15T01:02:05Z"])),
+        &mut FixedId("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
+    )
+    .unwrap();
+    down.finish_with(
+        &Ok("down".into()),
+        None,
+        &mut FixedClock(VecDeque::from(["2026-08-15T01:02:06Z"])),
+    )
+    .unwrap();
+
+    let records = readout::scan(&root.0, &project).unwrap();
+    let incomplete = records
+        .iter()
+        .filter(|record| record.incomplete)
+        .map(|record| record.operation_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(incomplete, [earlier, later]);
+    let down = records
+        .iter()
+        .find(|record| {
+            record
+                .started
+                .as_ref()
+                .is_some_and(|started| started.command == "down")
+        })
+        .unwrap();
+    assert!(!down.incomplete);
+    assert_eq!(
+        down.result.as_ref().unwrap().outcome.kind,
+        OutcomeKind::Success
+    );
+}
+
+fn crash_after_started(root: &Path, project: &Project, id: &'static str, configure: bool) {
+    let root = root.to_path_buf();
+    let project = project.clone();
+    std::thread::spawn(move || {
+        let _operation = Operation::start_with(
+            &root,
+            &project,
+            "test",
+            vec!["--project".into(), project.to_string()],
+            source(),
+            configure,
+            &mut FixedClock(VecDeque::from(["2026-08-15T01:02:03Z"])),
+            &mut FixedId(id),
+        )
+        .unwrap();
+    })
+    .join()
+    .unwrap();
+}
+
 fn child_failure(argv: &[&str], exit_code: Option<i32>, signal: Option<i32>) -> ChildFailure {
     ChildFailure {
         argv: argv.iter().map(|value| (*value).to_owned()).collect(),

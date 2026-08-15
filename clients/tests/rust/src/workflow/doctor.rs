@@ -4,11 +4,11 @@ use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{bail, ensure, Context, Result};
 use serde::Serialize;
 
+use super::argv::{ArgvCommand, CommandRunner, SystemCommandRunner};
 use super::repository;
 
 const REQUIRED_TOOLCHAIN: &str = "1.92.0";
@@ -29,13 +29,18 @@ struct RustToolchainReport {
 }
 
 pub fn run(repo_root: &Path) -> Result<DoctorReport> {
+    let mut runner = SystemCommandRunner;
+    run_with(repo_root, &mut runner)
+}
+
+fn run_with(repo_root: &Path, runner: &mut impl CommandRunner) -> Result<DoctorReport> {
     repository::validate_repo_root(repo_root)?;
     let mut commands = BTreeMap::new();
     for name in REQUIRED_COMMANDS {
         commands.insert((*name).to_owned(), find_command(name)?);
     }
 
-    let rustc_version = inspect_required_toolchain(&commands["rustup"])?;
+    let rustc_version = inspect_required_toolchain(repo_root, &commands["rustup"], runner)?;
     Ok(DoctorReport {
         status: "ok",
         repo_root: repo_root.to_path_buf(),
@@ -72,12 +77,17 @@ fn find_command_in(name: &str, path: &OsStr) -> Result<PathBuf> {
     bail!("required command {name:?} is not available on PATH")
 }
 
-fn inspect_required_toolchain(rustup: &Path) -> Result<String> {
-    let output = Command::new(rustup)
-        .args(["run", REQUIRED_TOOLCHAIN, "rustc", "--version"])
-        .output()
+fn inspect_required_toolchain(
+    repo_root: &Path,
+    rustup: &Path,
+    runner: &mut impl CommandRunner,
+) -> Result<String> {
+    let command =
+        ArgvCommand::new(rustup, repo_root).args(["run", REQUIRED_TOOLCHAIN, "rustc", "--version"]);
+    let output = runner
+        .run(&command)
         .context("inspect required Rust toolchain")?;
-    if !output.status.success() {
+    if !output.success {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
             "Rust toolchain {REQUIRED_TOOLCHAIN} is unavailable: {}",
@@ -112,6 +122,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+    use crate::workflow::argv::CommandOutput;
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -146,5 +157,67 @@ mod tests {
         );
         fs::remove_file(command).unwrap();
         fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn required_toolchain_inspection_uses_the_injected_argv_runner() {
+        let root = Path::new("/controlled/repository");
+        let rustup = Path::new("/controlled/bin/rustup");
+        let mut runner = RecordingRunner::returning(CommandOutput::success(
+            b"rustc 1.92.0 (ded5c06cf 2025-12-08)\n".to_vec(),
+        ));
+
+        assert_eq!(
+            inspect_required_toolchain(root, rustup, &mut runner).unwrap(),
+            "rustc 1.92.0 (ded5c06cf 2025-12-08)"
+        );
+        let command = runner.command.unwrap();
+        assert_eq!(command.program(), rustup.as_os_str());
+        assert_eq!(
+            command.args_slice(),
+            ["run", "1.92.0", "rustc", "--version"]
+        );
+        assert_eq!(command.current_dir, root);
+        assert!(command.environment.is_empty());
+        assert!(!command.environment_is_cleared());
+    }
+
+    #[test]
+    fn required_toolchain_failure_keeps_the_existing_diagnostic() {
+        let mut runner = RecordingRunner::returning(CommandOutput::failure(
+            1,
+            b"toolchain '1.92.0' is not installed\n".to_vec(),
+        ));
+        let error = inspect_required_toolchain(
+            Path::new("/controlled/repository"),
+            Path::new("/controlled/bin/rustup"),
+            &mut runner,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Rust toolchain 1.92.0 is unavailable: toolchain '1.92.0' is not installed"
+        );
+    }
+
+    struct RecordingRunner {
+        output: Option<CommandOutput>,
+        command: Option<ArgvCommand>,
+    }
+
+    impl RecordingRunner {
+        fn returning(output: CommandOutput) -> Self {
+            Self {
+                output: Some(output),
+                command: None,
+            }
+        }
+    }
+
+    impl CommandRunner for RecordingRunner {
+        fn run(&mut self, command: &ArgvCommand) -> Result<CommandOutput> {
+            assert!(self.command.replace(command.clone()).is_none());
+            Ok(self.output.take().unwrap())
+        }
     }
 }

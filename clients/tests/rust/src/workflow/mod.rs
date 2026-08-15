@@ -14,6 +14,7 @@ mod project_lock;
 mod ready_gate;
 mod repository;
 mod storage;
+mod supervision;
 mod test_runner;
 
 use std::ffi::OsString;
@@ -33,7 +34,18 @@ pub async fn run<I>(args: I) -> i32
 where
     I: IntoIterator<Item = OsString>,
 {
-    match run_inner(args).await {
+    let _signals = match supervision::SignalWatch::install() {
+        Ok(signals) => signals,
+        Err(error) => {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "bip448-test: initialize signal-safe child supervision: {error:#}"
+            );
+            return EXIT_FAILURE;
+        }
+    };
+    let result = _signals.scope_workflow(run_inner(args)).await;
+    match result {
         Ok(output) => match write_output(io::stdout().lock(), &output) {
             Ok(()) => EXIT_SUCCESS,
             Err(error) => {
