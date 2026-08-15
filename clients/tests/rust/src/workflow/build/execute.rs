@@ -11,8 +11,8 @@ use super::super::model::{
 use super::fingerprint::{snapshot, BuildSnapshot};
 use super::plan::{plan_build, selected_artifacts, Artifact, PlanAction};
 use super::{
-    run_checked, ArgvCommand, CommandRunner, INQUISITION_BUILD_ARG, INQUISITION_COMMIT,
-    LOCKBOX_BUILD_ARG,
+    run_checked, ArgvCommand, CommandRunner, VerifiedBuild, VerifiedImage, INQUISITION_BUILD_ARG,
+    INQUISITION_COMMIT, LOCKBOX_BUILD_ARG,
 };
 
 pub(super) fn execute(
@@ -170,6 +170,47 @@ pub(super) fn execute(
     ));
     updated.validate(repo_root, metadata.project())?;
     Ok(updated)
+}
+
+pub(super) fn verify_complete(
+    repo_root: &Path,
+    metadata: &StackMetadata,
+    runner: &mut impl CommandRunner,
+) -> Result<VerifiedBuild> {
+    let current = snapshot(repo_root, runner)?;
+    let resolution = metadata
+        .build_resolution()
+        .context("all BIP448 stack images must be resolved before lifecycle operations")?;
+    ensure!(
+        resolution.source() == &current.source
+            && resolution.fingerprints() == &current.fingerprints,
+        "current source does not match the complete build recorded in stack metadata"
+    );
+    validate_recorded_images(repo_root, resolution.images(), runner)?;
+
+    let resolved = resolution.images();
+    let image = |value: &ResolvedImage| VerifiedImage {
+        tag: value.tag().to_owned(),
+        image_id: value.image_id().to_owned(),
+    };
+    let lockbox = resolved
+        .lockbox()
+        .context("lockbox and deterministic RNG images are not resolved")?;
+    Ok(VerifiedBuild {
+        mercury: image(
+            resolved
+                .mercury()
+                .context("Mercury image is not resolved")?,
+        ),
+        token: image(resolved.token().context("token image is not resolved")?),
+        lockbox: image(lockbox.production()),
+        lockbox_rng: image(lockbox.deterministic_rng()),
+        inquisition: image(
+            resolved
+                .inquisition()
+                .context("Inquisition image is not resolved")?,
+        ),
+    })
 }
 
 fn validate_selected_recorded_images(

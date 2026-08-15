@@ -16,7 +16,16 @@ pub enum Command {
         project: Project,
         service: BuildService,
     },
+    Up {
+        project: Project,
+    },
+    Ready {
+        project: Project,
+    },
     Status {
+        project: Project,
+    },
+    Down {
         project: Project,
     },
 }
@@ -70,7 +79,10 @@ where
         }
         "configure" => parse_configure(&args[1..]),
         "build" => parse_build(&args[1..]),
-        "status" => parse_status(&args[1..]),
+        "up" => parse_project_command(&args[1..], |project| Command::Up { project }),
+        "ready" => parse_project_command(&args[1..], |project| Command::Ready { project }),
+        "status" => parse_project_command(&args[1..], |project| Command::Status { project }),
+        "down" => parse_project_command(&args[1..], |project| Command::Down { project }),
         other => Err(WorkflowError::usage(format!(
             "unknown or malformed command {other:?}"
         ))),
@@ -101,14 +113,15 @@ fn parse_configure(args: &[String]) -> Result<Command, WorkflowError> {
     Ok(Command::Configure { project, ports })
 }
 
-fn parse_status(args: &[String]) -> Result<Command, WorkflowError> {
+fn parse_project_command(
+    args: &[String],
+    command: impl FnOnce(Project) -> Command,
+) -> Result<Command, WorkflowError> {
     if args == ["--help"] {
         return Ok(Command::Help);
     }
     let options = parse_options(args, &["--project"])?;
-    Ok(Command::Status {
-        project: required_project(&options)?,
-    })
+    Ok(command(required_project(&options)?))
 }
 
 fn required_project(options: &BTreeMap<String, String>) -> Result<Project, WorkflowError> {
@@ -185,6 +198,24 @@ mod tests {
         assert_eq!(
             parse(args(&["status", "--project", "matrix_1"])).unwrap(),
             Command::Status {
+                project: Project::parse("matrix_1").unwrap()
+            }
+        );
+        assert_eq!(
+            parse(args(&["up", "--project", "matrix_1"])).unwrap(),
+            Command::Up {
+                project: Project::parse("matrix_1").unwrap()
+            }
+        );
+        assert_eq!(
+            parse(args(&["ready", "--project", "matrix_1"])).unwrap(),
+            Command::Ready {
+                project: Project::parse("matrix_1").unwrap()
+            }
+        );
+        assert_eq!(
+            parse(args(&["down", "--project", "matrix_1"])).unwrap(),
+            Command::Down {
                 project: Project::parse("matrix_1").unwrap()
             }
         );

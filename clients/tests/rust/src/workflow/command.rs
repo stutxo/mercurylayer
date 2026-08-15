@@ -4,6 +4,7 @@ use super::build::{self, SystemCommandRunner};
 use super::cli::Command;
 use super::doctor;
 use super::error::WorkflowError;
+use super::lifecycle;
 use super::model::canonical_json;
 use super::repository;
 use super::storage;
@@ -33,11 +34,29 @@ pub async fn execute(command: Command) -> Result<String, WorkflowError> {
                 .context("commit BIP448 build metadata")?;
             canonical_json(&updated).map_err(WorkflowError::from)
         }
+        Command::Up { project } => {
+            let root = repository::active_root()?;
+            let metadata = storage::status(&root, &project)
+                .context("read configured BIP448 lifecycle metadata")?;
+            canonical_json(&lifecycle::up(&root, &metadata)?).map_err(WorkflowError::from)
+        }
+        Command::Ready { project } => {
+            let root = repository::active_root()?;
+            let metadata = storage::status(&root, &project)
+                .context("read configured BIP448 lifecycle metadata")?;
+            canonical_json(&lifecycle::ready(&root, &metadata)?).map_err(WorkflowError::from)
+        }
         Command::Status { project } => {
             let root = repository::active_root()?;
             let metadata =
                 storage::status(&root, &project).context("read BIP448 test workflow status")?;
-            canonical_json(&metadata).map_err(WorkflowError::from)
+            canonical_json(&lifecycle::status(&root, &metadata)?).map_err(WorkflowError::from)
+        }
+        Command::Down { project } => {
+            let root = repository::active_root()?;
+            let metadata = storage::status(&root, &project)
+                .context("read configured BIP448 lifecycle metadata")?;
+            canonical_json(&lifecycle::down(&root, &metadata)?).map_err(WorkflowError::from)
         }
     }
 }

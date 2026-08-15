@@ -12,12 +12,11 @@ mod plan_tests;
 #[cfg(test)]
 mod test_support;
 
-use std::ffi::OsString;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 
+pub(super) use super::argv::{ArgvCommand, CommandOutput, CommandRunner, SystemCommandRunner};
 use super::cli::BuildService;
 use super::model::StackMetadata;
 
@@ -26,64 +25,18 @@ const INQUISITION_BUILD_ARG: &str = "BITCOIN_INQUISITION_COMMIT";
 const LOCKBOX_BUILD_ARG: &str = "LOCKBOX_ENABLE_TEST_RNG";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct ArgvCommand {
-    program: OsString,
-    args: Vec<OsString>,
-    current_dir: PathBuf,
-}
-
-impl ArgvCommand {
-    fn new(program: impl Into<OsString>, current_dir: &Path) -> Self {
-        Self {
-            program: program.into(),
-            args: Vec::new(),
-            current_dir: current_dir.to_path_buf(),
-        }
-    }
-
-    fn arg(mut self, arg: impl Into<OsString>) -> Self {
-        self.args.push(arg.into());
-        self
-    }
-
-    fn args<I, S>(mut self, args: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<OsString>,
-    {
-        self.args.extend(args.into_iter().map(Into::into));
-        self
-    }
+pub(super) struct VerifiedImage {
+    pub(super) tag: String,
+    pub(super) image_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct CommandOutput {
-    success: bool,
-    code: Option<i32>,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
-
-pub(super) trait CommandRunner {
-    fn run(&mut self, command: &ArgvCommand) -> Result<CommandOutput>;
-}
-
-pub(super) struct SystemCommandRunner;
-
-impl CommandRunner for SystemCommandRunner {
-    fn run(&mut self, command: &ArgvCommand) -> Result<CommandOutput> {
-        let output = Command::new(&command.program)
-            .args(&command.args)
-            .current_dir(&command.current_dir)
-            .output()
-            .with_context(|| format!("execute argv command {command:?}"))?;
-        Ok(CommandOutput {
-            success: output.status.success(),
-            code: output.status.code(),
-            stdout: output.stdout,
-            stderr: output.stderr,
-        })
-    }
+pub(super) struct VerifiedBuild {
+    pub(super) mercury: VerifiedImage,
+    pub(super) token: VerifiedImage,
+    pub(super) lockbox: VerifiedImage,
+    pub(super) lockbox_rng: VerifiedImage,
+    pub(super) inquisition: VerifiedImage,
 }
 
 pub(super) fn execute(
@@ -93,6 +46,14 @@ pub(super) fn execute(
     runner: &mut impl CommandRunner,
 ) -> Result<StackMetadata> {
     execute::execute(repo_root, metadata, service, runner)
+}
+
+pub(super) fn verify_complete(
+    repo_root: &Path,
+    metadata: &StackMetadata,
+    runner: &mut impl CommandRunner,
+) -> Result<VerifiedBuild> {
+    execute::verify_complete(repo_root, metadata, runner)
 }
 
 fn run_checked(runner: &mut impl CommandRunner, command: ArgvCommand) -> Result<CommandOutput> {

@@ -1,8 +1,10 @@
+mod argv;
 mod build;
 mod cli;
 mod command;
 mod doctor;
 mod error;
+mod lifecycle;
 mod matrix;
 mod metadata_lock;
 mod model;
@@ -20,7 +22,7 @@ pub use model::{
     ProjectSpec, RunPaths, StackMetadata, COMPONENTS,
 };
 
-pub const USAGE: &str = "Usage:\n  bip448-test --help\n  bip448-test doctor\n  bip448-test configure --project <PROJECT> --base-port <PORT>\n  bip448-test build --project <PROJECT> --service <all|mercury|token|lockbox|inquisition>\n  bip448-test status --project <PROJECT>";
+pub const USAGE: &str = "Usage:\n  bip448-test --help\n  bip448-test doctor\n  bip448-test configure --project <PROJECT> --base-port <PORT>\n  bip448-test build --project <PROJECT> --service <all|mercury|token|lockbox|inquisition>\n  bip448-test up --project <PROJECT>\n  bip448-test ready --project <PROJECT>\n  bip448-test status --project <PROJECT>\n  bip448-test down --project <PROJECT>";
 
 pub async fn run<I>(args: I) -> i32
 where
