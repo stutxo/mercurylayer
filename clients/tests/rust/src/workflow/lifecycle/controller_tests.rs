@@ -4,6 +4,7 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::super::argv::{begin_failure_capture, finish_failure_capture};
 use super::super::model::{canonical_json, PortMap, Project, StackMetadata};
 use super::test_support::{metadata, strings, MockDocker, MockHost, StackShape, StubVerifier};
 use super::{down_with, status_with, up_with};
@@ -177,6 +178,31 @@ fn down_never_removes_wallet_before_resource_and_volume_proofs() {
     let mut host = MockHost::new(true);
     assert!(down_with(&temp.path, &metadata, &mut daemon_error, &mut host).is_err());
     assert!(metadata.paths().wallet_database.exists());
+}
+
+#[test]
+fn volume_absence_capture_excludes_expected_absence_and_records_daemon_failure() {
+    let root = Path::new("/repo");
+    let mut absent = MockDocker::absent();
+    begin_failure_capture().unwrap();
+    let result =
+        super::docker_command::require_volume_absent(root, "life_test_vault_data", &mut absent);
+    let captured = finish_failure_capture();
+    assert!(result.is_ok());
+    assert!(captured.is_none());
+
+    let mut daemon_error = MockDocker::absent();
+    daemon_error.absence_daemon_error = true;
+    begin_failure_capture().unwrap();
+    let result = super::docker_command::require_volume_absent(
+        root,
+        "life_test_vault_data",
+        &mut daemon_error,
+    );
+    let captured = finish_failure_capture().unwrap();
+    assert!(result.is_err());
+    assert_eq!(captured.exit_code, Some(1));
+    assert_eq!(&captured.argv[..3], ["docker", "volume", "inspect"]);
 }
 
 #[test]

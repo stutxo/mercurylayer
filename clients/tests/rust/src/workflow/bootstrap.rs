@@ -351,6 +351,7 @@ fn checked(
 ) -> Result<CommandOutput> {
     let output = runner.run(command)?;
     if !output.success {
+        super::argv::record_failure(command, &output);
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
             "{context} failed with status {:?} signal {:?}: {}",

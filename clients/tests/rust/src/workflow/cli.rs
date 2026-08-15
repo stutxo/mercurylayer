@@ -26,6 +26,12 @@ pub enum Command {
     Status {
         project: Project,
     },
+    Checkpoint {
+        project: Project,
+    },
+    Logs {
+        project: Project,
+    },
     Down {
         project: Project,
     },
@@ -38,6 +44,25 @@ pub enum Command {
         target: String,
         test: String,
     },
+}
+
+impl Command {
+    pub(super) fn mutation(&self) -> Option<(&Project, &'static str)> {
+        match self {
+            Self::Configure { project, .. } => Some((project, "configure")),
+            Self::Build { project, .. } => Some((project, "build")),
+            Self::Up { project } => Some((project, "up")),
+            Self::Bootstrap { project, .. } => Some((project, "bootstrap")),
+            Self::Test { project, .. } => Some((project, "test")),
+            Self::Down { project } => Some((project, "down")),
+            Self::Help
+            | Self::Doctor
+            | Self::Ready { .. }
+            | Self::Status { .. }
+            | Self::Checkpoint { .. }
+            | Self::Logs { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,6 +117,10 @@ where
         "up" => parse_project_command(&args[1..], |project| Command::Up { project }),
         "ready" => parse_project_command(&args[1..], |project| Command::Ready { project }),
         "status" => parse_project_command(&args[1..], |project| Command::Status { project }),
+        "checkpoint" => {
+            parse_project_command(&args[1..], |project| Command::Checkpoint { project })
+        }
+        "logs" => parse_project_command(&args[1..], |project| Command::Logs { project }),
         "down" => parse_project_command(&args[1..], |project| Command::Down { project }),
         "bootstrap" => parse_bootstrap(&args[1..]),
         "test" => parse_test(&args[1..]),
@@ -298,6 +327,18 @@ mod tests {
         assert_eq!(
             parse(args(&["status", "--project", "matrix_1"])).unwrap(),
             Command::Status {
+                project: Project::parse("matrix_1").unwrap()
+            }
+        );
+        assert_eq!(
+            parse(args(&["checkpoint", "--project", "matrix_1"])).unwrap(),
+            Command::Checkpoint {
+                project: Project::parse("matrix_1").unwrap()
+            }
+        );
+        assert_eq!(
+            parse(args(&["logs", "--project", "matrix_1"])).unwrap(),
+            Command::Logs {
                 project: Project::parse("matrix_1").unwrap()
             }
         );

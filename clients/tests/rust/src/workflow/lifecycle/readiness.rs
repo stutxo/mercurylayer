@@ -13,11 +13,12 @@ use super::contract::{
     required_health, service_port, service_readiness, ReadinessKind, RequiredHealth, SERVICES,
 };
 use super::docker::{Container, Observation};
+use super::readiness_http::{parse_http_stream, ParseState};
 use super::report::ReadinessReport;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
-const MAX_HTTP_BYTES: u64 = 65_536;
+pub(super) const MAX_HTTP_BYTES: u64 = 65_536;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum HttpAttempt {
@@ -35,6 +36,7 @@ pub(super) trait HostProbe {
     fn port_is_free(&mut self, port: u16) -> Result<bool>;
     fn http_json(
         &mut self,
+        service: &str,
         port: u16,
         path: &str,
         authorization: Option<&str>,
@@ -70,12 +72,13 @@ impl HostProbe for SystemHostProbe {
 
     fn http_json(
         &mut self,
+        service: &str,
         port: u16,
         path: &str,
         authorization: Option<&str>,
         body: Option<&[u8]>,
     ) -> Result<HttpAttempt> {
-        http_json(port, path, authorization, body)
+        http_json(service, port, path, authorization, body)
     }
 
     fn now_millis(&self) -> u64 {
@@ -219,8 +222,22 @@ fn postgres(
             "1",
         ]);
     let output = runner.run(&command)?;
-    let stdout = String::from_utf8(output.stdout).context("pg_isready output is not UTF-8")?;
-    let stderr = String::from_utf8(output.stderr).context("pg_isready error is not UTF-8")?;
+    let text = std::str::from_utf8(&output.stdout)
+        .context("pg_isready output is not UTF-8")
+        .and_then(|stdout| {
+            std::str::from_utf8(&output.stderr)
+                .context("pg_isready error is not UTF-8")
+                .map(|stderr| (stdout, stderr))
+        });
+    let (stdout, stderr) = match text {
+        Ok(text) => text,
+        Err(error) => {
+            if !output.success {
+                super::super::argv::record_failure(&command, &output);
+            }
+            return Err(error);
+        }
+    };
     if output.success {
         ensure!(
             stdout.trim().ends_with(" - accepting connections") && stderr.trim().is_empty(),
@@ -234,6 +251,7 @@ fn postgres(
     {
         return Ok(Attempt::Retry("postgres_connection_miss".into()));
     }
+    super::super::argv::record_failure(&command, &output);
     bail!(
         "pg_isready failed non-retryably with status {:?}: {detail}",
         output.code
@@ -241,8 +259,14 @@ fn postgres(
 }
 
 fn vault(metadata: &StackMetadata, host: &mut impl HostProbe) -> Result<Attempt> {
-    match host.http_json(metadata.ports().vault, "/v1/sys/health", None, None)? {
-        HttpAttempt::ConnectionMiss(_) => Ok(Attempt::Retry("vault_connection_miss".into())),
+    match host.http_json(
+        "vault",
+        metadata.ports().vault,
+        "/v1/sys/health",
+        None,
+        None,
+    )? {
+        HttpAttempt::ConnectionMiss(detail) => Ok(Attempt::Retry(detail)),
         HttpAttempt::Response(response) => {
             ensure!(
                 response.status == 200,
@@ -265,8 +289,8 @@ fn http_config(
     host: &mut impl HostProbe,
 ) -> Result<Attempt> {
     let port = service_port(metadata, service)?;
-    match host.http_json(port, "/info/config", None, None)? {
-        HttpAttempt::ConnectionMiss(_) => Ok(Attempt::Retry("http_connection_miss".into())),
+    match host.http_json(service, port, "/info/config", None, None)? {
+        HttpAttempt::ConnectionMiss(detail) => Ok(Attempt::Retry(detail)),
         HttpAttempt::Response(response) => {
             ensure!(
                 response.status == 200
@@ -284,8 +308,8 @@ fn http_alive(
     host: &mut impl HostProbe,
 ) -> Result<Attempt> {
     let port = service_port(metadata, service)?;
-    match host.http_json(port, "/", None, None)? {
-        HttpAttempt::ConnectionMiss(_) => Ok(Attempt::Retry("http_connection_miss".into())),
+    match host.http_json(service, port, "/", None, None)? {
+        HttpAttempt::ConnectionMiss(detail) => Ok(Attempt::Retry(detail)),
         HttpAttempt::Response(response) => {
             ensure!(
                 matches!(response.status, 200 | 404)
@@ -308,12 +332,13 @@ fn inquisition(metadata: &StackMetadata, host: &mut impl HostProbe) -> Result<At
         "params": []
     }))?;
     match host.http_json(
+        "inquisition",
         metadata.ports().core_rpc,
         "/",
         Some("Basic bWVyY3VyeTptZXJjdXJ5"),
         Some(&body),
     )? {
-        HttpAttempt::ConnectionMiss(_) => Ok(Attempt::Retry("inquisition_connection_miss".into())),
+        HttpAttempt::ConnectionMiss(detail) => Ok(Attempt::Retry(detail)),
         HttpAttempt::Response(response) => {
             ensure!(
                 response.status == 200,
@@ -349,7 +374,8 @@ pub(super) fn port_observations(
         .collect()
 }
 
-fn http_json(
+pub(super) fn http_json(
+    service: &str,
     port: u16,
     path: &str,
     authorization: Option<&str>,
@@ -363,7 +389,13 @@ fn http_json(
     let mut stream = match TcpStream::connect_timeout(&address.into(), CONNECT_TIMEOUT) {
         Ok(stream) => stream,
         Err(error) if retryable_io(&error) => {
-            return Ok(HttpAttempt::ConnectionMiss(error.to_string()));
+            return Ok(HttpAttempt::ConnectionMiss(http_miss_context(
+                service,
+                port,
+                path,
+                0,
+                &format!("connect: {error}"),
+            )));
         }
         Err(error) => {
             return Err(error).with_context(|| format!("connect HTTP readiness port {port}"))
@@ -395,126 +427,73 @@ fn http_json(
         .and_then(|_| stream.write_all(body))
     {
         if retryable_io(&error) {
-            return Ok(HttpAttempt::ConnectionMiss(error.to_string()));
+            return Ok(HttpAttempt::ConnectionMiss(http_miss_context(
+                service,
+                port,
+                path,
+                0,
+                &format!("write: {error}"),
+            )));
         }
         return Err(error).context("write bounded HTTP readiness request");
     }
     let mut bytes = Vec::new();
-    if let Err(error) = stream.take(MAX_HTTP_BYTES + 1).read_to_end(&mut bytes) {
-        if retryable_io(&error) {
-            return Ok(HttpAttempt::ConnectionMiss(error.to_string()));
+    let read_miss = match stream.take(MAX_HTTP_BYTES + 1).read_to_end(&mut bytes) {
+        Ok(_) => None,
+        Err(error) if retryable_io(&error) => Some(error.to_string()),
+        Err(error) => {
+            return Err(error).context("read bounded HTTP readiness response");
         }
-        return Err(error).context("read bounded HTTP readiness response");
-    }
+    };
     ensure!(
         bytes.len() as u64 <= MAX_HTTP_BYTES,
-        "HTTP readiness response exceeds byte limit"
+        "HTTP readiness response exceeds byte limit; {}",
+        http_response_context(service, port, path, bytes.len())
     );
-    parse_http(&bytes).map(HttpAttempt::Response)
-}
-
-fn parse_http(bytes: &[u8]) -> Result<HttpResponse> {
-    let boundary = bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .context("HTTP readiness response has no header boundary")?;
-    let headers =
-        std::str::from_utf8(&bytes[..boundary]).context("HTTP readiness headers are not UTF-8")?;
-    let mut lines = headers.split("\r\n");
-    let status = lines
-        .next()
-        .context("HTTP readiness status line is absent")?;
-    let fields = status.split_ascii_whitespace().collect::<Vec<_>>();
-    ensure!(
-        fields.len() >= 2 && fields[0] == "HTTP/1.1",
-        "malformed HTTP readiness status line"
-    );
-    let status = fields[1]
-        .parse::<u16>()
-        .context("HTTP readiness status is not numeric")?;
-    ensure!(
-        (100..=599).contains(&status),
-        "HTTP readiness status is out of range"
-    );
-    let mut chunked = false;
-    let mut content_length = None;
-    for line in lines {
-        let (name, value) = line
-            .split_once(':')
-            .context("malformed HTTP readiness header")?;
-        let name = name.trim().to_ascii_lowercase();
-        let value = value.trim();
-        if name == "transfer-encoding" {
-            ensure!(
-                value.eq_ignore_ascii_case("chunked"),
-                "unsupported HTTP transfer encoding"
-            );
-            chunked = true;
-        } else if name == "content-length" {
-            ensure!(content_length.is_none(), "duplicate HTTP content length");
-            content_length = Some(
-                value
-                    .parse::<usize>()
-                    .context("malformed HTTP content length")?,
-            );
+    let parsed = parse_http_stream(&bytes, read_miss.is_none())
+        .with_context(|| http_response_context(service, port, path, bytes.len()))?;
+    match parsed {
+        ParseState::Complete(response) => Ok(HttpAttempt::Response(response)),
+        ParseState::Incomplete(phase) => {
+            let phase = match read_miss {
+                Some(error) => format!("{phase}; read: {error}"),
+                None => phase.to_owned(),
+            };
+            Ok(HttpAttempt::ConnectionMiss(http_miss_context(
+                service,
+                port,
+                path,
+                bytes.len(),
+                &phase,
+            )))
         }
     }
-    ensure!(
-        !(chunked && content_length.is_some()),
-        "ambiguous HTTP body framing"
-    );
-    let raw_body = &bytes[boundary + 4..];
-    let body = if chunked {
-        decode_chunked(raw_body)?
-    } else if let Some(length) = content_length {
-        ensure!(raw_body.len() == length, "HTTP body length mismatch");
-        raw_body.to_vec()
-    } else {
-        raw_body.to_vec()
-    };
-    let body = match serde_json::from_slice(&body) {
-        Ok(value) => value,
-        Err(_) => Value::String(
-            String::from_utf8(body)
-                .context("HTTP readiness body is neither JSON nor UTF-8")?
-                .trim()
-                .to_owned(),
-        ),
-    };
-    Ok(HttpResponse { status, body })
 }
 
-fn decode_chunked(mut bytes: &[u8]) -> Result<Vec<u8>> {
-    let mut output = Vec::new();
-    loop {
-        let end = bytes
-            .windows(2)
-            .position(|window| window == b"\r\n")
-            .context("malformed HTTP chunk length")?;
-        let length =
-            std::str::from_utf8(&bytes[..end]).context("HTTP chunk length is not UTF-8")?;
-        ensure!(
-            !length.contains(';'),
-            "HTTP chunk extensions are unsupported"
-        );
-        let length = usize::from_str_radix(length, 16).context("HTTP chunk length is malformed")?;
-        bytes = &bytes[end + 2..];
-        if length == 0 {
-            ensure!(bytes == b"\r\n", "malformed HTTP chunk terminator");
-            break;
-        }
-        ensure!(
-            bytes.len() >= length + 2 && &bytes[length..length + 2] == b"\r\n",
-            "truncated HTTP chunk"
-        );
-        output.extend_from_slice(&bytes[..length]);
-        ensure!(
-            output.len() as u64 <= MAX_HTTP_BYTES,
-            "decoded HTTP response exceeds byte limit"
-        );
-        bytes = &bytes[length + 2..];
+fn http_miss_context(service: &str, port: u16, path: &str, bytes: usize, phase: &str) -> String {
+    format!(
+        "http_connection_miss service={} port={port} path={} received_bytes={bytes} phase={}",
+        bounded_http_field(service),
+        bounded_http_field(path),
+        bounded_http_field(phase)
+    )
+}
+
+fn http_response_context(service: &str, port: u16, path: &str, bytes: usize) -> String {
+    format!(
+        "parse HTTP readiness response service={} port={port} path={} received_bytes={bytes}",
+        bounded_http_field(service),
+        bounded_http_field(path)
+    )
+}
+
+fn bounded_http_field(value: &str) -> String {
+    const MAX_FIELD_BYTES: usize = 160;
+    let mut end = value.len().min(MAX_FIELD_BYTES);
+    while !value.is_char_boundary(end) {
+        end -= 1;
     }
-    Ok(output)
+    value[..end].replace(['\r', '\n'], " ")
 }
 
 fn retryable_io(error: &std::io::Error) -> bool {

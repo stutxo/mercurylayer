@@ -111,13 +111,15 @@ pub(super) fn require_volume_absent(
         bail!("recorded anonymous Vault volume {volume} still exists after Compose down");
     }
     let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
-    ensure!(
-        output.code == Some(1) && stderr.contains("no such volume"),
+    if output.code == Some(1) && stderr.contains("no such volume") {
+        return Ok(());
+    }
+    super::super::argv::record_failure(&command, &output);
+    bail!(
         "Docker volume absence inspection failed with status {:?}: {}",
         output.code,
         String::from_utf8_lossy(&output.stderr).trim()
-    );
-    Ok(())
+    )
 }
 
 pub(super) fn docker(repo_root: &Path) -> ArgvCommand {
@@ -150,6 +152,7 @@ fn validate_image_id(value: &str) -> Result<()> {
 }
 
 fn command_failure<T>(command: &ArgvCommand, output: &CommandOutput) -> Result<T> {
+    super::super::argv::record_failure(command, output);
     bail!(
         "argv command {command:?} failed with status {:?}: stdout={} stderr={}",
         output.code,

@@ -59,6 +59,7 @@ pub(super) fn verify_complete(
 fn run_checked(runner: &mut impl CommandRunner, command: ArgvCommand) -> Result<CommandOutput> {
     let output = runner.run(&command)?;
     if !output.success {
+        super::argv::record_failure(&command, &output);
         bail!(
             "argv command {command:?} failed with status {:?}: stdout={} stderr={}",
             output.code,

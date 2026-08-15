@@ -129,6 +129,7 @@ pub(super) struct MockDocker {
     pub(super) dead: bool,
     pub(super) seen: Vec<ArgvCommand>,
     pub(super) postgres_misses: usize,
+    pub(super) postgres_failure: bool,
     pub(super) down_leaves_resources: bool,
     pub(super) absence_daemon_error: bool,
     pub(super) duplicate_list_id: bool,
@@ -146,6 +147,7 @@ impl MockDocker {
             dead: false,
             seen: Vec::new(),
             postgres_misses: 0,
+            postgres_failure: false,
             down_leaves_resources: false,
             absence_daemon_error: false,
             duplicate_list_id: false,
@@ -357,6 +359,9 @@ impl CommandRunner for MockDocker {
                 Ok(CommandOutput::failure(1, "permission denied\n"))
             }
             ["volume", "inspect", _] => Ok(CommandOutput::failure(1, "Error: No such volume\n")),
+            ["exec", _, "pg_isready", ..] if self.postgres_failure => {
+                Ok(CommandOutput::failure(3, "pg_isready internal failure\n"))
+            }
             ["exec", _, "pg_isready", ..] if self.postgres_misses > 0 => {
                 self.postgres_misses -= 1;
                 Ok(CommandOutput {
@@ -441,6 +446,7 @@ impl HostProbe for MockHost {
 
     fn http_json(
         &mut self,
+        _service: &str,
         port: u16,
         path: &str,
         _authorization: Option<&str>,

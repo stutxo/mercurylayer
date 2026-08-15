@@ -3,6 +3,7 @@ mod docker;
 mod docker_command;
 mod inspect_types;
 mod readiness;
+mod readiness_http;
 mod report;
 mod topology;
 mod wallet;
@@ -20,7 +21,7 @@ use std::time::Duration;
 
 use anyhow::{bail, ensure, Context, Result};
 
-use super::argv::{CommandRunner, SystemCommandRunner};
+use super::argv::{ArgvCommand, CommandOutput, CommandRunner, SystemCommandRunner};
 use super::build::{self, VerifiedBuild};
 use super::model::{ProjectSpec, StackMetadata};
 use contract::{
@@ -29,7 +30,8 @@ use contract::{
 use docker::{observe, Observation};
 use docker_command::{compose_command, resolve_unrecorded_image_ids, run_checked};
 use readiness::{port_observations, sample, HostProbe, SystemHostProbe};
-use report::{ReadinessReport, StatusReport};
+use report::ReadinessReport;
+pub(super) use report::StatusReport;
 
 const READY_DEADLINE: Duration = Duration::from_secs(120);
 const READY_RETRY_INTERVAL: Duration = Duration::from_millis(250);
@@ -80,6 +82,25 @@ pub(super) fn down(repo_root: &Path, metadata: &StackMetadata) -> Result<StatusR
     let mut runner = SystemCommandRunner;
     let mut host = SystemHostProbe::new();
     down_with(repo_root, metadata, &mut runner, &mut host)
+}
+
+pub(super) fn compose_logs_with(
+    repo_root: &Path,
+    metadata: &StackMetadata,
+    runner: &mut impl CommandRunner,
+) -> Result<(ArgvCommand, CommandOutput)> {
+    let environment = metadata
+        .project_spec(image_map_from_metadata(metadata)?)
+        .managed_environment()?;
+    let command = compose_command(
+        repo_root,
+        metadata,
+        &environment,
+        &["logs", "--no-color", "--timestamps", "--tail", "200"],
+    )?;
+    let output =
+        run_checked(runner, command.clone()).context("read bounded literal BIP448 Compose logs")?;
+    Ok((command, output))
 }
 
 pub(super) fn project_spec(metadata: &StackMetadata) -> Result<ProjectSpec> {
@@ -220,6 +241,21 @@ fn status_with<R: CommandRunner, H: HostProbe>(
             .collect()
     };
     make_report(metadata, observation, &expected, readiness, ports)
+}
+
+#[cfg(test)]
+pub(in crate::workflow) fn evidence_test_metadata(repo_root: &Path) -> StackMetadata {
+    test_support::metadata(repo_root)
+}
+
+#[cfg(test)]
+pub(in crate::workflow) fn evidence_test_absent_status(
+    repo_root: &Path,
+    metadata: &StackMetadata,
+) -> Result<StatusReport> {
+    let mut docker = test_support::MockDocker::absent();
+    let mut host = test_support::MockHost::new(true);
+    status_with(repo_root, metadata, &mut docker, &mut host)
 }
 
 fn down_with<R: CommandRunner, H: HostProbe>(

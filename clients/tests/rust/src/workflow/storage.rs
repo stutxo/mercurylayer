@@ -1,7 +1,11 @@
-use std::fs::{self, DirBuilder, File, OpenOptions};
+#[cfg(test)]
+use std::fs::DirBuilder;
+use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+#[cfg(test)]
+use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure, Context, Result};
@@ -14,12 +18,41 @@ const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const MAX_METADATA_BYTES: u64 = 1_048_576;
 
-pub fn configure(repo_root: &Path, project: Project, ports: PortMap) -> Result<StackMetadata> {
+pub(super) fn configure_prepared(
+    repo_root: &Path,
+    project: Project,
+    ports: PortMap,
+    operation_id: &str,
+) -> Result<StackMetadata> {
     let metadata = StackMetadata::new(repo_root, project, ports);
     metadata.validate(repo_root, metadata.project())?;
-    ensure_run_absent(metadata.paths())?;
+    let paths = metadata.paths();
+    require_mode(
+        &paths.run_directory,
+        FileKind::Directory,
+        PRIVATE_DIRECTORY_MODE,
+    )?;
+    require_mode(
+        &paths.run_directory.join("operations"),
+        FileKind::Directory,
+        PRIVATE_DIRECTORY_MODE,
+    )?;
+    let operation = paths.run_directory.join("operations").join(operation_id);
+    require_mode(&operation, FileKind::Directory, PRIVATE_DIRECTORY_MODE)?;
+    require_mode(
+        &operation.join("started.json"),
+        FileKind::Regular,
+        PRIVATE_FILE_MODE,
+    )?;
+    for path in [&paths.settings_file, &paths.stack_metadata] {
+        ensure!(
+            fs::symlink_metadata(path).is_err_and(|error| error.kind() == ErrorKind::NotFound),
+            "prepared configure run already contains {}",
+            path.display()
+        );
+    }
     let _reservations = reserve_ports(ports)?;
-    create_run(&metadata)?;
+    write_run_files(&metadata)?;
     Ok(metadata)
 }
 
@@ -157,6 +190,7 @@ fn reserve_ports(ports: PortMap) -> Result<Vec<TcpListener>> {
     Ok(reservations)
 }
 
+#[cfg(test)]
 fn create_run(metadata: &StackMetadata) -> Result<()> {
     let paths = metadata.paths();
     prepare_runs_root(&paths.run_directory)?;
@@ -166,21 +200,7 @@ fn create_run(metadata: &StackMetadata) -> Result<()> {
         .create(&paths.run_directory)
         .with_context(|| format!("create run directory {}", paths.run_directory.display()))?;
 
-    let result = (|| {
-        atomic_write(
-            &paths.settings_file,
-            metadata.settings_contents()?.as_bytes(),
-        )?;
-        atomic_write(&paths.stack_metadata, canonical_json(metadata)?.as_bytes())?;
-        sync_directory(&paths.run_directory)?;
-        sync_directory(
-            paths
-                .run_directory
-                .parent()
-                .context("run directory has no parent")?,
-        )?;
-        Ok(())
-    })();
+    let result = write_run_files(metadata);
 
     if let Err(error) = result {
         if let Err(cleanup) = cleanup_created_run(paths) {
@@ -191,6 +211,24 @@ fn create_run(metadata: &StackMetadata) -> Result<()> {
     Ok(())
 }
 
+fn write_run_files(metadata: &StackMetadata) -> Result<()> {
+    let paths = metadata.paths();
+    atomic_write(
+        &paths.settings_file,
+        metadata.settings_contents()?.as_bytes(),
+    )?;
+    atomic_write(&paths.stack_metadata, canonical_json(metadata)?.as_bytes())?;
+    sync_directory(&paths.run_directory)?;
+    sync_directory(
+        paths
+            .run_directory
+            .parent()
+            .context("run directory has no parent")?,
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
 fn prepare_runs_root(run_directory: &Path) -> Result<()> {
     let runs_root = run_directory
         .parent()
@@ -203,6 +241,7 @@ fn prepare_runs_root(run_directory: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn ensure_directory(path: &Path, required_mode: Option<u32>) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -233,6 +272,7 @@ fn ensure_directory(path: &Path, required_mode: Option<u32>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn ensure_run_absent(paths: &RunPaths) -> Result<()> {
     match fs::symlink_metadata(&paths.run_directory) {
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
@@ -283,6 +323,7 @@ fn temporary_path(path: &Path) -> Result<PathBuf> {
     Ok(path.with_file_name(format!(".{name}.tmp")))
 }
 
+#[cfg(test)]
 fn cleanup_created_run(paths: &RunPaths) -> Result<()> {
     for path in [
         temporary_path(&paths.settings_file)?,

@@ -423,6 +423,7 @@ fn image_id(
         if stderr.to_ascii_lowercase().contains("no such image") {
             return Ok(None);
         }
+        super::super::argv::record_failure(&command, &output);
         bail!(
             "argv command {command:?} failed with status {:?}: stdout={} stderr={}",
             output.code,

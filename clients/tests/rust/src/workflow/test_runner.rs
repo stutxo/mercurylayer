@@ -69,6 +69,10 @@ where
 
     let discovery = runner.run(&cargo_discovery(repo_root, target, &environment)?)?;
     if !discovery.success {
+        super::argv::record_failure(
+            &cargo_discovery(repo_root, target, &environment)?,
+            &discovery,
+        );
         return Err(child_failure("Cargo ignored-test discovery", &discovery));
     }
     ensure_success_status(&discovery, "Cargo ignored-test discovery")?;
@@ -76,7 +80,12 @@ where
     ensure_frozen_discovery(matrix, &discovered)?;
 
     let output = runner.run(&cargo_test(repo_root, target, identity, &environment)?)?;
+    super::evidence::capture_test_output(&output.stdout, &output.stderr);
     if !output.success {
+        super::argv::record_failure(
+            &cargo_test(repo_root, target, identity, &environment)?,
+            &output,
+        );
         return Err(child_failure("exact BIP448 Cargo test", &output));
     }
     ensure_success_status(&output, "exact BIP448 Cargo test")?;

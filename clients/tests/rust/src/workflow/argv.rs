@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 #[cfg(test)]
 use std::ffi::OsStr;
@@ -9,6 +10,51 @@ use std::process::Command;
 use std::os::unix::process::ExitStatusExt;
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+thread_local! {
+    static FAILURE_CAPTURE: RefCell<Option<Option<ChildFailure>>> = const { RefCell::new(None) };
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ChildFailure {
+    pub(super) argv: Vec<String>,
+    pub(super) exit_code: Option<i32>,
+    pub(super) signal: Option<i32>,
+}
+
+pub(super) fn begin_failure_capture() -> Result<()> {
+    FAILURE_CAPTURE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        anyhow::ensure!(slot.is_none(), "child failure capture is already active");
+        *slot = Some(None);
+        Ok(())
+    })
+}
+
+pub(super) fn finish_failure_capture() -> Option<ChildFailure> {
+    FAILURE_CAPTURE.with(|slot| slot.borrow_mut().take().flatten())
+}
+
+pub(super) fn record_failure(command: &ArgvCommand, output: &CommandOutput) {
+    if output.success {
+        return;
+    }
+    FAILURE_CAPTURE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(captured) = slot.as_mut() else {
+            return;
+        };
+        if captured.is_none() {
+            *captured = Some(ChildFailure {
+                argv: command.encoded_argv(),
+                exit_code: output.code,
+                signal: output.signal,
+            });
+        }
+    });
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ArgvCommand {
@@ -66,6 +112,22 @@ impl ArgvCommand {
     pub(super) fn clear_environment(mut self) -> Self {
         self.clear_environment = true;
         self
+    }
+
+    pub(super) fn encoded_argv(&self) -> Vec<String> {
+        std::iter::once(&self.program)
+            .chain(self.args.iter())
+            .map(|value| match value.to_str() {
+                Some(value) => value.to_owned(),
+                #[cfg(unix)]
+                None => {
+                    use std::os::unix::ffi::OsStrExt;
+                    format!("hex:{}", hex::encode(value.as_bytes()))
+                }
+                #[cfg(not(unix))]
+                None => "<non-UTF-8>".to_owned(),
+            })
+            .collect()
     }
 
     #[cfg(test)]
@@ -136,7 +198,7 @@ impl CommandRunner for SystemCommandRunner {
             .envs(&command.environment)
             .output()
             .with_context(|| format!("execute argv command {command:?}"))?;
-        Ok(CommandOutput {
+        let output = CommandOutput {
             success: output.status.success(),
             code: output.status.code(),
             #[cfg(unix)]
@@ -145,6 +207,7 @@ impl CommandRunner for SystemCommandRunner {
             signal: None,
             stdout: output.stdout,
             stderr: output.stderr,
-        })
+        };
+        Ok(output)
     }
 }

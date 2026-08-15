@@ -5,10 +5,12 @@ mod cli;
 mod command;
 mod doctor;
 mod error;
+mod evidence;
 mod lifecycle;
 mod matrix;
 mod metadata_lock;
 mod model;
+mod project_lock;
 mod ready_gate;
 mod repository;
 mod storage;
@@ -25,7 +27,7 @@ pub use model::{
     ProjectSpec, RunPaths, StackMetadata, COMPONENTS,
 };
 
-pub const USAGE: &str = "Usage:\n  bip448-test --help\n  bip448-test doctor\n  bip448-test configure --project <PROJECT> --base-port <PORT>\n  bip448-test build --project <PROJECT> --service <all|mercury|token|lockbox|inquisition>\n  bip448-test up --project <PROJECT>\n  bip448-test ready --project <PROJECT>\n  bip448-test status --project <PROJECT>\n  bip448-test down --project <PROJECT>\n  bip448-test bootstrap --project <PROJECT> [--require-zero]\n  bip448-test test --project <PROJECT> --target <MATRIX_BINARY> --test <EXACT_IDENTITY>";
+pub const USAGE: &str = "Usage:\n  bip448-test --help\n  bip448-test doctor\n  bip448-test configure --project <PROJECT> --base-port <PORT>\n  bip448-test build --project <PROJECT> --service <all|mercury|token|lockbox|inquisition>\n  bip448-test up --project <PROJECT>\n  bip448-test ready --project <PROJECT>\n  bip448-test status --project <PROJECT>\n  bip448-test checkpoint --project <PROJECT>\n  bip448-test logs --project <PROJECT>\n  bip448-test down --project <PROJECT>\n  bip448-test bootstrap --project <PROJECT> [--require-zero]\n  bip448-test test --project <PROJECT> --target <MATRIX_BINARY> --test <EXACT_IDENTITY>";
 
 pub async fn run<I>(args: I) -> i32
 where
@@ -54,7 +56,17 @@ async fn run_inner<I>(args: I) -> Result<String, WorkflowError>
 where
     I: IntoIterator<Item = OsString>,
 {
-    command::execute(cli::parse(args)?).await
+    let raw = args.into_iter().collect::<Vec<_>>();
+    let command = cli::parse(raw.clone())?;
+    let raw = raw
+        .into_iter()
+        .map(|value| {
+            value
+                .into_string()
+                .map_err(|_| WorkflowError::usage("arguments must be valid UTF-8"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    command::execute(command, &raw).await
 }
 
 fn write_output(mut writer: impl Write, output: &str) -> io::Result<()> {
