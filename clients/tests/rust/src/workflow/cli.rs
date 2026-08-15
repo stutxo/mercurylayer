@@ -8,8 +8,41 @@ use super::model::{PortMap, Project};
 pub enum Command {
     Help,
     Doctor,
-    Configure { project: Project, ports: PortMap },
-    Status { project: Project },
+    Configure {
+        project: Project,
+        ports: PortMap,
+    },
+    Build {
+        project: Project,
+        service: BuildService,
+    },
+    Status {
+        project: Project,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuildService {
+    All,
+    Mercury,
+    Token,
+    Lockbox,
+    Inquisition,
+}
+
+impl BuildService {
+    fn parse(value: &str) -> Result<Self, WorkflowError> {
+        match value {
+            "all" => Ok(Self::All),
+            "mercury" => Ok(Self::Mercury),
+            "token" => Ok(Self::Token),
+            "lockbox" => Ok(Self::Lockbox),
+            "inquisition" => Ok(Self::Inquisition),
+            _ => Err(WorkflowError::usage(
+                "--service must be one of all, mercury, token, lockbox, or inquisition",
+            )),
+        }
+    }
 }
 
 pub fn parse<I>(args: I) -> Result<Command, WorkflowError>
@@ -36,11 +69,23 @@ where
             Ok(Command::Help)
         }
         "configure" => parse_configure(&args[1..]),
+        "build" => parse_build(&args[1..]),
         "status" => parse_status(&args[1..]),
         other => Err(WorkflowError::usage(format!(
             "unknown or malformed command {other:?}"
         ))),
     }
+}
+
+fn parse_build(args: &[String]) -> Result<Command, WorkflowError> {
+    if args == ["--help"] {
+        return Ok(Command::Help);
+    }
+    let options = parse_options(args, &["--project", "--service"])?;
+    Ok(Command::Build {
+        project: required_project(&options)?,
+        service: BuildService::parse(&options["--service"])?,
+    })
 }
 
 fn parse_configure(args: &[String]) -> Result<Command, WorkflowError> {
@@ -143,6 +188,42 @@ mod tests {
                 project: Project::parse("matrix_1").unwrap()
             }
         );
+        assert_eq!(
+            parse(args(&[
+                "build",
+                "--service",
+                "lockbox",
+                "--project",
+                "matrix_1",
+            ]))
+            .unwrap(),
+            Command::Build {
+                project: Project::parse("matrix_1").unwrap(),
+                service: BuildService::Lockbox,
+            }
+        );
+        for (value, service) in [
+            ("all", BuildService::All),
+            ("mercury", BuildService::Mercury),
+            ("token", BuildService::Token),
+            ("lockbox", BuildService::Lockbox),
+            ("inquisition", BuildService::Inquisition),
+        ] {
+            assert_eq!(
+                parse(args(&[
+                    "build",
+                    "--project",
+                    "matrix_1",
+                    "--service",
+                    value,
+                ]))
+                .unwrap(),
+                Command::Build {
+                    project: Project::parse("matrix_1").unwrap(),
+                    service,
+                }
+            );
+        }
     }
 
     #[test]
@@ -156,6 +237,8 @@ mod tests {
             vec!["configure", "--project", "UPPER", "--base-port", "23000"],
             vec!["configure", "--project", "ok", "--base-port", "65530"],
             vec!["status", "--project", "has.dot"],
+            vec!["build", "--project", "ok", "--service", "unknown"],
+            vec!["build", "--project", "ok"],
         ] {
             let error = parse(args(&values)).unwrap_err();
             assert!(error.is_usage(), "accepted or misclassified {values:?}");

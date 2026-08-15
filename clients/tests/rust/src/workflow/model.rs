@@ -13,6 +13,11 @@ use super::matrix::{self, MATRIX};
 pub const STACK_SCHEMA_VERSION: u32 = 1;
 pub const WORKFLOW_NAME: &str = "bip448-test";
 
+pub const MERCURY_IMAGE_PREFIX: &str = "mercurylayer/mercury-server:bip448-test-";
+pub const TOKEN_IMAGE_PREFIX: &str = "mercurylayer/token-server-v2:bip448-test-";
+pub const LOCKBOX_IMAGE_PREFIX: &str = "mercurylayer/lockbox:bip448-test-";
+pub const INQUISITION_IMAGE: &str = "mercurylayer/bitcoin-inquisition:f536586";
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Project(String);
@@ -210,9 +215,9 @@ impl ImageMap {
         lockbox: &str,
         lockbox_rng: &str,
     ) -> Result<Self> {
-        validate_image(mercury, "mercurylayer/mercury-server:bip448-test-")?;
-        validate_image(token, "mercurylayer/token-server-v2:bip448-test-")?;
-        let lockbox_fingerprint = validate_image(lockbox, "mercurylayer/lockbox:bip448-test-")?;
+        validate_image(mercury, MERCURY_IMAGE_PREFIX)?;
+        validate_image(token, TOKEN_IMAGE_PREFIX)?;
+        let lockbox_fingerprint = validate_image(lockbox, LOCKBOX_IMAGE_PREFIX)?;
         ensure!(
             lockbox_rng
                 == format!("mercurylayer/lockbox:bip448-test-{lockbox_fingerprint}-rng-{project}"),
@@ -530,6 +535,313 @@ pub struct LifecycleState {
     observation: LifecycleObservation,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComposeHashes {
+    token_servers_sha256: String,
+    lockbox_sha256: String,
+}
+
+impl ComposeHashes {
+    pub(super) fn new(token_servers_sha256: String, lockbox_sha256: String) -> Self {
+        Self {
+            token_servers_sha256,
+            lockbox_sha256,
+        }
+    }
+
+    pub(super) fn validate(&self) -> Result<()> {
+        validate_sha256(&self.token_servers_sha256, "token-servers Compose hash")?;
+        validate_sha256(&self.lockbox_sha256, "lockbox Compose hash")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildSource {
+    head: String,
+    status_sha256: String,
+    compose: ComposeHashes,
+}
+
+impl BuildSource {
+    pub(super) fn new(head: String, status_sha256: String, compose: ComposeHashes) -> Self {
+        Self {
+            head,
+            status_sha256,
+            compose,
+        }
+    }
+
+    pub(super) fn validate(&self) -> Result<()> {
+        ensure!(
+            self.head.len() == 40 && is_lower_hex(&self.head),
+            "build source HEAD must be a 40-character lowercase hexadecimal commit"
+        );
+        validate_sha256(&self.status_sha256, "build source status digest")?;
+        self.compose.validate()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildFingerprints {
+    mercury: String,
+    token: String,
+    lockbox: String,
+    inquisition: String,
+}
+
+impl BuildFingerprints {
+    pub(super) fn new(
+        mercury: String,
+        token: String,
+        lockbox: String,
+        inquisition: String,
+    ) -> Self {
+        Self {
+            mercury,
+            token,
+            lockbox,
+            inquisition,
+        }
+    }
+
+    pub(super) fn mercury(&self) -> &str {
+        &self.mercury
+    }
+
+    pub(super) fn token(&self) -> &str {
+        &self.token
+    }
+
+    pub(super) fn lockbox(&self) -> &str {
+        &self.lockbox
+    }
+
+    pub(super) fn inquisition(&self) -> &str {
+        &self.inquisition
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_sha256(&self.mercury, "Mercury build fingerprint")?;
+        validate_sha256(&self.token, "token build fingerprint")?;
+        validate_sha256(&self.lockbox, "lockbox build fingerprint")?;
+        validate_sha256(&self.inquisition, "Inquisition build fingerprint")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedImage {
+    fingerprint: String,
+    tag: String,
+    image_id: String,
+}
+
+impl ResolvedImage {
+    pub(super) fn new(fingerprint: String, tag: String, image_id: String) -> Self {
+        Self {
+            fingerprint,
+            tag,
+            image_id,
+        }
+    }
+
+    pub(super) fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    pub(super) fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    pub(super) fn image_id(&self) -> &str {
+        &self.image_id
+    }
+
+    fn validate(&self, fingerprint: &str, expected_tag: &str) -> Result<()> {
+        ensure!(
+            self.fingerprint == fingerprint,
+            "resolved image fingerprint does not match build fingerprints"
+        );
+        ensure!(self.tag == expected_tag, "resolved image tag mismatch");
+        validate_image_id(&self.image_id)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedLockboxImages {
+    production: ResolvedImage,
+    deterministic_rng: ResolvedImage,
+}
+
+impl ResolvedLockboxImages {
+    pub(super) fn new(production: ResolvedImage, deterministic_rng: ResolvedImage) -> Self {
+        Self {
+            production,
+            deterministic_rng,
+        }
+    }
+
+    pub(super) fn production(&self) -> &ResolvedImage {
+        &self.production
+    }
+
+    pub(super) fn deterministic_rng(&self) -> &ResolvedImage {
+        &self.deterministic_rng
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedImages {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mercury: Option<ResolvedImage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token: Option<ResolvedImage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lockbox: Option<ResolvedLockboxImages>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inquisition: Option<ResolvedImage>,
+}
+
+impl ResolvedImages {
+    pub(super) fn mercury(&self) -> Option<&ResolvedImage> {
+        self.mercury.as_ref()
+    }
+
+    pub(super) fn token(&self) -> Option<&ResolvedImage> {
+        self.token.as_ref()
+    }
+
+    pub(super) fn lockbox(&self) -> Option<&ResolvedLockboxImages> {
+        self.lockbox.as_ref()
+    }
+
+    pub(super) fn inquisition(&self) -> Option<&ResolvedImage> {
+        self.inquisition.as_ref()
+    }
+
+    pub(super) fn set_mercury(&mut self, image: ResolvedImage) {
+        self.mercury = Some(image);
+    }
+
+    pub(super) fn set_token(&mut self, image: ResolvedImage) {
+        self.token = Some(image);
+    }
+
+    pub(super) fn set_lockbox(&mut self, images: ResolvedLockboxImages) {
+        self.lockbox = Some(images);
+    }
+
+    pub(super) fn set_inquisition(&mut self, image: ResolvedImage) {
+        self.inquisition = Some(image);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.mercury.is_none()
+            && self.token.is_none()
+            && self.lockbox.is_none()
+            && self.inquisition.is_none()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildResolution {
+    source: BuildSource,
+    fingerprints: BuildFingerprints,
+    images: ResolvedImages,
+}
+
+impl BuildResolution {
+    pub(super) fn new(
+        source: BuildSource,
+        fingerprints: BuildFingerprints,
+        images: ResolvedImages,
+    ) -> Self {
+        Self {
+            source,
+            fingerprints,
+            images,
+        }
+    }
+
+    pub(super) fn source(&self) -> &BuildSource {
+        &self.source
+    }
+
+    pub(super) fn fingerprints(&self) -> &BuildFingerprints {
+        &self.fingerprints
+    }
+
+    pub(super) fn images(&self) -> &ResolvedImages {
+        &self.images
+    }
+
+    fn validate(&self, project: &Project) -> Result<()> {
+        self.source.validate()?;
+        self.fingerprints.validate()?;
+        ensure!(
+            !self.images.is_empty(),
+            "build resolution must contain at least one resolved image"
+        );
+
+        if let Some(image) = &self.images.mercury {
+            image.validate(
+                &self.fingerprints.mercury,
+                &fingerprinted_tag(MERCURY_IMAGE_PREFIX, &self.fingerprints.mercury),
+            )?;
+        }
+        if let Some(image) = &self.images.token {
+            image.validate(
+                &self.fingerprints.token,
+                &fingerprinted_tag(TOKEN_IMAGE_PREFIX, &self.fingerprints.token),
+            )?;
+        }
+        if let Some(images) = &self.images.lockbox {
+            let tag = fingerprinted_tag(LOCKBOX_IMAGE_PREFIX, &self.fingerprints.lockbox);
+            images
+                .production
+                .validate(&self.fingerprints.lockbox, &tag)?;
+            images
+                .deterministic_rng
+                .validate(&self.fingerprints.lockbox, &format!("{tag}-rng-{project}"))?;
+        }
+        if let Some(image) = &self.images.inquisition {
+            image.validate(&self.fingerprints.inquisition, INQUISITION_IMAGE)?;
+        }
+        Ok(())
+    }
+}
+
+fn fingerprinted_tag(prefix: &str, fingerprint: &str) -> String {
+    format!("{prefix}{}", &fingerprint[..16])
+}
+
+fn validate_sha256(value: &str, label: &str) -> Result<()> {
+    ensure!(
+        value.len() == 64 && is_lower_hex(value),
+        "{label} must be a 64-character lowercase hexadecimal SHA-256 digest"
+    );
+    Ok(())
+}
+
+fn validate_image_id(value: &str) -> Result<()> {
+    let digest = value
+        .strip_prefix("sha256:")
+        .context("resolved image ID must start with sha256:")?;
+    validate_sha256(digest, "resolved image ID")
+}
+
+fn is_lower_hex(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 impl LifecycleState {
     fn foundation() -> Self {
         Self {
@@ -552,6 +864,8 @@ pub struct StackMetadata {
     components: Vec<StoredComponentConfig>,
     matrix: MatrixSummary,
     lifecycle: LifecycleState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    build: Option<BuildResolution>,
 }
 
 impl StackMetadata {
@@ -564,6 +878,7 @@ impl StackMetadata {
             components: stored_components(),
             matrix: MatrixSummary::current(),
             lifecycle: LifecycleState::foundation(),
+            build: None,
             project,
             repo_root: repo_root.to_path_buf(),
             ports,
@@ -584,6 +899,14 @@ impl StackMetadata {
 
     pub fn endpoints(&self) -> &EndpointMap {
         &self.endpoints
+    }
+
+    pub(super) fn build_resolution(&self) -> Option<&BuildResolution> {
+        self.build.as_ref()
+    }
+
+    pub(super) fn set_build_resolution(&mut self, build: BuildResolution) {
+        self.build = Some(build);
     }
 
     pub fn project_spec(&self, images: ImageMap) -> ProjectSpec {
@@ -658,6 +981,9 @@ impl StackMetadata {
             self.lifecycle == LifecycleState::foundation(),
             "stack metadata lifecycle state is not supported by this foundation"
         );
+        if let Some(build) = &self.build {
+            build.validate(&self.project)?;
+        }
         Ok(())
     }
 }
@@ -785,6 +1111,7 @@ mod tests {
         assert!(encoded.contains("\"support\":\"unsupported\""));
         assert!(encoded.contains("\"target_count\":8"));
         assert!(encoded.contains("\"test_count\":58"));
+        assert!(!encoded.contains("\"build\""));
         assert_eq!(
             canonical_json(&parse_metadata(encoded.as_bytes()).unwrap()).unwrap(),
             encoded
@@ -792,6 +1119,48 @@ mod tests {
 
         let with_unknown = encoded.replacen('{', "{\"unknown\":true,", 1);
         assert!(parse_metadata(with_unknown.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn optional_build_resolution_preserves_schema_v1_and_is_strictly_validated() {
+        let mut metadata = metadata();
+        let fingerprints = BuildFingerprints::new(
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64),
+            "d".repeat(64),
+        );
+        let mut images = ResolvedImages::default();
+        images.set_mercury(ResolvedImage::new(
+            "a".repeat(64),
+            format!("{MERCURY_IMAGE_PREFIX}{}", "a".repeat(16)),
+            format!("sha256:{}", "e".repeat(64)),
+        ));
+        metadata.set_build_resolution(BuildResolution::new(
+            BuildSource::new(
+                "0".repeat(40),
+                "1".repeat(64),
+                ComposeHashes::new("2".repeat(64), "3".repeat(64)),
+            ),
+            fingerprints,
+            images,
+        ));
+        metadata
+            .validate(Path::new("/repo"), metadata.project())
+            .unwrap();
+        let encoded = canonical_json(&metadata).unwrap();
+        assert!(encoded.contains("\"schema_version\":1"));
+        assert!(encoded.contains("\"build\":"));
+        assert_eq!(
+            canonical_json(&parse_metadata(encoded.as_bytes()).unwrap()).unwrap(),
+            encoded
+        );
+
+        let invalid = encoded.replace(&format!("sha256:{}", "e".repeat(64)), "sha256:short");
+        let invalid = parse_metadata(invalid.as_bytes()).unwrap();
+        assert!(invalid
+            .validate(Path::new("/repo"), invalid.project())
+            .is_err());
     }
 
     #[test]

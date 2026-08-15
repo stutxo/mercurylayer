@@ -5,7 +5,9 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure, Context, Result};
+use uuid::Uuid;
 
+use super::metadata_lock::MetadataLock;
 use super::model::{canonical_json, parse_metadata, PortMap, Project, RunPaths, StackMetadata};
 
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
@@ -52,6 +54,96 @@ pub fn status(repo_root: &Path, project: &Project) -> Result<StackMetadata> {
         "Settings.toml does not match stack metadata"
     );
     Ok(metadata)
+}
+
+pub fn replace_metadata(
+    repo_root: &Path,
+    project: &Project,
+    expected: &StackMetadata,
+    updated: &StackMetadata,
+) -> Result<()> {
+    expected.validate(repo_root, project)?;
+    updated.validate(repo_root, project)?;
+    ensure!(
+        expected.paths() == updated.paths()
+            && expected.ports() == updated.ports()
+            && expected.endpoints() == updated.endpoints(),
+        "build metadata update changed configured stack identity"
+    );
+
+    let mut lock = MetadataLock::acquire(&expected.paths().stack_metadata)?;
+    let update = replace_metadata_locked(repo_root, project, expected, updated);
+    let unlock = lock.release();
+    match (update, unlock) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(unlock)) => Err(unlock),
+        (Err(error), Err(unlock)) => {
+            bail!("{error:#}; metadata update lock release also failed: {unlock:#}")
+        }
+    }
+}
+
+fn replace_metadata_locked(
+    repo_root: &Path,
+    project: &Project,
+    expected: &StackMetadata,
+    updated: &StackMetadata,
+) -> Result<()> {
+    ensure!(
+        status(repo_root, project)? == *expected,
+        "stack metadata changed after build began"
+    );
+
+    let path = &expected.paths().stack_metadata;
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("stack metadata filename is not UTF-8")?;
+    let temporary = path.with_file_name(format!(".{name}.{}.tmp", Uuid::new_v4().simple()));
+    let bytes = canonical_json(updated)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(PRIVATE_FILE_MODE)
+        .open(&temporary)
+        .with_context(|| format!("create metadata update file {}", temporary.display()))?;
+    let result = (|| {
+        file.write_all(bytes.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        ensure!(
+            status(repo_root, project)? == *expected,
+            "stack metadata changed while build metadata was being committed"
+        );
+        fs::rename(&temporary, path).with_context(|| {
+            format!(
+                "atomically replace stack metadata {} with {}",
+                path.display(),
+                temporary.display()
+            )
+        })?;
+        sync_directory(path.parent().context("stack metadata has no parent")?)?;
+        ensure!(
+            status(repo_root, project)? == *updated,
+            "stored build metadata did not round trip exactly"
+        );
+        Ok::<_, anyhow::Error>(())
+    })();
+    if let Err(error) = result {
+        match fs::remove_file(&temporary) {
+            Ok(()) => {}
+            Err(cleanup) if cleanup.kind() == ErrorKind::NotFound => {}
+            Err(cleanup) => {
+                bail!(
+                    "{error:#}; cleanup of metadata update file {} also failed: {cleanup}",
+                    temporary.display()
+                )
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn reserve_ports(ports: PortMap) -> Result<Vec<TcpListener>> {
@@ -245,8 +337,15 @@ fn sync_directory(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     use super::*;
+    use crate::workflow::metadata_lock::lock_path;
+    use crate::workflow::model::{
+        BuildFingerprints, BuildResolution, BuildSource, ComposeHashes, ResolvedImage,
+        ResolvedImages, MERCURY_IMAGE_PREFIX,
+    };
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -276,6 +375,27 @@ mod tests {
             Project::parse("storage_1").unwrap(),
             PortMap::from_base(23000).unwrap(),
         )
+    }
+
+    fn with_mercury_build(original: &StackMetadata, fingerprint_byte: char) -> StackMetadata {
+        let fingerprint = fingerprint_byte.to_string().repeat(64);
+        let mut images = ResolvedImages::default();
+        images.set_mercury(ResolvedImage::new(
+            fingerprint.clone(),
+            format!("{MERCURY_IMAGE_PREFIX}{}", &fingerprint[..16]),
+            format!("sha256:{fingerprint}"),
+        ));
+        let mut updated = original.clone();
+        updated.set_build_resolution(BuildResolution::new(
+            BuildSource::new(
+                "0".repeat(40),
+                "1".repeat(64),
+                ComposeHashes::new("2".repeat(64), "3".repeat(64)),
+            ),
+            BuildFingerprints::new(fingerprint, "b".repeat(64), "c".repeat(64), "d".repeat(64)),
+            images,
+        ));
+        updated
     }
 
     #[test]
@@ -318,6 +438,97 @@ mod tests {
         )
         .unwrap();
         assert!(status(&temp.0, metadata.project()).is_err());
+    }
+
+    #[test]
+    fn build_metadata_replacement_is_atomic_exact_and_rejects_stale_writers() {
+        let temp = TempDirectory::new();
+        let original = metadata(&temp.0);
+        create_run(&original).unwrap();
+        let settings_before = fs::read(&original.paths().settings_file).unwrap();
+
+        let updated = with_mercury_build(&original, 'a');
+
+        replace_metadata(&temp.0, original.project(), &original, &updated).unwrap();
+        assert_eq!(status(&temp.0, original.project()).unwrap(), updated);
+        assert_eq!(
+            fs::read(&original.paths().settings_file).unwrap(),
+            settings_before
+        );
+        assert!(fs::read_dir(&original.paths().run_directory)
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")));
+
+        assert!(replace_metadata(&temp.0, original.project(), &original, &updated).is_err());
+        assert_eq!(status(&temp.0, original.project()).unwrap(), updated);
+        assert!(!lock_path(&original.paths().stack_metadata)
+            .unwrap()
+            .exists());
+    }
+
+    #[test]
+    fn crash_lock_residue_fails_closed_without_changing_metadata() {
+        let temp = TempDirectory::new();
+        let original = metadata(&temp.0);
+        create_run(&original).unwrap();
+        let updated = with_mercury_build(&original, 'a');
+        let path = lock_path(&original.paths().stack_metadata).unwrap();
+        let mut residue = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(PRIVATE_FILE_MODE)
+            .open(&path)
+            .unwrap();
+        residue.write_all(b"crash residue").unwrap();
+        residue.sync_all().unwrap();
+        drop(residue);
+
+        assert!(replace_metadata(&temp.0, original.project(), &original, &updated).is_err());
+        assert_eq!(status(&temp.0, original.project()).unwrap(), original);
+        assert_eq!(fs::read(path).unwrap(), b"crash residue");
+    }
+
+    #[test]
+    fn concurrent_divergent_metadata_writers_have_one_exact_winner() {
+        let temp = TempDirectory::new();
+        let original = metadata(&temp.0);
+        create_run(&original).unwrap();
+        let left = with_mercury_build(&original, 'a');
+        let right = with_mercury_build(&original, 'e');
+        let barrier = Arc::new(Barrier::new(3));
+
+        let spawn_writer = |updated: StackMetadata| {
+            let root = temp.0.clone();
+            let expected = original.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                replace_metadata(&root, expected.project(), &expected, &updated)
+            })
+        };
+        let left_writer = spawn_writer(left.clone());
+        let right_writer = spawn_writer(right.clone());
+        barrier.wait();
+        let left_result = left_writer.join().unwrap();
+        let right_result = right_writer.join().unwrap();
+
+        assert_eq!(
+            usize::from(left_result.is_ok()) + usize::from(right_result.is_ok()),
+            1
+        );
+        let stored = status(&temp.0, original.project()).unwrap();
+        if left_result.is_ok() {
+            assert_eq!(stored, left);
+        } else {
+            assert_eq!(stored, right);
+        }
+        assert!(!lock_path(&original.paths().stack_metadata)
+            .unwrap()
+            .exists());
     }
 
     #[test]
