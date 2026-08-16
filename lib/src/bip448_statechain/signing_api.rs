@@ -254,7 +254,7 @@ pub struct Bip448StatechainId(String);
 
 impl Bip448StatechainId {
     pub fn new(value: String) -> Result<Self, Bip448WireError> {
-        if value.is_empty() || value.len() > 50 {
+        if value.is_empty() || value.len() > 50 || value.contains('\0') {
             return Err(Bip448WireError::InvalidStatechainId);
         }
         Ok(Self(value))
@@ -1419,6 +1419,67 @@ mod tests {
                 !json.contains(forbidden_value),
                 "v2 lockbox payload exposed forbidden value sentinel {forbidden_value}: {json}"
             );
+        }
+    }
+
+    #[test]
+    fn bip448_statechain_id_rejects_embedded_nul_without_normalizing() {
+        for invalid in ["\0", "\0a", "a\0b", "a\0"] {
+            assert!(matches!(
+                Bip448StatechainId::new(invalid.to_owned()),
+                Err(Bip448WireError::InvalidStatechainId)
+            ));
+            assert!(matches!(
+                Bip448StatechainId::try_from(invalid),
+                Err(Bip448WireError::InvalidStatechainId)
+            ));
+        }
+
+        assert!(serde_json::from_str::<Bip448StatechainId>(r#""a\u0000b""#).is_err());
+
+        let lockbox_json = format!(
+            r#"{{"statechain_id":"lockbox\u0000id","signing_id":"{SIGNING_ID}","expected_key_generation":0,"expected_server_pubkey":"{SERVER_KEY}"}}"#
+        );
+        assert!(lockbox_json.contains(r"\u0000"));
+        assert!(
+            serde_json::from_str::<Bip448LockboxSignFirstRequestPayloadV2>(&lockbox_json).is_err()
+        );
+
+        let one_byte = "a";
+        let fifty_bytes = "b".repeat(50);
+        let fifty_one_bytes = "c".repeat(51);
+        assert!(Bip448StatechainId::new(one_byte.to_owned()).is_ok());
+        assert!(Bip448StatechainId::new(fifty_bytes.clone()).is_ok());
+        assert!(matches!(
+            Bip448StatechainId::new(fifty_one_bytes),
+            Err(Bip448WireError::InvalidStatechainId)
+        ));
+
+        let composed_source = "é";
+        let decomposed_source = "e\u{301}";
+        let composed = Bip448StatechainId::new(composed_source.to_owned()).unwrap();
+        let decomposed = Bip448StatechainId::new(decomposed_source.to_owned()).unwrap();
+        assert_ne!(composed, decomposed);
+        assert_eq!(
+            serde_json::to_string(&composed).unwrap().as_bytes(),
+            b"\"\xc3\xa9\""
+        );
+        assert_eq!(
+            serde_json::to_string(&decomposed).unwrap().as_bytes(),
+            b"\"e\xcc\x81\""
+        );
+
+        for valid in [
+            one_byte.to_owned(),
+            fifty_bytes,
+            composed_source.to_owned(),
+            decomposed_source.to_owned(),
+        ] {
+            let statechain_id = Bip448StatechainId::new(valid.clone()).unwrap();
+            let json = serde_json::to_string(&statechain_id).unwrap();
+            let round_trip: Bip448StatechainId = serde_json::from_str(&json).unwrap();
+            assert_eq!(round_trip.as_str().as_bytes(), valid.as_bytes());
+            assert_eq!(serde_json::to_string(&round_trip).unwrap(), json);
         }
     }
 
