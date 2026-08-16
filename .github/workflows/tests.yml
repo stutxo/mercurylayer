@@ -10,18 +10,15 @@ on:
 
 jobs:
   test:
-    name: test (${{ matrix.backend }})
+    name: test
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - backend: inquisition-core
-            settings_file: regtest.core.Settings.toml
     env:
       RUSTUP_TOOLCHAIN: 1.92.0
-      ML_SETTINGS_FILE: ${{ matrix.settings_file }}
-      COMPOSE_PROJECT_NAME: bip448ci
+      BIP448_CONTROLLER: ./target/debug/bip448-test
+      BIP448_PRIMARY_PROJECT: b448-ci-${{ github.run_id }}-${{ github.run_attempt }}-primary
+      BIP448_CONTROL_PROJECT: b448-ci-${{ github.run_id }}-${{ github.run_attempt }}-control
+      BIP448_PRIMARY_BASE_PORT: "26000"
+      BIP448_CONTROL_BASE_PORT: "26008"
 
     steps:
       - name: Checkout code
@@ -34,90 +31,86 @@ jobs:
         run: |
           cargo test --workspace --locked
 
-      - name: Start regtest stack
+      - name: Build BIP448 controller
         run: |
-          docker compose -p "$COMPOSE_PROJECT_NAME" -f docker-compose-token-servers.yml up --build -d
+          cargo build --locked --package rust --bin bip448-test
 
-      - name: Wait for Mercury server
+      - name: Check BIP448 prerequisites
         run: |
-          timeout 180 bash -c 'until curl -sf http://127.0.0.1:8000/info/config >/dev/null; do sleep 2; done'
+          "$BIP448_CONTROLLER" doctor
 
-      - name: Wait for Inquisition node
+      - name: Run authoritative BIP448 verification
         run: |
-          container_ids=$(docker ps \
-            --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" \
-            --filter "label=com.docker.compose.service=inquisition" \
-            --filter "status=running" \
-            --format '{{.ID}}')
-          container_count=$(printf '%s\n' "$container_ids" | sed '/^$/d' | wc -l)
-          if [ "$container_count" -ne 1 ]; then
-            echo "Expected exactly one running Inquisition container for project $COMPOSE_PROJECT_NAME, found $container_count"
-            exit 1
-          fi
-          container_id="$container_ids"
-          timeout 180 bash -c 'until docker exec "'"$container_id"'" bitcoin-cli -regtest -rpcuser=mercury -rpcpassword=mercury getblockchaininfo >/dev/null; do sleep 2; done'
+          "$BIP448_CONTROLLER" verify \
+            --project "$BIP448_PRIMARY_PROJECT" \
+            --base-port "$BIP448_PRIMARY_BASE_PORT" \
+            --control-project "$BIP448_CONTROL_PROJECT" \
+            --control-base-port "$BIP448_CONTROL_BASE_PORT"
 
-      - name: Initialize regtest wallet
-        run: |
-          container_ids=$(docker ps \
-            --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" \
-            --filter "label=com.docker.compose.service=inquisition" \
-            --filter "status=running" \
-            --format '{{.ID}}')
-          container_count=$(printf '%s\n' "$container_ids" | sed '/^$/d' | wc -l)
-          if [ "$container_count" -ne 1 ]; then
-            echo "Expected exactly one running Inquisition container for project $COMPOSE_PROJECT_NAME, found $container_count"
-            exit 1
-          fi
-          container_id="$container_ids"
-          echo "Container ID: $container_id"
-          wallet_name="mercury_test"
-          docker exec "$container_id" bitcoin-cli -regtest -rpcuser=mercury -rpcpassword=mercury createwallet "$wallet_name" || docker exec "$container_id" bitcoin-cli -regtest -rpcuser=mercury -rpcpassword=mercury loadwallet "$wallet_name"
-          address=$(docker exec "$container_id" bitcoin-cli -regtest -rpcuser=mercury -rpcpassword=mercury -rpcwallet="$wallet_name" getnewaddress)
-          echo "New Wallet Address: $address"
-          docker exec "$container_id" bitcoin-cli -regtest -rpcuser=mercury -rpcpassword=mercury generatetoaddress 101 "$address"
-
-      - name: Run retained integration suite
-        run: |
-          cd clients/tests/rust
-          cargo test --locked --test functional -- --ignored --test-threads=1
-
-      - name: Run BIP448 primitive integration suite
-        run: |
-          cd clients/tests/rust
-          cargo test --locked --test bip448_primitive_spike -- --ignored --test-threads=1
-
-      - name: Run BIP448 CSFS signing integration suite
-        run: |
-          cd clients/tests/rust
-          cargo test --locked --test bip448_csfs_signing -- --ignored --test-threads=1
-
-      - name: Run BIP448 deposit and recovery integration suite
-        run: |
-          cd clients/tests/rust
-          cargo test --locked --test bip448_deposit -- --ignored --test-threads=1
-
-      - name: Run BIP448 duplicate funding integration suite
-        run: |
-          cd clients/tests/rust
-          cargo test --locked --test bip448_duplicates -- --ignored --test-threads=1
-
-      - name: Run BIP448 transfer-sender integration suite
-        run: |
-          cd clients/tests/rust
-          cargo test --locked --test bip448_transfer_sender -- --ignored --test-threads=1
-
-      - name: Run BIP448 withdrawal integration suite
-        run: |
-          cd clients/tests/rust
-          cargo test --locked --test bip448_withdraw -- --ignored --test-threads=1
-
-      - name: Run lockbox compatibility suite
-        run: |
-          cd clients/tests/rust
-          cargo test --locked --test lockbox_compatibility -- --ignored --test-threads=1
-
-      - name: Tear down
+      - name: Read primary BIP448 status
         if: always()
         run: |
-          docker compose -p "$COMPOSE_PROJECT_NAME" -f docker-compose-token-servers.yml down -v
+          "$BIP448_CONTROLLER" status --project "$BIP448_PRIMARY_PROJECT"
+
+      - name: Checkpoint primary BIP448 evidence
+        if: always()
+        run: |
+          "$BIP448_CONTROLLER" checkpoint --project "$BIP448_PRIMARY_PROJECT"
+
+      - name: Read primary BIP448 logs
+        if: always()
+        run: |
+          "$BIP448_CONTROLLER" logs --project "$BIP448_PRIMARY_PROJECT"
+
+      - name: Read control BIP448 status
+        if: always()
+        run: |
+          "$BIP448_CONTROLLER" status --project "$BIP448_CONTROL_PROJECT"
+
+      - name: Checkpoint control BIP448 evidence
+        if: always()
+        run: |
+          "$BIP448_CONTROLLER" checkpoint --project "$BIP448_CONTROL_PROJECT"
+
+      - name: Read control BIP448 logs
+        if: always()
+        run: |
+          "$BIP448_CONTROLLER" logs --project "$BIP448_CONTROL_PROJECT"
+
+      - name: Upload primary BIP448 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bip448-${{ github.run_id }}-${{ github.run_attempt }}-primary
+          path: target/bip448-runs/${{ env.BIP448_PRIMARY_PROJECT }}
+          if-no-files-found: error
+          include-hidden-files: true
+
+      - name: Upload control BIP448 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bip448-${{ github.run_id }}-${{ github.run_attempt }}-control
+          path: target/bip448-runs/${{ env.BIP448_CONTROL_PROJECT }}
+          if-no-files-found: error
+          include-hidden-files: true
+
+      - name: Tear down primary BIP448 project
+        if: always()
+        run: |
+          "$BIP448_CONTROLLER" down --project "$BIP448_PRIMARY_PROJECT"
+
+      - name: Tear down control BIP448 project
+        if: always()
+        run: |
+          "$BIP448_CONTROLLER" down --project "$BIP448_CONTROL_PROJECT"
+
+      - name: Prove primary BIP448 cleanup status
+        if: always()
+        run: |
+          "$BIP448_CONTROLLER" status --project "$BIP448_PRIMARY_PROJECT"
+
+      - name: Prove control BIP448 cleanup status
+        if: always()
+        run: |
+          "$BIP448_CONTROLLER" status --project "$BIP448_CONTROL_PROJECT"
