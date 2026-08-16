@@ -13,6 +13,7 @@ mod model;
 mod project_lock;
 mod ready_gate;
 mod repository;
+mod reset;
 mod storage;
 mod supervision;
 mod test_runner;
@@ -28,7 +29,7 @@ pub use model::{
     ProjectSpec, RunPaths, StackMetadata, COMPONENTS,
 };
 
-pub const USAGE: &str = "Usage:\n  bip448-test --help\n  bip448-test doctor\n  bip448-test configure --project <PROJECT> --base-port <PORT>\n  bip448-test build --project <PROJECT> --service <all|mercury|token|lockbox|inquisition>\n  bip448-test up --project <PROJECT>\n  bip448-test ready --project <PROJECT>\n  bip448-test status --project <PROJECT>\n  bip448-test checkpoint --project <PROJECT>\n  bip448-test logs --project <PROJECT>\n  bip448-test down --project <PROJECT>\n  bip448-test bootstrap --project <PROJECT> [--require-zero]\n  bip448-test test --project <PROJECT> --target <MATRIX_BINARY> --test <EXACT_IDENTITY>";
+pub const USAGE: &str = "Usage:\n  bip448-test --help\n  bip448-test doctor\n  bip448-test configure --project <PROJECT> --base-port <PORT>\n  bip448-test build --project <PROJECT> --service <all|mercury|token|lockbox|inquisition>\n  bip448-test up --project <PROJECT>\n  bip448-test ready --project <PROJECT>\n  bip448-test status --project <PROJECT>\n  bip448-test checkpoint --project <PROJECT>\n  bip448-test logs --project <PROJECT>\n  bip448-test down --project <PROJECT>\n  bip448-test bootstrap --project <PROJECT> [--require-zero]\n  bip448-test test --project <PROJECT> --target <MATRIX_BINARY> --test <EXACT_IDENTITY>\n  bip448-test reset --project <PROJECT>\n\nreset permanently removes the selected project's run and operation-evidence tree. Run checkpoint and logs first when evidence must be retained.";
 
 pub async fn run<I>(args: I) -> i32
 where

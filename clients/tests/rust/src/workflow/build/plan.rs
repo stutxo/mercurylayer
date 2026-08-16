@@ -8,6 +8,8 @@ use super::super::model::{
 };
 use super::fingerprint::BuildSnapshot;
 
+const DOCKER_TAG_COMPONENT_MAX_BYTES: usize = 128;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Artifact {
     Mercury,
@@ -91,10 +93,12 @@ pub(super) fn plan_build(
     nonce: &str,
 ) -> Result<BuildPlan> {
     ensure!(
-        nonce.len() == 32 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit()),
-        "staging nonce must be 32 hexadecimal characters"
+        nonce.len() == 32
+            && nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "staging nonce must be 32 lowercase hexadecimal characters"
     );
-    let project_fragment = project.as_str().chars().take(24).collect::<String>();
     let mut images = Vec::new();
     for artifact in selected_artifacts(service) {
         let final_tag = artifact.final_tag(project, snapshot);
@@ -110,11 +114,13 @@ pub(super) fn plan_build(
                     .rsplit_once(':')
                     .map(|(repository, _)| repository)
                     .context("final image tag has no tag separator")?;
+                let component = format!("b448-stage-{project}-{nonce}-{}", artifact.label());
+                ensure!(
+                    component.len() <= DOCKER_TAG_COMPONENT_MAX_BYTES,
+                    "staging image tag component exceeds Docker's 128-byte limit"
+                );
                 PlanAction::Build {
-                    staging_tag: format!(
-                        "{repository}:b448-stage-{project_fragment}-{nonce}-{}",
-                        artifact.label()
-                    ),
+                    staging_tag: format!("{repository}:{component}"),
                 }
             }
         };

@@ -9,11 +9,18 @@ use super::evidence;
 use super::lifecycle;
 use super::model::canonical_json;
 use super::repository;
+use super::reset;
 use super::storage;
 use super::test_runner;
 use super::USAGE;
 
 pub async fn execute(command: Command, raw_arguments: &[String]) -> Result<String, WorkflowError> {
+    if let Command::Reset { project } = &command {
+        let root = repository::active_root()?;
+        let _lock = super::project_lock::ProjectLock::acquire(&root, project)
+            .context("serialize destructive BIP448 project reset")?;
+        return reset::execute(&root, project).map_err(WorkflowError::from);
+    }
     if command.mutation().is_some() {
         let root = repository::active_root()?;
         let owned = command.clone();
@@ -33,6 +40,7 @@ pub async fn execute(command: Command, raw_arguments: &[String]) -> Result<Strin
         | Command::Down { .. }
         | Command::Bootstrap { .. }
         | Command::Test { .. } => unreachable!("mutations are dispatched through evidence"),
+        Command::Reset { .. } => unreachable!("reset is dispatched through its lock-only path"),
         Command::Ready { project } => {
             let root = repository::active_root()?;
             let metadata = storage::status(&root, &project)

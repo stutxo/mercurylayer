@@ -66,6 +66,65 @@ fn planner_distinguishes_cache_hits_and_unique_staging_misses() {
         "not-a-uuid"
     )
     .is_err());
+    assert!(plan_build(
+        BuildService::Lockbox,
+        &project,
+        &snapshot,
+        &BTreeMap::from([(Artifact::Lockbox, None), (Artifact::LockboxRng, None)]),
+        "0123456789ABCDEF0123456789ABCDEF"
+    )
+    .is_err());
+}
+
+#[test]
+fn full_project_identity_makes_long_shared_prefix_staging_tags_disjoint() {
+    let snapshot = snapshot();
+    let prefix = "a".repeat(24);
+    let first = Project::parse(&format!("{prefix}-first")).unwrap();
+    let second = Project::parse(&format!("{prefix}-second")).unwrap();
+    let observed = BTreeMap::from([(Artifact::Mercury, None)]);
+    let first_plan =
+        plan_build(BuildService::Mercury, &first, &snapshot, &observed, NONCE).unwrap();
+    let second_plan =
+        plan_build(BuildService::Mercury, &second, &snapshot, &observed, NONCE).unwrap();
+    let PlanAction::Build {
+        staging_tag: first_tag,
+    } = &first_plan.images[0].action
+    else {
+        panic!("first long project did not plan a staging build")
+    };
+    let PlanAction::Build {
+        staging_tag: second_tag,
+    } = &second_plan.images[0].action
+    else {
+        panic!("second long project did not plan a staging build")
+    };
+    assert_ne!(first_tag, second_tag);
+    assert!(first_tag.contains(first.as_str()));
+    assert!(second_tag.contains(second.as_str()));
+}
+
+#[test]
+fn maximum_project_staging_component_is_valid_and_within_docker_limit() {
+    let project = Project::parse(&"a".repeat(63)).unwrap();
+    let plan = plan_build(
+        BuildService::Lockbox,
+        &project,
+        &snapshot(),
+        &BTreeMap::from([
+            (Artifact::Lockbox, Some(MockRunner::image_id(1))),
+            (Artifact::LockboxRng, None),
+        ]),
+        NONCE,
+    )
+    .unwrap();
+    let PlanAction::Build { staging_tag } = &plan.images[1].action else {
+        panic!("maximum project RNG miss did not plan a staging build")
+    };
+    let component = staging_tag.rsplit_once(':').unwrap().1;
+    assert!(component.contains(project.as_str()));
+    assert_eq!(component.len(), 119);
+    assert!(component.len() <= 128);
 }
 
 #[test]
