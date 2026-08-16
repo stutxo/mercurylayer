@@ -31,6 +31,7 @@ pub(super) struct ContainerReport {
     pub(super) running: bool,
     pub(super) restarting: bool,
     pub(super) dead: bool,
+    pub(super) started_at: Option<String>,
     pub(super) health: Option<String>,
     pub(super) image: ImageReport,
     pub(super) listeners: Vec<ListenerReport>,

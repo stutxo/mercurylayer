@@ -261,7 +261,7 @@ impl MockDocker {
                             "com.docker.compose.project":PROJECT,
                             "com.docker.compose.service":service
                         }},
-                        "State":{"Status":self.state,"Running":self.running,"Restarting":self.restarting,"Dead":self.dead,"Health":health},
+                        "State":{"Status":self.state,"Running":self.running,"Restarting":self.restarting,"Dead":self.dead,"StartedAt":"2026-08-15T00:00:00.000000000Z","Health":health},
                         "NetworkSettings":{"Networks":{network.clone():{"NetworkID":Self::network_id()}},"Ports":listeners},
                         "Mounts": mounts
                     })

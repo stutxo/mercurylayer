@@ -302,19 +302,28 @@ fn http_config(
     }
 }
 
-pub(super) fn require_exact_mercury_config(
+pub(super) fn exact_mercury_config(
     metadata: &StackMetadata,
     host: &mut impl HostProbe,
-) -> Result<()> {
-    match http_config(metadata, "mercury-server", host)? {
-        Attempt::Ready(detail) => {
-            ensure!(
-                detail == "http_config_ready",
-                "Mercury config probe returned a non-canonical success"
-            );
-            Ok(())
+) -> Result<Value> {
+    match host.http_json(
+        "mercury-server",
+        metadata.ports().mercury,
+        "/info/config",
+        None,
+        None,
+    )? {
+        HttpAttempt::ConnectionMiss(detail) => {
+            bail!("Mercury /info/config was not directly ready: {detail}")
         }
-        Attempt::Retry(detail) => bail!("Mercury /info/config was not directly ready: {detail}"),
+        HttpAttempt::Response(response) => {
+            ensure!(
+                response.status == 200
+                    && response.body == json!({"batchtimeout": 20, "version": "0.2.1"}),
+                "Mercury returned malformed /info/config response"
+            );
+            Ok(response.body)
+        }
     }
 }
 

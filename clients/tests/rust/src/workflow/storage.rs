@@ -191,7 +191,7 @@ fn reserve_ports(ports: PortMap) -> Result<Vec<TcpListener>> {
 }
 
 #[cfg(test)]
-fn create_run(metadata: &StackMetadata) -> Result<()> {
+pub(super) fn create_run(metadata: &StackMetadata) -> Result<()> {
     let paths = metadata.paths();
     prepare_runs_root(&paths.run_directory)?;
     ensure_run_absent(paths)?;

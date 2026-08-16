@@ -5,7 +5,7 @@ mod tests;
 use std::path::Path;
 
 use anyhow::{bail, ensure, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::argv::{ArgvCommand, CommandOutput, CommandRunner, SystemCommandRunner};
@@ -35,6 +35,17 @@ struct Balance {
     value: f64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ChainWalletSnapshot {
+    pub(super) height: u64,
+    pub(super) best_block_hash: String,
+    pub(super) mempool: Vec<String>,
+    pub(super) loaded_wallets: Vec<String>,
+    pub(super) wallet: String,
+    pub(super) confirmed_spendable_balance: String,
+}
+
 pub(super) fn execute(
     repo_root: &Path,
     metadata: &StackMetadata,
@@ -44,6 +55,78 @@ pub(super) fn execute(
     let mut gate = LiveReadyGate;
     let report = execute_with(repo_root, metadata, require_zero, &mut runner, &mut gate)?;
     canonical_json(&report).map_err(WorkflowError::from)
+}
+
+pub(super) fn snapshot(repo_root: &Path, metadata: &StackMetadata) -> Result<ChainWalletSnapshot> {
+    let mut runner = SystemCommandRunner;
+    let container = inquisition_container(repo_root, metadata, &mut runner)?;
+    let height = block_height(repo_root, &container, &mut runner)?;
+    let best_block_hash = bitcoin_text(
+        repo_root,
+        &container,
+        &["getbestblockhash"],
+        "getbestblockhash",
+        &mut runner,
+    )?;
+    ensure_hash(&best_block_hash, "best block hash")?;
+    let mut mempool = bitcoin_json(repo_root, &container, &["getrawmempool"], &mut runner)?
+        .as_array()
+        .context("getrawmempool response is not an array")?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .context("getrawmempool contains a non-string transaction ID")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for txid in &mempool {
+        ensure_hash(txid, "mempool transaction ID")?;
+    }
+    mempool.sort();
+    let mut loaded_wallets = loaded_wallets(repo_root, &container, &mut runner)?;
+    loaded_wallets.sort();
+    ensure!(
+        loaded_wallets.iter().any(|wallet| wallet == WALLET),
+        "authoritative wallet {WALLET} is not loaded"
+    );
+    let balance = confirmed_spendable_balance(repo_root, &container, &mut runner)?;
+    ensure!(
+        balance.value > 0.0,
+        "authoritative wallet has no positive confirmed spendable balance"
+    );
+    Ok(ChainWalletSnapshot {
+        height,
+        best_block_hash,
+        mempool,
+        loaded_wallets,
+        wallet: WALLET.into(),
+        confirmed_spendable_balance: balance.text,
+    })
+}
+
+fn bitcoin_text(
+    repo_root: &Path,
+    container: &str,
+    args: &[&str],
+    label: &str,
+    runner: &mut impl CommandRunner,
+) -> Result<String> {
+    let output = bitcoin_checked(repo_root, container, args, runner)?;
+    let value = utf8(&output.stdout, label)?.trim().to_owned();
+    ensure!(!value.is_empty(), "{label} returned an empty value");
+    Ok(value)
+}
+
+fn ensure_hash(value: &str, label: &str) -> Result<()> {
+    ensure!(
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{label} is not a lowercase 32-byte hexadecimal identity"
+    );
+    Ok(())
 }
 
 fn execute_with<R: CommandRunner, G: ReadyGate>(

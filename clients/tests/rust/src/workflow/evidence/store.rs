@@ -39,6 +39,7 @@ impl IdSource for UuidSource {
 pub(super) struct Operation {
     directory: PathBuf,
     started: StartedRecord,
+    captures_test_output: bool,
 }
 
 impl Operation {
@@ -57,6 +58,21 @@ impl Operation {
         )
     }
 
+    pub(super) fn start_auxiliary(
+        repo_root: &Path,
+        project: &Project,
+        command: &str,
+        arguments: Vec<String>,
+        source: SourceIdentity,
+        configure: bool,
+    ) -> Result<Self> {
+        let mut clock = SystemClock;
+        let mut ids = UuidSource;
+        Self::start_mode(
+            repo_root, project, command, arguments, source, configure, false, &mut clock, &mut ids,
+        )
+    }
+
     pub(super) fn start_with(
         repo_root: &Path,
         project: &Project,
@@ -64,6 +80,22 @@ impl Operation {
         arguments: Vec<String>,
         source: SourceIdentity,
         configure: bool,
+        clock: &mut impl Clock,
+        ids: &mut impl IdSource,
+    ) -> Result<Self> {
+        Self::start_mode(
+            repo_root, project, command, arguments, source, configure, true, clock, ids,
+        )
+    }
+
+    fn start_mode(
+        repo_root: &Path,
+        project: &Project,
+        command: &str,
+        arguments: Vec<String>,
+        source: SourceIdentity,
+        configure: bool,
+        captures_test_output: bool,
         clock: &mut impl Clock,
         ids: &mut impl IdSource,
     ) -> Result<Self> {
@@ -111,8 +143,14 @@ impl Operation {
             &directory.join("started.json"),
             canonical_json(&started)?.as_bytes(),
         )?;
-        begin_test_capture()?;
-        Ok(Self { directory, started })
+        if captures_test_output {
+            begin_test_capture()?;
+        }
+        Ok(Self {
+            directory,
+            started,
+            captures_test_output,
+        })
     }
 
     pub(super) fn operation_id(&self) -> &str {
@@ -132,13 +170,34 @@ impl Operation {
         self.finish_with(action, child, &mut clock)
     }
 
+    pub(super) fn finish_generic<T>(
+        self,
+        action: &Result<T, WorkflowError>,
+        child: Option<ChildFailure>,
+    ) -> Result<()> {
+        let mut clock = SystemClock;
+        self.finish_with_generic(action, child, &mut clock)
+    }
+
     pub(super) fn finish_with(
         self,
         action: &Result<String, WorkflowError>,
         child: Option<ChildFailure>,
         clock: &mut impl Clock,
     ) -> Result<()> {
-        let test_output = finish_test_capture();
+        self.finish_with_generic(action, child, clock)
+    }
+
+    fn finish_with_generic<T>(
+        self,
+        action: &Result<T, WorkflowError>,
+        child: Option<ChildFailure>,
+        clock: &mut impl Clock,
+    ) -> Result<()> {
+        let test_output = self
+            .captures_test_output
+            .then(finish_test_capture)
+            .flatten();
         let test_logs = match test_output {
             Some((stdout, stderr)) => Some(TestLogs {
                 stdout: write_log(&self.directory, "test.stdout", &stdout)?,
@@ -251,6 +310,13 @@ pub(super) fn combine_action_and_finalization(
     action: Result<String, WorkflowError>,
     finalization: Result<()>,
 ) -> Result<String, WorkflowError> {
+    combine_generic(action, finalization)
+}
+
+pub(super) fn combine_generic<T>(
+    action: Result<T, WorkflowError>,
+    finalization: Result<()>,
+) -> Result<T, WorkflowError> {
     match (action, finalization) {
         (Ok(output), Ok(())) => Ok(output),
         (Err(primary), Ok(())) => Err(primary),
@@ -267,8 +333,8 @@ pub(super) fn combine_action_and_finalization(
     }
 }
 
-fn classify(
-    action: &Result<String, WorkflowError>,
+fn classify<T>(
+    action: &Result<T, WorkflowError>,
     child: Option<&ChildFailure>,
 ) -> (Outcome, Option<String>) {
     match action {

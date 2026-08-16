@@ -57,7 +57,15 @@ impl StartedRecord {
         ensure!(
             matches!(
                 self.command.as_str(),
-                "configure" | "build" | "up" | "bootstrap" | "test" | "verify" | "down"
+                "configure"
+                    | "build"
+                    | "up"
+                    | "bootstrap"
+                    | "test"
+                    | "verify"
+                    | "verify-control"
+                    | "verify-matrix-target"
+                    | "down"
             ),
             "started record command is unsupported"
         );

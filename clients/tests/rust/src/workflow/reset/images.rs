@@ -227,7 +227,7 @@ fn inspect_image(
     Ok(Some(ImageInspect { id, repo_tags }))
 }
 
-fn image_tags(
+pub(in crate::workflow) fn image_tags(
     repo_root: &Path,
     runner: &mut impl CommandRunner,
 ) -> Result<BTreeMap<String, String>> {

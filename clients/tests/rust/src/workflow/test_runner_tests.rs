@@ -129,7 +129,9 @@ fn exact_success_discovers_then_runs_once_with_sanitized_environment() {
     )
     .unwrap();
 
-    assert_eq!(report.status, "passed");
+    assert_eq!(report.report.status, "passed");
+    assert_eq!(report.metadata, metadata());
+    assert!(report.rng_adoption.is_none());
     assert_eq!(gate.calls, 2);
     assert_eq!(runner.seen.len(), 2);
     assert_eq!(*events.borrow(), ["ready", "discover", "test", "ready"]);

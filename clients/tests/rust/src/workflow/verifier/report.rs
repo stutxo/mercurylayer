@@ -13,7 +13,7 @@ pub(super) struct Route {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct SettingsReport {
+pub(in crate::workflow) struct SettingsReport {
     pub(super) keys: BTreeMap<String, String>,
 }
 
@@ -51,7 +51,7 @@ pub(super) struct SqliteCatalog {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct ClientDatabaseReport {
+pub(in crate::workflow) struct ClientDatabaseReport {
     pub(super) catalog: SqliteCatalog,
     pub(super) reference_catalog: SqliteCatalog,
     pub(super) migrations_applied_twice: bool,
@@ -117,7 +117,7 @@ pub(super) struct PgCatalog {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct PostgresReport {
+pub(in crate::workflow) struct PostgresReport {
     pub(super) mercury: PgCatalog,
     pub(super) mercury_migrations: Vec<MigrationRow>,
     pub(super) lockbox: PgCatalog,
@@ -125,7 +125,17 @@ pub(super) struct PostgresReport {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct VerifyReport {
+pub(in crate::workflow) struct StableContractSnapshot {
+    pub(in crate::workflow) settings: SettingsReport,
+    pub(in crate::workflow) mercury_config: serde_json::Value,
+    pub(in crate::workflow) client_migration_sha256: String,
+    pub(in crate::workflow) client_database: ClientDatabaseReport,
+    pub(in crate::workflow) postgres: PostgresReport,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::workflow) struct VerifyReport {
     pub(super) version: u32,
     pub(super) project: String,
     pub(super) status: String,

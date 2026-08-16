@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 
+use super::authoritative::PairSpec;
 use super::error::WorkflowError;
 use super::matrix;
 use super::model::{PortMap, Project};
@@ -45,7 +46,7 @@ pub enum Command {
         test: String,
     },
     Verify {
-        project: Project,
+        pair: PairSpec,
     },
     Reset {
         project: Project,
@@ -60,7 +61,7 @@ impl Command {
             Self::Up { project } => Some((project, "up")),
             Self::Bootstrap { project, .. } => Some((project, "bootstrap")),
             Self::Test { project, .. } => Some((project, "test")),
-            Self::Verify { project } => Some((project, "verify")),
+            Self::Verify { pair } => Some((pair.primary(), "verify")),
             Self::Down { project } => Some((project, "down")),
             // Reset is the single destructive, evidence-exempt mutation. The
             // dispatcher still serializes it with the stable project lock.
@@ -134,12 +135,43 @@ where
         "down" => parse_project_command(&args[1..], |project| Command::Down { project }),
         "bootstrap" => parse_bootstrap(&args[1..]),
         "test" => parse_test(&args[1..]),
-        "verify" => parse_project_command(&args[1..], |project| Command::Verify { project }),
+        "verify" => parse_verify(&args[1..]),
         "reset" => parse_project_command(&args[1..], |project| Command::Reset { project }),
         other => Err(WorkflowError::usage(format!(
             "unknown or malformed command {other:?}"
         ))),
     }
+}
+
+fn parse_verify(args: &[String]) -> Result<Command, WorkflowError> {
+    if args == ["--help"] {
+        return Ok(Command::Help);
+    }
+    let options = parse_variable_options(
+        args,
+        &["--project", "--base-port"],
+        &["--control-project", "--control-base-port"],
+    )?;
+    let primary = required_project(&options)?;
+    let primary_base = parse_port(&options["--base-port"], "--base-port")?;
+    let control = options
+        .get("--control-project")
+        .map(|value| Project::parse(value).map_err(WorkflowError::usage))
+        .transpose()?;
+    let control_base = options
+        .get("--control-base-port")
+        .map(|value| parse_port(value, "--control-base-port"))
+        .transpose()?;
+    Ok(Command::Verify {
+        pair: PairSpec::new(primary, primary_base, control, control_base)
+            .map_err(WorkflowError::usage)?,
+    })
+}
+
+fn parse_port(value: &str, option: &str) -> Result<u16, WorkflowError> {
+    value.parse::<u16>().map_err(|_| {
+        WorkflowError::usage(format!("{option} must be an integer in the u16 port range"))
+    })
 }
 
 fn parse_bootstrap(args: &[String]) -> Result<Command, WorkflowError> {
@@ -278,6 +310,41 @@ fn parse_options(
     Ok(parsed)
 }
 
+fn parse_variable_options(
+    args: &[String],
+    required: &[&str],
+    optional: &[&str],
+) -> Result<BTreeMap<String, String>, WorkflowError> {
+    if args.len() % 2 != 0 {
+        return Err(WorkflowError::usage("every verify option requires a value"));
+    }
+    let mut parsed = BTreeMap::new();
+    for pair in args.chunks_exact(2) {
+        let name = pair[0].as_str();
+        if !required.contains(&name) && !optional.contains(&name) {
+            return Err(WorkflowError::usage(format!("unknown option {name:?}")));
+        }
+        if pair[1].starts_with("--") {
+            return Err(WorkflowError::usage(format!(
+                "option {name} requires a value"
+            )));
+        }
+        if parsed.insert(pair[0].clone(), pair[1].clone()).is_some() {
+            return Err(WorkflowError::usage(format!(
+                "option {name} may be specified only once"
+            )));
+        }
+    }
+    for name in required {
+        if !parsed.contains_key(*name) {
+            return Err(WorkflowError::usage(format!(
+                "required option {name} is missing"
+            )));
+        }
+    }
+    Ok(parsed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,9 +440,17 @@ mod tests {
             }
         );
         assert_eq!(
-            parse(args(&["verify", "--project", "matrix_1"])).unwrap(),
+            parse(args(&[
+                "verify",
+                "--project",
+                "matrix_1",
+                "--base-port",
+                "23000",
+            ]))
+            .unwrap(),
             Command::Verify {
-                project: Project::parse("matrix_1").unwrap()
+                pair: PairSpec::new(Project::parse("matrix_1").unwrap(), 23000, None, None,)
+                    .unwrap(),
             }
         );
         assert_eq!(
@@ -427,6 +502,27 @@ mod tests {
             vec!["configure", "--project", "UPPER", "--base-port", "23000"],
             vec!["configure", "--project", "ok", "--base-port", "65530"],
             vec!["status", "--project", "has.dot"],
+            vec!["verify", "--project", "ok"],
+            vec![
+                "verify",
+                "--project",
+                "same",
+                "--base-port",
+                "23000",
+                "--control-project",
+                "same",
+            ],
+            vec![
+                "verify",
+                "--project",
+                "one",
+                "--base-port",
+                "23000",
+                "--control-project",
+                "two",
+                "--control-base-port",
+                "23007",
+            ],
             vec!["build", "--project", "ok", "--service", "unknown"],
             vec!["build", "--project", "ok"],
             vec![

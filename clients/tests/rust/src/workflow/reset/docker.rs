@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{bail, ensure, Context, Result};
+use serde::Serialize;
 use serde_json::Value;
 
 use super::super::argv::{ArgvCommand, CommandOutput, CommandRunner};
@@ -10,16 +11,23 @@ use super::super::model::Project;
 const PROJECT_LABEL: &str = "com.docker.compose.project";
 const SERVICE_LABEL: &str = "com.docker.compose.service";
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(super) struct ResourceSets {
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::workflow) struct ResourceSets {
     pub(super) containers: BTreeSet<String>,
     pub(super) networks: BTreeSet<String>,
     pub(super) volumes: BTreeSet<String>,
 }
 
 impl ResourceSets {
-    pub(super) fn is_empty(&self) -> bool {
+    pub(in crate::workflow) fn is_empty(&self) -> bool {
         self.containers.is_empty() && self.networks.is_empty() && self.volumes.is_empty()
+    }
+
+    pub(in crate::workflow) fn is_disjoint(&self, other: &Self) -> bool {
+        self.containers.is_disjoint(&other.containers)
+            && self.networks.is_disjoint(&other.networks)
+            && self.volumes.is_disjoint(&other.volumes)
     }
 
     fn without(&self, removed: &Self) -> Result<Self> {
@@ -89,7 +97,10 @@ impl DockerPlan {
     }
 }
 
-fn global_resources(repo_root: &Path, runner: &mut impl CommandRunner) -> Result<ResourceSets> {
+pub(in crate::workflow) fn global_resources(
+    repo_root: &Path,
+    runner: &mut impl CommandRunner,
+) -> Result<ResourceSets> {
     Ok(ResourceSets {
         containers: listed(
             repo_root,
@@ -112,7 +123,7 @@ fn global_resources(repo_root: &Path, runner: &mut impl CommandRunner) -> Result
     })
 }
 
-fn project_resources(
+pub(in crate::workflow) fn project_resources(
     repo_root: &Path,
     project: &Project,
     runner: &mut impl CommandRunner,

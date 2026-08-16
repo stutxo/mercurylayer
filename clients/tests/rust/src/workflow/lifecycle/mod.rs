@@ -107,9 +107,26 @@ pub(super) fn project_spec(metadata: &StackMetadata) -> Result<ProjectSpec> {
     Ok(metadata.project_spec(image_map_from_metadata(metadata)?))
 }
 
-pub(super) fn require_exact_mercury_config(metadata: &StackMetadata) -> Result<()> {
+pub(super) fn exact_mercury_config(metadata: &StackMetadata) -> Result<serde_json::Value> {
     let mut host = SystemHostProbe::new();
-    readiness::require_exact_mercury_config(metadata, &mut host)
+    readiness::exact_mercury_config(metadata, &mut host)
+}
+
+pub(super) fn require_stable_started(report: &StatusReport) -> Result<()> {
+    ensure!(
+        report.runtime.all_services_ready && report.runtime.containers.len() == 8,
+        "control topology is not exactly eight ready services"
+    );
+    for (service, container) in &report.runtime.containers {
+        ensure!(
+            container
+                .started_at
+                .as_ref()
+                .is_some_and(|value| !value.trim().is_empty()),
+            "control service {service} has no stable StartedAt identity"
+        );
+    }
+    Ok(())
 }
 
 pub(super) fn restart_mercury(

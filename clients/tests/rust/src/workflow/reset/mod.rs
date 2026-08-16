@@ -1,7 +1,7 @@
 mod deletion;
-mod docker;
+pub(super) mod docker;
 mod filesystem;
-mod images;
+pub(super) mod images;
 
 #[cfg(test)]
 mod tests;

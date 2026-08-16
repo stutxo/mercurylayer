@@ -409,7 +409,7 @@ fn cleanup_staging_tags(
     Ok(())
 }
 
-fn image_id(
+pub(super) fn image_id(
     repo_root: &Path,
     tag: &str,
     runner: &mut impl CommandRunner,

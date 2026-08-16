@@ -1,3 +1,5 @@
+#[path = "test_runner_reconcile.rs"]
+mod reconcile;
 #[cfg(test)]
 #[path = "test_runner_tests.rs"]
 mod tests;
@@ -14,6 +16,7 @@ use super::error::WorkflowError;
 use super::matrix::{self, MatrixTarget};
 use super::model::{canonical_json, ProjectSpec, StackMetadata};
 use super::ready_gate::{LiveReadyGate, ReadyGate};
+pub(super) use reconcile::{RngAdoptionRecord, RNG_RECONCILIATION_TARGET, RNG_RECONCILIATION_TEST};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -24,6 +27,13 @@ struct TestReport {
     status: String,
     stdout: String,
     stderr: String,
+    rng_adoption: Option<RngAdoptionRecord>,
+}
+
+pub(super) struct TestExecution {
+    pub(super) output: String,
+    pub(super) metadata: StackMetadata,
+    pub(super) rng_adoption: Option<RngAdoptionRecord>,
 }
 
 pub(super) fn execute(
@@ -31,11 +41,11 @@ pub(super) fn execute(
     metadata: &StackMetadata,
     target: &str,
     identity: &str,
-) -> Result<String, WorkflowError> {
+) -> Result<TestExecution, WorkflowError> {
     let mut runner = SystemCommandRunner;
     let mut gate = LiveReadyGate;
     let inherited = std::env::vars_os().collect::<Vec<_>>();
-    let report = execute_with(
+    let execution = execute_with(
         repo_root,
         metadata,
         target,
@@ -44,7 +54,19 @@ pub(super) fn execute(
         &mut runner,
         &mut gate,
     )?;
-    canonical_json(&report).map_err(WorkflowError::from)
+    let output = canonical_json(&execution.report).map_err(WorkflowError::from)?;
+    Ok(TestExecution {
+        output,
+        metadata: execution.metadata,
+        rng_adoption: execution.rng_adoption,
+    })
+}
+
+#[derive(Debug)]
+struct TestExecutionInner {
+    report: TestReport,
+    metadata: StackMetadata,
+    rng_adoption: Option<RngAdoptionRecord>,
 }
 
 fn execute_with<R, G, I>(
@@ -55,7 +77,7 @@ fn execute_with<R, G, I>(
     inherited: I,
     runner: &mut R,
     gate: &mut G,
-) -> Result<TestReport, WorkflowError>
+) -> Result<TestExecutionInner, WorkflowError>
 where
     R: CommandRunner,
     G: ReadyGate,
@@ -89,16 +111,21 @@ where
         return Err(child_failure("exact BIP448 Cargo test", &output));
     }
     ensure_success_status(&output, "exact BIP448 Cargo test")?;
-    gate.require_ready(repo_root, metadata)
-        .context("require exact ready stack after successful BIP448 test")?;
+    let boundary = reconcile::after_success(repo_root, metadata, target, identity, runner, gate)?;
 
-    Ok(TestReport {
-        project: metadata.project().to_string(),
+    let report = TestReport {
+        project: boundary.metadata.project().to_string(),
         target: target.into(),
         test: identity.into(),
         status: "passed".into(),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        rng_adoption: boundary.adoption.clone(),
+    };
+    Ok(TestExecutionInner {
+        report,
+        metadata: boundary.metadata,
+        rng_adoption: boundary.adoption,
     })
 }
 

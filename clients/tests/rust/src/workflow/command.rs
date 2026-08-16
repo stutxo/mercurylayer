@@ -1,5 +1,6 @@
 use anyhow::Context;
 
+use super::authoritative;
 use super::bootstrap;
 use super::build::{self, SystemCommandRunner};
 use super::cli::Command;
@@ -12,7 +13,6 @@ use super::repository;
 use super::reset;
 use super::storage;
 use super::test_runner;
-use super::verifier;
 use super::USAGE;
 
 pub async fn execute(command: Command, raw_arguments: &[String]) -> Result<String, WorkflowError> {
@@ -21,6 +21,19 @@ pub async fn execute(command: Command, raw_arguments: &[String]) -> Result<Strin
         let _lock = super::project_lock::ProjectLock::acquire(&root, project)
             .context("serialize destructive BIP448 project reset")?;
         return reset::execute(&root, project).map_err(WorkflowError::from);
+    }
+    if let Command::Verify { pair } = &command {
+        let root = repository::active_root()?;
+        let pair = pair.clone();
+        return evidence::execute_authoritative(
+            &root,
+            pair.primary(),
+            pair.control(),
+            raw_arguments,
+            |primary_operation, control_operation| {
+                authoritative::execute(&root, &pair, primary_operation, control_operation)
+            },
+        );
     }
     if command.mutation().is_some() {
         let root = repository::active_root()?;
@@ -40,8 +53,10 @@ pub async fn execute(command: Command, raw_arguments: &[String]) -> Result<Strin
         | Command::Up { .. }
         | Command::Down { .. }
         | Command::Bootstrap { .. }
-        | Command::Test { .. }
-        | Command::Verify { .. } => unreachable!("mutations are dispatched through evidence"),
+        | Command::Test { .. } => unreachable!("mutations are dispatched through evidence"),
+        Command::Verify { .. } => {
+            unreachable!("authoritative verify is dispatched through paired evidence")
+        }
         Command::Reset { .. } => unreachable!("reset is dispatched through its lock-only path"),
         Command::Ready { project } => {
             let root = repository::active_root()?;
@@ -116,13 +131,9 @@ fn execute_mutation(
         } => {
             let metadata =
                 storage::status(root, &project).context("read configured BIP448 test metadata")?;
-            test_runner::execute(root, &metadata, &target, &test)
+            test_runner::execute(root, &metadata, &target, &test).map(|execution| execution.output)
         }
-        Command::Verify { project } => {
-            let metadata = storage::status(root, &project)
-                .context("read configured BIP448 verifier metadata")?;
-            verifier::execute(root, &metadata, operation_id)
-        }
+        Command::Verify { .. } => unreachable!("authoritative verify has a paired dispatcher"),
         _ => unreachable!("only mutations reach mutation dispatcher"),
     }
 }

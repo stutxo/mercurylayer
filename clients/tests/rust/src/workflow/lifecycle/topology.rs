@@ -306,6 +306,7 @@ pub(super) fn report(
                 running: container.running,
                 restarting: container.restarting,
                 dead: container.dead,
+                started_at: Some(container.started_at.clone()),
                 health: container.health.clone(),
                 image: ImageReport {
                     configured_tag: Some(container.configured_image.clone()),
@@ -340,6 +341,7 @@ pub(super) fn report(
                 running: false,
                 restarting: false,
                 dead: false,
+                started_at: None,
                 health: None,
                 image: ImageReport {
                     configured_tag: expected_image.map(|image| image.tag.clone()),

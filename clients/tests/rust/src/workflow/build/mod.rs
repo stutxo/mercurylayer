@@ -2,6 +2,7 @@ mod execute;
 mod fingerprint;
 mod inputs;
 mod plan;
+mod reconcile;
 
 #[cfg(test)]
 mod execute_tests;
@@ -19,6 +20,7 @@ use anyhow::{bail, Result};
 pub(super) use super::argv::{ArgvCommand, CommandOutput, CommandRunner, SystemCommandRunner};
 use super::cli::BuildService;
 use super::model::StackMetadata;
+pub(super) use reconcile::{inspect_rng_replacement, RngImageReplacement};
 
 const INQUISITION_COMMIT: &str = "f5365867662091c2dbf1b2d438b8bb477a3dcb6f";
 const INQUISITION_BUILD_ARG: &str = "BITCOIN_INQUISITION_COMMIT";

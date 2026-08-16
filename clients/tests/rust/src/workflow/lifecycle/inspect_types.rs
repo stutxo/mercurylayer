@@ -38,6 +38,8 @@ pub(super) struct ContainerState {
     pub(super) restarting: bool,
     #[serde(rename = "Dead")]
     pub(super) dead: bool,
+    #[serde(rename = "StartedAt")]
+    pub(super) started_at: String,
     #[serde(rename = "Health")]
     pub(super) health: Option<ContainerHealth>,
 }

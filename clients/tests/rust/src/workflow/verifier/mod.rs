@@ -1,6 +1,7 @@
 mod artifacts;
 mod client_contract;
 mod client_db;
+mod executable;
 pub(in crate::workflow) mod helper;
 mod postgres;
 mod postgres_columns;
@@ -15,7 +16,7 @@ mod settings;
 #[cfg(test)]
 mod tests;
 
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -23,43 +24,23 @@ use anyhow::{bail, ensure, Context, Result};
 
 use super::argv::{record_failure, ArgvCommand, CommandOutput, CommandRunner, SystemCommandRunner};
 use super::build;
-use super::error::WorkflowError;
 use super::lifecycle;
-use super::model::{canonical_json, StackMetadata};
+use super::model::StackMetadata;
 use artifacts::ArtifactGuard;
-use report::{ClientDatabaseReport, PostgresReport, VerifyReport};
+use report::{ClientDatabaseReport, PostgresReport};
+pub(super) use report::{StableContractSnapshot, VerifyReport};
 
 const HELPER_SETTINGS: &str = ".verify-client.Settings.toml";
 const HELPER_DATABASE: &str = "verify-client.sqlite";
 const MAX_HELPER_OUTPUT: usize = 4 * 1_048_576;
 
-pub(super) fn execute(
-    repo_root: &Path,
-    metadata: &StackMetadata,
-    _operation_id: &str,
-) -> Result<String, WorkflowError> {
-    execute_inner(repo_root, metadata).map_err(WorkflowError::from)
-}
-
-fn execute_inner(repo_root: &Path, metadata: &StackMetadata) -> Result<String> {
-    let settings = settings::verify(metadata).context("verify exact generated client settings")?;
-    let (mercury_token_routes, lockbox_routes) =
-        routes::verify(repo_root).context("verify static server route inventories")?;
-
-    lifecycle::ready(repo_root, metadata).context("require exact ready stack before verifier")?;
-    lifecycle::require_exact_mercury_config(metadata)
-        .context("directly verify Mercury /info/config")?;
+pub(super) fn direct(repo_root: &Path, metadata: &StackMetadata) -> Result<VerifyReport> {
     let mut runner = SystemCommandRunner;
     let build_before = build::verify_complete(repo_root, metadata, &mut runner)
-        .context("verify source/build identity before direct checks")?;
-
-    let client_database = run_client_helper(repo_root, metadata, &mut runner)?;
-    let client_migration_sha256 = client_contract::verify(repo_root, &client_database)
-        .context("verify exact client SQLite contract")?;
-
-    let postgres_before_restart = run_postgres_helper(repo_root, metadata, &mut runner)?;
-    postgres::verify(repo_root, &postgres_before_restart)
-        .context("verify PostgreSQL contracts before restart")?;
+        .context("capture source/build identity before direct verifier")?;
+    let (mercury_token_routes, lockbox_routes) =
+        routes::verify(repo_root).context("verify static server route inventories")?;
+    let before = stable_snapshot(repo_root, metadata)?;
 
     lifecycle::restart_mercury(repo_root, metadata, &mut runner)?;
     lifecycle::ready(repo_root, metadata).context("require exact ready stack after restart")?;
@@ -67,7 +48,7 @@ fn execute_inner(repo_root: &Path, metadata: &StackMetadata) -> Result<String> {
     postgres::verify(repo_root, &postgres_after_restart)
         .context("verify PostgreSQL contracts after restart")?;
     ensure!(
-        postgres_after_restart == postgres_before_restart,
+        postgres_after_restart == before.postgres,
         "PostgreSQL migration row or catalogs changed across the exact Mercury restart"
     );
 
@@ -75,28 +56,76 @@ fn execute_inner(repo_root: &Path, metadata: &StackMetadata) -> Result<String> {
         .context("recheck source/build identity after direct checks")?;
     ensure!(
         build_after == build_before,
-        "source/build identity changed while verifier was running"
+        "source/build identity changed while direct verifier was running"
     );
     lifecycle::ready(repo_root, metadata).context("final exact ready-stack recheck")?;
 
-    let report = VerifyReport {
+    Ok(VerifyReport {
         version: 1,
         project: metadata.project().to_string(),
         status: "verified".into(),
-        settings,
+        settings: before.settings,
         mercury_token_routes,
         lockbox_routes,
-        client_migration_sha256,
-        client_database,
-        postgres_before_restart,
+        client_migration_sha256: before.client_migration_sha256,
+        client_database: before.client_database,
+        postgres_before_restart: before.postgres,
         postgres_after_restart,
         mercury_restart_count: 1,
         build_identity_unchanged: true,
         ready_after_restart: true,
-    };
-    let output = canonical_json(&report)?;
-    super::evidence::capture_test_output(output.as_bytes(), b"");
-    Ok(output)
+    })
+}
+
+pub(super) fn require_direct_success(
+    report: &VerifyReport,
+    metadata: &StackMetadata,
+) -> Result<()> {
+    ensure!(
+        report.version == 1
+            && report.project == metadata.project().as_str()
+            && report.status == "verified"
+            && report.mercury_restart_count == 1
+            && report.build_identity_unchanged
+            && report.ready_after_restart
+            && report.postgres_before_restart == report.postgres_after_restart,
+        "direct verifier did not return its exact one-restart successful contract"
+    );
+    Ok(())
+}
+
+pub(super) fn stable_snapshot(
+    repo_root: &Path,
+    metadata: &StackMetadata,
+) -> Result<StableContractSnapshot> {
+    lifecycle::ready(repo_root, metadata)
+        .context("require exact ready stack before stable contract snapshot")?;
+    let mut runner = SystemCommandRunner;
+    let build_before = build::verify_complete(repo_root, metadata, &mut runner)
+        .context("verify source/build identity before stable contract snapshot")?;
+    let settings = settings::verify(metadata).context("verify exact generated client settings")?;
+    let mercury_config = lifecycle::exact_mercury_config(metadata)
+        .context("directly capture exact Mercury /info/config")?;
+    let client_database = run_client_helper(repo_root, metadata, &mut runner)?;
+    let client_migration_sha256 = client_contract::verify(repo_root, &client_database)
+        .context("verify exact client SQLite contract")?;
+    let postgres = run_postgres_helper(repo_root, metadata, &mut runner)?;
+    postgres::verify(repo_root, &postgres).context("verify exact PostgreSQL contracts")?;
+    let build_after = build::verify_complete(repo_root, metadata, &mut runner)
+        .context("recheck source/build identity after stable contract snapshot")?;
+    ensure!(
+        build_after == build_before,
+        "source/build identity changed during stable contract snapshot"
+    );
+    lifecycle::ready(repo_root, metadata)
+        .context("final ready check after stable contract snapshot")?;
+    Ok(StableContractSnapshot {
+        settings,
+        mercury_config,
+        client_migration_sha256,
+        client_database,
+        postgres,
+    })
 }
 
 fn run_client_helper(
@@ -155,16 +184,7 @@ fn run_postgres_helper(
 }
 
 fn helper_command(repo_root: &Path) -> Result<ArgvCommand> {
-    let executable = std::env::current_exe().context("resolve current Rust workflow executable")?;
-    let metadata =
-        fs::symlink_metadata(&executable).context("inspect current workflow executable")?;
-    ensure!(
-        metadata.is_file() && !metadata.file_type().is_symlink(),
-        "workflow executable must be a regular non-symlink file"
-    );
-    Ok(ArgvCommand::new(executable, repo_root)
-        .clear_environment()
-        .arg("__bip448-verify-helper"))
+    executable::helper_command(repo_root)
 }
 
 fn require_helper_success(command: &ArgvCommand, output: &CommandOutput) -> Result<()> {
