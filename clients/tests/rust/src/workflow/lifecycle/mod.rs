@@ -107,6 +107,29 @@ pub(super) fn project_spec(metadata: &StackMetadata) -> Result<ProjectSpec> {
     Ok(metadata.project_spec(image_map_from_metadata(metadata)?))
 }
 
+pub(super) fn require_exact_mercury_config(metadata: &StackMetadata) -> Result<()> {
+    let mut host = SystemHostProbe::new();
+    readiness::require_exact_mercury_config(metadata, &mut host)
+}
+
+pub(super) fn restart_mercury(
+    repo_root: &Path,
+    metadata: &StackMetadata,
+    runner: &mut impl CommandRunner,
+) -> Result<()> {
+    let environment = metadata
+        .project_spec(image_map_from_metadata(metadata)?)
+        .managed_environment()?;
+    let command = compose_command(
+        repo_root,
+        metadata,
+        &environment,
+        &["restart", "mercury-server"],
+    )?;
+    run_checked(runner, command).context("restart exactly the project Mercury service")?;
+    Ok(())
+}
+
 fn up_with<R, H, V>(
     repo_root: &Path,
     metadata: &StackMetadata,

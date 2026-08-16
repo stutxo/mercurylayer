@@ -4,10 +4,60 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::super::argv::{begin_failure_capture, finish_failure_capture};
+use super::super::argv::{
+    begin_failure_capture, finish_failure_capture, ArgvCommand, CommandOutput, CommandRunner,
+};
 use super::super::model::{canonical_json, PortMap, Project, StackMetadata};
 use super::test_support::{metadata, strings, MockDocker, MockHost, StackShape, StubVerifier};
-use super::{down_with, status_with, up_with};
+use super::{down_with, restart_mercury, status_with, up_with};
+
+struct RestartRunner {
+    seen: Vec<ArgvCommand>,
+    fail: bool,
+}
+
+impl CommandRunner for RestartRunner {
+    fn run(&mut self, command: &ArgvCommand) -> anyhow::Result<CommandOutput> {
+        self.seen.push(command.clone());
+        if self.fail {
+            Ok(CommandOutput::failure(7, "restart failed"))
+        } else {
+            Ok(CommandOutput::success(Vec::new()))
+        }
+    }
+}
+
+#[test]
+fn verifier_restart_is_one_exact_mercury_only_compose_argv_and_failure_stops() {
+    let root = Path::new("/repo");
+    let metadata = metadata(root);
+    let mut runner = RestartRunner {
+        seen: Vec::new(),
+        fail: false,
+    };
+    restart_mercury(root, &metadata, &mut runner).unwrap();
+    assert_eq!(runner.seen.len(), 1);
+    assert_eq!(
+        strings(&runner.seen[0].args),
+        [
+            "compose",
+            "-p",
+            "life_test",
+            "-f",
+            "/repo/docker-compose-token-servers.yml",
+            "restart",
+            "mercury-server",
+        ]
+    );
+    assert_eq!(runner.seen[0].environment.len(), 12);
+    assert!(!strings(&runner.seen[0].args)
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "build" | "pull" | "lockbox")));
+
+    runner.fail = true;
+    assert!(restart_mercury(root, &metadata, &mut runner).is_err());
+    assert_eq!(runner.seen.len(), 2);
+}
 
 #[test]
 fn up_uses_one_exact_compose_argv_and_repeated_up_preserves_container_ids() {

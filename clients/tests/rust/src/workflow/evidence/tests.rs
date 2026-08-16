@@ -387,7 +387,7 @@ fn child_exit_uses_matching_signal_or_exit_and_falls_back_to_propagated_status()
 }
 
 #[test]
-fn incomplete_operations_block_five_mutations_but_down_is_separate_and_allowed() {
+fn incomplete_operations_block_six_mutations_but_down_is_separate_and_allowed() {
     let root = Temp::new();
     let project = Project::parse("incomplete_gate_1").unwrap();
     let later = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
@@ -396,7 +396,7 @@ fn incomplete_operations_block_five_mutations_but_down_is_separate_and_allowed()
     crash_after_started(&root.0, &project, earlier, false);
 
     let expected_ids = format!("{earlier},{later}");
-    for command in ["configure", "build", "up", "bootstrap", "test"] {
+    for command in ["configure", "build", "up", "bootstrap", "test", "verify"] {
         let error = super::incomplete::reject_mutation(&root.0, &project, command).unwrap_err();
         let message = error.to_string();
         assert!(message.contains(&format!("blocks {command}")));

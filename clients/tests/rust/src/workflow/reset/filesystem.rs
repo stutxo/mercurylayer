@@ -319,10 +319,15 @@ impl DirectoryKind {
         match self {
             Self::Run => match name {
                 "operations" => Ok(AllowedEntry::Directory(Self::Operations)),
-                "Settings.toml" | "stack.json" => Ok(AllowedEntry::File(FileKind::Private)),
+                "Settings.toml" | "stack.json" | ".verify-client.Settings.toml" => {
+                    Ok(AllowedEntry::File(FileKind::Private))
+                }
                 "wallet.db" | "wallet.db-wal" | "wallet.db-shm" => {
                     Ok(AllowedEntry::File(FileKind::Wallet))
                 }
+                "verify-client.sqlite"
+                | "verify-client.sqlite-wal"
+                | "verify-client.sqlite-shm" => Ok(AllowedEntry::File(FileKind::Wallet)),
                 value if valid_run_temporary(value) => Ok(AllowedEntry::File(FileKind::Private)),
                 _ => bail!("unexpected run-tree entry {name:?}"),
             },
@@ -589,6 +594,10 @@ mod tests {
         fixture.wallet("wallet.db", 0o644);
         fixture.wallet("wallet.db-wal", PRIVATE_FILE_MODE);
         fixture.wallet("wallet.db-shm", 0o644);
+        fixture.private(".verify-client.Settings.toml");
+        fixture.wallet("verify-client.sqlite", 0o644);
+        fixture.wallet("verify-client.sqlite-wal", PRIVATE_FILE_MODE);
+        fixture.wallet("verify-client.sqlite-shm", 0o644);
 
         let complete = fixture.operation("00000000-0000-4000-8000-000000000001");
         for name in ["started.json", "result.json", "test.stdout", "test.stderr"] {

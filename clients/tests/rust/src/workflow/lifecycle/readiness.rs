@@ -302,6 +302,22 @@ fn http_config(
     }
 }
 
+pub(super) fn require_exact_mercury_config(
+    metadata: &StackMetadata,
+    host: &mut impl HostProbe,
+) -> Result<()> {
+    match http_config(metadata, "mercury-server", host)? {
+        Attempt::Ready(detail) => {
+            ensure!(
+                detail == "http_config_ready",
+                "Mercury config probe returned a non-canonical success"
+            );
+            Ok(())
+        }
+        Attempt::Retry(detail) => bail!("Mercury /info/config was not directly ready: {detail}"),
+    }
+}
+
 fn http_alive(
     metadata: &StackMetadata,
     service: &str,

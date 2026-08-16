@@ -44,6 +44,9 @@ pub enum Command {
         target: String,
         test: String,
     },
+    Verify {
+        project: Project,
+    },
     Reset {
         project: Project,
     },
@@ -57,6 +60,7 @@ impl Command {
             Self::Up { project } => Some((project, "up")),
             Self::Bootstrap { project, .. } => Some((project, "bootstrap")),
             Self::Test { project, .. } => Some((project, "test")),
+            Self::Verify { project } => Some((project, "verify")),
             Self::Down { project } => Some((project, "down")),
             // Reset is the single destructive, evidence-exempt mutation. The
             // dispatcher still serializes it with the stable project lock.
@@ -130,6 +134,7 @@ where
         "down" => parse_project_command(&args[1..], |project| Command::Down { project }),
         "bootstrap" => parse_bootstrap(&args[1..]),
         "test" => parse_test(&args[1..]),
+        "verify" => parse_project_command(&args[1..], |project| Command::Verify { project }),
         "reset" => parse_project_command(&args[1..], |project| Command::Reset { project }),
         other => Err(WorkflowError::usage(format!(
             "unknown or malformed command {other:?}"
@@ -364,6 +369,12 @@ mod tests {
         assert_eq!(
             parse(args(&["down", "--project", "matrix_1"])).unwrap(),
             Command::Down {
+                project: Project::parse("matrix_1").unwrap()
+            }
+        );
+        assert_eq!(
+            parse(args(&["verify", "--project", "matrix_1"])).unwrap(),
+            Command::Verify {
                 project: Project::parse("matrix_1").unwrap()
             }
         );
