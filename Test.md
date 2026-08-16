@@ -1,152 +1,213 @@
 # Testing the BIP448 prototype
 
-## Workspace gate
+The BIP448 integration workflow is implemented entirely in Rust by the
+`bip448-test` binary in `clients/tests/rust`. The old Python controller and
+helper paths (`scripts/bip448-test`, `scripts/bip448_testlib.py`, and
+`scripts/bip448_evidence.py`) do not exist. The workflow neither requires nor
+invokes host Python; do not use old Python helper commands for it.
 
-Run the non-ignored workspace tests from the repository root:
+Run every command below from the repository root. Evidence-recorded mutations
+(all mutations except `reset`) require a clean Git worktree and record the
+exact source commit and Git-status digest.
 
-```text
-RUSTUP_TOOLCHAIN=1.92.0 cargo test --workspace --locked
+## Build and check the controller
+
+The controller requires Rust 1.92.0 plus `cargo`, `docker`, `git`, `rustc`, and
+`rustup` on `PATH`:
+
+```sh
+export RUSTUP_TOOLCHAIN=1.92.0
+cargo test --workspace --locked
+cargo build --locked --package rust --bin bip448-test
+BIP448=./target/debug/bip448-test
+"$BIP448" doctor
+"$BIP448" --help
 ```
 
-The integration suites are ignored by default because they require a fresh
-Docker stack and activated BIP448 consensus rules. The intended matrix is 58
-ignored entries across eight binaries; the two environment-controlled child
-entries are included because Cargo discovers them as tests.
+`doctor` checks the repository shape, required commands, and the exact Rust
+toolchain. The workflow uses direct argument vectors; it does not invoke a
+shell or a Python helper.
 
-## Fresh Docker/Inquisition stack
+## Quick persistent local flow
 
-Before starting, check that no unrelated stack owns the compose file's fixed
-container names. Choose a unique lowercase project name, then run:
+Use this path to run one reviewed MATRIX identity while keeping project
+metadata and operation evidence available for diagnosis. Pick an unused
+lowercase project name and a free range of eight consecutive ports:
 
-```text
-docker compose -p <project> -f docker-compose-token-servers.yml up --build -d
+```sh
+PROJECT=b448-local
+BASE_PORT=25400
+
+"$BIP448" configure --project "$PROJECT" --base-port "$BASE_PORT"
+"$BIP448" build --project "$PROJECT" --service all
+"$BIP448" up --project "$PROJECT"
+"$BIP448" ready --project "$PROJECT"
+"$BIP448" bootstrap --project "$PROJECT" --require-zero
+"$BIP448" test \
+  --project "$PROJECT" \
+  --target bip448_primitive_spike \
+  --test bip448_template_signature_rebinds_prevout_on_inquisition
+"$BIP448" status --project "$PROJECT"
+"$BIP448" checkpoint --project "$PROJECT" \
+  > "target/${PROJECT}-checkpoint.json"
+"$BIP448" logs --project "$PROJECT" \
+  > "target/${PROJECT}-logs.json"
+"$BIP448" down --project "$PROJECT"
+"$BIP448" status --project "$PROJECT"
+"$BIP448" reset --project "$PROJECT"
 ```
 
-Wait until `http://127.0.0.1:8000/info/config` and the Inquisition RPC are
-ready. Create or load the `mercury_test` regtest wallet and mine 101 blocks as
-the current CI workflow does. Run suite processes serially: their global guard,
-database state, and chain state are not designed for concurrent suite
-processes. Record the first attempt and any emitted transaction IDs or
-signature counts rather than silently replacing a failure with a retry.
+`--require-zero` proves a fresh height-zero Inquisition chain before mining
+the exact 101-block bootstrap. `test` accepts only an exact binary/identity
+pair from the Rust MATRIX. This manual path is useful for a focused diagnosis;
+it is not the authoritative 58-test verification.
 
-Export the same literal project name into every Cargo process so test helpers
-restart only that stack. From `clients/tests/rust`, run the complete retained
-ignored matrix:
+`down` safely removes the selected project's containers, network, volumes,
+listeners, and wallet database. It retains `stack.json`, `Settings.toml`, and
+operation evidence, so run `checkpoint` and `logs` before destructive cleanup.
+`reset` first proves the project is down, then permanently removes its
+validated run/evidence tree and exact project-owned deterministic-RNG and
+staging tags. Save any reports outside `target/bip448-runs/<PROJECT>` first.
 
-```text
-RUSTUP_TOOLCHAIN=1.92.0 ML_SETTINGS_FILE=regtest.core.Settings.toml \
-  COMPOSE_PROJECT_NAME=<project> \
-  cargo test --locked --test functional -- \
-  --ignored --nocapture --test-threads=1
+## Authoritative fresh verification
 
-RUSTUP_TOOLCHAIN=1.92.0 ML_SETTINGS_FILE=regtest.core.Settings.toml \
-  COMPOSE_PROJECT_NAME=<project> \
-  cargo test --locked --test bip448_primitive_spike -- \
-  --ignored --nocapture --test-threads=1
+One command owns the complete acceptance run:
 
-RUSTUP_TOOLCHAIN=1.92.0 ML_SETTINGS_FILE=regtest.core.Settings.toml \
-  COMPOSE_PROJECT_NAME=<project> \
-  cargo test --locked --test bip448_csfs_signing -- \
-  --ignored --nocapture --test-threads=1
+```sh
+PRIMARY_PROJECT=b448-local-primary
+PRIMARY_BASE_PORT=25600
 
-RUSTUP_TOOLCHAIN=1.92.0 ML_SETTINGS_FILE=regtest.core.Settings.toml \
-  COMPOSE_PROJECT_NAME=<project> \
-  cargo test --locked --test bip448_deposit -- \
-  --ignored --nocapture --test-threads=1
-
-RUSTUP_TOOLCHAIN=1.92.0 ML_SETTINGS_FILE=regtest.core.Settings.toml \
-  COMPOSE_PROJECT_NAME=<project> \
-  cargo test --locked --test bip448_duplicates -- \
-  --ignored --nocapture --test-threads=1
-
-RUSTUP_TOOLCHAIN=1.92.0 ML_SETTINGS_FILE=regtest.core.Settings.toml \
-  COMPOSE_PROJECT_NAME=<project> \
-  cargo test --locked --test bip448_transfer_sender -- \
-  --ignored --nocapture --test-threads=1
-
-RUSTUP_TOOLCHAIN=1.92.0 ML_SETTINGS_FILE=regtest.core.Settings.toml \
-  COMPOSE_PROJECT_NAME=<project> \
-  cargo test --locked --test bip448_withdraw -- \
-  --ignored --nocapture --test-threads=1
-
-RUSTUP_TOOLCHAIN=1.92.0 ML_SETTINGS_FILE=regtest.core.Settings.toml \
-  COMPOSE_PROJECT_NAME=<project> \
-  cargo test --locked --test lockbox_compatibility -- \
-  --ignored --nocapture --test-threads=1
+"$BIP448" verify \
+  --project "$PRIMARY_PROJECT" \
+  --base-port "$PRIMARY_BASE_PORT"
 ```
 
-Expected discovery is:
+With no control overrides, the controller derives the control project as
+`b448ctl-` followed by the first 12 lowercase hexadecimal characters of
+SHA-256 over the primary project name. Its eight-port base is the primary base
+plus 8 when the primary base is at most 65520, or minus 8 otherwise. Explicit
+identities are also supported:
 
-| Binary | Ignored entries |
-| --- | ---: |
-| `functional` | 2 |
-| `bip448_primitive_spike` | 1 |
-| `bip448_csfs_signing` | 4 |
-| `bip448_deposit` | 13 |
-| `bip448_duplicates` | 8 |
-| `bip448_transfer_sender` | 6 |
-| `bip448_withdraw` | 1 |
-| `lockbox_compatibility` | 23 |
-| **Total** | **58** |
+```sh
+CONTROL_PROJECT=b448-local-control
+CONTROL_BASE_PORT=25608
 
-Tear down only that exact project and its volumes:
-
-```text
-docker compose -p <project> -f docker-compose-token-servers.yml down -v
+"$BIP448" verify \
+  --project "$PRIMARY_PROJECT" \
+  --base-port "$PRIMARY_BASE_PORT" \
+  --control-project "$CONTROL_PROJECT" \
+  --control-base-port "$CONTROL_BASE_PORT"
 ```
 
-Query Docker by the project label and verify that its containers, network, and
-volumes are gone. Do not remove unrelated Docker resources. The
-[test-case reference](docs/test_cases.md) states the narrow evidence supplied
-by each integration test.
+Primary and control names must be different. Their eight-port ranges must be
+disjoint. Before creating either run, `verify` requires both run directories
+and Docker projects to be absent and reserves all 16 loopback ports together.
+It never searches for another port automatically.
 
-## Cooperative duplicate-sweep boundaries
+The invocation configures and builds both projects from one source identity,
+starts and fresh-bootstraps both stacks, runs the primary MATRIX serially,
+directly verifies the primary contracts, and proves control isolation. It then
+tears down the primary while the control remains ready and unchanged, proves
+the control snapshot again, and tears down the control. Success reports
+`status: "authoritative"`, `matrix_test_count: 58`,
+`complete_first_invocation_target_records: 8`, `retries: 0`,
+`mercury_restart_count: 1`, `cleanup_order: ["primary", "control"]`, and final
+resource, port, wallet, source, image, and cache accounting.
 
-- Once canonical funding is pinned, the wallet keeps one logical `Coin` and
-  canonical amount while normalized bindings record every observed
-  same-script value. Duplicate indices are stable only inside that wallet
-  database and are nested under `coin.duplicates`; passive binding
-  synchronization does not sign.
-- The exact command `bip448-sweep-duplicate <WALLET_NAME> <STATECHAIN_ID>
-  <DUPLICATE_INDEX> <TO_ADDRESS> [FEE_RATE]` sweeps one confirmed duplicate in
-  one one-input/one-output transaction. Its checked fee is
-  `ceil(112 * fee_rate_sat_per_vbyte)`; a nonpositive/nonfinite rate, fee not
-  smaller than the input, or dust output is rejected before signing. Each
-  output has its own transaction, fee, and signing count.
-- Attempt artifacts and phases are durable and retries reuse the exact request
-  and transaction. `SecondArmed` is persisted before a possibly delivered
-  `sign/second`, making the statechain permanently exit-only. A duplicate sweep
-  never deletes server state; canonical withdrawal is last and requires every
-  known current-owner duplicate to be handled. Dust and unresolved bindings
-  remain visible and can block that close.
-- The client durably records a transfer intent before sender mutation. With no
-  intervening different authenticated request, exact same-request
-  `/transfer/sender` response-loss replay returns one stored `x1` for the
-  active unconsumed owner generation; authentication and generation changes
-  are checked against locked rows. BIP448 update-message `x1_pub`, unlock
-  `auth_pub_key`, and receiver `batch_data` carry the canonical compressed
-  `x1` public generation key. Their signatures respectively bind
-  statechain/recipient/generation/ciphertext hash,
-  role/statechain/generation, and statechain/`t2`/generation.
-- `--force-send-with-duplicates` acknowledges only the cooperative-value
-  warning. The receiver rescans independently from height 0, assigns its own
-  local indices, and decides whether and when to sweep; the sender receives no
-  notification or sweep guarantee. A completed latch creation does not reserve
-  future transfer rights against a later durable sweep attempt.
-- Live unresolved arbitrary-value duplicates of the current owner remain
-  cooperatively server-dependent until exact signed sweep bytes exist or an
-  independent spend confirms. Previous-owner and retired late rows stay
-  visible but are not actionable. Canonical `U`/`S` packages are the only
-  claimed unilateral recovery; the emergency recovery commands can strand
-  cooperative-only duplicates.
-- There is no multi-input batching, equal-value recovery forest, arbitrary-value
-  duplicate unilateral recovery, or exact legacy parity. A canonical attempt
-  retires and freezes the address: a duplicate first found afterward blocks
-  completion while server state remains, and one found only after deletion may
-  be unrecoverable. The receiver key-update crash boundary remains unrepaired.
-- Use fresh databases: the client schema has twelve application tables;
-  Mercury has six and lockbox has two. The CLI has sixteen commands, including
-  exact flag `--force-send-with-duplicates`; the intended ignored matrix has
-  58 direct entries in eight binaries. This is an Inquisition-dependent proof
-  of concept, with no automatic stale-state watcher, Bitcoin mainnet support,
-  or production-use claim. Tests establish only their direct assertions.
+This command must be the first actual invocation of every MATRIX identity for
+the run: do not add a pre-smoke, direct Cargo test, second invocation, or retry.
+A source change during the run invalidates it. Preserve a failed run's evidence
+and investigate it; a later attempt must start with fresh project identities
+and a clean source rather than overwrite or reinterpret the first result.
+
+## MATRIX source of truth
+
+The sole editable list of exact test identities is
+[`clients/tests/rust/src/workflow/matrix.rs`](clients/tests/rust/src/workflow/matrix.rs).
+The controller also freezes this target order and count split:
+
+| Order | Cargo test binary | Tests |
+| ---: | --- | ---: |
+| 1 | `functional` | 2 |
+| 2 | `bip448_primitive_spike` | 1 |
+| 3 | `bip448_csfs_signing` | 4 |
+| 4 | `bip448_deposit` | 13 |
+| 5 | `bip448_duplicates` | 8 |
+| 6 | `bip448_transfer_sender` | 6 |
+| 7 | `bip448_withdraw` | 1 |
+| 8 | `lockbox_compatibility` | 23 |
+|  | **Total** | **58** |
+
+Do not copy the 58 identities into another script or document. The runner
+checks Cargo's ignored-test discovery against `MATRIX` and executes the exact
+pairs serially with one test thread.
+
+## What authoritative verification proves
+
+The direct verifier is part of `verify`; there is no separate single-stack
+verification step. It checks:
+
+- the exact 11 generated `Settings.toml` keys and a 200 Mercury `/info/config`
+  response of `{"batchtimeout":20,"version":"0.2.1"}`;
+- lexical source inventories of 18 Mercury/token and seven lockbox routes;
+- the SHA-pinned 12-table client SQLite migration, complete columns, table
+  SQL/CHECKs, three partial unique indexes, zero foreign keys, no legacy backup
+  table, two real client loads, and preserved wallet/statechain sentinels;
+- one Mercury PostgreSQL migration row and complete live catalogs: Mercury has
+  6 tables, 46 columns, 16 constraints, and 14 indexes; lockbox has 2 tables,
+  15 columns, 8 constraints, and 4 indexes; and
+- exactly one Mercury restart, followed by readiness, unchanged build
+  identity, and exactly equal PostgreSQL catalog reports.
+
+The control stack supplies a live isolation proof, not another MATRIX run.
+Before the primary MATRIX, after the MATRIX and direct verification, and after
+primary teardown, the controller compares the control's topology and stable
+container start identities, height-101 chain/wallet state, settings, Mercury
+config, client catalog, and PostgreSQL catalogs. Any drift fails the run.
+
+## Evidence, failures, and cleanup
+
+Every mutation writes private evidence under
+`target/bip448-runs/<PROJECT>/operations/<UUID>/`: `started.json` is durable
+before work begins and `result.json` is written last. Test output is stored as
+`test.stdout` and `test.stderr` where applicable, with `bytes` and `sha256`
+fields in the result. `checkpoint` reports lifecycle plus all operations;
+`logs` reports recorded test output plus bounded Compose logs.
+
+Exit status is 0 for success, 2 for invalid CLI usage, 1 for an operational
+controller failure, or the failing child status when a child process fails.
+Children run in their own process groups. While a child is active, SIGINT and
+SIGTERM are forwarded to the group, descendants are reaped, the signal is
+recorded, and the controller exits 130 or 143 respectively.
+
+A `started.json` without `result.json` is incomplete evidence. It blocks every
+later mutation for that project except `down`; read-only `status`, `ready`,
+`checkpoint`, and `logs` remain available. Inspect and save the evidence, run
+`down`, then use explicit `reset` only when permanent evidence removal is
+intended.
+
+Normal teardown and reset never prune Docker. Authoritative verification
+retains authenticated final image tags and any new BuildKit cache records for
+reuse, while proving that pre-existing images, tags, caches, and unrelated
+containers/networks/volumes did not disappear or change. `reset` untags only
+the exact selected project's deterministic-RNG and leftover staging tags with
+no prune; shared fingerprinted production images and build cache remain.
+
+## CI and scope
+
+The integration workflow in [`.github/workflows/tests.yml`](.github/workflows/tests.yml)
+builds the Rust controller, runs `doctor`, and invokes authoritative `verify`
+exactly once with explicit primary/control identities and port ranges. It does
+not duplicate configure/build/up/bootstrap/test orchestration. Always-run CI
+steps collect status, checkpoints, logs, and both evidence trees before
+ordered cleanup.
+
+Detailed cooperative duplicate-sweep and recovery boundaries remain in the
+[README](README.md#cooperative-duplicate-sweep-boundaries); they are not
+duplicated in this executable workflow guide.
+
+These tests require fresh databases and the pinned Bitcoin Inquisition
+environment. They exercise regtest BIP448 proof-of-concept behavior only: they
+do not support Bitcoin mainnet, establish full legacy parity, or make a
+production-readiness or production-safety claim. Test success establishes only
+the assertions and invariants named by the current Rust MATRIX and verifier.
