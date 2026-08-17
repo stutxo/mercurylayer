@@ -115,14 +115,23 @@ pub(super) const MERCURY_CONSTRAINTS: &[ConstraintSpec] = &[
 ];
 
 pub(super) const LOCKBOX_CONSTRAINTS: &[ConstraintSpec] = &[
+    ("bip448_keyupdate_receipt","bip448_keyupdate_receipt_accepted_sig_count_check","c",&["accepted_sig_count"],"CHECK (accepted_sig_count >= 0)"),
+    ("bip448_keyupdate_receipt","bip448_keyupdate_receipt_pkey","p",&["statechain_id","operation_id"],"PRIMARY KEY (statechain_id, operation_id)"),
+    ("bip448_keyupdate_receipt","bip448_keyupdate_receipt_previous_key_generation_check","c",&["previous_key_generation"],"CHECK (previous_key_generation >= 0)"),
+    ("bip448_keyupdate_receipt","bip448_keyupdate_receipt_resulting_key_generation_check","c",&["resulting_key_generation","previous_key_generation"],"CHECK (resulting_key_generation = previous_key_generation + 1)"),
+    ("bip448_keyupdate_receipt","bip448_keyupdate_receipt_statechain_id_fkey","f",&["statechain_id"],"FOREIGN KEY (statechain_id) REFERENCES generated_public_key(statechain_id) ON DELETE CASCADE"),
     ("bip448_nonce_state","bip448_nonce_state_challenge_check","c",&["challenge"],"CHECK (challenge IS NULL OR challenge ~ '^[0-9a-f]{64}$')"),
     ("bip448_nonce_state","bip448_nonce_state_claim_check","c",&["challenge","negate_seckey","partial_sig"],"CHECK (challenge IS NULL AND negate_seckey IS NULL AND partial_sig IS NULL OR challenge IS NOT NULL AND negate_seckey IS NOT NULL)"),
+    ("bip448_nonce_state","bip448_nonce_state_key_generation_nonnegative","c",&["key_generation"],"CHECK (key_generation >= 0)"),
     ("bip448_nonce_state","bip448_nonce_state_negate_check","c",&["negate_seckey"],"CHECK (negate_seckey IS NULL OR (negate_seckey = ANY (ARRAY[0, 1])))"),
+    ("bip448_nonce_state","bip448_nonce_state_parent","f",&["statechain_id"],"FOREIGN KEY (statechain_id) REFERENCES generated_public_key(statechain_id) ON DELETE CASCADE"),
     ("bip448_nonce_state","bip448_nonce_state_pkey","p",&["id"],"PRIMARY KEY (id)"),
     ("bip448_nonce_state","bip448_nonce_state_signing_id_check","c",&["signing_id"],"CHECK (signing_id ~ '^[0-9a-f]{64}$')"),
     ("bip448_nonce_state","bip448_nonce_state_unique","u",&["statechain_id","signing_id"],"UNIQUE (statechain_id, signing_id)"),
+    ("generated_public_key","generated_public_key_key_generation_nonnegative","c",&["key_generation"],"CHECK (key_generation >= 0)"),
     ("generated_public_key","generated_public_key_pkey","p",&["id"],"PRIMARY KEY (id)"),
     ("generated_public_key","generated_public_key_public_key_key","u",&["public_key"],"UNIQUE (public_key)"),
+    ("generated_public_key","generated_public_key_sig_count_nonnegative","c",&["sig_count"],"CHECK (sig_count >= 0)"),
 ];
 
 pub(super) type IndexSpec = (
@@ -242,6 +251,14 @@ pub(super) const MERCURY_INDEXES: &[IndexSpec] = &[
 ];
 pub(super) const LOCKBOX_INDEXES: &[IndexSpec] = &[
     (
+        "bip448_keyupdate_receipt",
+        "bip448_keyupdate_receipt_pkey",
+        true,
+        true,
+        &["statechain_id", "operation_id"],
+        None,
+    ),
+    (
         "bip448_nonce_state",
         "bip448_nonce_state_pkey",
         true,
@@ -271,6 +288,14 @@ pub(super) const LOCKBOX_INDEXES: &[IndexSpec] = &[
         true,
         false,
         &["public_key"],
+        None,
+    ),
+    (
+        "generated_public_key",
+        "generated_public_key_statechain_id_key",
+        true,
+        false,
+        &["statechain_id"],
         None,
     ),
 ];

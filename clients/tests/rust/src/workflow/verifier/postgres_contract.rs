@@ -15,7 +15,7 @@ use super::report::MigrationRow;
 use super::report::{PgCatalog, PgColumn, PgConstraint, PgIndex, PostgresReport};
 
 const SERVER_SHA256: &str = "16bc984910b01a7986f47c3c8f219c9ad63f3fcb847c853faa932fa5b0eef726";
-const LOCKBOX_SHA256: &str = "12bc6eb570c8d4bbd37b6f08a98a8159f9b12cebf72c2db971171ea2069aece4";
+const LOCKBOX_SHA256: &str = "0196f7068695bfc1e9d05e4ec152924cf44e461b0246dc5010aa0e37cb3ec6e4";
 const MIGRATION_SHA384: &str = "1b64ae4df869baac77e5193f76403ed309d096769ddc8cbf39570fb7400ff033d26a2f730863cf63330774f78eaa5fae";
 
 pub(super) fn verify(repo_root: &Path, report: &PostgresReport) -> Result<()> {
@@ -66,7 +66,11 @@ fn expected_mercury() -> PgCatalog {
 
 fn expected_lockbox() -> PgCatalog {
     catalog(
-        &["bip448_nonce_state", "generated_public_key"],
+        &[
+            "bip448_keyupdate_receipt",
+            "bip448_nonce_state",
+            "generated_public_key",
+        ],
         LOCKBOX_COLUMNS,
         LOCKBOX_CONSTRAINTS,
         LOCKBOX_INDEXES,
@@ -159,10 +163,10 @@ mod tests {
         assert_eq!(exact.mercury.columns.len(), 46);
         assert_eq!(exact.mercury.constraints.len(), 16);
         assert_eq!(exact.mercury.indexes.len(), 14);
-        assert_eq!(exact.lockbox.tables.len(), 2);
-        assert_eq!(exact.lockbox.columns.len(), 15);
-        assert_eq!(exact.lockbox.constraints.len(), 8);
-        assert_eq!(exact.lockbox.indexes.len(), 4);
+        assert_eq!(exact.lockbox.tables.len(), 3);
+        assert_eq!(exact.lockbox.columns.len(), 26);
+        assert_eq!(exact.lockbox.constraints.len(), 17);
+        assert_eq!(exact.lockbox.indexes.len(), 6);
 
         assert!(!exact
             .mercury
@@ -287,7 +291,7 @@ mod tests {
             &[
                 "service=lockbox",
                 "dimension=columns",
-                "object=public.bip448_nonce_state.id",
+                "object=public.bip448_keyupdate_receipt.statechain_id",
                 "field=nullable",
             ],
         );

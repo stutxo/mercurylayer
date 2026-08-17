@@ -107,6 +107,7 @@ const EXPECTED_LOCKBOX: &[(&str, &str)] = &[
     ("POST", "/bip448/get_public_nonce"),
     ("POST", "/bip448/get_partial_signature"),
     ("GET", "/signature_count/<string>"),
+    ("GET", "/bip448/state/<string>"),
     ("POST", "/keyupdate"),
     ("DELETE", "/delete_statechain/<string>"),
 ];
@@ -457,7 +458,7 @@ mod tests {
     fn current_protected_sources_have_exact_lexical_inventory() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let (mercury_token, lockbox) = verify(&root).unwrap();
-        assert_eq!((mercury_token.len(), lockbox.len()), (18, 7));
+        assert_eq!((mercury_token.len(), lockbox.len()), (18, 8));
     }
 
     #[test]
