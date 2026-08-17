@@ -410,7 +410,7 @@ pub(super) async fn signature_count_for_missing_statechain_returns_not_found() -
         .context("failed to read missing signature_count body")?;
 
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(body, "BIP448 state not found");
+    assert_eq!(body, "Signature count not found.");
 
     Ok(())
 }

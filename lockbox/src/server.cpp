@@ -392,6 +392,7 @@ namespace lockbox {
         CROW_ROUTE(app,"/signature_count/<string>")
         ([](std::string statechain_id) {
             const auto result = db_manager::observe_bip448_state(statechain_id);
+            if (result.outcome == db_manager::Bip448Outcome::NotFound) return crow::response(404, "Signature count not found.");
             if (result.outcome != db_manager::Bip448Outcome::Applied || !result.state) return result_error(result);
             crow::json::wvalue body; body["sig_count"] = static_cast<std::uint64_t>(result.state->sig_count);
             return json_response(200, std::move(body));
