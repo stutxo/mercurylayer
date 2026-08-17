@@ -4,7 +4,7 @@ use uuid::Uuid;
 const STALE_PRE_NONCE_LEASE_INTERVAL: &str = "5 minutes";
 
 pub async fn get_bip448_signing_nonce_lease(
-    pool: &sqlx::PgPool,
+    connection: &mut sqlx::PgConnection,
     statechain_id: &str,
 ) -> Option<String> {
     let query = "\
@@ -14,7 +14,7 @@ pub async fn get_bip448_signing_nonce_lease(
 
     let row = sqlx::query(query)
         .bind(statechain_id)
-        .fetch_optional(pool)
+        .fetch_optional(connection)
         .await
         .unwrap();
 
@@ -22,7 +22,7 @@ pub async fn get_bip448_signing_nonce_lease(
 }
 
 pub async fn insert_bip448_signing_nonce_lease(
-    pool: &sqlx::PgPool,
+    connection: &mut sqlx::PgConnection,
     statechain_id: &str,
     signing_id: &str,
 ) -> Option<String> {
@@ -37,7 +37,7 @@ pub async fn insert_bip448_signing_nonce_lease(
         .bind(statechain_id)
         .bind(signing_id)
         .bind(&lease_token)
-        .execute(pool)
+        .execute(connection)
         .await
         .unwrap();
 
@@ -45,7 +45,7 @@ pub async fn insert_bip448_signing_nonce_lease(
 }
 
 pub async fn bip448_signing_nonce_lease_matches(
-    pool: &sqlx::PgPool,
+    connection: &mut sqlx::PgConnection,
     statechain_id: &str,
     signing_id: &str,
     lease_token: &str,
@@ -61,14 +61,14 @@ pub async fn bip448_signing_nonce_lease_matches(
         .bind(statechain_id)
         .bind(signing_id)
         .bind(lease_token)
-        .fetch_optional(pool)
+        .fetch_optional(connection)
         .await
         .unwrap()
         .is_some()
 }
 
 pub async fn delete_bip448_signing_nonce_lease(
-    pool: &sqlx::PgPool,
+    connection: &mut sqlx::PgConnection,
     statechain_id: &str,
     signing_id: &str,
 ) -> bool {
@@ -79,7 +79,7 @@ pub async fn delete_bip448_signing_nonce_lease(
     let result = sqlx::query(query)
         .bind(statechain_id)
         .bind(signing_id)
-        .execute(pool)
+        .execute(connection)
         .await
         .unwrap();
 
@@ -87,7 +87,7 @@ pub async fn delete_bip448_signing_nonce_lease(
 }
 
 pub async fn delete_bip448_signing_nonce_lease_by_token(
-    pool: &sqlx::PgPool,
+    connection: &mut sqlx::PgConnection,
     statechain_id: &str,
     signing_id: &str,
     lease_token: &str,
@@ -101,7 +101,7 @@ pub async fn delete_bip448_signing_nonce_lease_by_token(
         .bind(statechain_id)
         .bind(signing_id)
         .bind(lease_token)
-        .execute(pool)
+        .execute(connection)
         .await
         .unwrap();
 
@@ -113,7 +113,10 @@ pub async fn delete_bip448_signing_nonce_lease_by_token(
 /// before asking the lockbox for a nonce and then persist nonce state only if
 /// the same token is still present. Incomplete BIP448 rounds are nonce rows
 /// without a stored partial signature.
-pub async fn reclaim_stale_signing_nonce_lease(pool: &sqlx::PgPool, statechain_id: &str) -> bool {
+pub async fn reclaim_stale_signing_nonce_lease(
+    connection: &mut sqlx::PgConnection,
+    statechain_id: &str,
+) -> bool {
     let query = "\
         WITH deleted_lease AS (\
             DELETE FROM signing_nonce_leases AS lease \
@@ -161,7 +164,7 @@ pub async fn reclaim_stale_signing_nonce_lease(pool: &sqlx::PgPool, statechain_i
     let row = sqlx::query(query)
         .bind(statechain_id)
         .bind(STALE_PRE_NONCE_LEASE_INTERVAL)
-        .fetch_one(pool)
+        .fetch_one(connection)
         .await
         .unwrap();
 

@@ -344,12 +344,15 @@ pub async fn commit_bip448_transfer_generation_update(
     Ok(())
 }
 
-pub async fn get_statechain_info(pool: &sqlx::PgPool, statechain_id: &str) -> Vec<StatechainInfo> {
+pub async fn get_statechain_info(
+    connection: &mut sqlx::PgConnection,
+    statechain_id: &str,
+) -> Vec<StatechainInfo> {
     let mut result = Vec::<StatechainInfo>::new();
 
     let rows = sqlx::query(GET_STATECHAIN_INFO_QUERY)
         .bind(statechain_id)
-        .fetch_all(pool)
+        .fetch_all(connection)
         .await
         .unwrap();
 
@@ -401,14 +404,17 @@ pub async fn get_enclave_pubkey(pool: &sqlx::PgPool, statechain_id: &str) -> Opt
     Some(enclave_public_key)
 }
 
-pub async fn get_x1pub(pool: &sqlx::PgPool, statechain_id: &str) -> Option<PublicKey> {
+pub async fn get_x1pub(
+    connection: &mut sqlx::PgConnection,
+    statechain_id: &str,
+) -> Option<PublicKey> {
     let query = "SELECT x1 \
         FROM statechain_transfer \
         WHERE statechain_id = $1";
 
     let row = sqlx::query(query)
         .bind(statechain_id)
-        .fetch_optional(pool)
+        .fetch_optional(connection)
         .await
         .unwrap();
 

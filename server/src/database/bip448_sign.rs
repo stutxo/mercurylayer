@@ -28,7 +28,7 @@ pub struct Bip448IncompleteSignatureRecord {
 }
 
 pub async fn get_bip448_signature_record(
-    pool: &sqlx::PgPool,
+    connection: &mut sqlx::PgConnection,
     statechain_id: &str,
     signing_id: &str,
 ) -> Option<Bip448SignatureRecord> {
@@ -40,7 +40,7 @@ pub async fn get_bip448_signature_record(
     let row = sqlx::query(query)
         .bind(statechain_id)
         .bind(signing_id)
-        .fetch_optional(pool)
+        .fetch_optional(connection)
         .await
         .unwrap();
 
@@ -53,7 +53,7 @@ pub async fn get_bip448_signature_record(
 }
 
 pub async fn get_incomplete_bip448_signature_record(
-    pool: &sqlx::PgPool,
+    connection: &mut sqlx::PgConnection,
     statechain_id: &str,
 ) -> Option<Bip448IncompleteSignatureRecord> {
     let query = "\
@@ -65,7 +65,7 @@ pub async fn get_incomplete_bip448_signature_record(
 
     let row = sqlx::query(query)
         .bind(statechain_id)
-        .fetch_optional(pool)
+        .fetch_optional(connection)
         .await
         .unwrap();
 
@@ -80,7 +80,7 @@ pub async fn get_incomplete_bip448_signature_record(
 /// opaque signing id; `signing_nonce_leases` enforces the one in-flight round
 /// per statechain invariant.
 pub async fn insert_bip448_signature_reservation(
-    pool: &sqlx::PgPool,
+    connection: &mut sqlx::PgConnection,
     statechain_id: &str,
     signing_id: &str,
 ) -> bool {
@@ -93,7 +93,7 @@ pub async fn insert_bip448_signature_reservation(
     let result = sqlx::query(query)
         .bind(statechain_id)
         .bind(signing_id)
-        .execute(pool)
+        .execute(connection)
         .await
         .unwrap();
 
@@ -101,7 +101,7 @@ pub async fn insert_bip448_signature_reservation(
 }
 
 pub async fn update_bip448_signature_data_server_pubnonce_if_lease_matches(
-    pool: &sqlx::PgPool,
+    connection: &mut sqlx::PgConnection,
     statechain_id: &str,
     signing_id: &str,
     server_pubnonce: &str,
@@ -125,7 +125,7 @@ pub async fn update_bip448_signature_data_server_pubnonce_if_lease_matches(
         .bind(statechain_id)
         .bind(signing_id)
         .bind(lease_token)
-        .execute(pool)
+        .execute(connection)
         .await
         .unwrap();
 
@@ -133,7 +133,7 @@ pub async fn update_bip448_signature_data_server_pubnonce_if_lease_matches(
 }
 
 pub async fn delete_bip448_signature_reservation(
-    pool: &sqlx::PgPool,
+    connection: &mut sqlx::PgConnection,
     statechain_id: &str,
     signing_id: &str,
 ) {
@@ -145,13 +145,13 @@ pub async fn delete_bip448_signature_reservation(
     let _ = sqlx::query(query)
         .bind(statechain_id)
         .bind(signing_id)
-        .execute(pool)
+        .execute(connection)
         .await
         .unwrap();
 }
 
 pub async fn try_claim_bip448_signature_data_challenge(
-    pool: &sqlx::PgPool,
+    connection: &mut sqlx::PgConnection,
     statechain_id: &str,
     signing_id: &str,
     server_pubnonce: &str,
@@ -170,7 +170,7 @@ pub async fn try_claim_bip448_signature_data_challenge(
         .bind(statechain_id)
         .bind(signing_id)
         .bind(server_pubnonce)
-        .execute(pool)
+        .execute(connection)
         .await
         .unwrap();
 
@@ -178,7 +178,7 @@ pub async fn try_claim_bip448_signature_data_challenge(
 }
 
 pub async fn clear_bip448_signature_data_challenge(
-    pool: &sqlx::PgPool,
+    connection: &mut sqlx::PgConnection,
     statechain_id: &str,
     signing_id: &str,
     challenge: &str,
@@ -193,7 +193,7 @@ pub async fn clear_bip448_signature_data_challenge(
         .bind(statechain_id)
         .bind(signing_id)
         .bind(challenge)
-        .execute(pool)
+        .execute(connection)
         .await
         .unwrap();
 
@@ -201,7 +201,7 @@ pub async fn clear_bip448_signature_data_challenge(
 }
 
 pub async fn update_bip448_signature_data_partial_sig(
-    pool: &sqlx::PgPool,
+    connection: &mut sqlx::PgConnection,
     statechain_id: &str,
     signing_id: &str,
     challenge: &str,
@@ -218,7 +218,7 @@ pub async fn update_bip448_signature_data_partial_sig(
         .bind(statechain_id)
         .bind(signing_id)
         .bind(challenge)
-        .execute(pool)
+        .execute(connection)
         .await
         .unwrap();
 

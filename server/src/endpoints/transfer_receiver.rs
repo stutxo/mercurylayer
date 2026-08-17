@@ -1,12 +1,19 @@
 use std::str::FromStr;
 
+use mercurylib::bip448_statechain::signing_api::{
+    Bip448AppliedStatus, Bip448CanonicalScalar, Bip448CompressedPublicKey,
+    Bip448HandoffErrorResponsePayloadV2, Bip448KeyUpdateAppliedReceiptPayloadV2,
+    Bip448LockboxKeyUpdateRequestPayloadV2, Bip448LockboxStateResponsePayloadV2,
+    Bip448ProtocolVersionV2, Bip448PublicNonce, Bip448SecretScalar, Bip448StatechainId,
+    Bip448StatechainInfoResponsePayloadV2, Bip448StatechainInfoV2,
+};
 use mercurylib::transfer::receiver::{
     GetMsgAddrResponsePayload, StatechainInfoResponsePayload, TransferReceiverError,
-    TransferReceiverErrorResponsePayload, TransferReceiverPostResponsePayload,
-    TransferReceiverRequestPayload, TransferUnlockRequestPayload,
+    TransferReceiverErrorResponsePayload, TransferReceiverRequestPayloadV2,
+    TransferUnlockRequestPayload,
 };
 use rocket::{http::Status, response::status, serde::json::Json, State};
-use secp256k1::{PublicKey, Secp256k1};
+use secp256k1::{PublicKey, Secp256k1, SecretKey};
 use serde_json::{json, Value};
 
 use crate::server::StateChainEntity;
@@ -32,22 +39,33 @@ fn statechain_data_not_found_response() -> status::Custom<Json<Value>> {
     )
 }
 
-fn lockbox_signature_count_error_response(
+fn lockbox_state_divergence_response() -> status::Custom<Json<Value>> {
+    internal_server_error_response(
+        "lockbox BIP448 state is unavailable for an existing Mercury statechain".to_string(),
+    )
+}
+
+fn lockbox_error_response(
     status_code: reqwest::StatusCode,
     body: String,
 ) -> status::Custom<Json<Value>> {
-    let message = if body.is_empty() {
-        format!("lockbox signature_count returned {}", status_code.as_u16())
-    } else {
-        format!(
-            "lockbox signature_count returned {}: {}",
-            status_code.as_u16(),
-            body
-        )
+    if status_code == reqwest::StatusCode::CONFLICT {
+        return match serde_json::from_str::<Bip448HandoffErrorResponsePayloadV2>(&body) {
+            Ok(error) => status::Custom(Status::Conflict, Json(json!(error))),
+            Err(_) => internal_server_error_response(
+                "lockbox returned a malformed BIP448 conflict".to_string(),
+            ),
+        };
+    }
+    let message = format!("lockbox returned {}", status_code.as_u16());
+    let status = match status_code.as_u16() {
+        400 => Status::BadRequest,
+        404 => Status::NotFound,
+        _ => Status::InternalServerError,
     };
 
     status::Custom(
-        Status::InternalServerError,
+        status,
         Json(json!({
             "error": "Lockbox Error",
             "message": message,
@@ -55,20 +73,81 @@ fn lockbox_signature_count_error_response(
     )
 }
 
-fn parse_lockbox_signature_count(value: &str) -> Result<u64, String> {
-    let response: Value = serde_json::from_str(value)
-        .map_err(|err| format!("failed to parse lockbox signature_count response: {err}"))?;
-
-    response["sig_count"]
-        .as_u64()
-        .ok_or_else(|| "lockbox signature_count response is missing sig_count".to_string())
-}
-
 fn parse_lockbox_keyupdate_response(
     value: &str,
-) -> Result<TransferReceiverPostResponsePayload, String> {
+) -> Result<Bip448KeyUpdateAppliedReceiptPayloadV2, String> {
     serde_json::from_str(value)
         .map_err(|err| format!("failed to parse lockbox keyupdate response: {err}"))
+}
+
+fn locked_server_pubkey(
+    locked: &crate::database::transfer_receiver::LockedStatechainGeneration,
+) -> Result<Bip448CompressedPublicKey, String> {
+    let bytes: [u8; 33] = locked
+        .server_public_key
+        .as_slice()
+        .try_into()
+        .map_err(|_| "statechain server public key is malformed".to_string())?;
+    Bip448CompressedPublicKey::from_bytes(bytes)
+        .map_err(|_| "statechain server public key is malformed".to_string())
+}
+
+async fn observe_locked_bip448_state(
+    statechain_entity: &StateChainEntity,
+    statechain_id: &Bip448StatechainId,
+    locked: &crate::database::transfer_receiver::LockedStatechainGeneration,
+) -> Result<Bip448LockboxStateResponsePayloadV2, status::Custom<Json<Value>>> {
+    let enclave_index = usize::try_from(locked.enclave_index).map_err(|_| {
+        internal_server_error_response("Enclave index for statechain ID not found.".to_string())
+    })?;
+    let enclave = statechain_entity
+        .config
+        .enclaves
+        .get(enclave_index)
+        .ok_or_else(|| {
+            internal_server_error_response("Enclave index for statechain ID not found.".to_string())
+        })?;
+    let request = statechain_entity
+        .http_client
+        .get(format!(
+            "{}/bip448/state/{}",
+            enclave.url,
+            statechain_id.as_str()
+        ))
+        .timeout(outbound_request_timeout());
+    let response = request
+        .send()
+        .await
+        .map_err(|err| internal_server_error_response(err.to_string()))?;
+    let response_status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|err| internal_server_error_response(err.to_string()))?;
+    if !response_status.is_success() {
+        return Err(lockbox_state_divergence_response());
+    }
+    let observed: Bip448LockboxStateResponsePayloadV2 =
+        serde_json::from_str(&text).map_err(|err| {
+            internal_server_error_response(format!(
+                "failed to parse lockbox BIP448 state response: {err}"
+            ))
+        })?;
+    if observed.statechain_id != *statechain_id {
+        return Err(internal_server_error_response(
+            "lockbox returned BIP448 state for a different statechain".to_string(),
+        ));
+    }
+    let mercury_server_pubkey =
+        locked_server_pubkey(locked).map_err(internal_server_error_response)?;
+    if observed.server_pubkey != mercury_server_pubkey {
+        return Err(status::Custom(
+            Status::Conflict,
+            Json(json!({"message": "Mercury and lockbox BIP448 server keys do not match"})),
+        ));
+    }
+
+    Ok(observed)
 }
 
 fn parse_bip448_generation_tag(value: Option<&str>) -> Option<PublicKey> {
@@ -77,14 +156,86 @@ fn parse_bip448_generation_tag(value: Option<&str>) -> Option<PublicKey> {
     (key.to_string() == value).then_some(key)
 }
 
-fn parse_bip448_receiver_t2(value: &str) -> Option<[u8; 32]> {
-    let bytes = hex::decode(value).ok()?;
-    if bytes.len() != 32 || hex::encode(&bytes) != value {
-        return None;
+fn validate_keyupdate_receipt(
+    request: &Bip448LockboxKeyUpdateRequestPayloadV2,
+    transfer_generation: &PublicKey,
+    receipt: &Bip448KeyUpdateAppliedReceiptPayloadV2,
+) -> Result<PublicKey, String> {
+    let expected_resulting_generation = request
+        .expected_key_generation
+        .get()
+        .checked_add(1)
+        .ok_or_else(|| "BIP448 key generation overflowed".to_string())?;
+    if receipt.operation_id != request.operation_id
+        || receipt.statechain_id != request.statechain_id
+        || receipt.accepted_sig_count != request.expected_sig_count
+        || receipt.previous_key_generation != request.expected_key_generation
+        || receipt.resulting_key_generation.get() != expected_resulting_generation
+        || receipt.previous_server_pubkey != request.expected_server_pubkey
+        || receipt.transfer_generation_pubkey.as_bytes() != &transfer_generation.serialize()
+    {
+        return Err("lockbox keyupdate receipt does not match the exact request".to_string());
     }
-    let bytes: [u8; 32] = bytes.try_into().ok()?;
-    secp256k1::SecretKey::from_slice(&bytes).ok()?;
-    Some(bytes)
+
+    let previous_server = PublicKey::from_slice(request.expected_server_pubkey.as_bytes())
+        .map_err(|_| "BIP448 request server key is malformed".to_string())?;
+    let t2 = SecretKey::from_secret_bytes(*request.t2.as_bytes())
+        .map_err(|_| "BIP448 request t2 is malformed".to_string())?;
+    let x1 = SecretKey::from_secret_bytes(*request.x1.as_bytes())
+        .map_err(|_| "BIP448 request x1 is malformed".to_string())?;
+    let secp = Secp256k1::new();
+    if x1.public_key(&secp) != *transfer_generation {
+        return Err("BIP448 request x1 does not match the transfer generation".to_string());
+    }
+    let expected_result = previous_server
+        .combine(&t2.public_key(&secp))
+        .and_then(|key| key.combine(&transfer_generation.negate()))
+        .map_err(|_| "BIP448 keyupdate receipt violates transfer algebra".to_string())?;
+    let resulting_server = PublicKey::from_slice(receipt.resulting_server_pubkey.as_bytes())
+        .map_err(|_| "lockbox keyupdate receipt server key is malformed".to_string())?;
+    if resulting_server != expected_result {
+        return Err("lockbox keyupdate receipt violates transfer algebra".to_string());
+    }
+
+    Ok(resulting_server)
+}
+
+fn completed_keyupdate_replay_receipt(
+    request: &Bip448LockboxKeyUpdateRequestPayloadV2,
+    transfer_generation: &PublicKey,
+    current: &Bip448LockboxStateResponsePayloadV2,
+) -> Result<Bip448KeyUpdateAppliedReceiptPayloadV2, String> {
+    let resulting_generation = request
+        .expected_key_generation
+        .get()
+        .checked_add(1)
+        .ok_or_else(|| "BIP448 key generation overflowed".to_string())?;
+    if current.statechain_id != request.statechain_id
+        || current.sig_count != request.expected_sig_count
+        || current.key_generation.get() != resulting_generation
+    {
+        return Err("completed BIP448 keyupdate does not match current lockbox state".to_string());
+    }
+    let receipt = Bip448KeyUpdateAppliedReceiptPayloadV2 {
+        protocol_version: Bip448ProtocolVersionV2,
+        operation_id: request.operation_id,
+        statechain_id: request.statechain_id.clone(),
+        status: Bip448AppliedStatus,
+        accepted_sig_count: request.expected_sig_count,
+        previous_key_generation: request.expected_key_generation,
+        resulting_key_generation: current.key_generation,
+        previous_server_pubkey: request.expected_server_pubkey,
+        resulting_server_pubkey: current.server_pubkey,
+        transfer_generation_pubkey: Bip448CompressedPublicKey::from_bytes(
+            transfer_generation.serialize(),
+        )
+        .map_err(|_| "transfer generation public key is malformed".to_string())?,
+    };
+    let resulting_server = validate_keyupdate_receipt(request, transfer_generation, &receipt)?;
+    if resulting_server.serialize() != *current.server_pubkey.as_bytes() {
+        return Err("completed BIP448 keyupdate server key does not match live state".to_string());
+    }
+    Ok(receipt)
 }
 
 #[get("/info/statechain/<statechain_id>")]
@@ -92,97 +243,100 @@ pub async fn statechain_info(
     statechain_entity: &State<StateChainEntity>,
     statechain_id: &str,
 ) -> status::Custom<Json<Value>> {
-    let enclave_public_key = crate::database::transfer_receiver::get_enclave_pubkey(
-        &statechain_entity.pool,
-        &statechain_id,
-    )
-    .await;
-
-    if enclave_public_key.is_none() {
-        return statechain_data_not_found_response();
-    }
-
-    let enclave_public_key = enclave_public_key.unwrap();
-
-    let config = crate::server_config::ServerConfig::load();
-
-    let enclave_index = crate::database::utils::get_enclave_index_from_database(
-        &statechain_entity.pool,
-        &statechain_id,
-    )
-    .await;
-
-    let enclave_index = match enclave_index {
-        Some(index) => index,
-        None => {
-            let response_body = json!({
-                "message": format!("Enclave index for statechain {} ID not found.", statechain_id)
-            });
-
-            return status::Custom(Status::InternalServerError, Json(response_body));
+    let typed_statechain_id = match Bip448StatechainId::try_from(statechain_id) {
+        Ok(value) => value,
+        Err(err) => {
+            return status::Custom(
+                Status::UnprocessableEntity,
+                Json(json!({"message": err.to_string()})),
+            );
         }
     };
+    let mut handoff_fence = match statechain_entity.pool.begin().await {
+        Ok(transaction) => transaction,
+        Err(err) => return internal_server_error_response(err.to_string()),
+    };
+    let locked = match crate::database::transfer_receiver::lock_statechain_generation(
+        &mut *handoff_fence,
+        statechain_id,
+    )
+    .await
+    {
+        Ok(Some(locked)) => locked,
+        Ok(None) => return statechain_data_not_found_response(),
+        Err(err) => return internal_server_error_response(err.to_string()),
+    };
+    let observed =
+        match observe_locked_bip448_state(statechain_entity.inner(), &typed_statechain_id, &locked)
+            .await
+        {
+            Ok(observed) => observed,
+            Err(response) => return response,
+        };
+    let history =
+        crate::database::transfer_receiver::get_statechain_info(&mut *handoff_fence, statechain_id)
+            .await;
+    let x1_pubkey =
+        crate::database::transfer_receiver::get_x1pub(&mut *handoff_fence, statechain_id).await;
+    let mercury_server_pubkey = match locked_server_pubkey(&locked) {
+        Ok(key) => key,
+        Err(err) => return internal_server_error_response(err),
+    };
 
-    let enclave_index = enclave_index as usize;
-
-    let lockbox_endpoint = config.enclaves.get(enclave_index).unwrap().url.clone();
-    let path = "signature_count";
-
-    let client = statechain_entity.inner().http_client.clone();
-    let request = client
-        .get(&format!("{}/{}/{}", lockbox_endpoint, path, statechain_id))
-        .timeout(outbound_request_timeout());
-
-    let value = match request.send().await {
-        Ok(response) => {
-            let response_status = response.status();
-            let text = match response.text().await {
-                Ok(text) => text,
+    let response = if let Some(x1_pubkey) = x1_pubkey {
+        let x1_pub = match Bip448CompressedPublicKey::from_bytes(x1_pubkey.serialize()) {
+            Ok(key) => key,
+            Err(err) => return internal_server_error_response(err.to_string()),
+        };
+        let mut typed_history = Vec::with_capacity(history.len());
+        for item in history {
+            let history_statechain_id =
+                match Bip448StatechainId::try_from(item.statechain_id.as_str()) {
+                    Ok(value) => value,
+                    Err(err) => return internal_server_error_response(err.to_string()),
+                };
+            let server_pubnonce = match Bip448PublicNonce::try_from(item.server_pubnonce.as_str()) {
+                Ok(value) => value,
                 Err(err) => return internal_server_error_response(err.to_string()),
             };
-
-            if !response_status.is_success() {
-                return lockbox_signature_count_error_response(response_status, text);
-            }
-
-            text
+            let challenge = match Bip448CanonicalScalar::try_from(item.challenge.as_str()) {
+                Ok(value) => value,
+                Err(err) => return internal_server_error_response(err.to_string()),
+            };
+            typed_history.push(Bip448StatechainInfoV2 {
+                statechain_id: history_statechain_id,
+                server_pubnonce,
+                challenge,
+                tx_n: item.tx_n,
+            });
         }
-        Err(err) => {
-            return internal_server_error_response(err.to_string());
-        }
+        json!(Bip448StatechainInfoResponsePayloadV2 {
+            protocol_version: Bip448ProtocolVersionV2,
+            enclave_public_key: mercury_server_pubkey,
+            num_sigs: observed.sig_count,
+            lockbox_key_generation: observed.key_generation,
+            statechain_info: typed_history,
+            x1_pub,
+        })
+    } else {
+        let num_sigs = match u32::try_from(observed.sig_count) {
+            Ok(value) => value,
+            Err(err) => return internal_server_error_response(err.to_string()),
+        };
+        json!(StatechainInfoResponsePayload {
+            enclave_public_key: hex::encode(mercury_server_pubkey.as_bytes()),
+            num_sigs,
+            statechain_info: history,
+            x1_pub: None,
+        })
     };
 
-    let num_sigs = match parse_lockbox_signature_count(value.as_str()) {
-        Ok(num_sigs) => num_sigs,
-        Err(message) => return internal_server_error_response(message),
-    };
-
-    let statechain_info = crate::database::transfer_receiver::get_statechain_info(
-        &statechain_entity.pool,
-        &statechain_id,
-    )
-    .await;
-
-    let x1_pubkey =
-        crate::database::transfer_receiver::get_x1pub(&statechain_entity.pool, &statechain_id)
-            .await;
-
-    let mut x1_pub: Option<String> = None;
-
-    if x1_pubkey.is_some() {
-        x1_pub = Some(x1_pubkey.unwrap().to_string());
+    if handoff_fence.commit().await.is_err() {
+        return internal_server_error_response(
+            "Failed to finish statechain observation.".to_string(),
+        );
     }
-
-    let statechain_info_response_payload = StatechainInfoResponsePayload {
-        enclave_public_key: enclave_public_key.to_string(),
-        num_sigs: num_sigs as u32,
-        statechain_info,
-        x1_pub,
-    };
-
-    let response_body = json!(statechain_info_response_payload);
-
-    return status::Custom(Status::Ok, Json(response_body));
+    status::Custom(Status::Ok, Json(response))
 }
 
 #[get("/transfer/get_msg_addr/<new_auth_key>")]
@@ -274,54 +428,72 @@ pub async fn transfer_unlock(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mercurylib::bip448_statechain::signing_api::{
+        Bip448KeyGeneration, Bip448OperationId, Bip448SignatureCount,
+    };
 
-    #[test]
-    fn parse_lockbox_signature_count_accepts_valid_json() {
-        let sig_count = parse_lockbox_signature_count(r#"{"sig_count":7}"#).unwrap();
-
-        assert_eq!(sig_count, 7);
-    }
-
-    #[test]
-    fn parse_lockbox_signature_count_rejects_plain_text() {
-        let err = parse_lockbox_signature_count("Signature count not found.").unwrap_err();
-
-        assert!(err.contains("failed to parse lockbox signature_count response"));
-    }
-
-    #[test]
-    fn parse_lockbox_signature_count_rejects_missing_sig_count() {
-        let err = parse_lockbox_signature_count(r#"{"status":"ok"}"#).unwrap_err();
-
-        assert_eq!(
-            err,
-            "lockbox signature_count response is missing sig_count".to_string()
-        );
-    }
-
-    #[test]
-    fn lockbox_signature_count_not_found_after_mercury_lookup_maps_to_internal_error() {
-        let response = lockbox_signature_count_error_response(
-            reqwest::StatusCode::NOT_FOUND,
-            "Signature count not found.".to_string(),
-        );
-
-        assert_eq!(response.0, Status::InternalServerError);
-        assert_eq!(response.1 .0["error"], "Lockbox Error");
-        assert!(response.1 .0["message"].as_str().unwrap().contains("404"));
-        assert!(response.1 .0["message"]
-            .as_str()
+    fn keyupdate_fixture() -> (
+        Bip448LockboxKeyUpdateRequestPayloadV2,
+        PublicKey,
+        Bip448KeyUpdateAppliedReceiptPayloadV2,
+    ) {
+        let secp = Secp256k1::new();
+        let previous = SecretKey::from_secret_bytes([3; 32])
             .unwrap()
-            .contains("Signature count not found."));
+            .public_key(&secp);
+        let t2 = SecretKey::from_secret_bytes([5; 32]).unwrap();
+        let x1 = SecretKey::from_secret_bytes([7; 32]).unwrap();
+        let transfer_generation = x1.public_key(&secp);
+        let resulting = previous
+            .combine(&t2.public_key(&secp))
+            .unwrap()
+            .combine(&transfer_generation.negate())
+            .unwrap();
+        let request = Bip448LockboxKeyUpdateRequestPayloadV2 {
+            protocol_version: Bip448ProtocolVersionV2,
+            operation_id: Bip448OperationId::from_bytes([0x11; 32]),
+            statechain_id: Bip448StatechainId::try_from("statechain-receipt-test").unwrap(),
+            t2: Bip448SecretScalar::from_bytes(t2.to_secret_bytes()).unwrap(),
+            x1: Bip448SecretScalar::from_bytes(x1.to_secret_bytes()).unwrap(),
+            expected_sig_count: Bip448SignatureCount::new(2),
+            expected_key_generation: Bip448KeyGeneration::new(4),
+            expected_server_pubkey: Bip448CompressedPublicKey::from_bytes(previous.serialize())
+                .unwrap(),
+        };
+        let receipt = Bip448KeyUpdateAppliedReceiptPayloadV2 {
+            protocol_version: Bip448ProtocolVersionV2,
+            operation_id: request.operation_id,
+            statechain_id: request.statechain_id.clone(),
+            status: Bip448AppliedStatus,
+            accepted_sig_count: request.expected_sig_count,
+            previous_key_generation: request.expected_key_generation,
+            resulting_key_generation: Bip448KeyGeneration::new(5),
+            previous_server_pubkey: request.expected_server_pubkey,
+            resulting_server_pubkey: Bip448CompressedPublicKey::from_bytes(resulting.serialize())
+                .unwrap(),
+            transfer_generation_pubkey: Bip448CompressedPublicKey::from_bytes(
+                transfer_generation.serialize(),
+            )
+            .unwrap(),
+        };
+        (request, transfer_generation, receipt)
+    }
+
+    #[test]
+    fn lockbox_conflict_stays_a_public_conflict() {
+        let response = lockbox_error_response(
+            reqwest::StatusCode::CONFLICT,
+            r#"{"code":"bip448_signature_count_mismatch","message":"BIP448 request conflicts with current state","expected_sig_count":2,"actual_sig_count":3}"#.to_string(),
+        );
+
+        assert_eq!(response.0, Status::Conflict);
+        assert_eq!(response.1 .0["code"], "bip448_signature_count_mismatch");
     }
 
     #[test]
     fn only_initial_missing_mercury_row_returns_exact_not_found_envelope() {
         let initial_lookup_response = statechain_data_not_found_response();
-        let lockbox_missing_response = lockbox_signature_count_error_response(
-            reqwest::StatusCode::NOT_FOUND,
-            "Signature count not found.".to_string(),
-        );
+        let lockbox_missing_response = lockbox_state_divergence_response();
 
         assert_eq!(initial_lookup_response.0, Status::NotFound);
         assert_eq!(
@@ -334,9 +506,11 @@ mod tests {
 
     #[test]
     fn parse_lockbox_keyupdate_response_accepts_valid_json() {
-        let response = parse_lockbox_keyupdate_response(r#"{"server_pubkey":"abc"}"#).unwrap();
+        let (_, _, receipt) = keyupdate_fixture();
+        let response =
+            parse_lockbox_keyupdate_response(&serde_json::to_string(&receipt).unwrap()).unwrap();
 
-        assert_eq!(response.server_pubkey, "abc");
+        assert_eq!(response, receipt);
     }
 
     #[test]
@@ -362,12 +536,81 @@ mod tests {
     }
 
     #[test]
-    fn bip448_receiver_t2_requires_lowercase_valid_scalar() {
-        let canonical = "ab".repeat(32);
-        assert_eq!(parse_bip448_receiver_t2(&canonical), Some([0xab; 32]));
-        assert!(parse_bip448_receiver_t2(&canonical.to_uppercase()).is_none());
-        assert!(parse_bip448_receiver_t2(&"07".repeat(31)).is_none());
-        assert!(parse_bip448_receiver_t2(&"00".repeat(32)).is_none());
+    fn keyupdate_receipt_binds_every_fence_and_transfer_algebra() {
+        let (request, transfer_generation, receipt) = keyupdate_fixture();
+        assert_eq!(
+            validate_keyupdate_receipt(&request, &transfer_generation, &receipt).unwrap(),
+            PublicKey::from_slice(receipt.resulting_server_pubkey.as_bytes()).unwrap()
+        );
+
+        let other_key = Bip448CompressedPublicKey::from_bytes(
+            SecretKey::from_secret_bytes([9; 32])
+                .unwrap()
+                .public_key(&Secp256k1::new())
+                .serialize(),
+        )
+        .unwrap();
+        let mut mismatches = Vec::new();
+        let mut changed = receipt.clone();
+        changed.operation_id = Bip448OperationId::from_bytes([0x22; 32]);
+        mismatches.push(changed);
+        let mut changed = receipt.clone();
+        changed.statechain_id = Bip448StatechainId::try_from("other-statechain").unwrap();
+        mismatches.push(changed);
+        let mut wrong_count = receipt.clone();
+        wrong_count.accepted_sig_count = Bip448SignatureCount::new(3);
+        mismatches.push(wrong_count);
+        let mut changed = receipt.clone();
+        changed.previous_key_generation = Bip448KeyGeneration::new(3);
+        mismatches.push(changed);
+        let mut changed = receipt.clone();
+        changed.resulting_key_generation = Bip448KeyGeneration::new(6);
+        mismatches.push(changed);
+        let mut changed = receipt.clone();
+        changed.previous_server_pubkey = other_key;
+        mismatches.push(changed);
+        let mut changed = receipt.clone();
+        changed.resulting_server_pubkey = request.expected_server_pubkey;
+        mismatches.push(changed);
+        let mut changed = receipt;
+        changed.transfer_generation_pubkey = other_key;
+        mismatches.push(changed);
+
+        for mismatch in mismatches {
+            assert!(validate_keyupdate_receipt(&request, &transfer_generation, &mismatch).is_err());
+        }
+    }
+
+    #[test]
+    fn completed_keyupdate_replay_requires_matching_live_n_g_and_s() {
+        let (request, transfer_generation, receipt) = keyupdate_fixture();
+        let current = Bip448LockboxStateResponsePayloadV2 {
+            protocol_version: Bip448ProtocolVersionV2,
+            statechain_id: request.statechain_id.clone(),
+            sig_count: request.expected_sig_count,
+            key_generation: receipt.resulting_key_generation,
+            server_pubkey: receipt.resulting_server_pubkey,
+        };
+        assert_eq!(
+            completed_keyupdate_replay_receipt(&request, &transfer_generation, &current).unwrap(),
+            receipt
+        );
+
+        let mut wrong_n = current.clone();
+        wrong_n.sig_count = Bip448SignatureCount::new(current.sig_count.get() + 1);
+        assert!(
+            completed_keyupdate_replay_receipt(&request, &transfer_generation, &wrong_n).is_err()
+        );
+        let mut wrong_g = current.clone();
+        wrong_g.key_generation = Bip448KeyGeneration::new(current.key_generation.get() + 1);
+        assert!(
+            completed_keyupdate_replay_receipt(&request, &transfer_generation, &wrong_g).is_err()
+        );
+        let mut wrong_s = current;
+        wrong_s.server_pubkey = request.expected_server_pubkey;
+        assert!(
+            completed_keyupdate_replay_receipt(&request, &transfer_generation, &wrong_s).is_err()
+        );
     }
 
     #[test]
@@ -414,10 +657,10 @@ mod tests {
 )]
 pub async fn transfer_receiver(
     statechain_entity: &State<StateChainEntity>,
-    transfer_receiver_request_payload: Json<TransferReceiverRequestPayload>,
+    transfer_receiver_request_payload: Json<TransferReceiverRequestPayloadV2>,
 ) -> status::Custom<Json<Value>> {
-    let statechain_id = transfer_receiver_request_payload.statechain_id.clone();
-    let t2 = transfer_receiver_request_payload.t2.clone();
+    let payload = transfer_receiver_request_payload.0;
+    let statechain_id = payload.statechain_id.as_str().to_owned();
     let generation_error = || {
         status::Custom(
             Status::InternalServerError,
@@ -474,6 +717,112 @@ pub async fn transfer_receiver(
             }
         };
 
+    let x1_secret = match secp256k1::SecretKey::from_secret_bytes(transfer.x1) {
+        Ok(value) => value,
+        Err(_) => {
+            let _ = transaction.rollback().await;
+            return generation_error();
+        }
+    };
+    let x1_generation = x1_secret.public_key(&Secp256k1::new());
+    if payload.transfer_generation_pubkey.as_bytes() != &x1_generation.serialize() {
+        let _ = transaction.rollback().await;
+        return generation_error();
+    }
+    let recipient_auth = match PublicKey::from_slice(&transfer.recipient_auth_public_key) {
+        Ok(key) => key,
+        Err(_) => {
+            let _ = transaction.rollback().await;
+            return generation_error();
+        }
+    };
+    let recipient_auth_xonly = recipient_auth.x_only_public_key().0;
+    let digest = match payload.auth_digest() {
+        Ok(digest) => digest,
+        Err(_) => {
+            let _ = transaction.rollback().await;
+            return generation_error();
+        }
+    };
+    let signature_matches = crate::endpoints::utils::try_verify_digest_signature(
+        &hex::encode(payload.auth_sig.as_bytes()),
+        &digest,
+        &recipient_auth_xonly,
+    )
+    .unwrap_or(false);
+    if !signature_matches {
+        let _ = transaction.rollback().await;
+        return generation_error();
+    }
+
+    let mercury_server_pubkey = match locked_server_pubkey(&statechain) {
+        Ok(key) => key,
+        Err(err) => {
+            let _ = transaction.rollback().await;
+            return internal_server_error_response(err);
+        }
+    };
+    if !transfer.key_updated && payload.expected_server_pubkey != mercury_server_pubkey {
+        let _ = transaction.rollback().await;
+        return generation_error();
+    }
+    let x1 = match Bip448SecretScalar::from_bytes(transfer.x1) {
+        Ok(x1) => x1,
+        Err(_) => {
+            let _ = transaction.rollback().await;
+            return generation_error();
+        }
+    };
+    let key_update_request = Bip448LockboxKeyUpdateRequestPayloadV2 {
+        protocol_version: Bip448ProtocolVersionV2,
+        operation_id: payload.operation_id,
+        statechain_id: payload.statechain_id,
+        t2: payload.t2,
+        x1,
+        expected_sig_count: payload.expected_sig_count,
+        expected_key_generation: payload.expected_key_generation,
+        expected_server_pubkey: payload.expected_server_pubkey,
+    };
+
+    if transfer.key_updated {
+        if statechain.auth_xonly_public_key != recipient_auth_xonly.serialize() {
+            let _ = transaction.rollback().await;
+            return internal_server_error_response(
+                "completed BIP448 transfer does not match Mercury ownership state".to_string(),
+            );
+        }
+        let current = match observe_locked_bip448_state(
+            statechain_entity.inner(),
+            &key_update_request.statechain_id,
+            &statechain,
+        )
+        .await
+        {
+            Ok(current) => current,
+            Err(response) => {
+                let _ = transaction.rollback().await;
+                return response;
+            }
+        };
+        let receipt =
+            match completed_keyupdate_replay_receipt(&key_update_request, &x1_generation, &current)
+            {
+                Ok(receipt) => receipt,
+                Err(err) => {
+                    let _ = transaction.rollback().await;
+                    return internal_server_error_response(err);
+                }
+            };
+        if transaction.commit().await.is_err() {
+            return internal_server_error_response("Failed to finish receiver replay.".to_string());
+        }
+        return status::Custom(Status::Ok, Json(json!(receipt)));
+    }
+
+    // Completed retries return above after authenticating and matching live
+    // lockbox state. Batch expiry and batch-wide row locks are first-apply
+    // checks only and must not turn an otherwise read-only replay into a new
+    // dependency on the rest of the batch.
     let batch_info = match crate::database::transfer::get_batch_id_and_time_by_statechain_id_in_tx(
         &mut *transaction,
         &statechain_id,
@@ -525,88 +874,6 @@ pub async fn transfer_receiver(
         }
     }
 
-    let x1_secret = match secp256k1::SecretKey::from_slice(&transfer.x1) {
-        Ok(value) => value,
-        Err(_) => {
-            let _ = transaction.rollback().await;
-            return generation_error();
-        }
-    };
-    let x1_generation = x1_secret.public_key(&Secp256k1::new());
-    let supplied_generation = match parse_bip448_generation_tag(
-        transfer_receiver_request_payload.batch_data.as_deref(),
-    ) {
-        Some(key) if key == x1_generation => key,
-        _ => {
-            let _ = transaction.rollback().await;
-            return generation_error();
-        }
-    };
-    let t2_bytes = match parse_bip448_receiver_t2(&t2) {
-        Some(bytes) => bytes,
-        None => {
-            let _ = transaction.rollback().await;
-            return generation_error();
-        }
-    };
-    let recipient_auth = match PublicKey::from_slice(&transfer.recipient_auth_public_key) {
-        Ok(key) => key,
-        Err(_) => {
-            let _ = transaction.rollback().await;
-            return generation_error();
-        }
-    };
-    let digest = match mercurylib::transfer::receiver::bip448_transfer_receiver_auth_digest(
-        &statechain_id,
-        &t2_bytes,
-        &supplied_generation,
-    ) {
-        Ok(digest) => digest,
-        Err(_) => {
-            let _ = transaction.rollback().await;
-            return generation_error();
-        }
-    };
-    let signature_matches = crate::endpoints::utils::try_verify_digest_signature(
-        &transfer_receiver_request_payload.auth_sig,
-        &digest,
-        &recipient_auth.x_only_public_key().0,
-    )
-    .unwrap_or(false);
-    if !signature_matches {
-        let _ = transaction.rollback().await;
-        return generation_error();
-    }
-
-    if transfer.key_updated {
-        let server_public_key = match PublicKey::from_slice(&statechain.server_public_key) {
-            Ok(key) => key,
-            Err(_) => {
-                let _ = transaction.rollback().await;
-                return internal_server_error_response("Server public key not found.".to_string());
-            }
-        };
-        if transaction.commit().await.is_err() {
-            return internal_server_error_response("Failed to finish receiver replay.".to_string());
-        }
-        return status::Custom(
-            Status::Ok,
-            Json(json!(TransferReceiverPostResponsePayload {
-                server_pubkey: server_public_key.to_string(),
-            })),
-        );
-    }
-
-    let x1_hex = hex::encode(transfer.x1);
-
-    let key_update_response_payload = mercurylib::transfer::receiver::KeyUpdateResponsePayload {
-        statechain_id: statechain_id.clone(),
-        t2,
-        x1: x1_hex,
-    };
-
-    let config = crate::server_config::ServerConfig::load();
-
     let enclave_index = match usize::try_from(statechain.enclave_index) {
         Ok(index) => index,
         Err(_) => {
@@ -616,7 +883,7 @@ pub async fn transfer_receiver(
             );
         }
     };
-    let Some(enclave) = config.enclaves.get(enclave_index) else {
+    let Some(enclave) = statechain_entity.config.enclaves.get(enclave_index) else {
         let _ = transaction.rollback().await;
         return internal_server_error_response(
             "Enclave index for statechain ID not found.".to_string(),
@@ -630,7 +897,7 @@ pub async fn transfer_receiver(
         .post(&format!("{}/{}", lockbox_endpoint, path))
         .timeout(outbound_request_timeout());
 
-    let value = match request.json(&key_update_response_payload).send().await {
+    let value = match request.json(&key_update_request).send().await {
         Ok(response) => {
             let response_status = response.status();
             let text = match response.text().await {
@@ -643,11 +910,7 @@ pub async fn transfer_receiver(
 
             if !response_status.is_success() {
                 let _ = transaction.rollback().await;
-                return internal_server_error_response(format!(
-                    "lockbox keyupdate returned {}: {}",
-                    response_status.as_u16(),
-                    text
-                ));
+                return lockbox_error_response(response_status, text);
             }
 
             text
@@ -658,7 +921,7 @@ pub async fn transfer_receiver(
         }
     };
 
-    let response: TransferReceiverPostResponsePayload =
+    let receipt: Bip448KeyUpdateAppliedReceiptPayloadV2 =
         match parse_lockbox_keyupdate_response(value.as_str()) {
             Ok(response) => response,
             Err(err) => {
@@ -666,29 +929,21 @@ pub async fn transfer_receiver(
                 return internal_server_error_response(err);
             }
         };
-
-    let mut server_pubkey_hex = response.server_pubkey.clone();
-
-    if server_pubkey_hex.starts_with("0x") {
-        server_pubkey_hex = server_pubkey_hex[2..].to_string();
-    }
-
-    let server_pubkey = match PublicKey::from_str(&server_pubkey_hex) {
-        Ok(key) => key,
-        Err(_) => {
-            let _ = transaction.rollback().await;
-            return internal_server_error_response(
-                "Lockbox returned an invalid server public key.".to_string(),
-            );
-        }
-    };
+    let server_pubkey =
+        match validate_keyupdate_receipt(&key_update_request, &x1_generation, &receipt) {
+            Ok(key) => key,
+            Err(err) => {
+                let _ = transaction.rollback().await;
+                return internal_server_error_response(err);
+            }
+        };
 
     if crate::database::transfer_receiver::commit_bip448_transfer_generation_update(
         &mut *transaction,
         &statechain_id,
         &statechain,
         &transfer,
-        &recipient_auth.x_only_public_key().0,
+        &recipient_auth_xonly,
         &server_pubkey,
     )
     .await
@@ -703,9 +958,5 @@ pub async fn transfer_receiver(
         return internal_server_error_response("Failed to commit transfer generation.".to_string());
     }
 
-    let response_body = json!(TransferReceiverPostResponsePayload {
-        server_pubkey: server_pubkey.to_string(),
-    });
-
-    status::Custom(Status::Ok, Json(response_body))
+    status::Custom(Status::Ok, Json(json!(receipt)))
 }

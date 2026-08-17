@@ -20,11 +20,15 @@
 //!   signature counter so a receiver can verify it independently.
 
 use mercurylib::bip448_statechain::signing_api::{
-    validate_negate_seckey_flag, validate_signing_id, Bip448PartialSignatureRequestPayload,
+    validate_negate_seckey_flag, validate_signing_id, Bip448BlindedSession,
+    Bip448CompressedPublicKey, Bip448LockboxPartialSignatureRequestPayloadV2,
+    Bip448LockboxSignFirstRequestPayloadV2, Bip448LockboxStateResponsePayloadV2,
+    Bip448NegateSeckeyFlag, Bip448PartialSignatureRequestPayload, Bip448PublicNonce,
     Bip448SignFirstRequestPayload, Bip448SignFirstResponsePayload,
-    Bip448SignatureCountResponsePayload,
+    Bip448SignatureCountResponsePayload, Bip448SigningId, Bip448StatechainId,
 };
 use rocket::{http::Status, response::status, serde::json::Json, State};
+use secp256k1::XOnlyPublicKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -185,41 +189,20 @@ fn pending_nonce_response() -> status::Custom<Json<Value>> {
     )
 }
 
-async fn recover_bip448_sign_second_pre_lockbox_claim(
-    pool: &sqlx::PgPool,
-    statechain_id: &str,
-    signing_id: &str,
-    challenge: &str,
-) {
-    crate::database::bip448_sign::clear_bip448_signature_data_challenge(
-        pool,
-        statechain_id,
-        signing_id,
-        challenge,
-    )
-    .await;
-    crate::database::signing_nonce::delete_bip448_signing_nonce_lease(
-        pool,
-        statechain_id,
-        signing_id,
-    )
-    .await;
-}
-
 async fn cleanup_bip448_sign_first_reservation(
-    pool: &sqlx::PgPool,
+    connection: &mut sqlx::PgConnection,
     statechain_id: &str,
     signing_id: &str,
     lease_token: &str,
 ) {
     crate::database::bip448_sign::delete_bip448_signature_reservation(
-        pool,
+        &mut *connection,
         statechain_id,
         signing_id,
     )
     .await;
     crate::database::signing_nonce::delete_bip448_signing_nonce_lease_by_token(
-        pool,
+        connection,
         statechain_id,
         signing_id,
         lease_token,
@@ -228,13 +211,13 @@ async fn cleanup_bip448_sign_first_reservation(
 }
 
 async fn replay_bip448_partial_signature(
-    pool: &sqlx::PgPool,
+    connection: &mut sqlx::PgConnection,
     statechain_id: &str,
     signing_id: &str,
     server_partial_sig: String,
 ) -> status::Custom<Json<Value>> {
     crate::database::signing_nonce::delete_bip448_signing_nonce_lease(
-        pool,
+        connection,
         statechain_id,
         signing_id,
     )
@@ -246,33 +229,128 @@ async fn replay_bip448_partial_signature(
     )
 }
 
-async fn validate_bip448_auth(
-    pool: &sqlx::PgPool,
+fn validate_locked_bip448_auth(
+    locked: &crate::database::transfer_receiver::LockedStatechainGeneration,
     signed_statechain_id: &str,
     statechain_id: &str,
 ) -> Result<(), status::Custom<Json<Value>>> {
-    match crate::endpoints::utils::try_validate_signature(pool, signed_statechain_id, statechain_id)
-        .await
-    {
+    let auth_key = XOnlyPublicKey::from_slice(&locked.auth_xonly_public_key).map_err(|_| {
+        error_response(
+            Status::InternalServerError,
+            "statechain auth key is invalid".to_string(),
+        )
+    })?;
+
+    match crate::endpoints::utils::try_verify_statechain_signature(
+        signed_statechain_id,
+        statechain_id,
+        &auth_key,
+    ) {
         Ok(true) => Ok(()),
         Ok(false) => Err(error_response(
             Status::Unauthorized,
             "Signature does not match authentication key.".to_string(),
         )),
-        Err(SignatureValidationError::StatechainNotFound) => Err(error_response(
-            Status::NotFound,
-            format!("statechain {statechain_id} not found"),
-        )),
         Err(SignatureValidationError::InvalidSignature) => Err(error_response(
             Status::UnprocessableEntity,
             "signed_statechain_id is not a valid Schnorr signature".to_string(),
         )),
-        Err(err @ SignatureValidationError::MissingAuthKey)
+        Err(err @ SignatureValidationError::StatechainNotFound)
+        | Err(err @ SignatureValidationError::MissingAuthKey)
         | Err(err @ SignatureValidationError::InvalidAuthKey)
         | Err(err @ SignatureValidationError::Database(_)) => {
             Err(error_response(Status::InternalServerError, err.to_string()))
         }
     }
+}
+
+fn locked_server_pubkey(
+    locked: &crate::database::transfer_receiver::LockedStatechainGeneration,
+) -> Result<Bip448CompressedPublicKey, status::Custom<Json<Value>>> {
+    let bytes: [u8; 33] = locked
+        .server_public_key
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            error_response(
+                Status::InternalServerError,
+                "statechain server public key is malformed".to_string(),
+            )
+        })?;
+    Bip448CompressedPublicKey::from_bytes(bytes).map_err(|_| {
+        error_response(
+            Status::InternalServerError,
+            "statechain server public key is malformed".to_string(),
+        )
+    })
+}
+
+async fn observe_locked_bip448_state(
+    statechain_entity: &StateChainEntity,
+    statechain_id: &Bip448StatechainId,
+    locked: &crate::database::transfer_receiver::LockedStatechainGeneration,
+) -> Result<(String, Bip448LockboxStateResponsePayloadV2), status::Custom<Json<Value>>> {
+    let enclave_index = usize::try_from(locked.enclave_index).map_err(|_| {
+        error_response(
+            Status::InternalServerError,
+            "Enclave index for statechain ID not found.".to_string(),
+        )
+    })?;
+    let enclave = statechain_entity
+        .config
+        .enclaves
+        .get(enclave_index)
+        .ok_or_else(|| {
+            error_response(
+                Status::InternalServerError,
+                format!("Enclave index {enclave_index} is not configured."),
+            )
+        })?;
+    let lockbox_endpoint = enclave.url.clone();
+    let request = statechain_entity
+        .http_client
+        .get(format!(
+            "{}/bip448/state/{}",
+            lockbox_endpoint,
+            statechain_id.as_str()
+        ))
+        .timeout(outbound_request_timeout());
+    let response = request
+        .send()
+        .await
+        .map_err(|err| error_response(Status::InternalServerError, err.to_string()))?;
+    let response_status = response.status();
+    let value = response
+        .text()
+        .await
+        .map_err(|err| error_response(Status::InternalServerError, err.to_string()))?;
+    if !response_status.is_success() {
+        return Err(error_response(
+            Status::InternalServerError,
+            "lockbox BIP448 state is unavailable for an existing Mercury statechain".to_string(),
+        ));
+    }
+    let observed: Bip448LockboxStateResponsePayloadV2 =
+        serde_json::from_str(&value).map_err(|err| {
+            error_response(
+                Status::InternalServerError,
+                format!("failed to parse lockbox BIP448 state response: {err}"),
+            )
+        })?;
+    if observed.statechain_id != *statechain_id {
+        return Err(error_response(
+            Status::InternalServerError,
+            "lockbox returned BIP448 state for a different statechain".to_string(),
+        ));
+    }
+    if observed.server_pubkey != locked_server_pubkey(locked)? {
+        return Err(error_response(
+            Status::Conflict,
+            "Mercury and lockbox BIP448 server keys do not match".to_string(),
+        ));
+    }
+
+    Ok((lockbox_endpoint, observed))
 }
 
 #[post(
@@ -291,151 +369,102 @@ pub async fn bip448_sign_first(
         Ok(signing_id) => signing_id,
         Err(err) => return error_response(Status::UnprocessableEntity, err.to_string()),
     };
-
-    if let Err(response) = validate_bip448_auth(
-        &statechain_entity.pool,
-        &payload.signed_statechain_id,
-        &payload.statechain_id,
-    )
-    .await
-    {
-        return response;
-    }
-
-    crate::database::signing_nonce::reclaim_stale_signing_nonce_lease(
-        &statechain_entity.pool,
-        &payload.statechain_id,
-    )
-    .await;
-
-    let existing = crate::database::bip448_sign::get_bip448_signature_record(
-        &statechain_entity.pool,
-        &payload.statechain_id,
-        &signing_id,
-    )
-    .await;
-    let existing_bip448_round_is_incomplete = existing
-        .as_ref()
-        .map(|record| record.server_partial_sig.is_none())
-        .unwrap_or(false);
-
-    match classify_sign_first(existing.as_ref()) {
-        SignFirstDecision::Replay { server_pubnonce } => {
-            if existing_bip448_round_is_incomplete {
-                let _ = crate::database::signing_nonce::insert_bip448_signing_nonce_lease(
-                    &statechain_entity.pool,
-                    &payload.statechain_id,
-                    &signing_id,
-                )
-                .await;
-            }
-            let response = Bip448SignFirstResponsePayload { server_pubnonce };
-            return status::Custom(Status::Ok, Json(json!(response)));
-        }
-        SignFirstDecision::Pending => {
-            let _ = crate::database::signing_nonce::insert_bip448_signing_nonce_lease(
-                &statechain_entity.pool,
-                &payload.statechain_id,
-                &signing_id,
-            )
-            .await;
-            return pending_nonce_response();
-        }
-        SignFirstDecision::Fresh => {}
-    }
-
-    if let Some(incomplete) = crate::database::bip448_sign::get_incomplete_bip448_signature_record(
-        &statechain_entity.pool,
-        &payload.statechain_id,
-    )
-    .await
-    {
-        let _ = crate::database::signing_nonce::insert_bip448_signing_nonce_lease(
-            &statechain_entity.pool,
-            &payload.statechain_id,
-            &incomplete.signing_id,
-        )
-        .await;
-        return incomplete_round_response(incomplete);
-    }
-
-    if crate::database::signing_nonce::get_bip448_signing_nonce_lease(
-        &statechain_entity.pool,
-        &payload.statechain_id,
-    )
-    .await
-    .is_some()
-    {
-        return pending_nonce_response();
-    }
-
-    let lease_token = crate::database::signing_nonce::insert_bip448_signing_nonce_lease(
-        &statechain_entity.pool,
-        &payload.statechain_id,
-        &signing_id,
-    )
-    .await;
-
-    let Some(lease_token) = lease_token else {
-        return pending_nonce_response();
+    let statechain_id = match Bip448StatechainId::try_from(payload.statechain_id.as_str()) {
+        Ok(statechain_id) => statechain_id,
+        Err(err) => return error_response(Status::UnprocessableEntity, err.to_string()),
+    };
+    let lockbox_signing_id = match Bip448SigningId::try_from(signing_id.as_str()) {
+        Ok(signing_id) => signing_id,
+        Err(err) => return error_response(Status::UnprocessableEntity, err.to_string()),
     };
 
-    let reserved = crate::database::bip448_sign::insert_bip448_signature_reservation(
-        &statechain_entity.pool,
-        &payload.statechain_id,
-        &signing_id,
+    // The inner flow produces the response while this transaction remains the
+    // handoff fence; its Mercury metadata is committed and the lock released
+    // exactly once after any lockbox call has completed.
+    let mut handoff_fence = match statechain_entity.pool.begin().await {
+        Ok(transaction) => transaction,
+        Err(err) => return error_response(Status::InternalServerError, err.to_string()),
+    };
+    let locked = match crate::database::transfer_receiver::lock_statechain_generation(
+        &mut *handoff_fence,
+        statechain_id.as_str(),
     )
-    .await;
+    .await
+    {
+        Ok(Some(locked)) => locked,
+        Ok(None) => {
+            return error_response(
+                Status::NotFound,
+                format!("statechain {} not found", statechain_id.as_str()),
+            );
+        }
+        Err(err) => return error_response(Status::InternalServerError, err.to_string()),
+    };
+    if let Err(response) = validate_locked_bip448_auth(
+        &locked,
+        &payload.signed_statechain_id,
+        statechain_id.as_str(),
+    ) {
+        return response;
+    }
+    let (lockbox_endpoint, lockbox_state) =
+        match observe_locked_bip448_state(statechain_entity, &statechain_id, &locked).await {
+            Ok(observed) => observed,
+            Err(response) => return response,
+        };
 
-    if !reserved {
+    let response = async {
+        crate::database::signing_nonce::reclaim_stale_signing_nonce_lease(
+            &mut *handoff_fence,
+            &payload.statechain_id,
+        )
+        .await;
+
         let existing = crate::database::bip448_sign::get_bip448_signature_record(
-            &statechain_entity.pool,
+            &mut *handoff_fence,
             &payload.statechain_id,
             &signing_id,
         )
         .await;
+        let existing_bip448_round_is_incomplete = existing
+            .as_ref()
+            .map(|record| record.server_partial_sig.is_none())
+            .unwrap_or(false);
 
-        if let SignFirstDecision::Replay { server_pubnonce } =
-            classify_sign_first(existing.as_ref())
-        {
-            crate::database::signing_nonce::delete_bip448_signing_nonce_lease_by_token(
-                &statechain_entity.pool,
-                &payload.statechain_id,
-                &signing_id,
-                &lease_token,
-            )
-            .await;
-            let response = Bip448SignFirstResponsePayload { server_pubnonce };
-            return status::Custom(Status::Ok, Json(json!(response)));
-        }
-
-        if let SignFirstDecision::Pending = classify_sign_first(existing.as_ref()) {
-            crate::database::signing_nonce::delete_bip448_signing_nonce_lease_by_token(
-                &statechain_entity.pool,
-                &payload.statechain_id,
-                &signing_id,
-                &lease_token,
-            )
-            .await;
-            return pending_nonce_response();
+        match classify_sign_first(existing.as_ref()) {
+            SignFirstDecision::Replay { server_pubnonce } => {
+                if existing_bip448_round_is_incomplete {
+                    let _ = crate::database::signing_nonce::insert_bip448_signing_nonce_lease(
+                        &mut *handoff_fence,
+                        &payload.statechain_id,
+                        &signing_id,
+                    )
+                    .await;
+                }
+                let response = Bip448SignFirstResponsePayload { server_pubnonce };
+                return status::Custom(Status::Ok, Json(json!(response)));
+            }
+            SignFirstDecision::Pending => {
+                let _ = crate::database::signing_nonce::insert_bip448_signing_nonce_lease(
+                    &mut *handoff_fence,
+                    &payload.statechain_id,
+                    &signing_id,
+                )
+                .await;
+                return pending_nonce_response();
+            }
+            SignFirstDecision::Fresh => {}
         }
 
         if let Some(incomplete) =
             crate::database::bip448_sign::get_incomplete_bip448_signature_record(
-                &statechain_entity.pool,
+                &mut *handoff_fence,
                 &payload.statechain_id,
             )
             .await
         {
-            crate::database::signing_nonce::delete_bip448_signing_nonce_lease_by_token(
-                &statechain_entity.pool,
-                &payload.statechain_id,
-                &signing_id,
-                &lease_token,
-            )
-            .await;
             let _ = crate::database::signing_nonce::insert_bip448_signing_nonce_lease(
-                &statechain_entity.pool,
+                &mut *handoff_fence,
                 &payload.statechain_id,
                 &incomplete.signing_id,
             )
@@ -443,132 +472,181 @@ pub async fn bip448_sign_first(
             return incomplete_round_response(incomplete);
         }
 
-        crate::database::signing_nonce::delete_bip448_signing_nonce_lease_by_token(
-            &statechain_entity.pool,
+        if crate::database::signing_nonce::get_bip448_signing_nonce_lease(
+            &mut *handoff_fence,
+            &payload.statechain_id,
+        )
+        .await
+        .is_some()
+        {
+            return pending_nonce_response();
+        }
+
+        let lease_token = crate::database::signing_nonce::insert_bip448_signing_nonce_lease(
+            &mut *handoff_fence,
             &payload.statechain_id,
             &signing_id,
-            &lease_token,
         )
         .await;
 
-        return error_response(
-            Status::Conflict,
-            "BIP448 signing reservation was concurrently created; retry the request".to_string(),
-        );
-    }
+        let Some(lease_token) = lease_token else {
+            return pending_nonce_response();
+        };
 
-    let config = &statechain_entity.config;
-    let enclave_index = crate::database::utils::get_enclave_index_from_database(
-        &statechain_entity.pool,
-        &payload.statechain_id,
-    )
-    .await;
+        let reserved = crate::database::bip448_sign::insert_bip448_signature_reservation(
+            &mut *handoff_fence,
+            &payload.statechain_id,
+            &signing_id,
+        )
+        .await;
 
-    let enclave_index = match enclave_index {
-        Some(index) => index as usize,
-        None => {
-            cleanup_bip448_sign_first_reservation(
-                &statechain_entity.pool,
+        if !reserved {
+            let existing = crate::database::bip448_sign::get_bip448_signature_record(
+                &mut *handoff_fence,
                 &payload.statechain_id,
                 &signing_id,
-                &lease_token,
             )
             .await;
-            return error_response(
-                Status::InternalServerError,
-                format!(
-                    "Enclave index for statechain {} ID not found.",
-                    payload.statechain_id
-                ),
-            );
-        }
-    };
 
-    let Some(enclave) = config.enclaves.get(enclave_index) else {
-        cleanup_bip448_sign_first_reservation(
-            &statechain_entity.pool,
-            &payload.statechain_id,
-            &signing_id,
-            &lease_token,
-        )
-        .await;
-        return error_response(
-            Status::InternalServerError,
-            format!("Enclave index {} is not configured.", enclave_index),
-        );
-    };
-
-    let lockbox_endpoint = enclave.url.clone();
-    let path = "bip448/get_public_nonce";
-
-    let client = statechain_entity.http_client.clone();
-    let request = client
-        .post(&format!("{}/{}", lockbox_endpoint, path))
-        .timeout(outbound_request_timeout());
-
-    if !crate::database::signing_nonce::bip448_signing_nonce_lease_matches(
-        &statechain_entity.pool,
-        &payload.statechain_id,
-        &signing_id,
-        &lease_token,
-    )
-    .await
-    {
-        cleanup_bip448_sign_first_reservation(
-            &statechain_entity.pool,
-            &payload.statechain_id,
-            &signing_id,
-            &lease_token,
-        )
-        .await;
-        return pending_nonce_response();
-    }
-
-    let value = match request.json(&payload.to_lockbox_payload()).send().await {
-        Ok(response) => match lockbox_response_text(response).await {
-            Ok(text) => text,
-            Err(response) => {
-                cleanup_bip448_sign_first_reservation(
-                    &statechain_entity.pool,
+            if let SignFirstDecision::Replay { server_pubnonce } =
+                classify_sign_first(existing.as_ref())
+            {
+                crate::database::signing_nonce::delete_bip448_signing_nonce_lease_by_token(
+                    &mut *handoff_fence,
                     &payload.statechain_id,
                     &signing_id,
                     &lease_token,
                 )
                 .await;
-                return response;
+                let response = Bip448SignFirstResponsePayload { server_pubnonce };
+                return status::Custom(Status::Ok, Json(json!(response)));
             }
-        },
-        Err(err) => {
-            cleanup_bip448_sign_first_reservation(
-                &statechain_entity.pool,
+
+            if let SignFirstDecision::Pending = classify_sign_first(existing.as_ref()) {
+                crate::database::signing_nonce::delete_bip448_signing_nonce_lease_by_token(
+                    &mut *handoff_fence,
+                    &payload.statechain_id,
+                    &signing_id,
+                    &lease_token,
+                )
+                .await;
+                return pending_nonce_response();
+            }
+
+            if let Some(incomplete) =
+                crate::database::bip448_sign::get_incomplete_bip448_signature_record(
+                    &mut *handoff_fence,
+                    &payload.statechain_id,
+                )
+                .await
+            {
+                crate::database::signing_nonce::delete_bip448_signing_nonce_lease_by_token(
+                    &mut *handoff_fence,
+                    &payload.statechain_id,
+                    &signing_id,
+                    &lease_token,
+                )
+                .await;
+                let _ = crate::database::signing_nonce::insert_bip448_signing_nonce_lease(
+                    &mut *handoff_fence,
+                    &payload.statechain_id,
+                    &incomplete.signing_id,
+                )
+                .await;
+                return incomplete_round_response(incomplete);
+            }
+
+            crate::database::signing_nonce::delete_bip448_signing_nonce_lease_by_token(
+                &mut *handoff_fence,
                 &payload.statechain_id,
                 &signing_id,
                 &lease_token,
             )
             .await;
-            return error_response(Status::InternalServerError, err.to_string());
-        }
-    };
 
-    let response: Bip448SignFirstResponsePayload = match serde_json::from_str(value.as_str()) {
-        Ok(response) => response,
-        Err(err) => {
+            return error_response(
+                Status::Conflict,
+                "BIP448 signing reservation was concurrently created; retry the request"
+                    .to_string(),
+            );
+        }
+
+        let path = "bip448/get_public_nonce";
+
+        let client = statechain_entity.http_client.clone();
+        let request = client
+            .post(&format!("{}/{}", lockbox_endpoint, path))
+            .timeout(outbound_request_timeout());
+
+        if !crate::database::signing_nonce::bip448_signing_nonce_lease_matches(
+            &mut *handoff_fence,
+            &payload.statechain_id,
+            &signing_id,
+            &lease_token,
+        )
+        .await
+        {
             cleanup_bip448_sign_first_reservation(
-                &statechain_entity.pool,
+                &mut *handoff_fence,
                 &payload.statechain_id,
                 &signing_id,
                 &lease_token,
             )
             .await;
-            return error_response(Status::InternalServerError, err.to_string());
+            return pending_nonce_response();
         }
-    };
 
-    let server_pubnonce_hex = normalize_hex_wire_value(&response.server_pubnonce);
+        let lockbox_payload = Bip448LockboxSignFirstRequestPayloadV2 {
+            statechain_id,
+            signing_id: lockbox_signing_id,
+            expected_key_generation: lockbox_state.key_generation,
+            expected_server_pubkey: lockbox_state.server_pubkey,
+        };
+        let value = match request.json(&lockbox_payload).send().await {
+            Ok(response) => match lockbox_response_text(response).await {
+                Ok(text) => text,
+                Err(response) => {
+                    cleanup_bip448_sign_first_reservation(
+                        &mut *handoff_fence,
+                        &payload.statechain_id,
+                        &signing_id,
+                        &lease_token,
+                    )
+                    .await;
+                    return response;
+                }
+            },
+            Err(err) => {
+                cleanup_bip448_sign_first_reservation(
+                    &mut *handoff_fence,
+                    &payload.statechain_id,
+                    &signing_id,
+                    &lease_token,
+                )
+                .await;
+                return error_response(Status::InternalServerError, err.to_string());
+            }
+        };
 
-    let updated =
+        let response: Bip448SignFirstResponsePayload = match serde_json::from_str(value.as_str()) {
+            Ok(response) => response,
+            Err(err) => {
+                cleanup_bip448_sign_first_reservation(
+                    &mut *handoff_fence,
+                    &payload.statechain_id,
+                    &signing_id,
+                    &lease_token,
+                )
+                .await;
+                return error_response(Status::InternalServerError, err.to_string());
+            }
+        };
+
+        let server_pubnonce_hex = normalize_hex_wire_value(&response.server_pubnonce);
+
+        let updated =
         crate::database::bip448_sign::update_bip448_signature_data_server_pubnonce_if_lease_matches(
-            &statechain_entity.pool,
+            &mut *handoff_fence,
             &payload.statechain_id,
             &signing_id,
             &server_pubnonce_hex,
@@ -576,25 +654,35 @@ pub async fn bip448_sign_first(
         )
         .await;
 
-    if !updated {
-        cleanup_bip448_sign_first_reservation(
-            &statechain_entity.pool,
-            &payload.statechain_id,
-            &signing_id,
-            &lease_token,
-        )
-        .await;
+        if !updated {
+            cleanup_bip448_sign_first_reservation(
+                &mut *handoff_fence,
+                &payload.statechain_id,
+                &signing_id,
+                &lease_token,
+            )
+            .await;
+            return error_response(
+                Status::Conflict,
+                "BIP448 signing nonce lease expired; retry sign/first".to_string(),
+            );
+        }
+
+        let response = Bip448SignFirstResponsePayload {
+            server_pubnonce: server_pubnonce_hex,
+        };
+
+        status::Custom(Status::Ok, Json(json!(response)))
+    }
+    .await;
+
+    if handoff_fence.commit().await.is_err() {
         return error_response(
-            Status::Conflict,
-            "BIP448 signing nonce lease expired; retry sign/first".to_string(),
+            Status::InternalServerError,
+            "Failed to commit BIP448 sign/first metadata.".to_string(),
         );
     }
-
-    let response = Bip448SignFirstResponsePayload {
-        server_pubnonce: server_pubnonce_hex,
-    };
-
-    status::Custom(Status::Ok, Json(json!(response)))
+    response
 }
 
 #[post(
@@ -619,16 +707,6 @@ pub async fn bip448_sign_second(
         Err(err) => return error_response(Status::UnprocessableEntity, err.to_string()),
     };
 
-    if let Err(response) = validate_bip448_auth(
-        &statechain_entity.pool,
-        &payload.signed_statechain_id,
-        &payload.statechain_id,
-    )
-    .await
-    {
-        return response;
-    }
-
     let challenge = match challenge_from_session_hex(&payload.session) {
         Some(challenge) => challenge,
         None => {
@@ -638,10 +716,68 @@ pub async fn bip448_sign_second(
             );
         }
     };
+    payload.session.make_ascii_lowercase();
     payload.server_pub_nonce = normalize_hex_wire_value(&payload.server_pub_nonce);
+    let statechain_id = match Bip448StatechainId::try_from(payload.statechain_id.as_str()) {
+        Ok(statechain_id) => statechain_id,
+        Err(err) => return error_response(Status::UnprocessableEntity, err.to_string()),
+    };
+    let lockbox_signing_id = match Bip448SigningId::try_from(signing_id.as_str()) {
+        Ok(signing_id) => signing_id,
+        Err(err) => return error_response(Status::UnprocessableEntity, err.to_string()),
+    };
+    let lockbox_negate_seckey = match Bip448NegateSeckeyFlag::try_from(payload.negate_seckey) {
+        Ok(flag) => flag,
+        Err(err) => return error_response(Status::UnprocessableEntity, err.to_string()),
+    };
+    let lockbox_session = match Bip448BlindedSession::try_from(payload.session.as_str()) {
+        Ok(session) => session,
+        Err(err) => return error_response(Status::UnprocessableEntity, err.to_string()),
+    };
+    let lockbox_server_pub_nonce =
+        match Bip448PublicNonce::try_from(payload.server_pub_nonce.as_str()) {
+            Ok(nonce) => nonce,
+            Err(err) => return error_response(Status::UnprocessableEntity, err.to_string()),
+        };
 
-    let existing = crate::database::bip448_sign::get_bip448_signature_record(
-        &statechain_entity.pool,
+    // The inner flow produces the response while this transaction remains the
+    // handoff fence; its Mercury metadata is committed and the lock released
+    // exactly once after any lockbox call has completed.
+    let mut handoff_fence = match statechain_entity.pool.begin().await {
+        Ok(transaction) => transaction,
+        Err(err) => return error_response(Status::InternalServerError, err.to_string()),
+    };
+    let locked = match crate::database::transfer_receiver::lock_statechain_generation(
+        &mut *handoff_fence,
+        statechain_id.as_str(),
+    )
+    .await
+    {
+        Ok(Some(locked)) => locked,
+        Ok(None) => {
+            return error_response(
+                Status::NotFound,
+                format!("statechain {} not found", statechain_id.as_str()),
+            );
+        }
+        Err(err) => return error_response(Status::InternalServerError, err.to_string()),
+    };
+    if let Err(response) = validate_locked_bip448_auth(
+        &locked,
+        &payload.signed_statechain_id,
+        statechain_id.as_str(),
+    ) {
+        return response;
+    }
+    let (lockbox_endpoint, lockbox_state) =
+        match observe_locked_bip448_state(statechain_entity, &statechain_id, &locked).await {
+            Ok(observed) => observed,
+            Err(response) => return response,
+        };
+
+    let response = async {
+        let existing = crate::database::bip448_sign::get_bip448_signature_record(
+        &mut *handoff_fence,
         &payload.statechain_id,
         &signing_id,
     )
@@ -674,7 +810,7 @@ pub async fn bip448_sign_second(
     match sign_second_decision {
         SignSecondDecision::Replay { server_partial_sig } => {
             return replay_bip448_partial_signature(
-                &statechain_entity.pool,
+                &mut *handoff_fence,
                 &payload.statechain_id,
                 &signing_id,
                 server_partial_sig,
@@ -687,7 +823,7 @@ pub async fn bip448_sign_second(
     };
 
     if let Some(lease_signing_id) = crate::database::signing_nonce::get_bip448_signing_nonce_lease(
-        &statechain_entity.pool,
+        &mut *handoff_fence,
         &payload.statechain_id,
     )
     .await
@@ -697,7 +833,7 @@ pub async fn bip448_sign_second(
         }
     } else {
         let lease_token = crate::database::signing_nonce::insert_bip448_signing_nonce_lease(
-            &statechain_entity.pool,
+            &mut *handoff_fence,
             &payload.statechain_id,
             &signing_id,
         )
@@ -710,7 +846,7 @@ pub async fn bip448_sign_second(
 
     if !retry_claimed_challenge {
         let claimed = crate::database::bip448_sign::try_claim_bip448_signature_data_challenge(
-            &statechain_entity.pool,
+            &mut *handoff_fence,
             &payload.statechain_id,
             &signing_id,
             &payload.server_pub_nonce,
@@ -721,7 +857,7 @@ pub async fn bip448_sign_second(
 
         if !claimed {
             let existing = crate::database::bip448_sign::get_bip448_signature_record(
-                &statechain_entity.pool,
+                &mut *handoff_fence,
                 &payload.statechain_id,
                 &signing_id,
             )
@@ -735,7 +871,7 @@ pub async fn bip448_sign_second(
             ) {
                 SignSecondDecision::Replay { server_partial_sig } => {
                     return replay_bip448_partial_signature(
-                        &statechain_entity.pool,
+                        &mut *handoff_fence,
                         &payload.statechain_id,
                         &signing_id,
                         server_partial_sig,
@@ -765,48 +901,6 @@ pub async fn bip448_sign_second(
             };
         }
     }
-    let config = &statechain_entity.config;
-    let enclave_index = crate::database::utils::get_enclave_index_from_database(
-        &statechain_entity.pool,
-        &payload.statechain_id,
-    )
-    .await;
-
-    let enclave_index = match enclave_index {
-        Some(index) => index as usize,
-        None => {
-            recover_bip448_sign_second_pre_lockbox_claim(
-                &statechain_entity.pool,
-                &payload.statechain_id,
-                &signing_id,
-                &challenge,
-            )
-            .await;
-            return error_response(
-                Status::InternalServerError,
-                format!(
-                    "Enclave index for statechain {} ID not found.",
-                    payload.statechain_id
-                ),
-            );
-        }
-    };
-
-    let Some(enclave) = config.enclaves.get(enclave_index) else {
-        recover_bip448_sign_second_pre_lockbox_claim(
-            &statechain_entity.pool,
-            &payload.statechain_id,
-            &signing_id,
-            &challenge,
-        )
-        .await;
-        return error_response(
-            Status::InternalServerError,
-            format!("Enclave index {} is not configured.", enclave_index),
-        );
-    };
-
-    let lockbox_endpoint = enclave.url.clone();
     let path = "bip448/get_partial_signature";
 
     let client = statechain_entity.http_client.clone();
@@ -818,7 +912,16 @@ pub async fn bip448_sign_second(
     // Mercury's point of view. The lockbox is authoritative for BIP448 exact
     // replay/conflict by opaque signing_id; Mercury must not clear/reopen the
     // challenge after this point.
-    let value = match request.json(&payload.to_lockbox_payload()).send().await {
+    let lockbox_payload = Bip448LockboxPartialSignatureRequestPayloadV2 {
+        statechain_id,
+        signing_id: lockbox_signing_id,
+        negate_seckey: lockbox_negate_seckey,
+        session: lockbox_session,
+        server_pub_nonce: lockbox_server_pub_nonce,
+        expected_key_generation: lockbox_state.key_generation,
+        expected_server_pubkey: lockbox_state.server_pubkey,
+    };
+    let value = match request.json(&lockbox_payload).send().await {
         Ok(response) => match lockbox_response_text(response).await {
             Ok(text) => text,
             Err(response) => {
@@ -843,7 +946,7 @@ pub async fn bip448_sign_second(
     };
 
     let updated = crate::database::bip448_sign::update_bip448_signature_data_partial_sig(
-        &statechain_entity.pool,
+        &mut *handoff_fence,
         &payload.statechain_id,
         &signing_id,
         &challenge,
@@ -853,7 +956,7 @@ pub async fn bip448_sign_second(
 
     if !updated {
         let existing = crate::database::bip448_sign::get_bip448_signature_record(
-            &statechain_entity.pool,
+            &mut *handoff_fence,
             &payload.statechain_id,
             &signing_id,
         )
@@ -867,7 +970,7 @@ pub async fn bip448_sign_second(
         ) {
             SignSecondDecision::Replay { server_partial_sig } => {
                 replay_bip448_partial_signature(
-                    &statechain_entity.pool,
+                    &mut *handoff_fence,
                     &payload.statechain_id,
                     &signing_id,
                     server_partial_sig,
@@ -889,13 +992,23 @@ pub async fn bip448_sign_second(
     }
 
     crate::database::signing_nonce::delete_bip448_signing_nonce_lease(
-        &statechain_entity.pool,
+        &mut *handoff_fence,
         &payload.statechain_id,
         &signing_id,
     )
     .await;
 
-    status::Custom(Status::Ok, Json(json!(response)))
+        status::Custom(Status::Ok, Json(json!(response)))
+    }
+    .await;
+
+    if handoff_fence.commit().await.is_err() {
+        return error_response(
+            Status::InternalServerError,
+            "Failed to commit BIP448 sign/second metadata.".to_string(),
+        );
+    }
+    response
 }
 
 #[get("/bip448-statechain/signature-count/<statechain_id>")]
@@ -960,8 +1073,33 @@ pub async fn bip448_signature_count(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::hashes::{sha256, Hash};
+    use secp256k1::{schnorr, KeyPair, Secp256k1, SecretKey};
 
     const SIGNING_ID: &str = "aa11955b1327167cb7ae3dc39d52c277be39d75737b9cb80514ce6e825fd8eea";
+
+    #[test]
+    fn signing_authentication_uses_the_locked_owner_key() {
+        let secp = Secp256k1::new();
+        let secret = SecretKey::from_secret_bytes([0x41; 32]).unwrap();
+        let keypair = KeyPair::from_secret_key(&secp, &secret);
+        let statechain_id = "locked-owner-statechain";
+        let digest = sha256::Hash::hash(statechain_id.as_bytes()).to_byte_array();
+        let signature = schnorr::sign(&digest, &keypair).to_string();
+        let locked = crate::database::transfer_receiver::LockedStatechainGeneration {
+            auth_xonly_public_key: keypair.x_only_public_key().0.serialize().to_vec(),
+            server_public_key: secret.public_key(&secp).serialize().to_vec(),
+            enclave_index: 0,
+        };
+
+        assert!(validate_locked_bip448_auth(&locked, &signature, statechain_id).is_ok());
+        assert_eq!(
+            validate_locked_bip448_auth(&locked, &signature, "different-statechain")
+                .unwrap_err()
+                .0,
+            Status::Unauthorized
+        );
+    }
 
     fn record(
         server_pubnonce: Option<&str>,
