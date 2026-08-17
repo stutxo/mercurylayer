@@ -769,14 +769,8 @@ pub async fn bip448_sign_second(
     ) {
         return response;
     }
-    let (lockbox_endpoint, lockbox_state) =
-        match observe_locked_bip448_state(statechain_entity, &statechain_id, &locked).await {
-            Ok(observed) => observed,
-            Err(response) => return response,
-        };
 
-    let response = async {
-        let existing = crate::database::bip448_sign::get_bip448_signature_record(
+    let existing = crate::database::bip448_sign::get_bip448_signature_record(
         &mut *handoff_fence,
         &payload.statechain_id,
         &signing_id,
@@ -805,10 +799,16 @@ pub async fn bip448_sign_second(
         | SignSecondDecision::Replay { .. } => {}
     }
 
+    let response = async {
     let retry_claimed_challenge = matches!(&sign_second_decision, SignSecondDecision::RetryClaimed);
 
     match sign_second_decision {
         SignSecondDecision::Replay { server_partial_sig } => {
+            if let Err(response) =
+                observe_locked_bip448_state(statechain_entity, &statechain_id, &locked).await
+            {
+                return response;
+            }
             return replay_bip448_partial_signature(
                 &mut *handoff_fence,
                 &payload.statechain_id,
@@ -901,6 +901,11 @@ pub async fn bip448_sign_second(
             };
         }
     }
+    let (lockbox_endpoint, lockbox_state) =
+        match observe_locked_bip448_state(statechain_entity, &statechain_id, &locked).await {
+            Ok(observed) => observed,
+            Err(response) => return response,
+        };
     let path = "bip448/get_partial_signature";
 
     let client = statechain_entity.http_client.clone();
