@@ -195,7 +195,7 @@ fn parse_transfer_receiver_response(
 
         return match error.code {
             mercurylib::transfer::receiver::TransferReceiverError::ExpiredBatchTimeError => {
-                Err(anyhow::anyhow!("BIP448 transfer batch has expired"))
+                Err(anyhow::anyhow!("Batch time has expired"))
             }
             mercurylib::transfer::receiver::TransferReceiverError::StatecoinBatchLockedError => {
                 Ok(Bip448TransferReceiverPostResult::BatchLocked)
