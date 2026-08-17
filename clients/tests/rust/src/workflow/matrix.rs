@@ -37,6 +37,7 @@ pub const MATRIX: &[MatrixTarget] = &[
             "bip448_transfer_address_reuse_accepts_two_distinct_statechains",
             "bip448_one_hop_transfer_accepts_and_recovers_state_two",
             "bip448_two_hop_transfer_accepts_and_recovers_state_three",
+            "bip448_ten_hop_transfer_advances_to_state_eleven",
             "bip448_same_wallet_second_hop_advances_to_state_three",
             "bip448_same_wallet_transfer_advances_the_accepted_record_to_state_two",
             "bip448_latest_state_fast_forwards_over_confirmed_old_state",
@@ -127,7 +128,7 @@ mod tests {
     #[test]
     fn matrix_has_the_exact_target_order_and_counts() {
         assert_eq!(MATRIX.len(), 8);
-        assert_eq!(test_count(), 58);
+        assert_eq!(test_count(), 59);
         assert_eq!(
             MATRIX
                 .iter()
@@ -137,7 +138,7 @@ mod tests {
                 ("functional", 2),
                 ("bip448_primitive_spike", 1),
                 ("bip448_csfs_signing", 4),
-                ("bip448_deposit", 13),
+                ("bip448_deposit", 14),
                 ("bip448_duplicates", 8),
                 ("bip448_transfer_sender", 6),
                 ("bip448_withdraw", 1),
@@ -168,7 +169,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(identities.len(), 58);
+        assert_eq!(identities.len(), 59);
     }
 
     #[test]

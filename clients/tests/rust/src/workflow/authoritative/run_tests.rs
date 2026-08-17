@@ -34,7 +34,7 @@ fn pair_preflight_rejects_duplicate_ports_and_existing_metadata() {
 }
 
 #[test]
-fn matrix_sequence_is_exactly_eight_targets_and_fifty_eight_one_shots() {
+fn matrix_sequence_is_exactly_eight_targets_and_fifty_nine_one_shots() {
     let mut seen = Vec::new();
     let mut started = Vec::new();
     let mut finished = 0;
@@ -67,7 +67,7 @@ fn matrix_sequence_is_exactly_eight_targets_and_fifty_eight_one_shots() {
             .collect::<Vec<_>>()
     );
     assert_eq!(finished, 8);
-    assert_eq!(seen.len(), 58);
+    assert_eq!(seen.len(), 59);
     assert_eq!(
         seen,
         MATRIX
@@ -141,7 +141,7 @@ fn next_matrix_identity_uses_the_adopted_metadata() {
         |(), result| result,
     )
     .unwrap();
-    assert_eq!(calls, 58);
+    assert_eq!(calls, 59);
     assert_eq!(result.metadata, adopted);
 }
 

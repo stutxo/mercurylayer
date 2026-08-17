@@ -98,6 +98,12 @@ async fn bip448_two_hop_transfer_accepts_and_recovers_state_three() -> Result<()
 
 #[tokio::test]
 #[ignore = "requires docker regtest stack with Mercury server, lockbox, and active BIP448 Inquisition deployments"]
+async fn bip448_ten_hop_transfer_advances_to_state_eleven() -> Result<()> {
+    transfer::bip448_ten_hop_transfer_advances_to_state_eleven().await
+}
+
+#[tokio::test]
+#[ignore = "requires docker regtest stack with Mercury server, lockbox, and active BIP448 Inquisition deployments"]
 async fn bip448_same_wallet_second_hop_advances_to_state_three() -> Result<()> {
     transfer::bip448_same_wallet_second_hop_advances_to_state_three().await
 }

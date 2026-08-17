@@ -1110,7 +1110,7 @@ mod tests {
         assert!(encoded.contains("\"observation\":\"not_observed\""));
         assert!(encoded.contains("\"support\":\"unsupported\""));
         assert!(encoded.contains("\"target_count\":8"));
-        assert!(encoded.contains("\"test_count\":58"));
+        assert!(encoded.contains("\"test_count\":59"));
         assert!(!encoded.contains("\"build\""));
         assert_eq!(
             canonical_json(&parse_metadata(encoded.as_bytes()).unwrap()).unwrap(),

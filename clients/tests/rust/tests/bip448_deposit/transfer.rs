@@ -582,6 +582,72 @@ pub(super) async fn bip448_two_hop_transfer_accepts_and_recovers_state_three() -
     Ok(())
 }
 
+pub(super) async fn bip448_ten_hop_transfer_advances_to_state_eleven() -> Result<()> {
+    const TRANSFER_COUNT: usize = 10;
+
+    let _guard = common::test_guard();
+
+    common::bitcoin_core::ensure_wallet_loaded()?;
+    common::bip448_activation::ensure_bip448_deployments_active()?;
+    common::bitcoin_core::ensure_wallet_ready()?;
+    let mercury_client = common::mercury::http_client();
+    common::mercury::wait_until_ready(&mercury_client).await?;
+    let lockbox_client = common::lockbox::http_client();
+    common::lockbox::wait_until_ready(&lockbox_client).await?;
+
+    let client_config = common::prepare_test_env().await?;
+    let mut wallets = Vec::with_capacity(TRANSFER_COUNT + 1);
+    for index in 0..=TRANSFER_COUNT {
+        let wallet = mercuryrustlib::wallet::create_wallet(
+            &format!("bip448-ten-hop-{index:02}"),
+            &client_config,
+        )
+        .await?;
+        mercuryrustlib::sqlite_manager::insert_wallet(&client_config.pool, &wallet).await?;
+        wallets.push(wallet);
+    }
+
+    let deposit = create_confirmed_bip448_deposit(&client_config, &wallets[0]).await?;
+    common::bitcoin_core::mine_blocks(client_config.confirmation_target)?;
+    mercuryrustlib::coin_status::update_coins(&client_config, &wallets[0].name).await?;
+
+    for hop in 0..TRANSFER_COUNT {
+        let expected_state_number = u32::try_from(hop + 2)?;
+        let state = transfer_and_accept_bip448(
+            &client_config,
+            &wallets[hop].name,
+            &wallets[hop + 1].name,
+            &deposit.statechain_id,
+        )
+        .await?;
+
+        assert_eq!(state.latest_state_number, expected_state_number);
+        assert_eq!(state.latest_state.state_number, expected_state_number);
+        assert_eq!(
+            state.latest_state.signing_metadata.server_signature_count,
+            u64::from(expected_state_number)
+        );
+        assert_eq!(
+            common::lockbox::get_signature_count(&lockbox_client, &deposit.statechain_id).await?,
+            expected_state_number
+        );
+    }
+
+    let final_wallet = mercuryrustlib::sqlite_manager::get_wallet(
+        &client_config.pool,
+        &wallets[TRANSFER_COUNT].name,
+    )
+    .await?;
+    let final_coin = final_wallet
+        .coins
+        .iter()
+        .find(|coin| coin.statechain_id.as_deref() == Some(&deposit.statechain_id))
+        .context("final receiver does not contain the accepted state-11 BIP448 coin")?;
+    assert_eq!(final_coin.status, CoinStatus::CONFIRMED);
+
+    Ok(())
+}
+
 pub(super) async fn bip448_same_wallet_second_hop_advances_to_state_three() -> Result<()> {
     let _guard = common::test_guard();
 

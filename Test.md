@@ -60,7 +60,7 @@ BASE_PORT=25400
 `--require-zero` proves a fresh height-zero Inquisition chain before mining
 the exact 101-block bootstrap. `test` accepts only an exact binary/identity
 pair from the Rust MATRIX. This manual path is useful for a focused diagnosis;
-it is not the authoritative 58-test verification.
+it is not the authoritative 59-test verification.
 
 `down` safely removes the selected project's containers, network, volumes,
 listeners, and wallet database. It retains `stack.json`, `Settings.toml`, and
@@ -109,7 +109,7 @@ starts and fresh-bootstraps both stacks, runs the primary MATRIX serially,
 directly verifies the primary contracts, and proves control isolation. It then
 tears down the primary while the control remains ready and unchanged, proves
 the control snapshot again, and tears down the control. Success reports
-`status: "authoritative"`, `matrix_test_count: 58`,
+`status: "authoritative"`, `matrix_test_count: 59`,
 `complete_first_invocation_target_records: 8`, `retries: 0`,
 `mercury_restart_count: 1`, `cleanup_order: ["primary", "control"]`, and final
 resource, port, wallet, source, image, and cache accounting.
@@ -131,14 +131,14 @@ The controller also freezes this target order and count split:
 | 1 | `functional` | 2 |
 | 2 | `bip448_primitive_spike` | 1 |
 | 3 | `bip448_csfs_signing` | 4 |
-| 4 | `bip448_deposit` | 13 |
+| 4 | `bip448_deposit` | 14 |
 | 5 | `bip448_duplicates` | 8 |
 | 6 | `bip448_transfer_sender` | 6 |
 | 7 | `bip448_withdraw` | 1 |
 | 8 | `lockbox_compatibility` | 23 |
-|  | **Total** | **58** |
+|  | **Total** | **59** |
 
-Do not copy the 58 identities into another script or document. The runner
+Do not copy the 59 identities into another script or document. The runner
 checks Cargo's ignored-test discovery against `MATRIX` and executes the exact
 pairs serially with one test thread.
 
