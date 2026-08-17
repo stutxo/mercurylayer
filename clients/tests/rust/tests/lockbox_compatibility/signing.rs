@@ -38,6 +38,13 @@ pub(super) async fn bip448_signing_lifecycle_returns_a_valid_partial_signature_a
 
     let sig_count = lockbox::get_signature_count(&client, &statechain_id).await?;
     assert_eq!(sig_count, 1);
+    let state = lockbox::get_bip448_state(&client, &statechain_id).await?;
+    assert_eq!(state.sig_count.get(), 1);
+    assert_eq!(state.key_generation.get(), 0);
+    assert_eq!(
+        hex::encode(state.server_pubkey.as_bytes()),
+        created.server_pubkey
+    );
 
     lockbox::delete_statechain(&client, &statechain_id).await?;
 
@@ -94,13 +101,7 @@ pub(super) async fn bip448_nonce_state_replays_after_restart_and_rejects_conflic
     let conflict = lockbox::post_json(
         &client,
         "bip448/get_partial_signature",
-        json!({
-            "statechain_id": conflicting_payload.statechain_id,
-            "signing_id": signing_id,
-            "negate_seckey": conflicting_payload.negate_seckey,
-            "session": conflicting_payload.session,
-            "server_pub_nonce": conflicting_payload.server_pub_nonce,
-        }),
+        lockbox::bip448_partial_request_value(&client, &conflicting_payload).await?,
     )
     .await?;
     let conflict_status = conflict.status();
@@ -109,7 +110,10 @@ pub(super) async fn bip448_nonce_state_replays_after_restart_and_rejects_conflic
         .await
         .context("failed to read BIP448 conflict body")?;
     assert_eq!(conflict_status, StatusCode::CONFLICT);
-    assert!(conflict_body.contains("challenge does not match"));
+    assert_eq!(
+        serde_json::from_str::<Value>(&conflict_body)?["code"],
+        "bip448_operation_conflict"
+    );
     assert_eq!(
         lockbox::get_signature_count(&client, &statechain_id).await?,
         1

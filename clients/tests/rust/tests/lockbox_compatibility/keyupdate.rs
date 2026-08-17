@@ -25,6 +25,9 @@ pub(super) async fn keyupdate_returns_the_expected_server_pubkey_and_statechain_
         &created.server_pubkey,
         &old_server_pubnonce.server_pubnonce,
     )?;
+    let old_generation_partial_body =
+        lockbox::bip448_partial_request_value(&client, &old_partial_signature_fixture.payload)
+            .await?;
     assert_eq!(old_server_pubnonce.server_pubnonce.len(), 132);
     assert_eq!(
         lockbox::get_signature_count(&client, &statechain_id).await?,
@@ -36,27 +39,71 @@ pub(super) async fn keyupdate_returns_the_expected_server_pubkey_and_statechain_
     let expected_server_pubkey =
         lockbox::expected_keyupdate_server_pubkey(&created.server_pubkey, t2, x1)?;
 
-    let new_key = lockbox::keyupdate(&client, &statechain_id, t2, x1).await?;
+    let request = lockbox::build_keyupdate_request(&client, &statechain_id, t2, x1).await?;
+    let first_receipt = lockbox::keyupdate_request(&client, &request).await?;
+    let replayed_receipt = lockbox::keyupdate_request(&client, &request).await?;
+    assert_eq!(first_receipt, replayed_receipt);
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(lockbox::database_url())
+        .await?;
+    let stored_request_hash = sqlx::query_scalar::<_, String>(
+        "SELECT request_hash FROM public.bip448_keyupdate_receipt WHERE statechain_id=$1 AND operation_id=$2",
+    )
+    .bind(request.statechain_id.as_str())
+    .bind(request.operation_id.to_string())
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(stored_request_hash, request.request_hash()?.to_string());
+    let new_key = lockbox::ServerPubkeyResponse {
+        server_pubkey: hex::encode(first_receipt.resulting_server_pubkey.as_bytes()),
+    };
 
     assert_ne!(new_key.server_pubkey, created.server_pubkey);
     assert_eq!(new_key.server_pubkey, expected_server_pubkey);
+    let state = lockbox::get_bip448_state(&client, &statechain_id).await?;
+    assert_eq!(state.sig_count.get(), 0);
+    assert_eq!(state.key_generation.get(), 1);
+    assert_eq!(
+        hex::encode(state.server_pubkey.as_bytes()),
+        expected_server_pubkey
+    );
 
-    let old_partial_signature_response = lockbox::post_json(
+    let mut conflicting_request = serde_json::to_value(&request)?;
+    conflicting_request["t2"] = json!(hex::encode([3_u8; 32]));
+    let conflict = lockbox::post_json(&client, "keyupdate", conflicting_request).await?;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    let conflict_body: Value = serde_json::from_str(&conflict.text().await?)?;
+    assert_eq!(conflict_body["code"], "bip448_operation_conflict");
+
+    let stale_generation_response = lockbox::post_json(
         &client,
         "bip448/get_partial_signature",
-        serde_json::to_value(&old_partial_signature_fixture.payload)?,
+        old_generation_partial_body,
     )
     .await?;
-    let old_partial_signature_status = old_partial_signature_response.status();
-    let old_partial_signature_body = old_partial_signature_response
+    assert_eq!(stale_generation_response.status(), StatusCode::CONFLICT);
+    let stale_generation_body: Value =
+        serde_json::from_str(&stale_generation_response.text().await?)?;
+    assert_eq!(
+        stale_generation_body["code"],
+        "bip448_key_generation_mismatch"
+    );
+
+    let deleted_nonce_response = lockbox::post_json(
+        &client,
+        "bip448/get_partial_signature",
+        lockbox::bip448_partial_request_value(&client, &old_partial_signature_fixture.payload)
+            .await?,
+    )
+    .await?;
+    let deleted_nonce_status = deleted_nonce_response.status();
+    let deleted_nonce_body = deleted_nonce_response
         .text()
         .await
         .context("failed to read post-keyupdate old BIP448 nonce-state body")?;
-    assert_eq!(old_partial_signature_status, StatusCode::NOT_FOUND);
-    assert_eq!(
-        old_partial_signature_body,
-        "BIP448 nonce state not found for signing_id"
-    );
+    assert_eq!(deleted_nonce_status, StatusCode::NOT_FOUND);
+    assert_eq!(deleted_nonce_body, "BIP448 state not found");
     assert_eq!(
         lockbox::get_signature_count(&client, &statechain_id).await?,
         0
@@ -92,6 +139,14 @@ pub(super) async fn keyupdate_returns_the_expected_server_pubkey_and_statechain_
     );
 
     lockbox::delete_statechain(&client, &statechain_id).await?;
+    let recreated = lockbox::create_statechain(&client, &statechain_id).await?;
+    assert_ne!(recreated.server_pubkey, created.server_pubkey);
+    let stale_replay =
+        lockbox::post_json(&client, "keyupdate", serde_json::to_value(&request)?).await?;
+    assert_eq!(stale_replay.status(), StatusCode::CONFLICT);
+    let stale_body: Value = serde_json::from_str(&stale_replay.text().await?)?;
+    assert_eq!(stale_body["code"], "bip448_server_key_mismatch");
+    lockbox::delete_statechain(&client, &statechain_id).await?;
 
     Ok(())
 }
@@ -108,7 +163,35 @@ pub(super) async fn keyupdate_state_survives_lockbox_restart() -> Result<()> {
     let expected_server_pubkey =
         lockbox::expected_keyupdate_server_pubkey(&created.server_pubkey, t2, x1)?;
 
-    let updated_key = lockbox::keyupdate(&client, &statechain_id, t2, x1).await?;
+    let request = lockbox::build_keyupdate_request(&client, &statechain_id, t2, x1).await?;
+
+    let mut count_mismatch = serde_json::to_value(&request)?;
+    count_mismatch["expected_sig_count"] = json!(1);
+    let count_response = lockbox::post_json(&client, "keyupdate", count_mismatch).await?;
+    assert_eq!(count_response.status(), StatusCode::CONFLICT);
+    let count_body: Value = serde_json::from_str(&count_response.text().await?)?;
+    assert_eq!(count_body["code"], "bip448_signature_count_mismatch");
+
+    let mut generation_mismatch = serde_json::to_value(&request)?;
+    generation_mismatch["expected_key_generation"] = json!(1);
+    let generation_response = lockbox::post_json(&client, "keyupdate", generation_mismatch).await?;
+    assert_eq!(generation_response.status(), StatusCode::CONFLICT);
+    let generation_body: Value = serde_json::from_str(&generation_response.text().await?)?;
+    assert_eq!(generation_body["code"], "bip448_key_generation_mismatch");
+
+    let mut key_mismatch = serde_json::to_value(&request)?;
+    key_mismatch["expected_server_pubkey"] = json!(SecretKey::from_secret_bytes([8_u8; 32])?
+        .public_key(&Secp256k1::new())
+        .to_string());
+    let key_response = lockbox::post_json(&client, "keyupdate", key_mismatch).await?;
+    assert_eq!(key_response.status(), StatusCode::CONFLICT);
+    let key_body: Value = serde_json::from_str(&key_response.text().await?)?;
+    assert_eq!(key_body["code"], "bip448_server_key_mismatch");
+
+    let receipt = lockbox::keyupdate_request(&client, &request).await?;
+    let updated_key = lockbox::ServerPubkeyResponse {
+        server_pubkey: hex::encode(receipt.resulting_server_pubkey.as_bytes()),
+    };
     assert_eq!(updated_key.server_pubkey, expected_server_pubkey);
 
     lockbox::restart_lockbox_service(&client).await?;
@@ -135,6 +218,13 @@ pub(super) async fn keyupdate_state_survives_lockbox_restart() -> Result<()> {
     assert_eq!(
         lockbox::get_signature_count(&client, &statechain_id).await?,
         1
+    );
+    let state = lockbox::get_bip448_state(&client, &statechain_id).await?;
+    assert_eq!(state.sig_count.get(), 1);
+    assert_eq!(state.key_generation.get(), 1);
+    assert_eq!(
+        hex::encode(state.server_pubkey.as_bytes()),
+        expected_server_pubkey
     );
 
     lockbox::delete_statechain(&client, &statechain_id).await?;

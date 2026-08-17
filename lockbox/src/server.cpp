@@ -1,6 +1,7 @@
 #include "server.h"
 #include <crow.h>
-#include <openssl/rand.h>
+#include <secp256k1.h>
+#include <secp256k1_musig.h>
 #include "utils.h"
 #include "enclave.h"
 #include "google_key_manager.h"
@@ -10,373 +11,261 @@
 #include "db_manager.h"
 #include <toml++/toml.h>
 #include <algorithm>
+#include <array>
 #include <chrono>
-#include <cctype>
+#include <cstdint>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <stdexcept>
+#include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace lockbox {
 
     namespace {
-        constexpr size_t BIP448_SIGNING_ID_HEX_SIZE = 64;
-        constexpr size_t BIP448_SESSION_SIZE = 133;
-        constexpr size_t BIP448_SESSION_CHALLENGE_OFFSET = 4 + 1 + 32 + 32;
-        constexpr size_t BIP448_SESSION_CHALLENGE_SIZE = 32;
-        constexpr unsigned char MUSIG_SESSION_MAGIC[4] = {0x9d, 0xed, 0xe9, 0x17};
+    constexpr std::size_t SESSION_SIZE = 133;
+    constexpr unsigned char SESSION_MAGIC[] = {0x9d, 0xed, 0xe9, 0x17};
+    constexpr unsigned char GROUP_ORDER[32] = {
+        0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xfe,
+        0xba,0xae,0xdc,0xe6,0xaf,0x48,0xa0,0x3b,0xbf,0xd2,0x5e,0x8c,0xd0,0x36,0x41,0x41};
+    const std::vector<std::string> SIGN_FIRST_KEYS = {
+        "expected_key_generation", "expected_server_pubkey", "signing_id", "statechain_id"};
+    const std::vector<std::string> SIGN_SECOND_KEYS = {
+        "expected_key_generation", "expected_server_pubkey", "negate_seckey", "server_pub_nonce",
+        "session", "signing_id", "statechain_id"};
+    const std::vector<std::string> KEYUPDATE_KEYS = {
+        "expected_key_generation", "expected_server_pubkey", "expected_sig_count", "operation_id",
+        "protocol_version", "statechain_id", "t2", "x1"};
 
-        std::string strip_hex_prefix(std::string value) {
-            if (value.rfind("0x", 0) == 0 || value.rfind("0X", 0) == 0) {
-                value = value.substr(2);
-            }
+    using SecpPtr = std::unique_ptr<secp256k1_context, decltype(&secp256k1_context_destroy)>;
 
-            std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-                return static_cast<char>(std::tolower(c));
-            });
+    struct EncryptedBufferGuard {
+        utils::chacha20_poly1305_encrypted_data& value;
+        ~EncryptedBufferGuard() { delete[] value.data; value.data = nullptr; }
+    };
 
-            return value;
+    std::string lower_hex(const unsigned char* data, std::size_t size) {
+        constexpr char digits[] = "0123456789abcdef";
+        std::string output(size * 2, '0');
+        for (std::size_t i = 0; i < size; ++i) {
+            output[i * 2] = digits[data[i] >> 4];
+            output[i * 2 + 1] = digits[data[i] & 0x0f];
         }
+        return output;
+    }
 
-        bool is_hex_string(const std::string& value) {
-            return std::all_of(value.begin(), value.end(), [](unsigned char c) {
-                return std::isxdigit(c) != 0;
-            });
+    bool canonical_hex(const std::string& value, std::size_t size) {
+        return value.size() == size && std::all_of(value.begin(), value.end(), [](unsigned char c) {
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        });
+    }
+
+    template <std::size_t N>
+    bool decode_hex(const std::string& value, std::array<unsigned char, N>& output) {
+        if (!canonical_hex(value, N * 2)) return false;
+        auto digit = [](char c) { return c <= '9' ? c - '0' : c - 'a' + 10; };
+        for (std::size_t i = 0; i < N; ++i) {
+            output[i] = static_cast<unsigned char>((digit(value[i * 2]) << 4) | digit(value[i * 2 + 1]));
         }
+        return true;
+    }
 
-        bool canonical_signing_id(std::string& signing_id) {
-            signing_id = strip_hex_prefix(signing_id);
-            return signing_id.size() == BIP448_SIGNING_ID_HEX_SIZE && is_hex_string(signing_id);
+    bool canonical_public_key(const db_manager::Bip448PublicKey& key) {
+        SecpPtr context(secp256k1_context_create(SECP256K1_CONTEXT_VERIFY), secp256k1_context_destroy);
+        secp256k1_pubkey parsed;
+        db_manager::Bip448PublicKey serialized{};
+        std::size_t size = serialized.size();
+        return context && secp256k1_ec_pubkey_parse(context.get(), &parsed, key.data(), key.size())
+            && secp256k1_ec_pubkey_serialize(context.get(), serialized.data(), &size, &parsed, SECP256K1_EC_COMPRESSED)
+            && size == key.size() && serialized == key;
+    }
+
+    bool canonical_public_nonce(const db_manager::Bip448PublicNonce& nonce) {
+        SecpPtr context(secp256k1_context_create(SECP256K1_CONTEXT_VERIFY), secp256k1_context_destroy);
+        secp256k1_musig_pubnonce parsed;
+        db_manager::Bip448PublicNonce serialized{};
+        return context && secp256k1_musig_pubnonce_parse(context.get(), &parsed, nonce.data())
+            && secp256k1_musig_pubnonce_serialize(context.get(), serialized.data(), &parsed)
+            && serialized == nonce;
+    }
+
+    bool canonical_session(const std::vector<unsigned char>& session) {
+        if (session.size() != SESSION_SIZE || !std::equal(std::begin(SESSION_MAGIC), std::end(SESSION_MAGIC), session.begin())
+            || (session[4] != 0 && session[4] != 1)
+            || std::any_of(session.begin() + 5, session.begin() + 37, [](unsigned char c) { return c != 0; })) return false;
+        for (std::size_t offset : {37u, 69u, 101u}) {
+            if (!std::lexicographical_compare(session.begin() + offset, session.begin() + offset + 32,
+                    std::begin(GROUP_ORDER), std::end(GROUP_ORDER))) return false;
         }
+        return true;
+    }
 
-        bool challenge_from_bip448_session(
-            const std::vector<unsigned char>& serialized_session,
-            std::string& challenge) {
-            if (serialized_session.size() != BIP448_SESSION_SIZE) {
-                return false;
-            }
+    bool exact_object(const crow::json::rvalue& body, const std::vector<std::string>& expected) {
+        try {
+            if (body.t() != crow::json::type::Object) return false;
+            auto keys = body.keys();
+            std::sort(keys.begin(), keys.end());
+            return keys == expected;
+        } catch (const std::exception&) { return false; }
+    }
 
-            if (!std::equal(MUSIG_SESSION_MAGIC, MUSIG_SESSION_MAGIC + sizeof(MUSIG_SESSION_MAGIC), serialized_session.begin())) {
-                return false;
-            }
-
-            challenge = strip_hex_prefix(utils::key_to_string(
-                serialized_session.data() + BIP448_SESSION_CHALLENGE_OFFSET,
-                BIP448_SESSION_CHALLENGE_SIZE));
+    bool read_string(const crow::json::rvalue& body, const char* key, std::string& value) {
+        try {
+            if (body[key].t() != crow::json::type::String) return false;
+            value = static_cast<std::string>(body[key].s());
             return true;
-        }
+        } catch (const std::exception&) { return false; }
+    }
 
-        crow::response bip448_partial_sig_response(const std::string& partial_sig) {
-            crow::json::wvalue result({{"partial_sig", partial_sig}});
-            return crow::response{result};
-        }
+    bool read_u64(const crow::json::rvalue& body, const char* key, std::uint64_t& value) {
+        try {
+            if (body[key].t() != crow::json::type::Number
+                || body[key].nt() != crow::json::num_type::Unsigned_integer) return false;
+            value = body[key].u();
+            return true;
+        } catch (const std::exception&) { return false; }
+    }
 
-        crow::response bip448_public_nonce_response(const std::string& server_pubnonce) {
-            crow::json::wvalue result({{"server_pubnonce", server_pubnonce}});
-            return crow::response{result};
-        }
+    bool read_counter(const crow::json::rvalue& body, const char* key, std::int64_t& value) {
+        std::uint64_t wire = 0;
+        if (!read_u64(body, key, wire) || wire > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) return false;
+        value = static_cast<std::int64_t>(wire);
+        return true;
+    }
 
-        crow::response bip448_conflict_response(const std::string& message) {
-            return crow::response(409, message);
-        }
+    bool read_statechain_id(const crow::json::rvalue& body, std::string& value) {
+        return read_string(body, "statechain_id", value) && db_manager::valid_statechain_id(value);
+    }
 
-        crow::response bip448_nonce_not_found_response() {
-            return crow::response(404, "BIP448 nonce state not found for signing_id");
+    bool read_public_key(const crow::json::rvalue& body, db_manager::Bip448PublicKey& value) {
+        std::string encoded;
+        return read_string(body, "expected_server_pubkey", encoded) && decode_hex(encoded, value)
+            && canonical_public_key(value);
+    }
+
+    bool read_scalar(const crow::json::rvalue& body, const char* key, db_manager::Bip448Scalar& value) {
+        std::string encoded;
+        SecpPtr context(secp256k1_context_create(SECP256K1_CONTEXT_VERIFY), secp256k1_context_destroy);
+        return read_string(body, key, encoded) && decode_hex(encoded, value) && context
+            && secp256k1_ec_seckey_verify(context.get(), value.data());
+    }
+
+    bool parse_sign_first(const crow::json::rvalue& body, db_manager::Bip448SignFirstRequest& request) {
+        return exact_object(body, SIGN_FIRST_KEYS) && read_statechain_id(body, request.statechain_id)
+            && read_string(body, "signing_id", request.signing_id) && canonical_hex(request.signing_id, 64)
+            && read_counter(body, "expected_key_generation", request.expected_key_generation)
+            && read_public_key(body, request.expected_server_pubkey);
+    }
+
+    bool parse_sign_second(const crow::json::rvalue& body, db_manager::Bip448SignSecondRequest& request) {
+        std::string session, nonce;
+        std::uint64_t negate = 0;
+        return exact_object(body, SIGN_SECOND_KEYS) && read_statechain_id(body, request.statechain_id)
+            && read_string(body, "signing_id", request.signing_id) && canonical_hex(request.signing_id, 64)
+            && read_u64(body, "negate_seckey", negate) && negate <= 1
+            && read_string(body, "session", session) && canonical_hex(session, SESSION_SIZE * 2)
+            && (request.session = utils::ParseHex(session), canonical_session(request.session))
+            && read_string(body, "server_pub_nonce", nonce) && decode_hex(nonce, request.server_pubnonce)
+            && canonical_public_nonce(request.server_pubnonce)
+            && read_counter(body, "expected_key_generation", request.expected_key_generation)
+            && read_public_key(body, request.expected_server_pubkey)
+            && (request.negate_seckey = static_cast<int>(negate), true);
+    }
+
+    bool parse_keyupdate(const crow::json::rvalue& body, db_manager::Bip448KeyupdateRequest& request) {
+        std::uint64_t version = 0;
+        return exact_object(body, KEYUPDATE_KEYS) && read_u64(body, "protocol_version", version) && version == 2
+            && read_string(body, "operation_id", request.operation_id) && canonical_hex(request.operation_id, 64)
+            && read_statechain_id(body, request.statechain_id) && read_scalar(body, "t2", request.t2)
+            && read_scalar(body, "x1", request.x1)
+            && read_counter(body, "expected_sig_count", request.expected_sig_count)
+            && read_counter(body, "expected_key_generation", request.expected_key_generation)
+            && read_public_key(body, request.expected_server_pubkey);
+    }
+
+    crow::response json_response(int status, crow::json::wvalue body) {
+        crow::response response(status, body.dump());
+        response.set_header("Content-Type", "application/json");
+        return response;
+    }
+
+    crow::response result_error(
+        const db_manager::Bip448Result& result, const std::string* operation_id = nullptr,
+        const std::int64_t* expected_count = nullptr, const std::int64_t* expected_generation = nullptr) {
+        if (result.outcome == db_manager::Bip448Outcome::InvalidInput) return crow::response(400, "Invalid BIP448 request");
+        if (result.outcome == db_manager::Bip448Outcome::NotFound) return crow::response(404, "BIP448 state not found");
+        const char* code = nullptr;
+        switch (result.outcome) {
+        case db_manager::Bip448Outcome::SignatureCountMismatch: code = "bip448_signature_count_mismatch"; break;
+        case db_manager::Bip448Outcome::KeyGenerationMismatch: code = "bip448_key_generation_mismatch"; break;
+        case db_manager::Bip448Outcome::ServerKeyMismatch: code = "bip448_server_key_mismatch"; break;
+        case db_manager::Bip448Outcome::OperationConflict: code = "bip448_operation_conflict"; break;
+        case db_manager::Bip448Outcome::Overflow:
+        case db_manager::Bip448Outcome::KeyupdateRejected: code = "bip448_keyupdate_rejected"; break;
+        default: return crow::response(500, "BIP448 storage operation failed");
         }
+        crow::json::wvalue body;
+        body["code"] = code; body["message"] = "BIP448 request conflicts with current state";
+        if (operation_id) body["operation_id"] = *operation_id;
+        if (expected_count) body["expected_sig_count"] = static_cast<std::uint64_t>(*expected_count);
+        if (result.actual_sig_count >= 0 && expected_count) body["actual_sig_count"] = static_cast<std::uint64_t>(result.actual_sig_count);
+        if (expected_generation) body["expected_key_generation"] = static_cast<std::uint64_t>(*expected_generation);
+        if (result.actual_key_generation >= 0 && expected_generation) body["actual_key_generation"] = static_cast<std::uint64_t>(result.actual_key_generation);
+        return json_response(409, std::move(body));
+    }
     } // namespace
 
-    crow::response generate_new_keypair(const std::string& statechain_id,  unsigned char *seed) {
-        auto new_key_pair_response = enclave::generate_new_keypair(seed);
-
-        std::string error_message;
-        bool data_saved = db_manager::save_generated_public_key(
-            new_key_pair_response.encrypted_data, 
-            new_key_pair_response.server_pubkey, 
-            sizeof(new_key_pair_response.server_pubkey), 
-            statechain_id, 
-            error_message);
-
-        if (!data_saved) {
-            error_message = "Failed to save aggregated key data: " + error_message;
-            return crow::response(500, error_message);
-        }
-
-        std::string server_pubkey_hex = utils::key_to_string(new_key_pair_response.server_pubkey, 33);
-
-        crow::json::wvalue result({{"server_pubkey", server_pubkey_hex}});
-        return crow::response{result};
+    crow::response generate_new_keypair(const std::string& statechain_id, unsigned char* seed) {
+        if (!db_manager::valid_statechain_id(statechain_id)) return crow::response(400);
+        try {
+            auto generated = enclave::generate_new_keypair(seed);
+            EncryptedBufferGuard guard{generated.encrypted_data};
+            std::string error;
+            if (!db_manager::save_generated_public_key(generated.encrypted_data, generated.server_pubkey,
+                    sizeof(generated.server_pubkey), statechain_id, error)) return crow::response(500, "Failed to store key");
+            crow::json::wvalue body; body["server_pubkey"] = lower_hex(generated.server_pubkey, sizeof(generated.server_pubkey));
+            return json_response(200, std::move(body));
+        } catch (const std::exception&) { return crow::response(500, "Failed to generate key"); }
     }
 
-    crow::response generate_bip448_public_nonce(
-        const std::string& statechain_id,
-        const std::string& signing_id,
-        unsigned char *seed) {
-
-        bool found = false;
-        std::string existing_public_nonce;
-        std::string error_message;
-        if (!db_manager::get_bip448_public_nonce(
-            statechain_id,
-            signing_id,
-            found,
-            existing_public_nonce,
-            error_message)) {
-            return crow::response(500, "Failed to load BIP448 nonce state: " + error_message);
+    crow::response generate_bip448_public_nonce(const db_manager::Bip448SignFirstRequest& request, unsigned char* seed) {
+        const auto result = db_manager::execute_bip448_sign_first(request, seed);
+        if (result.outcome != db_manager::Bip448Outcome::Applied && result.outcome != db_manager::Bip448Outcome::ExactReplay) {
+            return result_error(result, nullptr, nullptr, &request.expected_key_generation);
         }
-
-        if (found) {
-            return bip448_public_nonce_response(existing_public_nonce);
-        }
-
-        auto encrypted_keypair = std::make_unique<utils::chacha20_poly1305_encrypted_data>();
-        bool data_loaded = db_manager::load_generated_keypair(
-            statechain_id,
-            encrypted_keypair,
-            error_message
-        );
-
-        if (!data_loaded) {
-            error_message = "Failed to load aggregated key data: " + error_message;
-            return crow::response(500, error_message);
-        }
-
-        if (encrypted_keypair == nullptr) {
-            return crow::response(400, "Empty encrypted keypair!");
-        }
-
-        auto response = enclave::generate_nonce(seed, encrypted_keypair.get());
-
-        bool inserted = false;
-        bool data_saved = db_manager::insert_bip448_nonce_state(
-            statechain_id,
-            signing_id,
-            response.server_pubnonce, sizeof(response.server_pubnonce),
-            response.encrypted_secnonce,
-            inserted,
-            error_message
-        );
-
-        if (!data_saved) {
-            return crow::response(500, "Failed to save BIP448 nonce state: " + error_message);
-        }
-
-        if (!inserted) {
-            if (!db_manager::get_bip448_public_nonce(
-                statechain_id,
-                signing_id,
-                found,
-                existing_public_nonce,
-                error_message)) {
-                return crow::response(500, "Failed to reload BIP448 nonce state: " + error_message);
-            }
-
-            if (found) {
-                return bip448_public_nonce_response(existing_public_nonce);
-            }
-
-            return crow::response(500, "BIP448 nonce state was concurrently created but could not be reloaded");
-        }
-
-        auto serialized_server_pubnonce_hex = strip_hex_prefix(utils::key_to_string(response.server_pubnonce, sizeof(response.server_pubnonce)));
-        return bip448_public_nonce_response(serialized_server_pubnonce_hex);
+        crow::json::wvalue body; body["server_pubnonce"] = result.value;
+        return json_response(200, std::move(body));
     }
 
-    crow::response generate_bip448_partial_signature(
-        const std::string& statechain_id,
-        const std::string& signing_id,
-        int64_t negate_seckey,
-        std::vector<unsigned char>& serialized_session,
-        const std::string& server_pub_nonce,
-        unsigned char *seed) {
-
-            if (negate_seckey != 0 && negate_seckey != 1) {
-                return crow::response(400, "Invalid negate_seckey. Must be 0 or 1!");
-            }
-
-            std::string challenge;
-            if (!challenge_from_bip448_session(serialized_session, challenge)) {
-                return crow::response(400, "Invalid BIP448 session. Must be 133 bytes with Mercury MuSig session magic!");
-            }
-
-            const std::string requested_public_nonce = strip_hex_prefix(server_pub_nonce);
-            std::string error_message;
-            bool found = false;
-            db_manager::Bip448NonceState nonce_state;
-            if (!db_manager::load_bip448_nonce_state(
-                statechain_id,
-                signing_id,
-                found,
-                nonce_state,
-                error_message)) {
-                return crow::response(500, "Failed to load BIP448 nonce state: " + error_message);
-            }
-
-            if (!found) {
-                return bip448_nonce_not_found_response();
-            }
-
-            if (nonce_state.public_nonce_hex != requested_public_nonce) {
-                return bip448_conflict_response("server public nonce does not match BIP448 nonce state");
-            }
-
-            if (nonce_state.challenge.has_value()) {
-                if (nonce_state.challenge.value() != challenge) {
-                    return bip448_conflict_response("challenge does not match BIP448 nonce state");
-                }
-
-                if (!nonce_state.negate_seckey.has_value() || nonce_state.negate_seckey.value() != negate_seckey) {
-                    return bip448_conflict_response("negate_seckey does not match BIP448 nonce state");
-                }
-
-                if (nonce_state.partial_sig.has_value()) {
-                    return bip448_partial_sig_response(nonce_state.partial_sig.value());
-                }
-            } else {
-                bool claimed = false;
-                if (!db_manager::claim_bip448_nonce_challenge(
-                    statechain_id,
-                    signing_id,
-                    challenge,
-                    static_cast<int>(negate_seckey),
-                    claimed,
-                    error_message)) {
-                    return crow::response(500, "Failed to claim BIP448 nonce challenge: " + error_message);
-                }
-
-                if (!claimed) {
-                    if (!db_manager::load_bip448_nonce_state(
-                        statechain_id,
-                        signing_id,
-                        found,
-                        nonce_state,
-                        error_message)) {
-                        return crow::response(500, "Failed to reload BIP448 nonce state: " + error_message);
-                    }
-
-                    if (!found) {
-                        return bip448_nonce_not_found_response();
-                    }
-
-                    if (!nonce_state.challenge.has_value() || nonce_state.challenge.value() != challenge) {
-                        return bip448_conflict_response("challenge does not match BIP448 nonce state");
-                    }
-
-                    if (!nonce_state.negate_seckey.has_value() || nonce_state.negate_seckey.value() != negate_seckey) {
-                        return bip448_conflict_response("negate_seckey does not match BIP448 nonce state");
-                    }
-
-                    if (nonce_state.partial_sig.has_value()) {
-                        return bip448_partial_sig_response(nonce_state.partial_sig.value());
-                    }
-                }
-            }
-
-            auto encrypted_keypair = std::make_unique<utils::chacha20_poly1305_encrypted_data>();
-            bool data_loaded = db_manager::load_generated_keypair(
-                statechain_id,
-                encrypted_keypair,
-                error_message
-            );
-
-            if (!data_loaded) {
-                error_message = "Failed to load aggregated key data: " + error_message;
-                return crow::response(500, error_message);
-            }
-
-            if (encrypted_keypair == nullptr || nonce_state.encrypted_secnonce == nullptr) {
-                return crow::response(400, "Empty sealed keypair or BIP448 sealed secnonce!");
-            }
-
-            auto response = enclave::partial_signature(
-                seed,
-                encrypted_keypair.get(),
-                nonce_state.encrypted_secnonce.get(),
-                static_cast<int>(negate_seckey),
-                serialized_session.data(), serialized_session.size(),
-                nonce_state.public_nonce.data());
-
-            auto partial_sig_hex = utils::key_to_string(response.partial_sig_data, sizeof(response.partial_sig_data));
-
-            bool saved = false;
-            if (!db_manager::save_bip448_partial_signature(
-                statechain_id,
-                signing_id,
-                challenge,
-                static_cast<int>(negate_seckey),
-                partial_sig_hex,
-                saved,
-                error_message)) {
-                return crow::response(500, "Failed to save BIP448 partial signature: " + error_message);
-            }
-
-            if (saved) {
-                return bip448_partial_sig_response(partial_sig_hex);
-            }
-
-            if (!db_manager::load_bip448_nonce_state(
-                statechain_id,
-                signing_id,
-                found,
-                nonce_state,
-                error_message)) {
-                return crow::response(500, "Failed to reload BIP448 partial signature: " + error_message);
-            }
-
-            if (found
-                && nonce_state.challenge.has_value()
-                && nonce_state.challenge.value() == challenge
-                && nonce_state.negate_seckey.has_value()
-                && nonce_state.negate_seckey.value() == negate_seckey
-                && nonce_state.partial_sig.has_value()) {
-                return bip448_partial_sig_response(nonce_state.partial_sig.value());
-            }
-
-            return crow::response(500, "BIP448 partial signature was not saved or replayable");
+    crow::response generate_bip448_partial_signature(const db_manager::Bip448SignSecondRequest& request, unsigned char* seed) {
+        const auto result = db_manager::execute_bip448_sign_second(request, seed);
+        if (result.outcome != db_manager::Bip448Outcome::Applied && result.outcome != db_manager::Bip448Outcome::ExactReplay) {
+            return result_error(result, nullptr, nullptr, &request.expected_key_generation);
+        }
+        crow::json::wvalue body; body["partial_sig"] = result.value;
+        return json_response(200, std::move(body));
     }
 
-    crow::response keyupdate(
-        const std::string& statechain_id, 
-        std::vector<unsigned char>& serialized_t2,
-        std::vector<unsigned char>& serialized_x1,
-        unsigned char *seed) {
-
-            auto old_encrypted_keypair = std::make_unique<utils::chacha20_poly1305_encrypted_data>();
-        
-            std::string error_message;
-            bool data_loaded = db_manager::load_generated_keypair(
-                statechain_id,
-                old_encrypted_keypair,
-                error_message
-            );
-
-            if (!data_loaded) {
-                error_message = "Failed to load aggregated key data: " + error_message;
-                return crow::response(500, error_message);
-            }
-
-            if (old_encrypted_keypair == nullptr) {
-                return crow::response(400, "Empty encrypted keypair!");
-            }
-
-            auto response = enclave::key_update(
-                seed, 
-                old_encrypted_keypair.get(),
-                serialized_x1.data(),
-                serialized_t2.data());
-
-            bool data_saved = db_manager::update_sealed_keypair(
-                response.encrypted_data, 
-                response.server_pubkey, sizeof(response.server_pubkey),
-                statechain_id, 
-                error_message);
-
-            if (!data_saved) {
-                error_message = "Failed to update aggregated key data: " + error_message;
-                return crow::response(500, error_message);
-            }
-
-            auto new_server_seckey_hex = utils::key_to_string(response.server_pubkey, sizeof(response.server_pubkey));
-
-            crow::json::wvalue result({{"server_pubkey", new_server_seckey_hex}});
-            return crow::response{result};
+    crow::response keyupdate(const db_manager::Bip448KeyupdateRequest& request, unsigned char* seed) {
+        const auto result = db_manager::execute_bip448_keyupdate(request, seed);
+        if (result.outcome != db_manager::Bip448Outcome::Applied && result.outcome != db_manager::Bip448Outcome::ExactReplay) {
+            return result_error(result, &request.operation_id, &request.expected_sig_count, &request.expected_key_generation);
+        }
+        if (!result.receipt) return crow::response(500, "BIP448 receipt missing");
+        const auto& receipt = *result.receipt;
+        crow::json::wvalue body;
+        body["protocol_version"] = 2; body["operation_id"] = receipt.operation_id;
+        body["statechain_id"] = receipt.statechain_id; body["status"] = "applied";
+        body["accepted_sig_count"] = static_cast<std::uint64_t>(receipt.accepted_sig_count);
+        body["previous_key_generation"] = static_cast<std::uint64_t>(receipt.previous_key_generation);
+        body["resulting_key_generation"] = static_cast<std::uint64_t>(receipt.resulting_key_generation);
+        body["previous_server_pubkey"] = lower_hex(receipt.previous_server_pubkey.data(), receipt.previous_server_pubkey.size());
+        body["resulting_server_pubkey"] = lower_hex(receipt.resulting_server_pubkey.data(), receipt.resulting_server_pubkey.size());
+        body["transfer_generation_pubkey"] = lower_hex(receipt.transfer_generation_pubkey.data(), receipt.transfer_generation_pubkey.size());
+        return json_response(200, std::move(body));
     }
 
     std::string getKeyManager() {
@@ -415,6 +304,10 @@ namespace lockbox {
             error_message.clear();
             if (db_manager::initialize_database(error_message)) {
                 return;
+            }
+
+            if (error_message == "incompatible legacy lockbox database") {
+                throw std::runtime_error(error_message);
             }
 
             auto current_time = std::chrono::steady_clock::now();
@@ -472,149 +365,64 @@ namespace lockbox {
 
         CROW_ROUTE(app, "/get_public_key")
         .methods("POST"_method)([&seed](const crow::request& req) {
-
             auto req_body = crow::json::load(req.body);
-            if (!req_body)
-                return crow::response(400);
-
+            if (!req_body) return crow::response(400);
             if (req_body.count("statechain_id") == 0)
                 return crow::response(400, "Invalid parameter. It must be 'statechain_id'.");
-
             std::string statechain_id = req_body["statechain_id"].s();
-
             return generate_new_keypair(statechain_id, seed.data());
         });
 
         CROW_ROUTE(app, "/bip448/get_public_nonce")
         .methods("POST"_method)([&seed](const crow::request& req) {
-
             auto req_body = crow::json::load(req.body);
-            if (!req_body)
-                return crow::response(400);
-
-            if (req_body.count("statechain_id") == 0 || req_body.count("signing_id") == 0) {
-                return crow::response(400, "Invalid parameters. They must be 'statechain_id' and 'signing_id'.");
-            }
-
-            std::string statechain_id = req_body["statechain_id"].s();
-            std::string signing_id = req_body["signing_id"].s();
-
-            if (!canonical_signing_id(signing_id)) {
-                return crow::response(400, "Invalid signing_id. Must be a 32-byte hex string!");
-            }
-
-            return generate_bip448_public_nonce(statechain_id, signing_id, seed.data());
+            db_manager::Bip448SignFirstRequest request;
+            if (!req_body || !parse_sign_first(req_body, request)) return crow::response(400, "Invalid BIP448 request");
+            return generate_bip448_public_nonce(request, seed.data());
         });
 
         CROW_ROUTE(app, "/bip448/get_partial_signature")
-            .methods("POST"_method)([&seed](const crow::request& req) {
-
-                auto req_body = crow::json::load(req.body);
-                if (!req_body)
-                    return crow::response(400);
-
-                if (req_body.count("statechain_id") == 0 ||
-                    req_body.count("signing_id") == 0 ||
-                    req_body.count("negate_seckey") == 0 ||
-                    req_body.count("session") == 0 ||
-                    req_body.count("server_pub_nonce") == 0) {
-                    return crow::response(400, "Invalid parameters. They must be 'statechain_id', 'signing_id', 'negate_seckey', 'session' and 'server_pub_nonce'.");
-                }
-
-                std::string statechain_id = req_body["statechain_id"].s();
-                std::string signing_id = req_body["signing_id"].s();
-                int64_t negate_seckey = req_body["negate_seckey"].i();
-                std::string session_hex = req_body["session"].s();
-                std::string server_pub_nonce = req_body["server_pub_nonce"].s();
-
-                if (!canonical_signing_id(signing_id)) {
-                    return crow::response(400, "Invalid signing_id. Must be a 32-byte hex string!");
-                }
-
-                session_hex = strip_hex_prefix(session_hex);
-
-                std::vector<unsigned char> serialized_session = utils::ParseHex(session_hex);
-
-                if (serialized_session.size() != 133) {
-                    return crow::response(400, "Invalid session length. Must be 133 bytes!");
-                }
-
-                return generate_bip448_partial_signature(
-                    statechain_id,
-                    signing_id,
-                    negate_seckey,
-                    serialized_session,
-                    server_pub_nonce,
-                    seed.data());
-
+        .methods("POST"_method)([&seed](const crow::request& req) {
+            auto req_body = crow::json::load(req.body);
+            db_manager::Bip448SignSecondRequest request;
+            if (!req_body || !parse_sign_second(req_body, request)) return crow::response(400, "Invalid BIP448 request");
+            return generate_bip448_partial_signature(request, seed.data());
         });
 
         CROW_ROUTE(app,"/signature_count/<string>")
-        ([](std::string statechain_id){
+        ([](std::string statechain_id) {
+            const auto result = db_manager::observe_bip448_state(statechain_id);
+            if (result.outcome != db_manager::Bip448Outcome::Applied || !result.state) return result_error(result);
+            crow::json::wvalue body; body["sig_count"] = static_cast<std::uint64_t>(result.state->sig_count);
+            return json_response(200, std::move(body));
+        });
 
-            int sig_count = 0;
-            std::string error_message;
-            bool count_retrieved = db_manager::signature_count(statechain_id, sig_count, error_message);
-
-            if (!count_retrieved) {
-                if (error_message == "Signature count not found.") {
-                    return crow::response(404, error_message);
-                }
-                error_message = "Failed to retrieve signature count: " + error_message;
-                return crow::response(500, error_message);
-            }
-
-            crow::json::wvalue result({{"sig_count", sig_count}});
-            return crow::response{result};
+        CROW_ROUTE(app,"/bip448/state/<string>")
+        ([](std::string statechain_id) {
+            const auto result = db_manager::observe_bip448_state(statechain_id);
+            if (result.outcome != db_manager::Bip448Outcome::Applied || !result.state) return result_error(result);
+            crow::json::wvalue body;
+            body["protocol_version"] = 2; body["statechain_id"] = result.state->statechain_id;
+            body["sig_count"] = static_cast<std::uint64_t>(result.state->sig_count);
+            body["key_generation"] = static_cast<std::uint64_t>(result.state->key_generation);
+            body["server_pubkey"] = lower_hex(result.state->server_pubkey.data(), result.state->server_pubkey.size());
+            return json_response(200, std::move(body));
         });
 
         CROW_ROUTE(app, "/keyupdate")
-            .methods("POST"_method)([&seed](const crow::request& req) {
-                
-                auto req_body = crow::json::load(req.body);
-                if (!req_body)
-                    return crow::response(400);
-
-                if (req_body.count("statechain_id") == 0 || 
-                    req_body.count("t2") == 0 ||
-                    req_body.count("x1") == 0) {
-                    return crow::response(400, "Invalid parameters. They must be 'statechain_id', 't2' and 'x1'.");
-                }
-
-                std::string statechain_id = req_body["statechain_id"].s();
-                std::string t2_hex = req_body["t2"].s();
-                std::string x1_hex = req_body["x1"].s();
-
-                if (t2_hex.substr(0, 2) == "0x") {
-                    t2_hex = t2_hex.substr(2);
-                }
-
-                std::vector<unsigned char> serialized_t2 = utils::ParseHex(t2_hex);
-
-                if (serialized_t2.size() != 32) {
-                    return crow::response(400, "Invalid t2 length. Must be 32 bytes!");
-                }
-
-                if (x1_hex.substr(0, 2) == "0x") {
-                    x1_hex = x1_hex.substr(2);
-                }
-
-                std::vector<unsigned char> serialized_x1 = utils::ParseHex(x1_hex);
-
-                if (serialized_x1.size() != 32) {
-                    return crow::response(400, "Invalid x1 length. Must be 32 bytes!");
-                }
-
-                return keyupdate(statechain_id, serialized_t2, serialized_x1, seed.data());
+        .methods("POST"_method)([&seed](const crow::request& req) {
+            auto req_body = crow::json::load(req.body);
+            db_manager::Bip448KeyupdateRequest request;
+            if (!req_body || !parse_keyupdate(req_body, request)) return crow::response(400, "Invalid BIP448 request");
+            return keyupdate(request, seed.data());
         });
 
         CROW_ROUTE(app,"/delete_statechain/<string>")
-            .methods("DELETE"_method)([](std::string statechain_id){
-                if (db_manager::delete_statechain(statechain_id)) {
-                    return crow::response(200, "Statechain deleted.");
-                } else {
-                    return crow::response(500, "Failed to connect to the database and delete statechain.");
-                }
+        .methods("DELETE"_method)([](std::string statechain_id) {
+            const auto result = db_manager::delete_statechain(statechain_id);
+            if (result.outcome == db_manager::Bip448Outcome::Applied
+                || result.outcome == db_manager::Bip448Outcome::ExactReplay) return crow::response(200, "Statechain deleted.");
+            return result_error(result);
         });
 
         uint16_t server_port = 0;

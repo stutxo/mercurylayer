@@ -6,7 +6,12 @@ use mercurylib::{
     bip448_statechain::{
         signing::{CsfsSigningParticipant, CsfsSigningRole, CsfsSigningSession},
         signing_api::{
-            Bip448LockboxPartialSignatureRequestPayload, Bip448LockboxSignFirstRequestPayload,
+            Bip448BlindedSession, Bip448KeyUpdateAppliedReceiptPayloadV2,
+            Bip448LockboxKeyUpdateRequestPayloadV2, Bip448LockboxPartialSignatureRequestPayload,
+            Bip448LockboxPartialSignatureRequestPayloadV2, Bip448LockboxSignFirstRequestPayload,
+            Bip448LockboxSignFirstRequestPayloadV2, Bip448LockboxStateResponsePayloadV2,
+            Bip448NegateSeckeyFlag, Bip448OperationId, Bip448ProtocolVersionV2, Bip448PublicNonce,
+            Bip448SecretScalar, Bip448SigningId, Bip448StatechainId,
         },
     },
     wallet::{Settings, Wallet},
@@ -14,7 +19,8 @@ use mercurylib::{
 use reqwest::{Client, Response, StatusCode};
 use secp256k1::{
     musig::{new_musig_nonce_pair, BlindingFactor, MusigSessionId, PartialSignature, PublicNonce},
-    rand, Message, PublicKey, Secp256k1, SecretKey,
+    rand::{self, RngCore},
+    Message, PublicKey, Secp256k1, SecretKey,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -122,7 +128,17 @@ pub async fn post_json(client: &Client, path: &str, body: Value) -> Result<Respo
         .json(&body)
         .send()
         .await
-        .with_context(|| format!("failed POST {} with body {}", path, body))
+        .with_context(|| format!("failed POST {path}"))
+}
+
+pub async fn post_raw_json(client: &Client, path: &str, body: String) -> Result<Response> {
+    client
+        .post(format!("{}/{}", url(), path))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .with_context(|| format!("failed raw POST {path}"))
 }
 
 pub async fn get(client: &Client, path: &str) -> Result<Response> {
@@ -161,17 +177,54 @@ pub async fn bip448_get_public_nonce(
     client: &Client,
     payload: &Bip448LockboxSignFirstRequestPayload,
 ) -> Result<ServerPubnonceResponse> {
-    let response = post_json(
-        client,
-        "bip448/get_public_nonce",
-        serde_json::to_value(payload)?,
-    )
-    .await?;
+    let body = bip448_sign_first_request_value(client, payload).await?;
+    let response = post_json(client, "bip448/get_public_nonce", body).await?;
 
     let mut result: ServerPubnonceResponse =
         ensure_success(response, "bip448/get_public_nonce").await?;
     result.server_pubnonce = normalize_hex(&result.server_pubnonce);
     Ok(result)
+}
+
+pub async fn get_bip448_state(
+    client: &Client,
+    statechain_id: &str,
+) -> Result<Bip448LockboxStateResponsePayloadV2> {
+    let response = get(client, &format!("bip448/state/{statechain_id}")).await?;
+    ensure_success(response, "bip448/state").await
+}
+
+pub async fn bip448_sign_first_request_value(
+    client: &Client,
+    payload: &Bip448LockboxSignFirstRequestPayload,
+) -> Result<Value> {
+    let state = get_bip448_state(client, &payload.statechain_id).await?;
+    Ok(serde_json::to_value(
+        Bip448LockboxSignFirstRequestPayloadV2 {
+            statechain_id: Bip448StatechainId::new(payload.statechain_id.clone())?,
+            signing_id: Bip448SigningId::try_from(payload.signing_id.as_str())?,
+            expected_key_generation: state.key_generation,
+            expected_server_pubkey: state.server_pubkey,
+        },
+    )?)
+}
+
+pub async fn bip448_partial_request_value(
+    client: &Client,
+    payload: &Bip448LockboxPartialSignatureRequestPayload,
+) -> Result<Value> {
+    let state = get_bip448_state(client, &payload.statechain_id).await?;
+    Ok(serde_json::to_value(
+        Bip448LockboxPartialSignatureRequestPayloadV2 {
+            statechain_id: Bip448StatechainId::new(payload.statechain_id.clone())?,
+            signing_id: Bip448SigningId::try_from(payload.signing_id.as_str())?,
+            negate_seckey: Bip448NegateSeckeyFlag::try_from(payload.negate_seckey)?,
+            session: Bip448BlindedSession::try_from(payload.session.as_str())?,
+            server_pub_nonce: Bip448PublicNonce::try_from(payload.server_pub_nonce.as_str())?,
+            expected_key_generation: state.key_generation,
+            expected_server_pubkey: state.server_pubkey,
+        },
+    )?)
 }
 
 pub async fn delete_statechain(client: &Client, statechain_id: &str) -> Result<()> {
@@ -360,32 +413,48 @@ pub async fn keyupdate(
     t2_bytes: [u8; 32],
     x1_bytes: [u8; 32],
 ) -> Result<ServerPubkeyResponse> {
-    let response = post_json(
-        client,
-        "keyupdate",
-        json!({
-            "statechain_id": statechain_id,
-            "t2": hex::encode(t2_bytes),
-            "x1": hex::encode(x1_bytes),
-        }),
-    )
-    .await?;
+    let request = build_keyupdate_request(client, statechain_id, t2_bytes, x1_bytes).await?;
+    let receipt = keyupdate_request(client, &request).await?;
+    Ok(ServerPubkeyResponse {
+        server_pubkey: hex::encode(receipt.resulting_server_pubkey.as_bytes()),
+    })
+}
 
-    let mut result: ServerPubkeyResponse = ensure_success(response, "keyupdate").await?;
-    result.server_pubkey = normalize_hex(&result.server_pubkey);
-    Ok(result)
+pub async fn build_keyupdate_request(
+    client: &Client,
+    statechain_id: &str,
+    t2_bytes: [u8; 32],
+    x1_bytes: [u8; 32],
+) -> Result<Bip448LockboxKeyUpdateRequestPayloadV2> {
+    let state = get_bip448_state(client, statechain_id).await?;
+    let mut operation_id = [0_u8; 32];
+    rand::rng().fill_bytes(&mut operation_id);
+    Ok(Bip448LockboxKeyUpdateRequestPayloadV2 {
+        protocol_version: Bip448ProtocolVersionV2,
+        operation_id: Bip448OperationId::from_bytes(operation_id),
+        statechain_id: Bip448StatechainId::new(statechain_id.to_owned())?,
+        t2: Bip448SecretScalar::from_bytes(t2_bytes)?,
+        x1: Bip448SecretScalar::from_bytes(x1_bytes)?,
+        expected_sig_count: state.sig_count,
+        expected_key_generation: state.key_generation,
+        expected_server_pubkey: state.server_pubkey,
+    })
+}
+
+pub async fn keyupdate_request(
+    client: &Client,
+    request: &Bip448LockboxKeyUpdateRequestPayloadV2,
+) -> Result<Bip448KeyUpdateAppliedReceiptPayloadV2> {
+    let response = post_json(client, "keyupdate", serde_json::to_value(request)?).await?;
+    ensure_success(response, "keyupdate").await
 }
 
 pub async fn bip448_request_partial_signature(
     client: &Client,
     payload: &Bip448LockboxPartialSignatureRequestPayload,
 ) -> Result<String> {
-    let response = post_json(
-        client,
-        "bip448/get_partial_signature",
-        serde_json::to_value(payload)?,
-    )
-    .await?;
+    let body = bip448_partial_request_value(client, payload).await?;
+    let response = post_json(client, "bip448/get_partial_signature", body).await?;
     let mut result: PartialSignatureResponse =
         ensure_success(response, "bip448/get_partial_signature").await?;
     result.partial_sig = normalize_hex(&result.partial_sig);
