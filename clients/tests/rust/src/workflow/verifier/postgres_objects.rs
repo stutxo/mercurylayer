@@ -116,9 +116,9 @@ pub(super) const MERCURY_CONSTRAINTS: &[ConstraintSpec] = &[
 
 pub(super) const LOCKBOX_CONSTRAINTS: &[ConstraintSpec] = &[
     ("bip448_keyupdate_receipt","bip448_keyupdate_receipt_accepted_sig_count_check","c",&["accepted_sig_count"],"CHECK (accepted_sig_count >= 0)"),
+    ("bip448_keyupdate_receipt","bip448_keyupdate_receipt_check","c",&["resulting_key_generation","previous_key_generation"],"CHECK (resulting_key_generation = (previous_key_generation + 1))"),
     ("bip448_keyupdate_receipt","bip448_keyupdate_receipt_pkey","p",&["statechain_id","operation_id"],"PRIMARY KEY (statechain_id, operation_id)"),
     ("bip448_keyupdate_receipt","bip448_keyupdate_receipt_previous_key_generation_check","c",&["previous_key_generation"],"CHECK (previous_key_generation >= 0)"),
-    ("bip448_keyupdate_receipt","bip448_keyupdate_receipt_resulting_key_generation_check","c",&["resulting_key_generation","previous_key_generation"],"CHECK (resulting_key_generation = previous_key_generation + 1)"),
     ("bip448_keyupdate_receipt","bip448_keyupdate_receipt_statechain_id_fkey","f",&["statechain_id"],"FOREIGN KEY (statechain_id) REFERENCES generated_public_key(statechain_id) ON DELETE CASCADE"),
     ("bip448_nonce_state","bip448_nonce_state_challenge_check","c",&["challenge"],"CHECK (challenge IS NULL OR challenge ~ '^[0-9a-f]{64}$')"),
     ("bip448_nonce_state","bip448_nonce_state_claim_check","c",&["challenge","negate_seckey","partial_sig"],"CHECK (challenge IS NULL AND negate_seckey IS NULL AND partial_sig IS NULL OR challenge IS NOT NULL AND negate_seckey IS NOT NULL)"),
