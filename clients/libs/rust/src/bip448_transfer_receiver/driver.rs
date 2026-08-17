@@ -3,11 +3,17 @@ use std::{future::Future, str::FromStr};
 use anyhow::{anyhow, Result};
 use bitcoin::{PrivateKey, Txid};
 use mercurylib::{
-    bip448_statechain::deposit::BIP448_COIN_PROTOCOL,
+    bip448_statechain::{
+        deposit::BIP448_COIN_PROTOCOL,
+        signing_api::{Bip448OperationId, Bip448SchnorrSignature},
+    },
     transfer::bip448::Bip448TransferMsg,
     wallet::{Activity, Coin, CoinStatus},
 };
-use secp256k1::{schnorr, KeyPair, PublicKey, Secp256k1};
+use secp256k1::{
+    rand::{self, RngCore},
+    schnorr, KeyPair, PublicKey, Secp256k1,
+};
 
 use crate::{
     client_config::ClientConfig,
@@ -19,7 +25,7 @@ use super::{
     persist::persist_accepted_transfer,
     verify::{
         create_receiver_request, decrypt_transfer_message, expected_server_pubkey,
-        transfer_chain_facts,
+        statechain_info_for_verification, transfer_chain_facts, verify_keyupdate_receipt,
     },
     Bip448CompletedKeyUpdate, Bip448VerifiedTransfer,
 };
@@ -100,10 +106,11 @@ async fn transfer_bip448_receiver(
     wallet_name: &str,
     activities: &mut Vec<Activity>,
 ) -> Result<super::super::Bip448ReceiveOutcome> {
-    let statechain_info = utils::get_statechain_info(&msg.statechain_id, client_config)
+    let observed = utils::get_bip448_statechain_info_v2(&msg.statechain_id, client_config)
         .await?
         .ok_or_else(|| anyhow!("Statechain info not found"))?;
-    let current_server = PublicKey::from_str(&statechain_info.enclave_public_key)?;
+    let statechain_info = statechain_info_for_verification(&observed)?;
+    let current_server = PublicKey::from_slice(observed.enclave_public_key.as_bytes())?;
     if has_persisted_bip448_receipt(
         &client_config.pool,
         wallet_name,
@@ -149,10 +156,22 @@ async fn transfer_bip448_receiver(
     )?;
     let auth_secret = PrivateKey::from_wif(&coin.auth_privkey)?.inner;
     let auth_keypair = KeyPair::from_secret_key(&Secp256k1::new(), &auth_secret);
-    let unlock_signature = schnorr::sign(&unlock_digest, &auth_keypair).to_string();
+    let unlock_signature = schnorr::sign(&unlock_digest, &auth_keypair);
+    let recipient_unlock_auth_sig =
+        Bip448SchnorrSignature::try_from(unlock_signature.to_string().as_str())?;
+    let unlock_signature = unlock_signature.to_string();
     let unlock_statechain_id = verified.msg.statechain_id.clone();
     let x1_generation = verified.x1_generation.to_string();
-    let receiver_request = create_receiver_request(&verified.msg, coin, &verified.x1_generation)?;
+    let mut operation_id = [0_u8; 32];
+    rand::rng().fill_bytes(&mut operation_id);
+    let receiver_request = create_receiver_request(
+        &verified,
+        coin,
+        &observed,
+        Bip448OperationId::from_bytes(operation_id),
+        recipient_unlock_auth_sig,
+    )?;
+    let post_statechain_id = verified.msg.statechain_id.clone();
 
     execute_receiver_attempt(
         || std::future::ready(Ok(verified)),
@@ -170,7 +189,27 @@ async fn transfer_bip448_receiver(
                 .await
                 .map_err(ReceiverPostError::classify)
         },
-        |verified, response| {
+        |verified, response| async {
+            let response = match response {
+                super::super::Bip448TransferReceiverPostResult::BatchLocked => {
+                    super::super::TransferReceiveRequestResult {
+                        is_batch_locked: true,
+                        server_pubkey: None,
+                    }
+                }
+                super::super::Bip448TransferReceiverPostResult::Applied(receipt) => {
+                    let live_after =
+                        utils::get_bip448_statechain_info_v2(&post_statechain_id, client_config)
+                            .await?
+                            .ok_or_else(|| anyhow!("BIP448 state disappeared after keyupdate"))?;
+                    let server_pubkey =
+                        verify_keyupdate_receipt(&receiver_request, &receipt, &live_after)?;
+                    super::super::TransferReceiveRequestResult {
+                        is_batch_locked: false,
+                        server_pubkey: Some(server_pubkey.to_string()),
+                    }
+                }
+            };
             persist_accepted_transfer(
                 &client_config.pool,
                 wallet_name,
@@ -179,6 +218,7 @@ async fn transfer_bip448_receiver(
                 verified,
                 response,
             )
+            .await
         },
     )
     .await
@@ -297,7 +337,10 @@ pub(in crate::transfer_receiver) mod test_support {
 
     use super::super::{
         persist::persist_accepted_transfer,
-        verify::{create_receiver_request, decrypt_transfer_message, expected_server_pubkey},
+        verify::{
+            create_receiver_request, decrypt_transfer_message, expected_server_pubkey,
+            statechain_info_for_verification, verify_keyupdate_receipt,
+        },
         *,
     };
     use super::{execute_receiver_attempt, ReceiverPostError, ALREADY_UPDATED_ERROR};
@@ -305,12 +348,21 @@ pub(in crate::transfer_receiver) mod test_support {
     use anyhow::anyhow;
     use bitcoin::{Address, Network, OutPoint, PrivateKey, TxOut, Txid};
     use mercurylib::{
-        bip448_statechain::script,
+        bip448_statechain::{
+            script,
+            signing_api::{
+                Bip448AppliedStatus, Bip448CanonicalScalar, Bip448CompressedPublicKey,
+                Bip448KeyGeneration, Bip448KeyUpdateAppliedReceiptPayloadV2, Bip448OperationId,
+                Bip448ProtocolVersionV2, Bip448PublicNonce, Bip448SchnorrSignature,
+                Bip448SignatureCount, Bip448StatechainId, Bip448StatechainInfoResponsePayloadV2,
+                Bip448StatechainInfoV2,
+            },
+        },
         encode_sc_address,
-        transfer::receiver::StatechainInfoResponsePayload,
+        transfer::receiver::{StatechainInfoResponsePayload, TransferReceiverRequestPayloadV2},
         wallet::{Settings, Wallet},
     };
-    use secp256k1::{schnorr, Secp256k1, SecretKey};
+    use secp256k1::{schnorr, KeyPair, Secp256k1, SecretKey};
     use sqlx::sqlite::SqlitePoolOptions;
 
     // Cryptographically valid two-state transfer vector with deterministic keys and nonces.
@@ -372,13 +424,69 @@ pub(in crate::transfer_receiver) mod test_support {
         ClientConfig { statechain_entity: endpoint.clone(), chain_backend: "core".to_string(), chain_client: ChainClient::new(CoreRpcConfig { url: endpoint.clone(), auth: CoreRpcAuth::None }).unwrap(), core_rpc_url: Some(endpoint), core_rpc_auth: Some("none".to_string()), core_rpc_user: None, core_rpc_password: None, core_rpc_cookie_file: None, network: Network::Regtest, fee_rate_tolerance: 0.05, confirmation_target: 1, pool, tor_proxy: None, max_fee_rate: 100.0 }
     }
 
+    pub(in crate::transfer_receiver) fn observed_info() -> Bip448StatechainInfoResponsePayloadV2 {
+        let legacy: StatechainInfoResponsePayload = serde_json::from_str(INFO).unwrap();
+        Bip448StatechainInfoResponsePayloadV2 {
+            protocol_version: Bip448ProtocolVersionV2,
+            enclave_public_key: Bip448CompressedPublicKey::try_from(
+                legacy.enclave_public_key.as_str(),
+            )
+            .unwrap(),
+            num_sigs: Bip448SignatureCount::new(u64::from(legacy.num_sigs)),
+            lockbox_key_generation: Bip448KeyGeneration::new(0),
+            statechain_info: legacy
+                .statechain_info
+                .into_iter()
+                .map(|item| Bip448StatechainInfoV2 {
+                    statechain_id: Bip448StatechainId::try_from(item.statechain_id.as_str())
+                        .unwrap(),
+                    server_pubnonce: Bip448PublicNonce::try_from(item.server_pubnonce.as_str())
+                        .unwrap(),
+                    challenge: Bip448CanonicalScalar::try_from(item.challenge.as_str()).unwrap(),
+                    tx_n: item.tx_n,
+                })
+                .collect(),
+            x1_pub: Bip448CompressedPublicKey::try_from(legacy.x1_pub.unwrap().as_str()).unwrap(),
+        }
+    }
+
+    pub(in crate::transfer_receiver) fn applied_receipt(
+        request: &TransferReceiverRequestPayloadV2,
+    ) -> Bip448KeyUpdateAppliedReceiptPayloadV2 {
+        let secp = Secp256k1::new();
+        let previous = PublicKey::from_slice(request.expected_server_pubkey.as_bytes()).unwrap();
+        let t2 = SecretKey::from_secret_bytes(*request.t2.as_bytes()).unwrap();
+        let transfer_generation =
+            PublicKey::from_slice(request.transfer_generation_pubkey.as_bytes()).unwrap();
+        let resulting = previous
+            .combine(&t2.public_key(&secp))
+            .unwrap()
+            .combine(&transfer_generation.negate())
+            .unwrap();
+        Bip448KeyUpdateAppliedReceiptPayloadV2 {
+            protocol_version: Bip448ProtocolVersionV2,
+            operation_id: request.operation_id,
+            statechain_id: request.statechain_id.clone(),
+            status: Bip448AppliedStatus,
+            accepted_sig_count: request.expected_sig_count,
+            previous_key_generation: request.expected_key_generation,
+            resulting_key_generation: Bip448KeyGeneration::new(
+                request.expected_key_generation.get() + 1,
+            ),
+            previous_server_pubkey: request.expected_server_pubkey,
+            resulting_server_pubkey: Bip448CompressedPublicKey::from_bytes(resulting.serialize())
+                .unwrap(),
+            transfer_generation_pubkey: request.transfer_generation_pubkey,
+        }
+    }
+
     #[derive(Default)]
     #[rustfmt::skip]
-    pub(in crate::transfer_receiver) struct Transport { pub(in crate::transfer_receiver) server: String, pub(in crate::transfer_receiver) crash_before: bool, pub(in crate::transfer_receiver) lose_response: bool, pub(in crate::transfer_receiver) crash_after: bool, pub(in crate::transfer_receiver) verifies: u32, pub(in crate::transfer_receiver) unlocks: u32, pub(in crate::transfer_receiver) posts: u32 }
+    pub(in crate::transfer_receiver) struct Transport { pub(in crate::transfer_receiver) server: String, pub(in crate::transfer_receiver) sig_count: u64, pub(in crate::transfer_receiver) generation: u64, pub(in crate::transfer_receiver) crash_before: bool, pub(in crate::transfer_receiver) lose_response: bool, pub(in crate::transfer_receiver) crash_after: bool, pub(in crate::transfer_receiver) corrupt_receipt: bool, pub(in crate::transfer_receiver) corrupt_live_after: bool, pub(in crate::transfer_receiver) verifies: u32, pub(in crate::transfer_receiver) unlocks: u32, pub(in crate::transfer_receiver) posts: u32, pub(in crate::transfer_receiver) requests: Vec<TransferReceiverRequestPayloadV2> }
     #[rustfmt::skip]
     pub(in crate::transfer_receiver) fn transport() -> Rc<RefCell<Transport>> {
-        let info: StatechainInfoResponsePayload = serde_json::from_str(INFO).unwrap();
-        Rc::new(RefCell::new(Transport { server: info.enclave_public_key, ..Default::default() }))
+        let info = observed_info();
+        Rc::new(RefCell::new(Transport { server: hex::encode(info.enclave_public_key.as_bytes()), sig_count: info.num_sigs.get(), ..Default::default() }))
     }
 
     #[rustfmt::skip]
@@ -387,10 +495,14 @@ pub(in crate::transfer_receiver) mod test_support {
         activities: &mut Vec<Activity>, transport: Rc<RefCell<Transport>>,
     ) -> Result<Bip448ReceiveOutcome> {
         let msg = decrypt_transfer_message(&fixture.mailbox, &coin.auth_privkey)?;
-        let mut info: StatechainInfoResponsePayload = serde_json::from_str(INFO)?;
-        info.enclave_public_key = transport.borrow().server.clone();
-        if info.enclave_public_key != serde_json::from_str::<StatechainInfoResponsePayload>(INFO)?.enclave_public_key { info.statechain_info.clear(); }
-        let current_server = PublicKey::from_str(&info.enclave_public_key)?;
+        let mut observed = observed_info();
+        let initial_server = observed.enclave_public_key;
+        observed.enclave_public_key = Bip448CompressedPublicKey::try_from(transport.borrow().server.as_str())?;
+        observed.num_sigs = Bip448SignatureCount::new(transport.borrow().sig_count);
+        observed.lockbox_key_generation = Bip448KeyGeneration::new(transport.borrow().generation);
+        if observed.enclave_public_key != initial_server { observed.statechain_info.clear(); }
+        let info = statechain_info_for_verification(&observed)?;
+        let current_server = PublicKey::from_slice(observed.enclave_public_key.as_bytes())?;
         let expected = expected_server_pubkey(&msg, &fixture.facts.receiver_user_pubkey)?;
         transport.borrow_mut().verifies += 1;
         let verified = match Bip448VerifiedTransfer::new(msg, &info, fixture.facts.clone()) {
@@ -398,26 +510,36 @@ pub(in crate::transfer_receiver) mod test_support {
             Err(_) if current_server == expected => return Err(anyhow!(ALREADY_UPDATED_ERROR)),
             Err(error) => return Err(error),
         };
-        let request = create_receiver_request(
-            &verified.msg,
-            coin,
-            &verified.x1_generation,
-        )?;
-        assert_eq!(request.t2, hex::encode([4u8; 32]));
-        assert_eq!(request.batch_data.as_deref(), Some(verified.x1_generation.to_string().as_str()));
-        let t2_bytes: [u8; 32] = hex::decode(&request.t2)?.try_into().map_err(|_| anyhow!("invalid t2"))?;
-        let digest = mercurylib::transfer::receiver::bip448_transfer_receiver_auth_digest(
+        let auth_secret = PrivateKey::from_wif(&coin.auth_privkey)?.inner;
+        let auth_keypair = KeyPair::from_secret_key(&Secp256k1::new(), &auth_secret);
+        let unlock_digest = mercurylib::transfer::receiver::bip448_transfer_unlock_auth_digest(
+            mercurylib::transfer::receiver::Bip448TransferUnlockRole::Recipient,
             &verified.msg.statechain_id,
-            &t2_bytes,
             &verified.x1_generation,
         )?;
-        schnorr::verify(&schnorr::Signature::from_str(&request.auth_sig)?, &digest, &PublicKey::from_str(&coin.auth_pubkey)?.x_only_public_key().0)?;
+        let unlock_signature = schnorr::sign(&unlock_digest, &auth_keypair);
+        let recipient_unlock_auth_sig = Bip448SchnorrSignature::try_from(unlock_signature.to_string().as_str())?;
+        let request = create_receiver_request(
+            &verified,
+            coin,
+            &observed,
+            Bip448OperationId::from_bytes([0x77; 32]),
+            recipient_unlock_auth_sig,
+        )?;
+        assert_eq!(request.t2.as_bytes(), &[4u8; 32]);
+        assert_eq!(request.expected_sig_count, observed.num_sigs);
+        assert_eq!(request.expected_key_generation, observed.lockbox_key_generation);
+        assert_eq!(request.expected_server_pubkey, observed.enclave_public_key);
+        assert_eq!(request.transfer_generation_pubkey, observed.x1_pub);
+        assert_eq!(request.recipient_unlock_auth_sig, recipient_unlock_auth_sig);
+        schnorr::verify(&schnorr::Signature::from_byte_array(*request.auth_sig.as_bytes()), &request.auth_digest()?, &PublicKey::from_str(&coin.auth_pubkey)?.x_only_public_key().0)?;
         assert!(!mercurylib::transfer::receiver::sign_message(&verified.msg.statechain_id, coin)?.is_empty());
         let checkpoint_transport = Rc::clone(&transport);
         let unlock_transport = Rc::clone(&transport);
         let update_transport = Rc::clone(&transport);
         let persist_transport = Rc::clone(&transport);
-        let expected_text = expected.to_string();
+        let request_for_post = request.clone();
+        let request_for_verify = request.clone();
         execute_receiver_attempt(
             || std::future::ready(Ok(verified)),
             move || if std::mem::take(&mut checkpoint_transport.borrow_mut().crash_before) { Err(anyhow!("crash before transfer/receiver")) } else { Ok(()) },
@@ -425,13 +547,34 @@ pub(in crate::transfer_receiver) mod test_support {
             move || {
                 let mut transport = update_transport.borrow_mut();
                 transport.posts += 1;
-                transport.server = expected_text.clone();
-                let result = if std::mem::take(&mut transport.lose_response) { Err(ReceiverPostError::LostResponse(anyhow!("lost response"))) } else { Ok(super::super::super::TransferReceiveRequestResult { is_batch_locked: false, server_pubkey: Some(expected_text.clone()) }) };
+                transport.requests.push(request_for_post.clone());
+                let mut receipt = applied_receipt(&request_for_post);
+                transport.server = hex::encode(receipt.resulting_server_pubkey.as_bytes());
+                transport.generation = receipt.resulting_key_generation.get();
+                if transport.corrupt_receipt { receipt.operation_id = Bip448OperationId::from_bytes([0x66; 32]); }
+                let result = if std::mem::take(&mut transport.lose_response) { Err(ReceiverPostError::LostResponse(anyhow!("lost response"))) } else { Ok(super::super::super::Bip448TransferReceiverPostResult::Applied(receipt)) };
                 std::future::ready(result)
             },
             move |verified, response| {
-                let crash = std::mem::take(&mut persist_transport.borrow_mut().crash_after);
-                async move { if crash { Err(anyhow!("crash after key update")) } else { persist_accepted_transfer(pool, "wallet", coin, activities, verified, response).await } }
+                let mut transport = persist_transport.borrow_mut();
+                let crash = std::mem::take(&mut transport.crash_after);
+                let corrupt_live_after = transport.corrupt_live_after;
+                drop(transport);
+                async move {
+                    let response = match response {
+                        super::super::super::Bip448TransferReceiverPostResult::BatchLocked => super::super::super::TransferReceiveRequestResult { is_batch_locked: true, server_pubkey: None },
+                        super::super::super::Bip448TransferReceiverPostResult::Applied(receipt) => {
+                            let mut live_after = observed_info();
+                            live_after.num_sigs = receipt.accepted_sig_count;
+                            live_after.lockbox_key_generation = receipt.resulting_key_generation;
+                            live_after.enclave_public_key = receipt.resulting_server_pubkey;
+                            if corrupt_live_after { live_after.num_sigs = Bip448SignatureCount::new(live_after.num_sigs.get() + 1); }
+                            let server_pubkey = verify_keyupdate_receipt(&request_for_verify, &receipt, &live_after)?;
+                            super::super::super::TransferReceiveRequestResult { is_batch_locked: false, server_pubkey: Some(server_pubkey.to_string()) }
+                        }
+                    };
+                    if crash { Err(anyhow!("crash after key update")) } else { persist_accepted_transfer(pool, "wallet", coin, activities, verified, response).await }
+                }
             },
         ).await
     }
@@ -441,6 +584,15 @@ pub(in crate::transfer_receiver) mod test_support {
         use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener};
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let statechain_info = statechain_info.map(|value| {
+            if serde_json::from_str::<Bip448StatechainInfoResponsePayloadV2>(&value).is_ok() { return value; }
+            let legacy: StatechainInfoResponsePayload = serde_json::from_str(&value).unwrap();
+            let mut observed = observed_info();
+            observed.enclave_public_key = Bip448CompressedPublicKey::try_from(legacy.enclave_public_key.as_str()).unwrap();
+            observed.num_sigs = Bip448SignatureCount::new(u64::from(legacy.num_sigs));
+            observed.lockbox_key_generation = Bip448KeyGeneration::new(1);
+            serde_json::to_string(&observed).unwrap()
+        });
         let task = tokio::spawn(async move {
             let mailbox = serde_json::json!({"list_enc_transfer_msg": mailbox}).to_string();
             let mut rpc_calls = 0;
@@ -557,7 +709,37 @@ mod tests {
         transport.borrow_mut().lose_response = true;
         attempt(&fixture, &pool, &mut coin, &mut activities, Rc::clone(&transport)).await.unwrap();
         assert_eq!((transport.borrow().verifies, transport.borrow().posts), (1, 2));
+        assert_eq!(transport.borrow().requests.len(), 2);
+        assert_eq!(transport.borrow().requests[0], transport.borrow().requests[1]);
+        assert_eq!(transport.borrow().requests[0].operation_id, transport.borrow().requests[1].operation_id);
         assert!(crate::sqlite_manager::get_bip448_statechain_optional(&pool, "wallet", "statechain").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    #[rustfmt::skip]
+    async fn live_count_mismatch_rejects_before_keyupdate_or_persistence() {
+        let fixture = fixture(); let mut coin = fixture.coin.clone(); let mut activities = Vec::new();
+        let pool = pool().await; let transport = transport();
+        transport.borrow_mut().sig_count += 1;
+        assert!(attempt(&fixture, &pool, &mut coin, &mut activities, Rc::clone(&transport)).await.is_err());
+        assert_eq!(transport.borrow().posts, 0);
+        assert!(activities.is_empty());
+        assert!(crate::sqlite_manager::get_bip448_statechain_optional(&pool, "wallet", "statechain").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    #[rustfmt::skip]
+    async fn receipt_or_fresh_live_mismatch_never_reaches_wallet_persistence() {
+        for corrupt_receipt in [true, false] {
+            let fixture = fixture(); let mut coin = fixture.coin.clone(); let mut activities = Vec::new();
+            let pool = pool().await; let transport = transport();
+            transport.borrow_mut().corrupt_receipt = corrupt_receipt;
+            transport.borrow_mut().corrupt_live_after = !corrupt_receipt;
+            assert!(attempt(&fixture, &pool, &mut coin, &mut activities, Rc::clone(&transport)).await.is_err());
+            assert_eq!(transport.borrow().posts, 1);
+            assert!(activities.is_empty());
+            assert!(crate::sqlite_manager::get_bip448_statechain_optional(&pool, "wallet", "statechain").await.unwrap().is_none());
+        }
     }
 
     #[tokio::test]

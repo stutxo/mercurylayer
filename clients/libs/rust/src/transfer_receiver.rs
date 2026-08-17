@@ -7,7 +7,10 @@ use crate::{
 };
 use anyhow::Result;
 use bitcoin::{Address, Transaction, Txid};
-use mercurylib::{error::MercuryError, utils::get_network, wallet::CoinStatus};
+use mercurylib::{
+    bip448_statechain::signing_api::Bip448KeyUpdateAppliedReceiptPayloadV2, error::MercuryError,
+    transfer::receiver::TransferReceiverRequestPayloadV2, utils::get_network, wallet::CoinStatus,
+};
 use reqwest::StatusCode;
 
 mod bip448_post_acceptance;
@@ -175,10 +178,46 @@ pub struct TransferReceiveRequestResult {
     pub server_pubkey: Option<String>,
 }
 
+#[derive(Debug)]
+enum Bip448TransferReceiverPostResult {
+    BatchLocked,
+    Applied(Bip448KeyUpdateAppliedReceiptPayloadV2),
+}
+
+fn parse_transfer_receiver_response(
+    status: StatusCode,
+    value: &str,
+) -> Result<Bip448TransferReceiverPostResult> {
+    if status == StatusCode::BAD_REQUEST {
+        let error: mercurylib::transfer::receiver::TransferReceiverErrorResponsePayload =
+            serde_json::from_str(value)
+                .map_err(|_| anyhow::anyhow!("BIP448 transfer receiver returned malformed JSON"))?;
+
+        return match error.code {
+            mercurylib::transfer::receiver::TransferReceiverError::ExpiredBatchTimeError => {
+                Err(anyhow::anyhow!("BIP448 transfer batch has expired"))
+            }
+            mercurylib::transfer::receiver::TransferReceiverError::StatecoinBatchLockedError => {
+                Ok(Bip448TransferReceiverPostResult::BatchLocked)
+            }
+        };
+    }
+
+    if status == StatusCode::OK {
+        let response: Bip448KeyUpdateAppliedReceiptPayloadV2 = serde_json::from_str(value)
+            .map_err(|_| anyhow::anyhow!("BIP448 transfer receiver returned malformed JSON"))?;
+        return Ok(Bip448TransferReceiverPostResult::Applied(response));
+    }
+
+    Err(anyhow::anyhow!(
+        "BIP448 transfer receiver returned HTTP {status}"
+    ))
+}
+
 async fn send_transfer_receiver_request_payload(
     client_config: &ClientConfig,
-    transfer_receiver_request_payload: &mercurylib::transfer::receiver::TransferReceiverRequestPayload,
-) -> Result<TransferReceiveRequestResult> {
+    transfer_receiver_request_payload: &TransferReceiverRequestPayloadV2,
+) -> Result<Bip448TransferReceiverPostResult> {
     let path = "transfer/receiver";
 
     let client = client_config.get_reqwest_client()?;
@@ -195,37 +234,7 @@ async fn send_transfer_receiver_request_payload(
 
     let value = response.text().await?;
 
-    if status == StatusCode::BAD_REQUEST {
-        let error: mercurylib::transfer::receiver::TransferReceiverErrorResponsePayload =
-            serde_json::from_str(value.as_str())?;
-
-        match error.code {
-            mercurylib::transfer::receiver::TransferReceiverError::ExpiredBatchTimeError => {
-                return Err(anyhow::anyhow!(error.message));
-            }
-            mercurylib::transfer::receiver::TransferReceiverError::StatecoinBatchLockedError => {
-                return Ok(TransferReceiveRequestResult {
-                    is_batch_locked: true,
-                    server_pubkey: None,
-                });
-            }
-        }
-    }
-
-    if status == StatusCode::OK {
-        let response: mercurylib::transfer::receiver::TransferReceiverPostResponsePayload =
-            serde_json::from_str(value.as_str())?;
-        return Ok(TransferReceiveRequestResult {
-            is_batch_locked: false,
-            server_pubkey: Some(response.server_pubkey),
-        });
-    } else {
-        return Err(anyhow::anyhow!(
-            "{}: {}",
-            "Failed to update transfer message".to_string(),
-            value
-        ));
-    }
+    parse_transfer_receiver_response(status, &value)
 }
 
 #[cfg(test)]
@@ -350,5 +359,40 @@ mod tests {
             expected_address.to_string()
         );
         Ok(())
+    }
+
+    #[test]
+    fn v2_receiver_response_parses_typed_receipt_and_batch_lock() {
+        let receipt = r#"{"protocol_version":2,"operation_id":"1111111111111111111111111111111111111111111111111111111111111111","statechain_id":"statechain","status":"applied","accepted_sig_count":2,"previous_key_generation":0,"resulting_key_generation":1,"previous_server_pubkey":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","resulting_server_pubkey":"02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5","transfer_generation_pubkey":"02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"}"#;
+        let applied = parse_transfer_receiver_response(StatusCode::OK, receipt).unwrap();
+        let Bip448TransferReceiverPostResult::Applied(applied) = applied else {
+            panic!("typed receipt parsed as a batch lock");
+        };
+        assert_eq!(applied.accepted_sig_count.get(), 2);
+        assert_eq!(applied.resulting_key_generation.get(), 1);
+
+        let batch = parse_transfer_receiver_response(
+            StatusCode::BAD_REQUEST,
+            r#"{"code":"StatecoinBatchLockedError","message":"locked"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            batch,
+            Bip448TransferReceiverPostResult::BatchLocked
+        ));
+    }
+
+    #[test]
+    fn receiver_response_errors_never_echo_raw_bodies() {
+        let private_body = r#"{"transaction":"never-log-this"}"#;
+        let conflict =
+            parse_transfer_receiver_response(StatusCode::CONFLICT, private_body).unwrap_err();
+        let malformed = parse_transfer_receiver_response(StatusCode::OK, private_body).unwrap_err();
+
+        for error in [conflict, malformed] {
+            assert!(!error.to_string().contains(private_body));
+            assert!(!error.to_string().contains("transaction"));
+            assert!(!error.to_string().contains("never-log-this"));
+        }
     }
 }
