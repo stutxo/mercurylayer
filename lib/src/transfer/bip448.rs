@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::bip448_statechain::deposit::DEFAULT_BIP448_CHALLENGE_DELAY;
 use crate::bip448_statechain::script as bip448_script;
 use crate::bip448_statechain::signing::{CsfsSigningRole, CsfsSigningSession};
+use crate::bip448_statechain::signing_api::validate_signing_id;
 use crate::bip448_statechain::storage::{
     Bip448FeeBumpPolicy, Bip448FundingOutpoint, Bip448LatestState, Bip448RecoveryVerifyError,
     Bip448ValueSchedule, Bip448VerifiedRecoveryBinding,
@@ -498,6 +499,12 @@ pub fn verify_bip448_transfer_msg(
     {
         return Err(Bip448TransferVerifyError::InvalidSignatureCount);
     }
+    let signing_id = &msg.latest_state.signing_metadata.signing_id;
+    let canonical_signing_id = validate_signing_id(signing_id)
+        .map_err(|_| Bip448TransferVerifyError::InvalidStateHistory)?;
+    if canonical_signing_id != *signing_id {
+        return Err(Bip448TransferVerifyError::InvalidStateHistory);
+    }
 
     let funding_txid = Txid::from_str(&msg.funding_outpoint.txid)
         .map_err(|_| Bip448TransferVerifyError::InvalidFundingOutput)?;
@@ -572,6 +579,7 @@ pub fn verify_bip448_transfer_msg(
             entry,
             expected_state_number,
             signing_row.challenge.as_str(),
+            signing_row.server_pubnonce.as_str(),
             &aggregate_pubkey,
             chain_facts.funding_outpoint,
             chain_facts.funding_output.value,
@@ -690,6 +698,7 @@ fn verify_history_entry<C: Verification + Signing>(
     entry: &Bip448StateHistoryEntry,
     expected_state_number: u32,
     expected_challenge: &str,
+    expected_server_pubnonce: &str,
     aggregate_pubkey: &PublicKey,
     funding_outpoint: OutPoint,
     funding_value: u64,
@@ -736,6 +745,9 @@ fn verify_history_entry<C: Verification + Signing>(
 
     let client_nonce = parse_public_nonce(&entry.client_public_nonce)?;
     let server_nonce = parse_public_nonce(&entry.server_public_nonce)?;
+    if server_nonce != parse_public_nonce(expected_server_pubnonce)? {
+        return Err(Bip448TransferVerifyError::InvalidBlindedChallenge);
+    }
     let blinding_factor = BlindingFactor::from_slice(
         &hex::decode(&entry.blinding_factor)
             .map_err(|_| Bip448TransferVerifyError::InvalidBlindedChallenge)?,
@@ -2298,6 +2310,37 @@ mod tests {
         let mut fixture = three_state_transfer_fixture();
         fixture.msg.state_history.pop();
         assert_eq!(transfer_error(&fixture), InvalidSignatureCount);
+    }
+
+    #[test]
+    fn bip448_transfer_rejects_noncanonical_signing_id() {
+        for signing_id in ["not-hex".to_string(), "aa".repeat(31), "AB".repeat(32)] {
+            let mut fixture = transfer_fixture();
+            fixture.msg.latest_state.signing_metadata.signing_id = signing_id;
+            assert_eq!(transfer_error(&fixture), InvalidStateHistory);
+        }
+    }
+
+    #[test]
+    fn bip448_transfer_rejects_server_nonce_not_recorded_by_server() {
+        let mut fixture = transfer_fixture();
+        let other_server_nonce = fixture
+            .info
+            .statechain_info
+            .iter()
+            .find(|row| row.tx_n == 1)
+            .unwrap()
+            .server_pubnonce
+            .clone();
+        fixture
+            .info
+            .statechain_info
+            .iter_mut()
+            .find(|row| row.tx_n == 2)
+            .unwrap()
+            .server_pubnonce = other_server_nonce;
+
+        assert_eq!(transfer_error(&fixture), InvalidBlindedChallenge);
     }
 
     #[test]
