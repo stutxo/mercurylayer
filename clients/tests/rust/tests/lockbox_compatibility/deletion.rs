@@ -313,7 +313,7 @@ pub(super) async fn mercury_withdraw_complete_preserves_rows_when_lockbox_delete
             "direct lockbox delete during database outage returned {direct_status}: {direct_body}"
         );
         ensure!(
-            direct_body == "500 Internal Server Error\r\n",
+            direct_body == "BIP448 storage operation failed",
             "unexpected direct lockbox outage body: {direct_body}"
         );
 
@@ -449,8 +449,9 @@ pub(super) async fn mercury_withdraw_complete_preserves_rows_when_lockbox_delete
         "lockbox-only absence masqueraded as Mercury absence: {lockbox_missing_status}: {lockbox_missing_body}"
     );
     ensure!(
-        lockbox_missing_body.contains("lockbox signature_count returned 404"),
-        "Mercury did not report the lockbox signature-count failure: {lockbox_missing_body}"
+        lockbox_missing_body
+            .contains("lockbox BIP448 state is unavailable for an existing Mercury statechain"),
+        "Mercury did not report the lockbox state divergence: {lockbox_missing_body}"
     );
 
     let partial_failure_completion =
