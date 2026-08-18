@@ -219,7 +219,7 @@ async fn load_latch(
 async fn load_lockbox_generation(
     pool: &PgPool,
     statechain_id: &str,
-) -> Result<(Option<Vec<u8>>, Option<i32>)> {
+) -> Result<(Option<Vec<u8>>, Option<i64>)> {
     Ok(sqlx::query_as(
         "SELECT public_key,sig_count FROM generated_public_key WHERE statechain_id=$1",
     )
@@ -808,6 +808,7 @@ pub(super) async fn assert_unlock_generation_fences(
     lockbox_pool: &PgPool,
 ) -> Result<()> {
     let secp = Secp256k1::new();
+    let lockbox_client = lockbox::http_client();
     let (_wallet, coin) = mercury::create_deposited_coin(mercury_client).await?;
     let statechain_id = coin
         .statechain_id
@@ -1007,8 +1008,14 @@ pub(super) async fn assert_unlock_generation_fences(
         "current-owner response-loss replay changed row or latch timestamp"
     );
 
-    let receiver_request =
-        generation_bound_receiver_request(&statechain_id, &recipient_secret, x1, [0x44; 32])?;
+    let receiver_request = generation_bound_receiver_request(
+        &lockbox_client,
+        &statechain_id,
+        &recipient_secret,
+        x1,
+        [0x44; 32],
+    )
+    .await?;
     let receiver_response = post_mercury_json(
         mercury_client,
         "transfer/receiver",
@@ -1091,8 +1098,8 @@ pub(super) async fn assert_unlock_generation_fences(
     .await?;
     assert_json_response(
         &old_receiver_after_successor,
-        StatusCode::BAD_REQUEST,
-        json!({"code":"StatecoinBatchLockedError","message":"Statecoin batch is locked"}),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        generation_error.clone(),
     )?;
     ensure!(
         load_transfer_generation(mercury_pool, &statechain_id).await? == next_row
@@ -1267,6 +1274,7 @@ pub(super) async fn assert_receiver_generation_fences(
     lockbox_pool: &PgPool,
 ) -> Result<()> {
     let secp = Secp256k1::new();
+    let lockbox_client = lockbox::http_client();
     let (_wallet, coin) = mercury::create_deposited_coin(mercury_client).await?;
     let statechain_id = coin
         .statechain_id
@@ -1284,8 +1292,14 @@ pub(super) async fn assert_receiver_generation_fences(
     let sender_response = post_mercury_json(mercury_client, "transfer/sender", &sender).await?;
     let x1 = sender_x1(&sender_response)?;
     let generation = SecretKey::from_secret_bytes(x1)?.public_key(&secp);
-    let receiver =
-        generation_bound_receiver_request(&statechain_id, &recipient_secret, x1, [0xab; 32])?;
+    let receiver = generation_bound_receiver_request(
+        &lockbox_client,
+        &statechain_id,
+        &recipient_secret,
+        x1,
+        [0xab; 32],
+    )
+    .await?;
     let receiver_value = serde_json::to_value(&receiver)?;
     let initial_transfer = load_transfer_generation(mercury_pool, &statechain_id).await?;
     let initial_statechain = load_statechain_generation(mercury_pool, &statechain_id).await?;
@@ -1296,36 +1310,49 @@ pub(super) async fn assert_receiver_generation_fences(
     missing_generation
         .as_object_mut()
         .context("receiver payload is not an object")?
-        .remove("batch_data");
+        .remove("transfer_generation_pubkey");
     let mut malformed_generation = receiver_value.clone();
-    malformed_generation["batch_data"] = json!("not-a-public-key");
+    malformed_generation["transfer_generation_pubkey"] = json!("not-a-public-key");
     let mut noncanonical_generation = receiver_value.clone();
-    noncanonical_generation["batch_data"] = json!(generation.to_string().to_uppercase());
+    noncanonical_generation["transfer_generation_pubkey"] =
+        json!(generation.to_string().to_uppercase());
     let mut wrong_generation = receiver_value.clone();
-    wrong_generation["batch_data"] = json!(SecretKey::from_secret_bytes([0x52; 32])?
-        .public_key(&secp)
-        .to_string());
+    wrong_generation["transfer_generation_pubkey"] =
+        json!(SecretKey::from_secret_bytes([0x52; 32])?
+            .public_key(&secp)
+            .to_string());
     let mut noncanonical_t2 = receiver_value.clone();
-    noncanonical_t2["t2"] = json!(receiver.t2.to_uppercase());
+    noncanonical_t2["t2"] = json!(hex::encode(receiver.t2.as_bytes()).to_uppercase());
     let mut zero_t2 = receiver_value.clone();
     zero_t2["t2"] = json!("00".repeat(32));
     let mut substituted_t2 = receiver_value.clone();
     substituted_t2["t2"] = json!("ac".repeat(32));
     let mut wrong_signer = receiver_value.clone();
     let wrong_signer_secret = SecretKey::from_secret_bytes([0x53; 32])?;
-    let wrong_signer_digest =
-        bip448_transfer_receiver_auth_digest(&statechain_id, &[0xab; 32], &generation)?;
-    wrong_signer["auth_sig"] = json!(sign_digest(&wrong_signer_secret, &wrong_signer_digest));
+    wrong_signer["auth_sig"] = json!(sign_digest(&wrong_signer_secret, &receiver.auth_digest()?));
     for payload in [
         missing_generation,
         malformed_generation,
         noncanonical_generation,
-        wrong_generation,
         noncanonical_t2,
         zero_t2,
-        substituted_t2,
-        wrong_signer,
     ] {
+        let response = post_mercury_json(mercury_client, "transfer/receiver", &payload).await?;
+        ensure!(
+            response.0 == StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid receiver wire value returned {}: {}",
+            response.0,
+            response.1
+        );
+        ensure!(
+            load_transfer_generation(mercury_pool, &statechain_id).await? == initial_transfer
+                && load_statechain_generation(mercury_pool, &statechain_id).await?
+                    == initial_statechain
+                && load_lockbox_generation(lockbox_pool, &statechain_id).await? == initial_lockbox,
+            "invalid receiver wire input reached mutation"
+        );
+    }
+    for payload in [wrong_generation, substituted_t2, wrong_signer] {
         let response = post_mercury_json(mercury_client, "transfer/receiver", &payload).await?;
         assert_json_response(
             &response,
@@ -1360,12 +1387,8 @@ pub(super) async fn assert_receiver_generation_fences(
         .statechain_id
         .as_deref()
         .context("no-transfer receiver fixture has no ID")?;
-    let no_transfer_request = json!({
-        "statechain_id":no_transfer_id,
-        "batch_data":generation.to_string(),
-        "t2":receiver.t2,
-        "auth_sig":receiver.auth_sig,
-    });
+    let mut no_transfer_request = receiver_value.clone();
+    no_transfer_request["statechain_id"] = json!(no_transfer_id);
     let no_transfer_response =
         post_mercury_json(mercury_client, "transfer/receiver", &no_transfer_request).await?;
     assert_json_response(
@@ -1421,7 +1444,7 @@ pub(super) async fn assert_receiver_generation_fences(
         after_valid_transfer.key_updated == Some(true)
             && after_valid_state.auth_key
                 == Some(recipient.x_only_public_key().0.serialize().to_vec())
-            && valid_body["server_pubkey"].as_str().is_some(),
+            && valid_body["resulting_server_pubkey"].as_str().is_some(),
         "valid receiver did not consume its exact generation"
     );
     let valid_replay =
@@ -1460,12 +1483,16 @@ pub(super) async fn assert_receiver_generation_fences(
     let batch_sender_response =
         post_mercury_json(mercury_client, "transfer/sender", &batch_sender).await?;
     let batch_x1 = sender_x1(&batch_sender_response)?;
-    let batch_receiver = serde_json::to_value(generation_bound_receiver_request(
-        batch_statechain_id,
-        &batch_recipient_secret,
-        batch_x1,
-        [0x56; 32],
-    )?)?;
+    let batch_receiver = serde_json::to_value(
+        generation_bound_receiver_request(
+            &lockbox_client,
+            batch_statechain_id,
+            &batch_recipient_secret,
+            batch_x1,
+            [0x56; 32],
+        )
+        .await?,
+    )?;
     let locked_transfer = load_transfer_generation(mercury_pool, batch_statechain_id).await?;
     let locked_state = load_statechain_generation(mercury_pool, batch_statechain_id).await?;
     let locked_lockbox = load_lockbox_generation(lockbox_pool, batch_statechain_id).await?;
@@ -1522,12 +1549,16 @@ pub(super) async fn assert_receiver_generation_fences(
     let ordered_sender_response =
         post_mercury_json(mercury_client, "transfer/sender", &ordered_sender).await?;
     let ordered_x1 = sender_x1(&ordered_sender_response)?;
-    let ordered_receiver = serde_json::to_value(generation_bound_receiver_request(
-        &ordered_id,
-        &ordered_recipient_secret,
-        ordered_x1,
-        [0x58; 32],
-    )?)?;
+    let ordered_receiver = serde_json::to_value(
+        generation_bound_receiver_request(
+            &lockbox_client,
+            &ordered_id,
+            &ordered_recipient_secret,
+            ordered_x1,
+            [0x58; 32],
+        )
+        .await?,
+    )?;
     let signatures_before: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM bip448_signature_data WHERE statechain_id=$1")
             .bind(&ordered_id)
@@ -1609,12 +1640,16 @@ pub(super) async fn assert_receiver_generation_fences(
     let sender_a = sender_request_value(b_first_id, b_first_signature, &b_recipient, None);
     let sender_a_response = post_mercury_json(mercury_client, "transfer/sender", &sender_a).await?;
     let a_x1 = sender_x1(&sender_a_response)?;
-    let stale_receiver = serde_json::to_value(generation_bound_receiver_request(
-        b_first_id,
-        &b_recipient_secret,
-        a_x1,
-        [0x5b; 32],
-    )?)?;
+    let stale_receiver = serde_json::to_value(
+        generation_bound_receiver_request(
+            &lockbox_client,
+            b_first_id,
+            &b_recipient_secret,
+            a_x1,
+            [0x5b; 32],
+        )
+        .await?,
+    )?;
     let b_batch = format!("receiver-b-first-{}", uuid::Uuid::new_v4());
     let sender_b =
         sender_request_value(b_first_id, b_first_signature, &b_recipient, Some(&b_batch));

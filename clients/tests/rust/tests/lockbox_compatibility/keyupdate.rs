@@ -277,19 +277,24 @@ pub(super) async fn mercury_transfer_receiver_routes_keyupdate_to_lockbox() -> R
     )
     .await?;
     let request_payload = generation_bound_receiver_request(
+        &lockbox_client,
         &statechain_id,
         &new_user_auth_secret,
         x1_secret_key,
         t2,
-    )?;
+    )
+    .await?;
     let expected_server_pubkey =
         lockbox::expected_keyupdate_server_pubkey(&original_server_pubkey, t2, x1_secret_key)?;
 
     let first_response = mercury::transfer_receiver(&mercury_client, &request_payload).await?;
     let repeated_response = mercury::transfer_receiver(&mercury_client, &request_payload).await?;
 
-    assert_eq!(first_response.server_pubkey, expected_server_pubkey);
-    assert_eq!(repeated_response.server_pubkey, expected_server_pubkey);
+    assert_eq!(
+        hex::encode(first_response.resulting_server_pubkey.as_bytes()),
+        expected_server_pubkey
+    );
+    assert_eq!(first_response, repeated_response);
 
     let statechain_info = mercury::statechain_info(&mercury_client, &statechain_id).await?;
     assert_eq!(

@@ -6,14 +6,12 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use mercurylib::{
     bip448_statechain::signing_api::{
-        Bip448PartialSignatureRequestPayload, Bip448PartialSignatureResponsePayload,
-        Bip448SignFirstRequestPayload, Bip448SignFirstResponsePayload,
+        Bip448KeyUpdateAppliedReceiptPayloadV2, Bip448PartialSignatureRequestPayload,
+        Bip448PartialSignatureResponsePayload, Bip448SignFirstRequestPayload,
+        Bip448SignFirstResponsePayload,
     },
     deposit::{self, DepositMsg1, DepositMsg1Response, TokenResponse},
-    transfer::receiver::{
-        StatechainInfoResponsePayload, TransferReceiverPostResponsePayload,
-        TransferReceiverRequestPayload,
-    },
+    transfer::receiver::{StatechainInfoResponsePayload, TransferReceiverRequestPayloadV2},
     wallet::{Coin, Wallet},
 };
 use reqwest::{Client, Response, StatusCode};
@@ -131,8 +129,8 @@ pub async fn statechain_info(
 
 pub async fn transfer_receiver(
     client: &Client,
-    payload: &TransferReceiverRequestPayload,
-) -> Result<TransferReceiverPostResponsePayload> {
+    payload: &TransferReceiverRequestPayloadV2,
+) -> Result<Bip448KeyUpdateAppliedReceiptPayloadV2> {
     let response = client
         .post(format!("{}/transfer/receiver", url()))
         .json(payload)

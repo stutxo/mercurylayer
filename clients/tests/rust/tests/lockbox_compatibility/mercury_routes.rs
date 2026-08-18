@@ -171,11 +171,13 @@ pub(super) async fn mercury_statechain_info_returns_ordered_bip448_rows_and_tran
     mercury::transfer_receiver(
         &mercury_client,
         &generation_bound_receiver_request(
+            &lockbox_client,
             &statechain_id,
             &new_user_auth_secret,
             x1_secret_key,
             t2,
-        )?,
+        )
+        .await?,
     )
     .await?;
 

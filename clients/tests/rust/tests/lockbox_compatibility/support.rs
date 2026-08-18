@@ -1,21 +1,42 @@
 use super::*;
 
-pub(super) fn generation_bound_receiver_request(
+pub(super) async fn generation_bound_receiver_request(
+    lockbox_client: &reqwest::Client,
     statechain_id: &str,
     recipient_secret: &SecretKey,
     x1: [u8; 32],
     t2: [u8; 32],
-) -> Result<TransferReceiverRequestPayload> {
+) -> Result<TransferReceiverRequestPayloadV2> {
     let secp = Secp256k1::new();
     let generation = SecretKey::from_secret_bytes(x1)?.public_key(&secp);
-    let digest = bip448_transfer_receiver_auth_digest(statechain_id, &t2, &generation)?;
+    let live = lockbox::get_bip448_state(lockbox_client, statechain_id).await?;
+    let unlock_digest = bip448_transfer_unlock_auth_digest(
+        Bip448TransferUnlockRole::Recipient,
+        statechain_id,
+        &generation,
+    )?;
     let keypair = KeyPair::from_secret_key(&secp, recipient_secret);
-    Ok(TransferReceiverRequestPayload {
-        statechain_id: statechain_id.to_owned(),
-        batch_data: Some(generation.to_string()),
-        t2: hex::encode(t2),
-        auth_sig: schnorr::sign(&digest, &keypair).to_string(),
-    })
+    let recipient_unlock_auth_sig = Bip448SchnorrSignature::try_from(
+        schnorr::sign(&unlock_digest, &keypair).to_string().as_str(),
+    )?;
+    let mut request = TransferReceiverRequestPayloadV2 {
+        protocol_version: Bip448ProtocolVersionV2,
+        operation_id: Bip448OperationId::from_bytes(t2),
+        statechain_id: Bip448StatechainId::try_from(statechain_id)?,
+        t2: Bip448SecretScalar::from_bytes(t2)?,
+        transfer_generation_pubkey: Bip448CompressedPublicKey::from_bytes(generation.serialize())?,
+        expected_sig_count: Bip448SignatureCount::new(live.sig_count.get()),
+        expected_key_generation: Bip448KeyGeneration::new(live.key_generation.get()),
+        expected_server_pubkey: live.server_pubkey,
+        recipient_unlock_auth_sig,
+        auth_sig: recipient_unlock_auth_sig,
+    };
+    request.auth_sig = Bip448SchnorrSignature::try_from(
+        schnorr::sign(&request.auth_digest()?, &keypair)
+            .to_string()
+            .as_str(),
+    )?;
+    Ok(request)
 }
 
 pub(super) async fn unlock_recipient_transfer_generation(

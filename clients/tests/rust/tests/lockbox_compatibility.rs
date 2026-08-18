@@ -8,13 +8,16 @@ use mercurylib::{
     bip448_statechain::{
         signing::{CsfsSigningRole, CsfsSigningSession},
         signing_api::{
+            Bip448CompressedPublicKey, Bip448KeyGeneration,
             Bip448LockboxPartialSignatureRequestPayload, Bip448LockboxSignFirstRequestPayload,
-            Bip448PartialSignatureRequestPayload, Bip448SignFirstRequestPayload,
+            Bip448OperationId, Bip448PartialSignatureRequestPayload, Bip448ProtocolVersionV2,
+            Bip448SchnorrSignature, Bip448SecretScalar, Bip448SignFirstRequestPayload,
+            Bip448SignatureCount, Bip448StatechainId,
         },
     },
     transfer::receiver::{
-        bip448_transfer_receiver_auth_digest, bip448_transfer_unlock_auth_digest,
-        Bip448TransferUnlockRole, TransferReceiverRequestPayload, TransferUnlockRequestPayload,
+        bip448_transfer_unlock_auth_digest, Bip448TransferUnlockRole,
+        TransferReceiverRequestPayloadV2, TransferUnlockRequestPayload,
     },
     transfer::sender::{
         bip448_transfer_update_msg_auth_digest, TransferSenderResponsePayload,
