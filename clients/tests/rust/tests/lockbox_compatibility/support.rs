@@ -172,8 +172,8 @@ pub(super) async fn assert_missing_statechain_error(
         .await
         .with_context(|| format!("failed to read {} body", context))?;
 
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert!(body.contains("Failed to load aggregated key data"));
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body, "BIP448 state not found");
 
     Ok(())
 }

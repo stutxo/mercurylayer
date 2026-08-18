@@ -202,6 +202,7 @@ pub(super) async fn delete_statechain_is_idempotent_and_deleted_statechain_canno
         statechain_id: statechain_id.clone(),
         signing_id: signing_id.clone(),
     };
+    let nonce_request = lockbox::bip448_sign_first_request_value(&client, &nonce_payload).await?;
     let server_pubnonce = lockbox::bip448_get_public_nonce(&client, &nonce_payload).await?;
     let partial_signature_fixture = lockbox::build_bip448_partial_signature_fixture(
         &statechain_id,
@@ -209,6 +210,10 @@ pub(super) async fn delete_statechain_is_idempotent_and_deleted_statechain_canno
         &created.server_pubkey,
         &server_pubnonce.server_pubnonce,
     )?;
+    let partial_signature_request =
+        lockbox::bip448_partial_request_value(&client, &partial_signature_fixture.payload).await?;
+    let keyupdate_request =
+        lockbox::build_keyupdate_request(&client, &statechain_id, [7u8; 32], [8u8; 32]).await?;
 
     let delete_response =
         lockbox::delete(&client, &format!("delete_statechain/{}", statechain_id)).await?;
@@ -232,18 +237,14 @@ pub(super) async fn delete_statechain_is_idempotent_and_deleted_statechain_canno
     assert_eq!(second_delete_status, StatusCode::OK);
     assert_eq!(second_delete_body, "Statechain deleted.");
 
-    let nonce_response = lockbox::post_json(
-        &client,
-        "bip448/get_public_nonce",
-        serde_json::to_value(&nonce_payload)?,
-    )
-    .await?;
+    let nonce_response =
+        lockbox::post_json(&client, "bip448/get_public_nonce", nonce_request).await?;
     assert_missing_statechain_error(nonce_response, "post-delete bip448/get_public_nonce").await?;
 
     let partial_signature_response = lockbox::post_json(
         &client,
         "bip448/get_partial_signature",
-        serde_json::to_value(&partial_signature_fixture.payload)?,
+        partial_signature_request,
     )
     .await?;
     let partial_signature_status = partial_signature_response.status();
@@ -252,19 +253,12 @@ pub(super) async fn delete_statechain_is_idempotent_and_deleted_statechain_canno
         .await
         .context("failed to read post-delete bip448/get_partial_signature body")?;
     assert_eq!(partial_signature_status, StatusCode::NOT_FOUND);
-    assert_eq!(
-        partial_signature_body,
-        "BIP448 nonce state not found for signing_id"
-    );
+    assert_eq!(partial_signature_body, "BIP448 state not found");
 
     let keyupdate_response = lockbox::post_json(
         &client,
         "keyupdate",
-        json!({
-            "statechain_id": statechain_id,
-            "t2": hex::encode([7u8; 32]),
-            "x1": hex::encode([8u8; 32]),
-        }),
+        serde_json::to_value(&keyupdate_request)?,
     )
     .await?;
     assert_missing_statechain_error(keyupdate_response, "post-delete keyupdate").await?;
