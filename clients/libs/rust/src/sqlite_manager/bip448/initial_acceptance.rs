@@ -482,6 +482,7 @@ pub(in crate::sqlite_manager) fn validate_selected_bip448_coin(
                 | CoinStatus::UNCONFIRMED
                 | CoinStatus::CONFIRMED
                 | CoinStatus::IN_TRANSFER
+                | CoinStatus::TRANSFERRED
                     if exact_signing_facts
                         && coin.tx_withdraw.is_none()
                         && coin.withdrawal_address.is_none() => {}

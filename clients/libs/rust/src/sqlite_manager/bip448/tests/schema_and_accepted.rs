@@ -1207,6 +1207,35 @@ async fn initial_acceptance_restart_recovery_is_exact_atomic_and_fail_closed() -
         );
     }
 
+    let transferred_pool = migrated_pool().await?;
+    let (mut transferred_wallet, transferred_record, transferred_entry, _) =
+        real_accepted_fixture(CoinStatus::UNCONFIRMED)?;
+    insert_wallet(&transferred_pool, &transferred_wallet).await?;
+    persist_bip448_initial_acceptance(&transferred_pool, &transferred_record, &transferred_entry)
+        .await?;
+    transferred_wallet.coins[0].status = CoinStatus::TRANSFERRED;
+    update_wallet(&transferred_pool, &transferred_wallet).await?;
+    let transferred_raw = get_bip448_raw_wallet_json(&transferred_pool, "wallet").await?;
+    for _ in 0..2 {
+        assert_eq!(
+            recover_bip448_initial_acceptance_wallet(
+                &transferred_pool,
+                "wallet",
+                &transferred_raw,
+            )
+            .await?,
+            Bip448InitialAcceptanceRecovery::Unchanged
+        );
+        assert_eq!(
+            get_bip448_raw_wallet_json(&transferred_pool, "wallet").await?,
+            transferred_raw
+        );
+        assert_eq!(
+            get_wallet(&transferred_pool, "wallet").await?.coins[0].status,
+            CoinStatus::TRANSFERRED
+        );
+    }
+
     let corrupt_pending_pool = migrated_pool().await?;
     let (_, _, _, corrupt_expected_raw) =
         install_pre_materialized_initial_acceptance(&corrupt_pending_pool, false, true).await?;
