@@ -621,6 +621,19 @@ pub(super) async fn bip448_ten_hop_transfer_advances_to_state_eleven() -> Result
         )
         .await?;
 
+        for _ in 0..2 {
+            mercuryrustlib::coin_status::update_coins(&client_config, &wallets[hop].name).await?;
+            let previous_sender =
+                mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallets[hop].name)
+                    .await?;
+            let previous_sender_coin = previous_sender
+                .coins
+                .iter()
+                .find(|coin| coin.statechain_id.as_deref() == Some(&deposit.statechain_id))
+                .context("previous sender does not contain the transferred BIP448 coin")?;
+            assert_eq!(previous_sender_coin.status, CoinStatus::TRANSFERRED);
+        }
+
         assert_eq!(state.latest_state_number, expected_state_number);
         assert_eq!(state.latest_state.state_number, expected_state_number);
         assert_eq!(
@@ -631,6 +644,18 @@ pub(super) async fn bip448_ten_hop_transfer_advances_to_state_eleven() -> Result
             common::lockbox::get_signature_count(&lockbox_client, &deposit.statechain_id).await?,
             expected_state_number
         );
+    }
+
+    for previous_wallet in &wallets[..TRANSFER_COUNT] {
+        let previous_wallet =
+            mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &previous_wallet.name)
+                .await?;
+        let previous_coin = previous_wallet
+            .coins
+            .iter()
+            .find(|coin| coin.statechain_id.as_deref() == Some(&deposit.statechain_id))
+            .context("previous wallet does not contain the transferred BIP448 coin")?;
+        assert_eq!(previous_coin.status, CoinStatus::TRANSFERRED);
     }
 
     let final_wallet = mercuryrustlib::sqlite_manager::get_wallet(
@@ -644,6 +669,18 @@ pub(super) async fn bip448_ten_hop_transfer_advances_to_state_eleven() -> Result
         .find(|coin| coin.statechain_id.as_deref() == Some(&deposit.statechain_id))
         .context("final receiver does not contain the accepted state-11 BIP448 coin")?;
     assert_eq!(final_coin.status, CoinStatus::CONFIRMED);
+    let final_state = mercuryrustlib::sqlite_manager::get_bip448_statechain(
+        &client_config.pool,
+        &wallets[TRANSFER_COUNT].name,
+        &deposit.statechain_id,
+    )
+    .await?;
+    assert_eq!(final_state.latest_state_number, 11);
+    assert_eq!(final_state.latest_state.state_number, 11);
+    assert_eq!(
+        common::lockbox::get_signature_count(&lockbox_client, &deposit.statechain_id).await?,
+        11
+    );
 
     Ok(())
 }
