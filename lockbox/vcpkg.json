@@ -5,15 +5,6 @@
       "version>=": "1.2.0"
     },
     {
-      "name": "google-cloud-cpp",
-      "default-features": false,
-      "features": [
-        "kms",
-        "secretmanager",
-        "storage"
-      ]
-    },
-    {
       "name": "openssl",
       "version>=": "3.4.0"
     },
@@ -21,5 +12,20 @@
       "name": "cpr",
       "version>=": "1.11.1"
     }
-  ]
+  ],
+  "features": {
+    "google-kms": {
+      "description": "Build Google Secret Manager/KMS key manager support.",
+      "dependencies": [
+        {
+          "name": "google-cloud-cpp",
+          "default-features": false,
+          "features": [
+            "kms",
+            "secretmanager"
+          ]
+        }
+      ]
+    }
+  }
 }

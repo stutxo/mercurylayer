@@ -366,83 +366,68 @@ pub async fn post_deposit(
         }
     }
 
-    #[derive(Debug, Serialize, Deserialize)]
+    #[derive(Debug, Serialize)]
     pub struct GetPublicKeyRequestPayload {
         statechain_id: String,
     }
 
+    #[derive(Debug, Deserialize)]
+    struct GetPublicKeyResponsePayload {
+        server_pubkey: String,
+    }
+
     let statechain_id = uuid::Uuid::new_v4().as_simple().to_string();
 
-    let config = crate::server_config::ServerConfig::load();
-
-    let enclave_index = get_random_enclave_index(&statechain_id, &config.enclaves).unwrap();
-
-    let lockbox_endpoint = config.enclaves.get(enclave_index).unwrap().url.clone();
-    let path = "get_public_key";
-
-    let client = statechain_entity.http_client.clone();
-    let request = client
-        .post(&format!("{}/{}", lockbox_endpoint, path))
-        .timeout(outbound_request_timeout());
+    let enclave_index =
+        match get_random_enclave_index(&statechain_id, &statechain_entity.config.enclaves) {
+            Ok(index) => index,
+            Err(error) => {
+                log::error!("no Lockbox accepts deposits: {error}");
+                return status::Custom(
+                    Status::ServiceUnavailable,
+                    Json(json!({
+                        "message": "No signing enclave is available for deposits."
+                    })),
+                );
+            }
+        };
 
     let payload = GetPublicKeyRequestPayload {
         statechain_id: statechain_id.clone(),
     };
 
-    let value = match request.json(&payload).send().await {
-        Ok(response) => {
-            let response_status = response.status();
-            let text = match response.text().await {
-                Ok(text) => text,
-                Err(err) => return deposit_internal_error(err.to_string()),
-            };
-
-            if !response_status.is_success() {
-                return deposit_internal_error(format!(
-                    "lockbox get_public_key returned {}: {}",
-                    response_status.as_u16(),
-                    text
-                ));
-            }
-
-            text
-        }
-        Err(err) => {
-            let response_body = json!({
-                "error": "Internal Server Error",
-                "message": err.to_string()
-            });
-
-            return status::Custom(Status::InternalServerError, Json(response_body));
-        }
-    };
-
-    #[derive(Serialize, Deserialize)]
-    pub struct PublicNonceRequestPayload<'r> {
-        server_pubkey: &'r str,
-    }
-
-    let response: PublicNonceRequestPayload = match serde_json::from_str(value.as_str()) {
+    let response: GetPublicKeyResponsePayload = match statechain_entity
+        .lockboxes
+        .post_json(enclave_index, "/get_public_key", &payload)
+        .await
+    {
         Ok(response) => response,
-        Err(err) => {
-            return deposit_internal_error(format!(
-                "failed to parse lockbox get_public_key response: {err}"
-            ))
+        Err(error) => {
+            log::error!("get_public_key failed for Lockbox enclave {enclave_index}: {error:?}");
+            return status::Custom(
+                Status::BadGateway,
+                Json(json!({ "message": "Signing enclave request failed." })),
+            );
         }
     };
 
-    let mut server_pubkey_hex = response.server_pubkey.to_string();
-
-    if server_pubkey_hex.starts_with("0x") {
-        server_pubkey_hex = server_pubkey_hex[2..].to_string();
-    }
-
-    let server_pubkey = match PublicKey::from_str(&server_pubkey_hex) {
+    let server_pubkey_hex = response
+        .server_pubkey
+        .strip_prefix("0x")
+        .unwrap_or(&response.server_pubkey);
+    let server_pubkey = match PublicKey::from_str(server_pubkey_hex) {
         Ok(server_pubkey) => server_pubkey,
-        Err(err) => {
-            return deposit_internal_error(format!(
-                "lockbox get_public_key returned an invalid server public key: {err}"
-            ))
+        Err(error) => {
+            log::error!(
+                "get_public_key returned an invalid public key for Lockbox enclave \
+                 {enclave_index}: {error}"
+            );
+            return status::Custom(
+                Status::BadGateway,
+                Json(json!({
+                    "message": "Signing enclave returned an invalid public key."
+                })),
+            );
         }
     };
 
@@ -476,6 +461,10 @@ mod tests {
         Enclave {
             url: url.to_string(),
             allow_deposit,
+            pcr0: None,
+            pcr1: None,
+            pcr2: None,
+            debug: false,
         }
     }
 

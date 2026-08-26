@@ -15,7 +15,7 @@ use super::report::MigrationRow;
 use super::report::{PgCatalog, PgColumn, PgConstraint, PgIndex, PostgresReport};
 
 const SERVER_SHA256: &str = "16bc984910b01a7986f47c3c8f219c9ad63f3fcb847c853faa932fa5b0eef726";
-const LOCKBOX_SHA256: &str = "0196f7068695bfc1e9d05e4ec152924cf44e461b0246dc5010aa0e37cb3ec6e4";
+const LOCKBOX_SHA256: &str = "bac14d1159a1f8eb8bb0503587061acb7b4e4b5dca303f370e640062a7f3db9f";
 const MIGRATION_SHA384: &str = "1b64ae4df869baac77e5193f76403ed309d096769ddc8cbf39570fb7400ff033d26a2f730863cf63330774f78eaa5fae";
 
 pub(super) fn verify(repo_root: &Path, report: &PostgresReport) -> Result<()> {

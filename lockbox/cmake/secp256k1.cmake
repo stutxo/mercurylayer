@@ -9,7 +9,7 @@ set(SECP256K1_INSTALL_DIR ${CMAKE_BINARY_DIR}/secp256k1-install)
 ExternalProject_Add(
     secp256k1_external
     GIT_REPOSITORY https://github.com/w0xlt/secp256k1.git
-    GIT_TAG mercury-blinded-musig-port
+    GIT_TAG 8f22c0347d5277bb4cf90ba8bce14ae8d95ac232
     PREFIX ${SECP256K1_BUILD_DIR}
     CONFIGURE_COMMAND 
         cd <SOURCE_DIR> &&

@@ -1,5 +1,6 @@
 mod database;
 mod endpoints;
+mod lockbox_client;
 mod server;
 mod server_config;
 
@@ -44,7 +45,9 @@ async fn main() {
 
     let config = server_config::ServerConfig::load();
 
-    let statechain_entity = StateChainEntity::new(config).await;
+    let statechain_entity = StateChainEntity::new(config)
+        .await
+        .expect("failed to initialize Mercury dependencies");
 
     sqlx::migrate!("./migrations")
         .run(&statechain_entity.pool)
@@ -70,6 +73,7 @@ async fn main() {
                 endpoints::transfer_receiver::transfer_unlock,
                 endpoints::transfer_receiver::transfer_receiver,
                 endpoints::withdraw::withdraw_complete,
+                endpoints::health::ready,
                 utils::info_config,
                 all_options,
             ],

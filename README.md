@@ -26,6 +26,18 @@ The annotated tag `bip448-legacy-inclusive-baseline` preserves the older,
 legacy-inclusive source tree for historical inspection. It is not a claim that
 the current implementation reproduces every behavior in that tree.
 
+## Enclavia Lockbox on Mutinynet
+
+The BIP448 Mercury coordinator can run on signet against a separately deployed
+Enclavia Lockbox. Mercury pins the enclave's PCR0/1/2 measurements, verifies
+attestation through the Enclavia SDK, and sends signing requests through the
+encrypted direct channel.
+
+Deployment assets — the Enclavia enclave runbook and scripts, the Mutinynet
+Compose stack, and the EC2 publisher — live in the private
+[`mercury-deploy`](https://github.com/stutxo/mercury-deploy) companion
+repository so this tree stays focused on protocol code.
+
 ## Cooperative duplicate-sweep boundaries
 
 - Once canonical funding is pinned, the wallet keeps one logical `Coin` and

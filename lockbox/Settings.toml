@@ -1,5 +1,6 @@
 [general]
 database_connection_string = "postgresql://postgres:postgres@localhost/enclave"
+database_path = "./lockbox.sqlite3"
 server_port = 18080
 key_manager = "filesystem" # "google_kms", "hashicorp_container, "hashicorp_api", "filesystem"
 [filesystem]

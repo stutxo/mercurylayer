@@ -23,6 +23,7 @@ const MERCURY_MOUNTS: &[&str] = &[
     "endpoints::transfer_receiver::transfer_unlock",
     "endpoints::transfer_receiver::transfer_receiver",
     "endpoints::withdraw::withdraw_complete",
+    "endpoints::health::ready",
     "utils::info_config",
     "all_options",
 ];
@@ -52,6 +53,7 @@ const EXPECTED_MERCURY_TOKEN: &[(&str, &str, &str, &str)] = &[
     ),
     ("mercury", "get_token", "GET", "/deposit/get_token"),
     ("mercury", "post_deposit", "POST", "/deposit/init/pod"),
+    ("mercury", "ready", "GET", "/health/ready"),
     ("mercury", "info_config", "GET", "/info/config"),
     (
         "mercury",
@@ -103,10 +105,12 @@ const EXPECTED_MERCURY_TOKEN: &[(&str, &str, &str, &str)] = &[
 ];
 const EXPECTED_LOCKBOX: &[(&str, &str)] = &[
     ("GET", "/"),
+    ("GET", "/health/ready"),
     ("POST", "/get_public_key"),
     ("POST", "/bip448/get_public_nonce"),
     ("POST", "/bip448/get_partial_signature"),
     ("GET", "/signature_count/<string>"),
+    ("POST", "/verify_statechain"),
     ("GET", "/bip448/state/<string>"),
     ("POST", "/keyupdate"),
     ("DELETE", "/delete_statechain/<string>"),
@@ -128,6 +132,10 @@ pub(super) fn verify(repo_root: &Path) -> Result<(Vec<Route>, Vec<Route>)> {
         (
             "endpoints::bip448_sign",
             read(repo_root, "server/src/endpoints/bip448_sign.rs")?,
+        ),
+        (
+            "endpoints::health",
+            read(repo_root, "server/src/endpoints/health.rs")?,
         ),
         (
             "endpoints::lightning_latch",
@@ -458,7 +466,7 @@ mod tests {
     fn current_protected_sources_have_exact_lexical_inventory() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let (mercury_token, lockbox) = verify(&root).unwrap();
-        assert_eq!((mercury_token.len(), lockbox.len()), (18, 8));
+        assert_eq!((mercury_token.len(), lockbox.len()), (19, 10));
     }
 
     #[test]

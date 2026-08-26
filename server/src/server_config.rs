@@ -7,6 +7,14 @@ use std::env;
 pub struct Enclave {
     pub url: String,
     pub allow_deposit: bool,
+    #[serde(default)]
+    pub pcr0: Option<String>,
+    #[serde(default)]
+    pub pcr1: Option<String>,
+    #[serde(default)]
+    pub pcr2: Option<String>,
+    #[serde(default)]
+    pub debug: bool,
 }
 
 /// Config struct storing all StataChain Entity config
@@ -41,10 +49,18 @@ impl Default for ServerConfig {
                 Enclave {
                     url: "http://0.0.0.0:18080".to_string(),
                     allow_deposit: true,
+                    pcr0: None,
+                    pcr1: None,
+                    pcr2: None,
+                    debug: false,
                 },
                 Enclave {
                     url: "http://0.0.0.0:18080".to_string(),
                     allow_deposit: false,
+                    pcr0: None,
+                    pcr1: None,
+                    pcr2: None,
+                    debug: false,
                 },
             ],
             db_user: String::from("postgres"),

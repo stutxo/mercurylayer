@@ -3,3 +3,5 @@
 /server/.env
 /token-server-v2/.env
 /data_bitcoin_regtest
+mutinynet-wallet.db*
+**/__pycache__/

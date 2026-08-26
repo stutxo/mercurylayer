@@ -90,13 +90,25 @@ struct Bip448KeyupdateRequest {
     Bip448PublicKey expected_server_pubkey{};
 };
 
-bool initialize_database(std::string& error_message);
+bool initialize_database(
+    std::string& error_message,
+    const unsigned char* seed,
+    std::size_t seed_size,
+    bool allow_initialization);
+bool database_is_ready(std::string& error_message);
 
 bool save_generated_public_key(
     const utils::chacha20_poly1305_encrypted_data& encrypted_keypair,
     const unsigned char* server_public_key,
     std::size_t server_public_key_size,
     const std::string& statechain_id,
+    std::string& error_message);
+
+bool get_statechain_public_key(
+    const std::string& statechain_id,
+    bool& found,
+    unsigned char* server_public_key,
+    std::size_t server_public_key_size,
     std::string& error_message);
 
 Bip448Result observe_bip448_state(const std::string& statechain_id);

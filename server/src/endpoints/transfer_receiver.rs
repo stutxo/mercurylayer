@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 use crate::server::StateChainEntity;
 
-use super::{is_batch_expired, outbound_request_timeout};
+use super::is_batch_expired;
 
 fn internal_server_error_response(message: String) -> status::Custom<Json<Value>> {
     status::Custom(
@@ -45,11 +45,8 @@ fn lockbox_state_divergence_response() -> status::Custom<Json<Value>> {
     )
 }
 
-fn lockbox_error_response(
-    status_code: reqwest::StatusCode,
-    body: String,
-) -> status::Custom<Json<Value>> {
-    if status_code == reqwest::StatusCode::CONFLICT {
+fn lockbox_error_response(status_code: u16, body: String) -> status::Custom<Json<Value>> {
+    if status_code == 409 {
         return match serde_json::from_str::<Bip448HandoffErrorResponsePayloadV2>(&body) {
             Ok(error) => status::Custom(Status::Conflict, Json(json!(error))),
             Err(_) => internal_server_error_response(
@@ -57,8 +54,8 @@ fn lockbox_error_response(
             ),
         };
     }
-    let message = format!("lockbox returned {}", status_code.as_u16());
-    let status = match status_code.as_u16() {
+    let message = format!("lockbox returned {status_code}");
+    let status = match status_code {
         400 => Status::BadRequest,
         404 => Status::NotFound,
         _ => Status::InternalServerError,
@@ -100,35 +97,29 @@ async fn observe_locked_bip448_state(
     let enclave_index = usize::try_from(locked.enclave_index).map_err(|_| {
         internal_server_error_response("Enclave index for statechain ID not found.".to_string())
     })?;
-    let enclave = statechain_entity
+    if statechain_entity
         .config
         .enclaves
         .get(enclave_index)
-        .ok_or_else(|| {
-            internal_server_error_response("Enclave index for statechain ID not found.".to_string())
-        })?;
-    let request = statechain_entity
-        .http_client
-        .get(format!(
-            "{}/bip448/state/{}",
-            enclave.url,
-            statechain_id.as_str()
-        ))
-        .timeout(outbound_request_timeout());
-    let response = request
-        .send()
+        .is_none()
+    {
+        return Err(internal_server_error_response(
+            "Enclave index for statechain ID not found.".to_string(),
+        ));
+    }
+    let response = statechain_entity
+        .lockboxes
+        .get_raw(
+            enclave_index,
+            &format!("/bip448/state/{}", statechain_id.as_str()),
+        )
         .await
-        .map_err(|err| internal_server_error_response(err.to_string()))?;
-    let response_status = response.status();
-    let text = response
-        .text()
-        .await
-        .map_err(|err| internal_server_error_response(err.to_string()))?;
-    if !response_status.is_success() {
+        .map_err(|error| internal_server_error_response(error.to_string()))?;
+    if !(200..300).contains(&response.status) {
         return Err(lockbox_state_divergence_response());
     }
-    let observed: Bip448LockboxStateResponsePayloadV2 =
-        serde_json::from_str(&text).map_err(|err| {
+    let observed: Bip448LockboxStateResponsePayloadV2 = serde_json::from_str(&response.body)
+        .map_err(|err| {
             internal_server_error_response(format!(
                 "failed to parse lockbox BIP448 state response: {err}"
             ))
@@ -482,7 +473,7 @@ mod tests {
     #[test]
     fn lockbox_conflict_stays_a_public_conflict() {
         let response = lockbox_error_response(
-            reqwest::StatusCode::CONFLICT,
+            409,
             r#"{"code":"bip448_signature_count_mismatch","message":"BIP448 request conflicts with current state","expected_sig_count":2,"actual_sig_count":3}"#.to_string(),
         );
 
@@ -883,43 +874,34 @@ pub async fn transfer_receiver(
             );
         }
     };
-    let Some(enclave) = statechain_entity.config.enclaves.get(enclave_index) else {
+    if statechain_entity
+        .config
+        .enclaves
+        .get(enclave_index)
+        .is_none()
+    {
         let _ = transaction.rollback().await;
         return internal_server_error_response(
             "Enclave index for statechain ID not found.".to_string(),
         );
-    };
-    let lockbox_endpoint = enclave.url.clone();
-    let path = "keyupdate";
+    }
 
-    let client = statechain_entity.inner().http_client.clone();
-    let request = client
-        .post(&format!("{}/{}", lockbox_endpoint, path))
-        .timeout(outbound_request_timeout());
-
-    let value = match request.json(&key_update_request).send().await {
-        Ok(response) => {
-            let response_status = response.status();
-            let text = match response.text().await {
-                Ok(text) => text,
-                Err(err) => {
-                    let _ = transaction.rollback().await;
-                    return internal_server_error_response(err.to_string());
-                }
-            };
-
-            if !response_status.is_success() {
-                let _ = transaction.rollback().await;
-                return lockbox_error_response(response_status, text);
-            }
-
-            text
-        }
-        Err(err) => {
+    let response = match statechain_entity
+        .lockboxes
+        .post_json_raw(enclave_index, "/keyupdate", &key_update_request)
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
             let _ = transaction.rollback().await;
-            return internal_server_error_response(err.to_string());
+            return internal_server_error_response(error.to_string());
         }
     };
+    if !(200..300).contains(&response.status) {
+        let _ = transaction.rollback().await;
+        return lockbox_error_response(response.status, response.body);
+    }
+    let value = response.body;
 
     let receipt: Bip448KeyUpdateAppliedReceiptPayloadV2 =
         match parse_lockbox_keyupdate_response(value.as_str()) {

@@ -1,0 +1,12 @@
+statechain_entity = "http://127.0.0.1:8000"
+chain_backend = "core"
+core_rpc_url = "http://127.0.0.1:38332"
+core_rpc_auth = "userpass"
+core_rpc_user = "CHANGE_ME"
+core_rpc_password = "CHANGE_ME"
+#core_rpc_cookie_file = ""
+network = "signet"
+fee_rate_tolerance = 5
+database_file = "mutinynet-wallet.db"
+confirmation_target = 2
+max_fee_rate = 10
