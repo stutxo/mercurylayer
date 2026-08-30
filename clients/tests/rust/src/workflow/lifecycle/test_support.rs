@@ -409,8 +409,9 @@ pub(super) struct MockHost {
     pub(super) http_misses: BTreeMap<u16, usize>,
     pub(super) malformed_port: Option<u16>,
     pub(super) mercury_response: HttpResponse,
+    pub(super) lockbox_response: HttpResponse,
     pub(super) sleeps: usize,
-    pub(super) requests: Vec<(u16, String)>,
+    pub(super) requests: Vec<(u16, String, Option<String>)>,
 }
 
 impl MockHost {
@@ -424,7 +425,11 @@ impl MockHost {
             malformed_port: None,
             mercury_response: HttpResponse {
                 status: 200,
-                body: json!({"batchtimeout": 20, "version": "0.2.1"}),
+                body: json!({"batchtimeout": 20, "version": "0.1.0"}),
+            },
+            lockbox_response: HttpResponse {
+                status: 200,
+                body: json!({"status": "ready"}),
             },
             sleeps: 0,
             requests: Vec::new(),
@@ -449,10 +454,11 @@ impl HostProbe for MockHost {
         _service: &str,
         port: u16,
         path: &str,
-        _authorization: Option<&str>,
+        authorization: Option<&str>,
         _body: Option<&[u8]>,
     ) -> Result<HttpAttempt> {
-        self.requests.push((port, path.to_owned()));
+        self.requests
+            .push((port, path.to_owned(), authorization.map(str::to_owned)));
         if let Some(misses) = self.http_misses.get_mut(&port) {
             if *misses > 0 {
                 *misses -= 1;
@@ -468,15 +474,26 @@ impl HostProbe for MockHost {
         if port == 24000 {
             return Ok(HttpAttempt::Response(self.mercury_response.clone()));
         }
-        let body = match port {
-            24007 => json!({"initialized":true,"sealed":false}),
-            24005 => json!({"error":null,"result":{"chain":"regtest"}}),
-            24001 => Value::String("not found".into()),
-            24002 => Value::String("Hello, Crow!".into()),
-            _ => json!({"batchtimeout":20,"version":"0.2.1"}),
+        let response = match port {
+            24007 => HttpResponse {
+                status: 200,
+                body: json!({"initialized":true,"sealed":false}),
+            },
+            24005 => HttpResponse {
+                status: 200,
+                body: json!({"error":null,"result":{"chain":"regtest"}}),
+            },
+            24001 => HttpResponse {
+                status: 404,
+                body: Value::String("not found".into()),
+            },
+            24002 => self.lockbox_response.clone(),
+            _ => HttpResponse {
+                status: 200,
+                body: json!({"batchtimeout":20,"version":"0.1.0"}),
+            },
         };
-        let status = if port == 24001 { 404 } else { 200 };
-        Ok(HttpAttempt::Response(HttpResponse { status, body }))
+        Ok(HttpAttempt::Response(response))
     }
 
     fn now_millis(&self) -> u64 {

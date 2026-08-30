@@ -515,7 +515,7 @@ mod tests {
                 url: url.into(),
                 auth: CoreRpcAuth::None,
             })?,
-            core_rpc_url: Some(url.into()),
+            chain_endpoint: Some(url.into()),
             core_rpc_auth: Some("none".into()),
             core_rpc_user: None,
             core_rpc_password: None,

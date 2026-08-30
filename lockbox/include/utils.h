@@ -19,8 +19,11 @@ namespace utils {
     };
 
     static const config_var DATABASE_URL = {"LOCKBOX_DATABASE_URL", "general", "database_connection_string"};
+    static const config_var DATABASE_PATH = {"LOCKBOX_DATABASE_PATH", "general", "database_path"};
     static const config_var KEY_MANAGER = {"KEY_MANAGER", "general", "key_manager"};
     static const config_var SERVER_PORT = {"LOCKBOX_PORT", "general", "server_port"};
+    static const config_var SERVER_BIND_ADDRESS = {
+        "LOCKBOX_BIND_ADDRESS", "general", "bind_address"};
 
     static const config_var SEED_FILEPATH = {"SEED_FILEPATH", "filesystem", "seed_filepath"};
 

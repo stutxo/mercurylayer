@@ -12,9 +12,10 @@ test-hooks = []
 anyhow = "1.0"
 bitcoin = { git = "https://github.com/w0xlt/rust-bitcoin", branch = "inquisition-bip448-support-0.30.2", version = "0.30.2", features = ["serde", "base64", "rand-std", "std", "bitcoinconsensus"], default-features = false }
 chrono = "0.4.31"
-config = "0.13.1"
+config = { version = "0.13.4", default-features = false, features = ["toml"] }
 hex = "0.4.3"
-reqwest = { version = "0.11.16", features = ["blocking", "json", "socks"] }
+parking_lot = "0.12"
+reqwest = { version = "0.12.28", features = ["blocking", "json", "socks"] }
 secp256k1 = { git = "https://github.com/w0xlt/rust-secp256k1.git", branch = "mercury-blinded-musig-port", features = [ "rand-std", "bitcoin_hashes", "std" ] }
 serde = { version = "1.0.163", features = ["derive"] }
 serde_json = "1.0.96"

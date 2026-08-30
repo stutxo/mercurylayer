@@ -27,7 +27,9 @@ pub(super) use mercurylib::{
         },
         withdraw::{build_bip448_withdrawal_signing_data, create_bip448_keypath_nonces},
     },
-    transfer::bip448::{Bip448StateHistoryEntry, Bip448TransferMsg},
+    transfer::bip448::{
+        Bip448StateHistoryEntry, Bip448TransferMsg, BIP448_TRANSFER_MESSAGE_VERSION,
+    },
     wallet::{Coin, CoinStatus, Settings, Wallet},
 };
 pub(super) use secp256k1::{
@@ -221,7 +223,7 @@ pub(super) fn sample_bip448_transfer_msg() -> Bip448TransferMsg {
         .cpfp_child_templates
         .push(sample_cpfp_child_template());
     Bip448TransferMsg {
-        msg_version: 2,
+        msg_version: BIP448_TRANSFER_MESSAGE_VERSION,
         statechain_id: "statechain".to_string(),
         transfer_signature: "ab".repeat(64),
         sender_user_public_key: "02".to_string() + &"12".repeat(32),

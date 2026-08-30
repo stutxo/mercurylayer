@@ -311,7 +311,7 @@ pub(super) async fn keyupdate_validates_t2_and_x1_lengths() -> Result<()> {
     unknown["outpoint"] = json!("forbidden");
     assert_bad_request(&client, "keyupdate", unknown).await?;
     let mut wrong_version = exact.clone();
-    wrong_version["protocol_version"] = json!(1);
+    wrong_version["protocol_version"] = json!(2);
     assert_bad_request(&client, "keyupdate", wrong_version).await?;
     let mut count_overflow = exact.clone();
     count_overflow["expected_sig_count"] = json!(COUNTER_OVERFLOW);
@@ -372,7 +372,7 @@ pub(super) async fn keyupdate_requires_existing_statechain() -> Result<()> {
         &client,
         "keyupdate",
         json!({
-            "protocol_version": 2,
+            "protocol_version": 1,
             "operation_id": hex::encode([8_u8; 32]),
             "statechain_id": statechain_id,
             "t2": hex::encode([5_u8; 32]),

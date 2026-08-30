@@ -19,7 +19,9 @@ use mercurylib::{
             Bip448LatestState, Bip448RecoveryTemplateRole, Bip448StatechainRecord,
         },
     },
-    transfer::bip448::{Bip448StateHistoryEntry, Bip448TransferMsg},
+    transfer::bip448::{
+        Bip448StateHistoryEntry, Bip448TransferMsg, BIP448_TRANSFER_MESSAGE_VERSION,
+    },
     wallet::{Activity, Coin, CoinStatus, Wallet},
 };
 use secp256k1::{
@@ -705,7 +707,7 @@ pub(in crate::sqlite_manager) fn transfer_message_matches_record_and_history(
         .x_only_public_key()
         .0
         .to_string();
-    Ok(message.msg_version == 2
+    Ok(message.msg_version == BIP448_TRANSFER_MESSAGE_VERSION
         && message.statechain_id == record.statechain_id
         && message.aggregate_pubkey == record.aggregate_pubkey
         && message.funding_outpoint == record.funding_outpoint

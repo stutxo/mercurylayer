@@ -10,9 +10,9 @@ pub async fn create_wallet(name: &str, client_config: &ClientConfig) -> Result<W
 
     let chain_backend = client_config.chain_backend.to_string();
     let chain_endpoint = client_config
-        .core_rpc_url
+        .chain_endpoint
         .clone()
-        .expect("Bitcoin Core backend selected without core_rpc_url");
+        .expect("chain backend selected without an endpoint");
 
     let notifications = false;
     let tutorials = false;

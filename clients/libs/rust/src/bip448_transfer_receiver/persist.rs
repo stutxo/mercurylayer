@@ -206,7 +206,6 @@ mod tests {
         bip448_transfer_receiver::{test_support::*, Bip448VerifiedTransfer},
         Bip448ReceiveOutcome, TransferReceiveRequestResult,
     };
-    use mercurylib::transfer::receiver::StatechainInfoResponsePayload;
 
     #[tokio::test]
     #[rustfmt::skip]
@@ -216,8 +215,9 @@ mod tests {
         let coin_before = serde_json::to_string(&coin).unwrap();
         let mut activities = Vec::new();
         let pool = pool().await;
-        let info: StatechainInfoResponsePayload = serde_json::from_str(INFO).unwrap();
-        let verified = Bip448VerifiedTransfer::new(fixture.msg.clone(), &info, fixture.facts.clone()).unwrap();
+        let info = super::super::verify::statechain_info_for_verification(&observed_info()).unwrap();
+        let verified =
+            Bip448VerifiedTransfer::new(fixture.msg.clone(), &info, fixture.facts.clone()).unwrap();
 
         let outcome = persist_accepted_transfer(
             &pool, "wallet", &mut coin, &mut activities, verified,

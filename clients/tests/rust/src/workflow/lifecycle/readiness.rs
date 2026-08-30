@@ -194,6 +194,7 @@ fn probe_service(
         ReadinessKind::Postgres(database) => postgres(repo_root, container, database, runner),
         ReadinessKind::Vault => vault(metadata, host),
         ReadinessKind::HttpConfig => http_config(metadata, &container.service, host),
+        ReadinessKind::Lockbox => lockbox(metadata, host),
         ReadinessKind::HttpAlive => http_alive(metadata, &container.service, host),
         ReadinessKind::Inquisition => inquisition(metadata, host),
     }
@@ -294,7 +295,7 @@ fn http_config(
         HttpAttempt::Response(response) => {
             ensure!(
                 response.status == 200
-                    && response.body == json!({"batchtimeout": 20, "version": "0.2.1"}),
+                    && response.body == json!({"batchtimeout": 20, "version": "0.1.0"}),
                 "service {service} returned malformed /info/config response"
             );
             Ok(Attempt::Ready("http_config_ready".into()))
@@ -319,10 +320,29 @@ pub(super) fn exact_mercury_config(
         HttpAttempt::Response(response) => {
             ensure!(
                 response.status == 200
-                    && response.body == json!({"batchtimeout": 20, "version": "0.2.1"}),
+                    && response.body == json!({"batchtimeout": 20, "version": "0.1.0"}),
                 "Mercury returned malformed /info/config response"
             );
             Ok(response.body)
+        }
+    }
+}
+
+fn lockbox(metadata: &StackMetadata, host: &mut impl HostProbe) -> Result<Attempt> {
+    match host.http_json(
+        "lockbox",
+        metadata.ports().lockbox,
+        "/health/ready",
+        Some(super::LOCKBOX_TEST_AUTHORIZATION),
+        None,
+    )? {
+        HttpAttempt::ConnectionMiss(detail) => Ok(Attempt::Retry(detail)),
+        HttpAttempt::Response(response) => {
+            ensure!(
+                response.status == 200 && response.body == json!({"status": "ready"}),
+                "Lockbox returned malformed /health/ready response"
+            );
+            Ok(Attempt::Ready("lockbox_database_ready".into()))
         }
     }
 }

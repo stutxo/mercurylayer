@@ -1,0 +1,175 @@
+{
+  "deployment": {
+    "chainUrl": "https://mutinynet.com/api",
+    "enclaviaDebug": false,
+    "enclaviaProxyUrl": "https://11b69774-3ba1-4911-8897-ab2380488cdb.enclaves.beta.enclavia.io",
+    "expectedPcr0": "4adae8229127fb7e2403ab0651fd6bc5f13cf72c95938a3b4d5fbf2f86f5529f12b97c124a7eb1832ae223d48aafc737",
+    "expectedPcr1": "20167032afc54a578d7fa4509dd79e880d504a9d933d820d55a45a8a06880843176a9be7c6ddd375efc5557c2ad8370d",
+    "expectedPcr2": "624a5ff2de7daa1a1105837719d0dfc870ccca4ad519a2bc4a96fe53c368b9cd20b1e934f24f36236dd59ae5b3ab997e",
+    "explorerUrl": "https://mutinynet.com",
+    "mercuryUrl": "https://bip448.cash"
+  },
+  "enclave_runtime_proof": null,
+  "enclave_verification": null,
+  "funding_bindings": [
+    {
+      "bindingIndex": 0,
+      "fundingHeight": 100,
+      "observationStatus": "Confirmed",
+      "ownerStateNumber": 1,
+      "ownerUserPubkey": "cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115",
+      "spendHeight": null,
+      "spendTxid": null,
+      "statechainId": "statechain",
+      "txid": "405774462485f14a33cc2f489f47fda013196bda6b91b0458a51887806495ebb",
+      "valueSats": 50000,
+      "vout": 0
+    }
+  ],
+  "pending_deposits": [],
+  "pending_incoming_transfer": null,
+  "pending_outgoing_transfer": null,
+  "recovery_attempts": [],
+  "snapshot_version": 1,
+  "state_histories": {
+    "statechain": [
+      {
+        "blinding_factor": "0404040404040404040404040404040404040404040404040404040404040404",
+        "client_public_nonce": "03058ef7d4a32091a410c8f37025ece3956cbce3340a39dd5b20b098dbfc57e4ee03393b7bc11703ebe15fffaa15414c894c59b3330a946f79e4fcb494fc52f7e1cc",
+        "owner_public_key": "cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115",
+        "server_public_nonce": "02f07b0974519d6bd8f0a8af68f401f2d2e722117ec94f821d833dcd96b7f9689902ec9ff63dc81bd9585c3413e0430cf029aeca3af14c0c6759be5c9d2a77912b4d",
+        "settlement_template_hash": "03342b6cf504fb11cf42c67c947404d91d54be248deb749fb6b95649f203f50c",
+        "state_locktime": 500000000,
+        "state_number": 1,
+        "update_signature": "bab4c1a93b73012f736acbae3346a5157b4b38efc9edd330d553612d00d4d9ce4b8a9b900bd857ed5494b296dbee013f2cc74c705c30877b9b6dd39f0b299723",
+        "update_template_hash": "e61b0c88c5395062d3872b82742db0c383941d0fda7cf63615d88e547110c75b"
+      }
+    ]
+  },
+  "statechains": [
+    {
+      "aggregate_pubkey": "02ec5fed0853b469e5f9f455a29cf6f3c68d3d13b5039d5953548f0fdd6d3f8c93",
+      "amount_sats": 50000,
+      "challenge_delay": 144,
+      "funding_outpoint": {
+        "txid": "405774462485f14a33cc2f489f47fda013196bda6b91b0458a51887806495ebb",
+        "value_sats": 50000,
+        "vout": 0
+      },
+      "latest_state": {
+        "anchors": [
+          {
+            "output_index": 1,
+            "script_pubkey": "51024e73",
+            "tx_role": "funding_update",
+            "value_sats": 0
+          },
+          {
+            "output_index": 1,
+            "script_pubkey": "51024e73",
+            "tx_role": "settlement",
+            "value_sats": 0
+          }
+        ],
+        "challenge_delay": 144,
+        "cpfp_child_templates": [],
+        "csfs_key_metadata": {
+          "aggregate_pubkey_parity_odd": false,
+          "negate_seckey": false
+        },
+        "fee_bump_policy": "zero_fee_ephemeral_anchor",
+        "funding_update_control_block": "c1ec5fed0853b469e5f9f455a29cf6f3c68d3d13b5039d5953548f0fdd6d3f8c93",
+        "funding_update_script": "cecbcc",
+        "settlement_template_hash": "03342b6cf504fb11cf42c67c947404d91d54be248deb749fb6b95649f203f50c",
+        "settlement_tx": "030000000001016bb95bbd6c4f586342958be3daf8a506d2c4d58071f68b71c355d0c28f0b75c20000000000900000000250c3000000000000225120a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c00000000000000000451024e7302232003342b6cf504fb11cf42c67c947404d91d54be248deb749fb6b95649f203f50cce8741c1ec5fed0853b469e5f9f455a29cf6f3c68d3d13b5039d5953548f0fdd6d3f8c939ea091f068ef1d610d1438a671a88874cbc0aba171ff97fc1a0998271d0bf7840065cd1d",
+        "signing_metadata": {
+          "blinding_factor": "0404040404040404040404040404040404040404040404040404040404040404",
+          "client_public_nonce": "03058ef7d4a32091a410c8f37025ece3956cbce3340a39dd5b20b098dbfc57e4ee03393b7bc11703ebe15fffaa15414c894c59b3330a946f79e4fcb494fc52f7e1cc",
+          "role": "funding_update",
+          "server_public_nonce": "02f07b0974519d6bd8f0a8af68f401f2d2e722117ec94f821d833dcd96b7f9689902ec9ff63dc81bd9585c3413e0430cf029aeca3af14c0c6759be5c9d2a77912b4d",
+          "server_signature_count": 1,
+          "signing_id": "1111111111111111111111111111111111111111111111111111111111111111",
+          "update_signature": "bab4c1a93b73012f736acbae3346a5157b4b38efc9edd330d553612d00d4d9ce4b8a9b900bd857ed5494b296dbee013f2cc74c705c30877b9b6dd39f0b299723",
+          "update_template_hash": "e61b0c88c5395062d3872b82742db0c383941d0fda7cf63615d88e547110c75b"
+        },
+        "state_locktime": 500000000,
+        "state_number": 1,
+        "state_output_script_pubkey": "5120f0c6e6d093821f81f6d94db7487ab814e603dfb6d68db14f6f3553d0243f8c44",
+        "state_settlement_control_block": "c1ec5fed0853b469e5f9f455a29cf6f3c68d3d13b5039d5953548f0fdd6d3f8c939ea091f068ef1d610d1438a671a88874cbc0aba171ff97fc1a0998271d0bf784",
+        "state_settlement_script": "2003342b6cf504fb11cf42c67c947404d91d54be248deb749fb6b95649f203f50cce87",
+        "state_update_control_block": "c1ec5fed0853b469e5f9f455a29cf6f3c68d3d13b5039d5953548f0fdd6d3f8c937c22954c38e41561331099796d8da9b40ab4d7958e2bc03bff83c0f1b13d938a",
+        "state_update_script": "040165cd1db175cecbcc",
+        "update_template_hash": "e61b0c88c5395062d3872b82742db0c383941d0fda7cf63615d88e547110c75b",
+        "update_tx": "03000000000101bb5e49067888518a45b0916bda6b1913a0fd479f482fcc334af18524467457400000000000000000000250c3000000000000225120f0c6e6d093821f81f6d94db7487ab814e603dfb6d68db14f6f3553d0243f8c4400000000000000000451024e730340bab4c1a93b73012f736acbae3346a5157b4b38efc9edd330d553612d00d4d9ce4b8a9b900bd857ed5494b296dbee013f2cc74c705c30877b9b6dd39f0b29972303cecbcc21c1ec5fed0853b469e5f9f455a29cf6f3c68d3d13b5039d5953548f0fdd6d3f8c930065cd1d",
+        "value_schedule": {
+          "funding_value_sats": 50000,
+          "settlement_input_value_sats": 50000,
+          "settlement_recovery_output_value_sats": 50000,
+          "update_input_value_sats": 50000,
+          "update_state_output_value_sats": 50000
+        }
+      },
+      "latest_state_number": 1,
+      "network": "signet",
+      "statechain_id": "statechain",
+      "wallet_name": "browser"
+    }
+  ],
+  "wallet": {
+    "activities": [],
+    "blockheight": 100,
+    "chain_backend": "esplora",
+    "chain_endpoint": "https://mutinynet.com/api",
+    "coins": [
+      {
+        "address": "tml1qqpuezjtcexcj77achau9ans775t5zecvau3qm83yg7xl3whe4huz9gr7ph8tyfzmnpkysvs6ekmjpfw85v6mfxe9hdd499tksdt0zrvk4lqz8q3eg",
+        "aggregated_address": "tb1pjefh56nzsywzxwxxnn3nym9j59pp60xfs8gn70xsmv9lhscvf0xqjda56f",
+        "aggregated_pubkey": "02ec5fed0853b469e5f9f455a29cf6f3c68d3d13b5039d5953548f0fdd6d3f8c93",
+        "amount": 50000,
+        "auth_privkey": "cT4U5Rp5ZQZuSK6U5ZXCdYnEv2eeXwTwyHPnPdJaKA35H4t1zoFd",
+        "auth_pubkey": "03f06e759122dcc3624190d66db9052e3d19ada4d92ddada94abb41ab7886cb57e",
+        "backup_address": "tb1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqp3mvzv",
+        "blinding_factor": null,
+        "derivation_path": "m/86h/0h/0h/0/0",
+        "fingerprint": "73c5da0a",
+        "index": 0,
+        "locktime": null,
+        "public_nonce": null,
+        "secret_nonce": null,
+        "server_pubkey": "02989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f",
+        "server_public_nonce": null,
+        "signed_statechain_id": "signed",
+        "statechain_id": "statechain",
+        "statechain_protocol": "bip448",
+        "status": "CONFIRMED",
+        "tx_withdraw": null,
+        "user_privkey": "cPnuYdFEiKoyLWhKbFjVMbYZsXo7G7e18Xgadb798GCsLtnQbixp",
+        "user_pubkey": "03cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115",
+        "utxo_txid": "405774462485f14a33cc2f489f47fda013196bda6b91b0458a51887806495ebb",
+        "utxo_vout": 0,
+        "withdrawal_address": null
+      }
+    ],
+    "mnemonic": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+    "name": "browser",
+    "network": "signet",
+    "settings": {
+      "block_explorerURL": "https://mutinynet.com",
+      "chainBackend": "esplora",
+      "chainType": "esplora",
+      "chainUrl": "https://mutinynet.com/api",
+      "network": "signet",
+      "notifications": false,
+      "statechainEntityApi": "https://bip448.cash",
+      "torProxyControlPassword": null,
+      "torProxyControlPort": null,
+      "torProxyHost": null,
+      "torProxyPort": null,
+      "torStatechainEntityApi": null,
+      "tutorials": false
+    },
+    "state_entity_endpoint": "https://bip448.cash",
+    "version": "test"
+  },
+  "withdrawal_attempts": []
+}

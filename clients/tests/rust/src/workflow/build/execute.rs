@@ -352,7 +352,7 @@ fn build_command(repo_root: &Path, artifact: Artifact, staging_tag: &str) -> Arg
             .arg(repo_root),
         Artifact::Token => command
             .arg("--file")
-            .arg(repo_root.join("token-server-v2/Dockerfile"))
+            .arg(repo_root.join("token-server/Dockerfile"))
             .arg("--tag")
             .arg(staging_tag)
             .arg(repo_root),

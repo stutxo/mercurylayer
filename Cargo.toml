@@ -1,5 +1,5 @@
 [workspace]
-members = ["clients/apps/rust", "clients/libs/rust", "server", "lib", "clients/tests/rust", "token-server-v2"]
+members = ["clients/apps/rust", "clients/libs/rust", "server", "lib", "clients/tests/rust", "token-server", "web-wallet"]
 exclude = ["docs"]
 resolver = "2"
 

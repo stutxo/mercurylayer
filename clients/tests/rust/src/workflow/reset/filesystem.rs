@@ -659,6 +659,7 @@ mod tests {
         regular(&stack, PRIVATE_FILE_MODE);
 
         let wallet = fixture.wallet("wallet.db", 0o666);
+        fs::set_permissions(&wallet, fs::Permissions::from_mode(0o666)).unwrap();
         assert!(TreePlan::capture(fixture.paths.clone()).is_err());
         fs::set_permissions(&wallet, fs::Permissions::from_mode(0o644)).unwrap();
 

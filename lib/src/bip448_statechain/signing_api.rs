@@ -20,9 +20,9 @@ use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
 };
 
-pub const BIP448_PROTOCOL_VERSION_V2: u8 = 2;
+pub const BIP448_PROTOCOL_VERSION_V1: u8 = 1;
 
-const BIP448_LOCKBOX_KEYUPDATE_V2_DOMAIN: &[u8] = b"BIP448/lockbox-keyupdate/v2\0";
+const BIP448_LOCKBOX_KEYUPDATE_V1_DOMAIN: &[u8] = b"BIP448/lockbox-keyupdate/v1\0";
 const BIP448_MUSIG_SESSION_SERIALIZED_SIZE: usize = 133;
 const BIP448_MUSIG_SESSION_MAGIC: [u8; 4] = [0x9d, 0xed, 0xe9, 0x17];
 const BIP448_MUSIG_FINAL_NONCE_RANGE: std::ops::Range<usize> = 5..37;
@@ -74,7 +74,7 @@ impl fmt::Display for Bip448WireError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidProtocolVersion { value } => {
-                write!(f, "BIP448 protocol version must be 2, got {value}")
+                write!(f, "BIP448 protocol version must be 1, got {value}")
             }
             Self::InvalidStatechainId => f.write_str(
                 "BIP448 statechain_id must contain between 1 and 50 UTF-8 bytes",
@@ -222,24 +222,24 @@ canonical_hex_newtype!(Bip448RequestHash, 32, "request_hash");
 canonical_hex_newtype!(Bip448SigningId, 32, "signing_id");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Bip448ProtocolVersionV2;
+pub struct Bip448ProtocolVersionV1;
 
-impl Serialize for Bip448ProtocolVersionV2 {
+impl Serialize for Bip448ProtocolVersionV1 {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        serializer.serialize_u8(BIP448_PROTOCOL_VERSION_V2)
+        serializer.serialize_u8(BIP448_PROTOCOL_VERSION_V1)
     }
 }
 
-impl<'de> Deserialize<'de> for Bip448ProtocolVersionV2 {
+impl<'de> Deserialize<'de> for Bip448ProtocolVersionV1 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
         let value = u8::deserialize(deserializer)?;
-        if value == BIP448_PROTOCOL_VERSION_V2 {
+        if value == BIP448_PROTOCOL_VERSION_V1 {
             Ok(Self)
         } else {
             Err(de::Error::custom(Bip448WireError::InvalidProtocolVersion {
@@ -697,8 +697,8 @@ impl<'de> Deserialize<'de> for Bip448NegateSeckeyFlag {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct Bip448LockboxStateResponsePayloadV2 {
-    pub protocol_version: Bip448ProtocolVersionV2,
+pub struct Bip448LockboxStateResponsePayloadV1 {
+    pub protocol_version: Bip448ProtocolVersionV1,
     pub statechain_id: Bip448StatechainId,
     pub sig_count: Bip448SignatureCount,
     pub key_generation: Bip448KeyGeneration,
@@ -707,7 +707,7 @@ pub struct Bip448LockboxStateResponsePayloadV2 {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct Bip448LockboxSignFirstRequestPayloadV2 {
+pub struct Bip448LockboxSignFirstRequestPayloadV1 {
     pub statechain_id: Bip448StatechainId,
     pub signing_id: Bip448SigningId,
     pub expected_key_generation: Bip448KeyGeneration,
@@ -716,7 +716,7 @@ pub struct Bip448LockboxSignFirstRequestPayloadV2 {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct Bip448LockboxPartialSignatureRequestPayloadV2 {
+pub struct Bip448LockboxPartialSignatureRequestPayloadV1 {
     pub statechain_id: Bip448StatechainId,
     pub signing_id: Bip448SigningId,
     pub negate_seckey: Bip448NegateSeckeyFlag,
@@ -728,8 +728,8 @@ pub struct Bip448LockboxPartialSignatureRequestPayloadV2 {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct Bip448LockboxKeyUpdateRequestPayloadV2 {
-    pub protocol_version: Bip448ProtocolVersionV2,
+pub struct Bip448LockboxKeyUpdateRequestPayloadV1 {
+    pub protocol_version: Bip448ProtocolVersionV1,
     pub operation_id: Bip448OperationId,
     pub statechain_id: Bip448StatechainId,
     pub t2: Bip448SecretScalar,
@@ -739,13 +739,13 @@ pub struct Bip448LockboxKeyUpdateRequestPayloadV2 {
     pub expected_server_pubkey: Bip448CompressedPublicKey,
 }
 
-impl Bip448LockboxKeyUpdateRequestPayloadV2 {
+impl Bip448LockboxKeyUpdateRequestPayloadV1 {
     pub fn canonical_request_preimage(&self) -> Result<Vec<u8>, Bip448WireError> {
         let statechain_id = self.statechain_id.as_str().as_bytes();
         let statechain_id_len = u32::try_from(statechain_id.len())
             .map_err(|_| Bip448WireError::StatechainIdLengthOverflow)?;
         let mut preimage = Vec::with_capacity(
-            BIP448_LOCKBOX_KEYUPDATE_V2_DOMAIN.len()
+            BIP448_LOCKBOX_KEYUPDATE_V1_DOMAIN.len()
                 + 1
                 + 32
                 + 4
@@ -756,8 +756,8 @@ impl Bip448LockboxKeyUpdateRequestPayloadV2 {
                 + 8
                 + 33,
         );
-        preimage.extend_from_slice(BIP448_LOCKBOX_KEYUPDATE_V2_DOMAIN);
-        preimage.push(BIP448_PROTOCOL_VERSION_V2);
+        preimage.extend_from_slice(BIP448_LOCKBOX_KEYUPDATE_V1_DOMAIN);
+        preimage.push(BIP448_PROTOCOL_VERSION_V1);
         preimage.extend_from_slice(self.operation_id.as_bytes());
         preimage.extend_from_slice(&statechain_id_len.to_be_bytes());
         preimage.extend_from_slice(statechain_id);
@@ -804,8 +804,8 @@ impl<'de> Deserialize<'de> for Bip448AppliedStatus {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct Bip448KeyUpdateAppliedReceiptPayloadV2 {
-    pub protocol_version: Bip448ProtocolVersionV2,
+pub struct Bip448KeyUpdateAppliedReceiptPayloadV1 {
+    pub protocol_version: Bip448ProtocolVersionV1,
     pub operation_id: Bip448OperationId,
     pub statechain_id: Bip448StatechainId,
     pub status: Bip448AppliedStatus,
@@ -819,7 +819,7 @@ pub struct Bip448KeyUpdateAppliedReceiptPayloadV2 {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct Bip448StatechainInfoV2 {
+pub struct Bip448StatechainInfoV1 {
     pub statechain_id: Bip448StatechainId,
     pub server_pubnonce: Bip448PublicNonce,
     pub challenge: Bip448CanonicalScalar,
@@ -828,12 +828,12 @@ pub struct Bip448StatechainInfoV2 {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct Bip448StatechainInfoResponsePayloadV2 {
-    pub protocol_version: Bip448ProtocolVersionV2,
+pub struct Bip448StatechainInfoResponsePayloadV1 {
+    pub protocol_version: Bip448ProtocolVersionV1,
     pub enclave_public_key: Bip448CompressedPublicKey,
     pub num_sigs: Bip448SignatureCount,
     pub lockbox_key_generation: Bip448KeyGeneration,
-    pub statechain_info: Vec<Bip448StatechainInfoV2>,
+    pub statechain_info: Vec<Bip448StatechainInfoV1>,
     pub x1_pub: Bip448CompressedPublicKey,
 }
 
@@ -883,7 +883,7 @@ impl Bip448HandoffErrorCode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Bip448HandoffErrorResponsePayloadV2 {
+pub struct Bip448HandoffErrorResponsePayloadV1 {
     pub code: Bip448HandoffErrorCode,
     pub message: String,
     pub operation_id: Option<Bip448OperationId>,
@@ -893,7 +893,7 @@ pub struct Bip448HandoffErrorResponsePayloadV2 {
     pub actual_key_generation: Option<Bip448KeyGeneration>,
 }
 
-impl Bip448HandoffErrorResponsePayloadV2 {
+impl Bip448HandoffErrorResponsePayloadV1 {
     fn validate(&self) -> Result<(), &'static str> {
         if self.code == Bip448HandoffErrorCode::KeyupdatePending && self.operation_id.is_none() {
             return Err("bip448_keyupdate_pending requires operation_id");
@@ -902,7 +902,7 @@ impl Bip448HandoffErrorResponsePayloadV2 {
     }
 }
 
-impl Serialize for Bip448HandoffErrorResponsePayloadV2 {
+impl Serialize for Bip448HandoffErrorResponsePayloadV1 {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -919,7 +919,7 @@ impl Serialize for Bip448HandoffErrorResponsePayloadV2 {
         .filter(|present| *present)
         .count();
         let mut state = serializer
-            .serialize_struct("Bip448HandoffErrorResponsePayloadV2", 2 + optional_count)?;
+            .serialize_struct("Bip448HandoffErrorResponsePayloadV1", 2 + optional_count)?;
         state.serialize_field("code", &self.code)?;
         state.serialize_field("message", &self.message)?;
         if let Some(value) = self.operation_id {
@@ -941,7 +941,7 @@ impl Serialize for Bip448HandoffErrorResponsePayloadV2 {
     }
 }
 
-impl<'de> Deserialize<'de> for Bip448HandoffErrorResponsePayloadV2 {
+impl<'de> Deserialize<'de> for Bip448HandoffErrorResponsePayloadV1 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -949,10 +949,10 @@ impl<'de> Deserialize<'de> for Bip448HandoffErrorResponsePayloadV2 {
         struct ErrorEnvelopeVisitor;
 
         impl<'de> Visitor<'de> for ErrorEnvelopeVisitor {
-            type Value = Bip448HandoffErrorResponsePayloadV2;
+            type Value = Bip448HandoffErrorResponsePayloadV1;
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a canonical BIP448 handoff v2 error envelope")
+                f.write_str("a canonical BIP448 handoff v1 error envelope")
             }
 
             fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
@@ -1028,7 +1028,7 @@ impl<'de> Deserialize<'de> for Bip448HandoffErrorResponsePayloadV2 {
                     }
                 }
 
-                let value = Bip448HandoffErrorResponsePayloadV2 {
+                let value = Bip448HandoffErrorResponsePayloadV1 {
                     code: code.ok_or_else(|| de::Error::missing_field("code"))?,
                     message: message.ok_or_else(|| de::Error::missing_field("message"))?,
                     operation_id,
@@ -1352,7 +1352,7 @@ mod tests {
     }
 
     fn statechain_id() -> Bip448StatechainId {
-        Bip448StatechainId::try_from("statechain-vector-v2").unwrap()
+        Bip448StatechainId::try_from("statechain-vector-v1").unwrap()
     }
 
     fn server_key() -> Bip448CompressedPublicKey {
@@ -1367,9 +1367,9 @@ mod tests {
         Bip448SecretScalar::from_bytes([byte; 32]).unwrap()
     }
 
-    fn keyupdate_request() -> Bip448LockboxKeyUpdateRequestPayloadV2 {
-        Bip448LockboxKeyUpdateRequestPayloadV2 {
-            protocol_version: Bip448ProtocolVersionV2,
+    fn keyupdate_request() -> Bip448LockboxKeyUpdateRequestPayloadV1 {
+        Bip448LockboxKeyUpdateRequestPayloadV1 {
+            protocol_version: Bip448ProtocolVersionV1,
             operation_id: operation_id(),
             statechain_id: statechain_id(),
             t2: secret(0x11),
@@ -1407,7 +1407,7 @@ mod tests {
         ] {
             assert!(
                 !json.contains(forbidden),
-                "v2 lockbox payload exposed forbidden field sentinel {forbidden}: {json}"
+                "v1 lockbox payload exposed forbidden field sentinel {forbidden}: {json}"
             );
         }
         for forbidden_value in [
@@ -1417,7 +1417,7 @@ mod tests {
         ] {
             assert!(
                 !json.contains(forbidden_value),
-                "v2 lockbox payload exposed forbidden value sentinel {forbidden_value}: {json}"
+                "v1 lockbox payload exposed forbidden value sentinel {forbidden_value}: {json}"
             );
         }
     }
@@ -1442,7 +1442,7 @@ mod tests {
         );
         assert!(lockbox_json.contains(r"\u0000"));
         assert!(
-            serde_json::from_str::<Bip448LockboxSignFirstRequestPayloadV2>(&lockbox_json).is_err()
+            serde_json::from_str::<Bip448LockboxSignFirstRequestPayloadV1>(&lockbox_json).is_err()
         );
 
         let one_byte = "a";
@@ -1484,13 +1484,13 @@ mod tests {
     }
 
     #[test]
-    fn v2_wire_primitives_reject_noncanonical_input_without_normalizing() {
+    fn v1_wire_primitives_reject_noncanonical_input_without_normalizing() {
         assert_eq!(
-            serde_json::to_string(&Bip448ProtocolVersionV2).unwrap(),
-            "2"
+            serde_json::to_string(&Bip448ProtocolVersionV1).unwrap(),
+            "1"
         );
-        assert!(serde_json::from_str::<Bip448ProtocolVersionV2>("1").is_err());
-        assert!(serde_json::from_str::<Bip448ProtocolVersionV2>("\"2\"").is_err());
+        assert!(serde_json::from_str::<Bip448ProtocolVersionV1>("2").is_err());
+        assert!(serde_json::from_str::<Bip448ProtocolVersionV1>("\"1\"").is_err());
 
         for invalid in [
             OPERATION_ID.to_uppercase(),
@@ -1629,9 +1629,9 @@ mod tests {
 
     #[test]
     fn keyupdate_request_hash_matches_independent_literal_vector() {
-        const PREIMAGE_HEX: &str = "4249503434382f6c6f636b626f782d6b65797570646174652f76320002000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f000000147374617465636861696e2d766563746f722d7632111111111111111111111111111111111111111111111111111111111111111122222222222222222222222222222222222222222222222222222222222222220102030405060708111213141516171802c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+        const PREIMAGE_HEX: &str = "4249503434382f6c6f636b626f782d6b65797570646174652f76310001000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f000000147374617465636861696e2d766563746f722d7631111111111111111111111111111111111111111111111111111111111111111122222222222222222222222222222222222222222222222222222222222222220102030405060708111213141516171802c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
         const REQUEST_HASH: &str =
-            "d606e6ff89eb0ef045af4a807b1bdfd030f1f60eea127cd4c7762f9f9facd343";
+            "29e94ebf7fdd1b0ab5fd4d4326505fcba53192ff41fb996566d5ee8484904506";
 
         let request = keyupdate_request();
         assert_eq!(
@@ -1678,8 +1678,8 @@ mod tests {
     }
 
     #[test]
-    fn v2_lockbox_payloads_have_exact_private_key_sets() {
-        let first = Bip448LockboxSignFirstRequestPayloadV2 {
+    fn v1_lockbox_payloads_have_exact_private_key_sets() {
+        let first = Bip448LockboxSignFirstRequestPayloadV1 {
             statechain_id: statechain_id(),
             signing_id: Bip448SigningId::try_from(SIGNING_ID).unwrap(),
             expected_key_generation: Bip448KeyGeneration::new(7),
@@ -1699,7 +1699,7 @@ mod tests {
         );
         assert_lockbox_privacy(&serde_json::to_string(&first).unwrap());
 
-        let second = Bip448LockboxPartialSignatureRequestPayloadV2 {
+        let second = Bip448LockboxPartialSignatureRequestPayloadV1 {
             statechain_id: statechain_id(),
             signing_id: Bip448SigningId::try_from(SIGNING_ID).unwrap(),
             negate_seckey: Bip448NegateSeckeyFlag::try_from(1).unwrap(),
@@ -1746,32 +1746,32 @@ mod tests {
     }
 
     #[test]
-    fn v2_models_reject_unknown_missing_and_noncanonical_fields() {
+    fn v1_models_reject_unknown_missing_and_noncanonical_fields() {
         let request = keyupdate_request();
         let mut value = serde_json::to_value(&request).unwrap();
         value
             .as_object_mut()
             .unwrap()
             .insert("state_number".to_owned(), serde_json::json!(9));
-        assert!(serde_json::from_value::<Bip448LockboxKeyUpdateRequestPayloadV2>(value).is_err());
+        assert!(serde_json::from_value::<Bip448LockboxKeyUpdateRequestPayloadV1>(value).is_err());
 
         let mut value = serde_json::to_value(&request).unwrap();
         value.as_object_mut().unwrap().remove("expected_sig_count");
-        assert!(serde_json::from_value::<Bip448LockboxKeyUpdateRequestPayloadV2>(value).is_err());
+        assert!(serde_json::from_value::<Bip448LockboxKeyUpdateRequestPayloadV1>(value).is_err());
 
         let mut value = serde_json::to_value(&request).unwrap();
         value["protocol_version"] = serde_json::json!(3);
-        assert!(serde_json::from_value::<Bip448LockboxKeyUpdateRequestPayloadV2>(value).is_err());
+        assert!(serde_json::from_value::<Bip448LockboxKeyUpdateRequestPayloadV1>(value).is_err());
 
         let mut value = serde_json::to_value(&request).unwrap();
         value["operation_id"] = serde_json::json!(OPERATION_ID.to_uppercase());
-        assert!(serde_json::from_value::<Bip448LockboxKeyUpdateRequestPayloadV2>(value).is_err());
+        assert!(serde_json::from_value::<Bip448LockboxKeyUpdateRequestPayloadV1>(value).is_err());
     }
 
     #[test]
-    fn v2_receipt_and_mercury_observation_use_exact_typed_fields() {
-        let receipt = Bip448KeyUpdateAppliedReceiptPayloadV2 {
-            protocol_version: Bip448ProtocolVersionV2,
+    fn v1_receipt_and_mercury_observation_use_exact_typed_fields() {
+        let receipt = Bip448KeyUpdateAppliedReceiptPayloadV1 {
+            protocol_version: Bip448ProtocolVersionV1,
             operation_id: operation_id(),
             statechain_id: statechain_id(),
             status: Bip448AppliedStatus,
@@ -1803,16 +1803,16 @@ mod tests {
         let receipt_json = serde_json::to_string(&receipt).unwrap();
         assert!(receipt_json.contains("\"status\":\"applied\""));
         assert_eq!(
-            serde_json::from_str::<Bip448KeyUpdateAppliedReceiptPayloadV2>(&receipt_json).unwrap(),
+            serde_json::from_str::<Bip448KeyUpdateAppliedReceiptPayloadV1>(&receipt_json).unwrap(),
             receipt
         );
 
-        let observation = Bip448StatechainInfoResponsePayloadV2 {
-            protocol_version: Bip448ProtocolVersionV2,
+        let observation = Bip448StatechainInfoResponsePayloadV1 {
+            protocol_version: Bip448ProtocolVersionV1,
             enclave_public_key: server_key(),
             num_sigs: Bip448SignatureCount::new(1),
             lockbox_key_generation: Bip448KeyGeneration::new(7),
-            statechain_info: vec![Bip448StatechainInfoV2 {
+            statechain_info: vec![Bip448StatechainInfoV1 {
                 statechain_id: statechain_id(),
                 server_pubnonce: Bip448PublicNonce::try_from(PUBLIC_NONCE).unwrap(),
                 challenge: Bip448CanonicalScalar::from_bytes([0_u8; 32]).unwrap(),
@@ -1822,13 +1822,13 @@ mod tests {
         };
         let observation_json = serde_json::to_string(&observation).unwrap();
         assert_eq!(
-            serde_json::from_str::<Bip448StatechainInfoResponsePayloadV2>(&observation_json)
+            serde_json::from_str::<Bip448StatechainInfoResponsePayloadV1>(&observation_json)
                 .unwrap(),
             observation
         );
         let mut unknown = serde_json::to_value(&observation).unwrap();
         unknown["batch_data"] = serde_json::json!(null);
-        assert!(serde_json::from_value::<Bip448StatechainInfoResponsePayloadV2>(unknown).is_err());
+        assert!(serde_json::from_value::<Bip448StatechainInfoResponsePayloadV1>(unknown).is_err());
     }
 
     #[test]
@@ -1904,7 +1904,7 @@ mod tests {
             assert_eq!(code.later_http_status(), status);
         }
 
-        let conflict = Bip448HandoffErrorResponsePayloadV2 {
+        let conflict = Bip448HandoffErrorResponsePayloadV1 {
             code: Bip448HandoffErrorCode::SignatureCountMismatch,
             message: "signature count changed".to_owned(),
             operation_id: None,
@@ -1923,11 +1923,11 @@ mod tests {
         );
         assert!(!json.contains("null"));
         assert_eq!(
-            serde_json::from_str::<Bip448HandoffErrorResponsePayloadV2>(&json).unwrap(),
+            serde_json::from_str::<Bip448HandoffErrorResponsePayloadV1>(&json).unwrap(),
             conflict
         );
 
-        let pending = Bip448HandoffErrorResponsePayloadV2 {
+        let pending = Bip448HandoffErrorResponsePayloadV1 {
             code: Bip448HandoffErrorCode::KeyupdatePending,
             message: "operation pending".to_owned(),
             operation_id: Some(operation_id()),
@@ -1940,12 +1940,12 @@ mod tests {
             .unwrap()
             .contains(OPERATION_ID));
 
-        let pending_without_id = Bip448HandoffErrorResponsePayloadV2 {
+        let pending_without_id = Bip448HandoffErrorResponsePayloadV1 {
             operation_id: None,
             ..pending.clone()
         };
         assert!(serde_json::to_string(&pending_without_id).is_err());
-        assert!(serde_json::from_str::<Bip448HandoffErrorResponsePayloadV2>(
+        assert!(serde_json::from_str::<Bip448HandoffErrorResponsePayloadV1>(
             r#"{"code":"bip448_keyupdate_pending","message":"pending"}"#
         )
         .is_err());
@@ -1960,11 +1960,11 @@ mod tests {
                 "{{\"code\":\"bip448_signature_count_mismatch\",\"message\":\"conflict\",\"{optional}\":null}}"
             );
             assert!(
-                serde_json::from_str::<Bip448HandoffErrorResponsePayloadV2>(&value).is_err(),
+                serde_json::from_str::<Bip448HandoffErrorResponsePayloadV1>(&value).is_err(),
                 "explicit null accepted for {optional}"
             );
         }
-        assert!(serde_json::from_str::<Bip448HandoffErrorResponsePayloadV2>(
+        assert!(serde_json::from_str::<Bip448HandoffErrorResponsePayloadV1>(
             r#"{"code":"bip448_keyupdate_rejected","message":"no","extra":1}"#
         )
         .is_err());

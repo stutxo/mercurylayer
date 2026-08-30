@@ -34,17 +34,33 @@ pub(super) fn component_records(
     let mut records = Vec::new();
     match component {
         InputComponent::Mercury => {
+            let ignore = root_dockerignore(repo_root)?;
+            add_regular(repo_root, Path::new(".dockerignore"), &mut records)?;
             add_regular(repo_root, Path::new("Cargo.lock"), &mut records)?;
             add_regular(repo_root, Path::new("Rocket.toml"), &mut records)?;
-            walk_tree(repo_root, Path::new("server"), None, true, &mut records)?;
-            walk_tree(repo_root, Path::new("lib"), None, true, &mut records)?;
+            walk_tree(
+                repo_root,
+                Path::new("server"),
+                Some((&ignore, Path::new(""))),
+                true,
+                &mut records,
+            )?;
+            walk_tree(
+                repo_root,
+                Path::new("lib"),
+                Some((&ignore, Path::new(""))),
+                true,
+                &mut records,
+            )?;
         }
         InputComponent::Token => {
+            let ignore = root_dockerignore(repo_root)?;
+            add_regular(repo_root, Path::new(".dockerignore"), &mut records)?;
             add_regular(repo_root, Path::new("Cargo.lock"), &mut records)?;
             walk_tree(
                 repo_root,
-                Path::new("token-server-v2"),
-                None,
+                Path::new("token-server"),
+                Some((&ignore, Path::new(""))),
                 true,
                 &mut records,
             )?;
@@ -93,6 +109,11 @@ pub(super) fn component_paths(repo_root: &Path, component: InputComponent) -> Re
         .filter(|record| record.kind == InputKind::File)
         .map(|record| record.relative)
         .collect())
+}
+
+pub(super) fn root_dockerignore(repo_root: &Path) -> Result<DockerIgnore> {
+    DockerIgnore::parse(&read_regular(repo_root, Path::new(".dockerignore"))?)
+        .context("parse repository-root .dockerignore")
 }
 
 fn walk_tree(

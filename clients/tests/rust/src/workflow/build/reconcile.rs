@@ -210,7 +210,7 @@ mod tests {
         ));
         images.set_token(ResolvedImage::new(
             fingerprints.token().into(),
-            "mercurylayer/token-server-v2:bip448-test-5555555555555555".into(),
+            "mercurylayer/token-server:bip448-test-5555555555555555".into(),
             id('b'),
         ));
         images.set_lockbox(ResolvedLockboxImages::new(

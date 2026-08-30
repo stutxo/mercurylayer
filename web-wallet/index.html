@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1">
+  <meta name="description" content="Bitcoin layer 2 prototype for private, instant off-chain payments using Mercury Layer statechains and BIP448.">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self' wss://11b69774-3ba1-4911-8897-ab2380488cdb.enclaves.beta.enclavia.io https://bip448.cash https://mutinynet.com http://127.0.0.1:* http://localhost:*; img-src 'self' data:; style-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'">
+  <meta name="referrer" content="no-referrer">
+  <title>BIP448 Mercury Layer wallet</title>
+  <link rel="icon" href="./favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./web.css">
+</head>
+<body>
+<main class="app-window">
+  <header class="title-bar">
+    <h1>BIP448 Mercury Layer wallet</h1>
+    <span class="window-controls" aria-hidden="true"><i></i><i></i><i></i></span>
+  </header>
+
+  <nav class="app-tabs" aria-label="Wallet menu">
+    <a class="active" href="#wallet-section">Wallet</a>
+    <button id="open-about" class="tab-button" type="button" aria-haspopup="dialog" data-always-enabled>About</button>
+  </nav>
+
+  <section class="toolbar" aria-label="Wallet summary">
+    <div class="product-label"><strong>bip448.cash</strong><span>Mutinynet signet</span></div>
+    <div class="summary-fields">
+      <span>Balance <output id="wallet-balance">0 sats</output></span>
+      <span>Statecoins <output id="wallet-coin-count">0</output></span>
+    </div>
+  </section>
+
+  <p id="status" class="status" role="status" aria-live="polite">Starting…</p>
+
+  <section id="wallet-section" class="workspace-section">
+    <fieldset id="deposit-section" class="classic-panel">
+      <legend>Onboard</legend>
+      <form id="deposit-form" class="compact-form">
+        <label>Amount, sats
+          <input id="deposit-amount" type="number" min="1000" step="1" value="1000" inputmode="numeric" required>
+        </label>
+        <button type="submit" class="primary">Create deposit address</button>
+        <a class="button-link" href="https://faucet.mutinynet.com" target="_blank" rel="noreferrer">Open faucet</a>
+      </form>
+      <div id="pending-deposits" class="address-list hidden" aria-live="polite"></div>
+    </fieldset>
+
+    <fieldset id="transfer-section" class="classic-panel">
+      <legend>Transfer</legend>
+      <div id="pending-transfer" class="result-box warning hidden">
+        <strong id="pending-transfer-title">Pending transfer</strong>
+        <p id="pending-transfer-detail"></p>
+        <div class="copy-line"><code id="pending-transfer-recipient">—</code><button type="button" data-copy-target="pending-transfer-recipient">Copy</button></div>
+        <button id="cancel-transfer" class="danger" type="button">Cancel transfer</button>
+      </div>
+      <div class="transfer-grid">
+        <section class="transfer-pane">
+          <h2>Send</h2>
+          <form id="send-statecoin-form">
+            <label>Statecoin
+              <select id="send-statecoin-id" required></select>
+            </label>
+            <label>Recipient address
+              <input id="send-statecoin-address" autocomplete="off" spellcheck="false" placeholder="tml1…" required>
+            </label>
+            <label id="duplicate-send-warning" class="check-row hidden"><input id="force-send-duplicates" type="checkbox"> Send without extra deposits</label>
+            <button id="send-statecoin" class="primary" type="submit">Send</button>
+          </form>
+          <p id="send-statecoin-status" class="field-note">No spendable statecoin.</p>
+        </section>
+        <section class="transfer-pane" id="receive-section">
+          <h2>Receive</h2>
+          <div class="button-row">
+            <button id="create-receive-address" class="primary" type="button">New receive address</button>
+          </div>
+          <p id="receive-auto-note" class="receive-note">Incoming transfers appear automatically while this wallet is open.</p>
+          <div id="receive-addresses" class="address-list"></div>
+        </section>
+      </div>
+    </fieldset>
+  </section>
+
+  <section id="statecoins-section" class="workspace-section">
+    <div class="section-heading">
+      <h2>Offboard</h2>
+      <span>Cooperative withdrawal or unilateral exit</span>
+    </div>
+    <label id="offboard-coin-picker" class="offboard-picker hidden">Statecoin
+      <select id="offboard-statechain-id"></select>
+    </label>
+    <p id="coins-empty" class="empty-state">No statecoins.</p>
+    <div id="coins"></div>
+  </section>
+
+  <details id="enclave-details" class="utility-panel">
+    <summary>Enclave <span id="enclave-summary-status" class="summary-note">Not checked</span></summary>
+    <div class="enclave-panel">
+      <div class="enclave-actions">
+        <button id="verify-enclave" type="button">Verify enclave</button>
+        <strong id="enclave-verification-status">Not checked.</strong>
+      </div>
+      <div id="enclave-proof" class="hidden">
+        <dl class="enclave-facts">
+          <dt>Mode</dt><dd><code id="enclave-mode">—</code></dd>
+          <dt>Endpoint</dt><dd><code id="enclave-endpoint">—</code></dd>
+          <dt>Checked</dt><dd><code id="enclave-checked-at">—</code></dd>
+          <dt>Auth</dt><dd><code id="enclave-authentication">—</code></dd>
+          <dt>PCR0</dt><dd><code id="enclave-pcr0">—</code></dd>
+          <dt>PCR1</dt><dd><code id="enclave-pcr1">—</code></dd>
+          <dt>PCR2</dt><dd><code id="enclave-pcr2">—</code></dd>
+        </dl>
+        <p id="enclave-trust" class="field-note"></p>
+      </div>
+    </div>
+  </details>
+
+  <details id="backup-details" class="utility-panel">
+    <summary>Wallet backup</summary>
+    <div class="backup-grid">
+      <section>
+        <h2>Seed phrase</h2>
+        <button id="show-mnemonic" type="button">Reveal</button>
+        <pre id="mnemonic" class="hidden"></pre>
+      </section>
+      <form id="seed-import-form">
+        <label>Restore from seed phrase
+          <textarea id="seed-import" rows="3" autocomplete="off" spellcheck="false"></textarea>
+        </label>
+        <button type="submit">Restore wallet</button>
+      </form>
+      <section class="erase-panel">
+        <h2>Local wallet</h2>
+        <button id="reset-wallet" class="danger" type="button">Erase and restart</button>
+      </section>
+    </div>
+  </details>
+
+  <footer class="status-bar">
+    <span>Keys remain in this browser.</span>
+    <span class="status-links">
+      <span>Made with love by <a href="https://x.com/stutxo" target="_blank" rel="noreferrer">stutxo</a> at <a href="https://lx.dev" target="_blank" rel="noreferrer">lx.dev</a>.</span>
+      <a class="github-link" href="https://github.com/stutxo/mercurylayer/tree/feature/bip448-web-wallet-mutinynet" target="_blank" rel="noreferrer" aria-label="View source on GitHub">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .7a11.5 11.5 0 0 0-3.64 22.4c.58.1.79-.25.79-.56v-2.2c-3.22.7-3.9-1.37-3.9-1.37-.53-1.34-1.29-1.7-1.29-1.7-1.05-.72.08-.7.08-.7 1.16.08 1.78 1.2 1.78 1.2 1.03 1.77 2.71 1.26 3.37.96.1-.75.4-1.26.74-1.55-2.57-.29-5.27-1.28-5.27-5.69 0-1.26.45-2.28 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.16 1.18a10.9 10.9 0 0 1 5.76 0c2.2-1.49 3.16-1.18 3.16-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.83 1.19 3.09 0 4.42-2.71 5.39-5.29 5.68.42.36.79 1.07.79 2.16v3.2c0 .31.21.67.8.56A11.5 11.5 0 0 0 12 .7Z"/></svg>
+        Code
+      </a>
+    </span>
+  </footer>
+</main>
+<dialog id="about-dialog" aria-labelledby="about-title">
+  <section class="about-window">
+    <header class="title-bar">
+      <h2 id="about-title" tabindex="-1">About this wallet</h2>
+    </header>
+    <div class="about-content">
+      <p><strong><a href="https://mercurylayer.com/" target="_blank" rel="noreferrer">Mercury Layer</a> is a Bitcoin layer 2 for private, instant off-chain payments.</strong> This prototype uses blind-signing statechains and <a href="https://github.com/bitcoin/bips/blob/master/bip-0448.md" target="_blank" rel="noreferrer">BIP448</a> to save a pre-signed update and settlement path for each accepted statecoin state. The latest path allows an on-chain withdrawal without Mercury or Enclavia after the 144-block challenge delay.</p>
+      <p><strong>Proposed soft fork.</strong> BIP448 is a soft-fork proposal and is not currently active on Bitcoin mainnet. This prototype instead runs on Mutinynet, where the proposal's required opcodes are available.</p>
+      <p><strong><a href="https://github.com/w0xlt/mercurylayer/blob/rebindable_statechains/docs/bip448_rebindable_statechains.md" target="_blank" rel="noreferrer">How BIP448 rebinding works.</a></strong> Each state saves a pre-signed update <code>U(n)</code> and settlement <code>S(n)</code>. <code>OP_TEMPLATEHASH</code> commits to the transaction template but omits the input's previous outpoint. <code>OP_CHECKSIGFROMSTACK</code> verifies its Schnorr signature against the aggregate Taproot internal key supplied by <code>OP_INTERNALKEY</code>. Replacing only the update's input outpoint therefore preserves both the template hash and signature. A newer update can spend a compatible older state output because its higher locktime satisfies the older update path while the committed outputs and value remain unchanged, moving the coin to the latest state before an older settlement's 144-block delay completes.</p>
+      <p><strong>Enclavia.io TEE.</strong> Mercury keeps its signing share and monotonic state in an <a href="https://enclavia.io" target="_blank" rel="noreferrer">Enclavia.io</a> AWS Nitro enclave with encrypted storage and Enclavia <a href="https://enclavia.io/blog/how-we-solved-rollback-attacks/" target="_blank" rel="noreferrer">anti-rollback protection</a>. <strong>Verify enclave</strong> checks the direct SDK Noise channel, Nitro attestation, and pinned PCRs. <strong>Verify coin</strong> checks the Lockbox server share through that channel; Mercury cannot read or forge the exchange.</p>
+      <p><strong>Trust assumption.</strong> A previous owner and Mercury could steal from a future owner if they collude. The TEE is intended to verify that the Mercury server deleted its previous signing share.</p>
+      <p><strong>Someone must watch the chain.</strong> If a previous owner attempts to withdraw via their old state, you or a delegated watcher have 144 blocks to broadcast the newer saved state before they can settle. This prototype has no automatic watcher, and the seed phrase alone does not restore the saved exit transactions.</p>
+      <p><strong>Proof of concept.</strong> This is a Mutinynet research prototype by <a href="https://x.com/lxdev_" target="_blank" rel="noreferrer">@lx.dev</a>, not a production wallet. Review is welcome on the <a href="https://github.com/stutxo/mercurylayer/tree/feature/bip448-web-wallet-mutinynet" target="_blank" rel="noreferrer">GitHub branch</a>.</p>
+      <p><strong>Credits.</strong> The rebindable-signature BIP448 work was done by <a href="https://x.com/lclhostresearch" target="_blank" rel="noreferrer">localhost</a> and <a href="https://github.com/w0xlt/mercurylayer/tree/rebindable_statechains" target="_blank" rel="noreferrer">w0xlt</a>.</p>
+      <div class="about-actions">
+        <button id="close-about" type="button" data-always-enabled>Close</button>
+      </div>
+    </div>
+  </section>
+</dialog>
+
+<template id="coin-template">
+  <details class="coin-card" open>
+    <summary class="coin-header">
+      <h3 class="coin-amount"></h3>
+      <span class="coin-status"></span>
+    </summary>
+    <div class="coin-card-body">
+    <div class="coin-id-row"><span>ID</span><code class="coin-id"></code><button class="copy-coin-id" type="button">Copy</button></div>
+    <p class="coin-alert hidden"></p>
+    <div class="coin-meta"><span class="state-number"></span><span class="challenge-delay"></span><span class="duplicate-count"></span></div>
+
+    <div class="coin-actions">
+      <details class="coin-enclave">
+        <summary>Enclave origin <span class="coin-enclave-status summary-note">Not checked</span></summary>
+        <div class="enclave-panel">
+          <div class="enclave-actions">
+            <button class="verify-coin-enclave" type="button">Verify coin</button>
+            <strong class="coin-enclave-result">Not checked.</strong>
+          </div>
+          <p class="field-note">Uses a fresh challenge to match this statechain's Lockbox server share and the pinned enclave PCRs.</p>
+          <div class="coin-enclave-proof hidden">
+            <dl class="enclave-facts">
+              <dt>Checked</dt><dd><code class="coin-enclave-verified-at">—</code></dd>
+              <dt>Server share</dt><dd><code class="coin-enclave-server-pubkey">—</code></dd>
+              <dt>Challenge</dt><dd><code class="coin-enclave-challenge">—</code></dd>
+              <dt>PCR0</dt><dd><code class="coin-enclave-pcr0">—</code></dd>
+              <dt>PCR1</dt><dd><code class="coin-enclave-pcr1">—</code></dd>
+              <dt>PCR2</dt><dd><code class="coin-enclave-pcr2">—</code></dd>
+            </dl>
+            <p class="coin-enclave-trust field-note"></p>
+          </div>
+        </div>
+      </details>
+      <details class="cooperative-withdrawal">
+        <summary>Cooperative withdrawal</summary>
+        <p class="withdrawal-detail field-note"></p>
+        <form class="withdrawal-form compact-form">
+          <label>Destination
+            <input class="withdraw-address" data-draft="withdraw-address" autocomplete="off" spellcheck="false" placeholder="tb1…" required>
+          </label>
+          <label>Fee, sat/vB
+            <input class="withdraw-fee" data-draft="withdraw-fee" type="number" min="0.1" max="10" step="0.1" value="0.1" required>
+          </label>
+          <button class="withdraw-statecoin primary" type="submit">Withdraw</button>
+        </form>
+      </details>
+
+      <details class="unilateral-exit">
+        <summary>Unilateral exit</summary>
+        <p class="saved-exit-detail field-note"></p>
+        <div class="recovery-fee-callout">
+          <strong>Fee funding address</strong>
+          <div class="copy-line"><code class="fee-address"></code><button class="copy-fee-address" type="button">Copy</button></div>
+          <p class="recovery-fee-detail"></p>
+        </div>
+        <div class="exit-step">
+          <strong>1. Broadcast update</strong>
+          <p class="update-detail" aria-live="polite"></p>
+          <label>Fee, sat/vB <input class="update-fee" data-draft="update-fee" type="number" min="0.1" max="10" step="0.1" value="0.1"></label>
+          <div class="button-row">
+            <button class="broadcast-update" type="button">Broadcast update</button>
+            <button class="download-update" type="button">Download update hex</button>
+          </div>
+        </div>
+        <div class="exit-step wait-step">
+          <strong>2. Wait</strong>
+          <p class="wait-detail"></p>
+          <div class="progress" role="progressbar"><span></span></div>
+        </div>
+        <div class="exit-step">
+          <strong>3. Settle</strong>
+          <p class="settlement-detail" aria-live="polite"></p>
+          <label>Fee, sat/vB <input class="settlement-fee" data-draft="settlement-fee" type="number" min="0.1" max="10" step="0.1" value="0.1"></label>
+          <div class="button-row">
+            <button class="broadcast-settlement" type="button">Broadcast settlement</button>
+            <button class="download-settlement" type="button">Download settlement hex</button>
+          </div>
+        </div>
+      </details>
+
+      <details class="duplicates-panel hidden">
+        <summary>Extra deposits <span class="duplicate-summary-count"></span></summary>
+        <div class="duplicates-list"></div>
+      </details>
+    </div>
+    </div>
+  </details>
+</template>
+
+<script type="module" src="./web.js"></script>
+</body>
+</html>

@@ -20,7 +20,7 @@
 namespace db_manager {
 namespace {
 
-constexpr char KEYUPDATE_DOMAIN[] = "BIP448/lockbox-keyupdate/v2\0";
+constexpr char KEYUPDATE_DOMAIN[] = "BIP448/lockbox-keyupdate/v1\0";
 constexpr std::size_t MAX_SEALED_SIZE = 4096;
 constexpr std::size_t SESSION_CHALLENGE_OFFSET = 69;
 constexpr std::size_t SESSION_CHALLENGE_SIZE = 32;
@@ -326,7 +326,14 @@ bool parent_matches(const LockedParent& parent, std::int64_t generation, const B
 
 } // namespace
 
-bool initialize_database(std::string& error_message) {
+bool initialize_database(
+    std::string& error_message,
+    const unsigned char* seed,
+    std::size_t seed_size,
+    bool allow_initialization) {
+    (void)seed;
+    (void)seed_size;
+    (void)allow_initialization;
     error_message.clear();
     try {
         pqxx::connection connection(database_url());
@@ -347,6 +354,31 @@ bool initialize_database(std::string& error_message) {
     return false;
 }
 
+bool database_is_ready(std::string& error_message) {
+    error_message.clear();
+    try {
+        pqxx::connection connection(database_url());
+        if (!connection.is_open()) {
+            error_message = "database unavailable";
+            return false;
+        }
+        pqxx::nontransaction txn(connection);
+        txn.exec(
+            "SELECT statechain_id,sealed_keypair,public_key,sig_count,key_generation "
+            "FROM public.generated_public_key LIMIT 0");
+        txn.exec(
+            "SELECT statechain_id,signing_id,key_generation,public_nonce,sealed_secnonce,"
+            "challenge,negate_seckey,partial_sig FROM public.bip448_nonce_state LIMIT 0");
+        txn.exec(
+            "SELECT statechain_id,operation_id,request_hash FROM "
+            "public.bip448_keyupdate_receipt LIMIT 0");
+        return true;
+    } catch (const std::exception& error) {
+        error_message = error.what();
+        return false;
+    }
+}
+
 bool save_generated_public_key(
     const utils::chacha20_poly1305_encrypted_data& encrypted_keypair,
     const unsigned char* server_public_key, std::size_t server_public_key_size,
@@ -364,6 +396,41 @@ bool save_generated_public_key(
         return true;
     } catch (const std::exception&) {
         error_message = "generated public key could not be stored";
+        return false;
+    }
+}
+
+
+bool get_statechain_public_key(
+    const std::string& statechain_id,
+    bool& found,
+    unsigned char* server_public_key,
+    std::size_t server_public_key_size,
+    std::string& error_message) {
+    found = false;
+    error_message.clear();
+    if (!valid_statechain_id(statechain_id) || server_public_key == nullptr
+        || server_public_key_size != BIP448_PUBLIC_KEY_SIZE) {
+        error_message = "Statechain lookup requires a valid ID and 33-byte public key buffer.";
+        return false;
+    }
+    try {
+        pqxx::connection connection(database_url());
+        pqxx::nontransaction txn(connection);
+        const auto rows = txn.exec_params(
+            "SELECT public_key FROM public.generated_public_key WHERE statechain_id=$1",
+            statechain_id);
+        if (rows.empty()) return true;
+        Bip448PublicKey key{};
+        if (rows.size() != 1 || !field_array(rows[0]["public_key"], key)) {
+            error_message = "Stored statechain public key is malformed.";
+            return false;
+        }
+        std::copy(key.begin(), key.end(), server_public_key);
+        found = true;
+        return true;
+    } catch (const std::exception& error) {
+        error_message = error.what();
         return false;
     }
 }

@@ -41,7 +41,7 @@ use mercurylib::{
     transfer::{
         bip448::{
             verify_bip448_transfer_msg, Bip448StateHistoryEntry, Bip448TransferChainFacts,
-            Bip448TransferMsg,
+            Bip448TransferMsg, BIP448_TRANSFER_MESSAGE_VERSION,
         },
         receiver::{StatechainInfo, StatechainInfoResponsePayload},
         sender::{
@@ -838,7 +838,7 @@ async fn validate_persisted_transfer_message_local(
         .latest_state_number
         .checked_add(2)
         .ok_or_else(|| anyhow!("BIP448 persisted transfer state number overflow"))?;
-    if transfer_msg.msg_version != 2
+    if transfer_msg.msg_version != BIP448_TRANSFER_MESSAGE_VERSION
         || transfer_msg.aggregate_pubkey != record.aggregate_pubkey
         || transfer_msg.funding_outpoint != record.funding_outpoint
         || transfer_msg.challenge_delay != record.challenge_delay
@@ -1167,7 +1167,7 @@ fn build_transfer_msg(
     ));
     let receiver_user_public_key = receiver_user_pubkey.to_string();
     Ok(Bip448TransferMsg {
-        msg_version: 2,
+        msg_version: BIP448_TRANSFER_MESSAGE_VERSION,
         statechain_id: record.statechain_id.clone(),
         transfer_signature: transfer_signature.to_string(),
         sender_user_public_key: coin.user_pubkey.clone(),

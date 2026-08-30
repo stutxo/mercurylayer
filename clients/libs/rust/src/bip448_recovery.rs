@@ -250,7 +250,7 @@ async fn submit_stored_attempt(
     }
     if !submitted {
         return Err(anyhow!(
-            "Bitcoin Core submitpackage did not accept BIP448 package: {response}"
+            "chain backend did not accept BIP448 package: {response}"
         ));
     }
     set_bip448_package_attempt_status(

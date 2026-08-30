@@ -15,10 +15,15 @@ leaf is:
 OP_TEMPLATEHASH OP_INTERNALKEY OP_CHECKSIGFROMSTACK
 ```
 
-The leaf therefore requires both a BIP448 template-hash match and a Schnorr
-signature checked against the Taproot internal key. The client creates that
+`OP_TEMPLATEHASH` pushes a hash of the spending transaction's version,
+locktime, sequences, outputs, and input position, while deliberately omitting
+the previous outpoint. `OP_CHECKSIGFROMSTACK` verifies a Schnorr signature over
+that hash, and `OP_INTERNALKEY` supplies the Taproot output's aggregate
+internal key `P` without embedding it in the leaf. The client creates the
 signature through a blinded two-party MuSig exchange with Mercury and the
-lockbox.
+lockbox. Because the previous outpoint is not committed, the signed update
+template can be rebound to a compatible earlier state output and move the coin
+to the latest state before an older settlement becomes valid.
 
 ## Funding bindings and repeated payments
 
@@ -141,7 +146,7 @@ replayed.
 Before accepting, the recipient client decrypts the message and checks all of
 the following together:
 
-- message version 2, the configured network, and challenge delay 144;
+- message version 1, the configured network, and challenge delay 144;
 - the transfer signature binding the funding outpoint to the recipient key;
 - the confirmed, unspent `Tx0` outpoint, its script, and its value from the
   recipient's Bitcoin Core view;

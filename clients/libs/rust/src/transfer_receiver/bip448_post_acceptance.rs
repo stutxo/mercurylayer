@@ -259,7 +259,12 @@ mod tests {
     use super::*;
     use crate::transfer_receiver::bip448_transfer_receiver::test_support::*;
     use anyhow::anyhow;
-    use mercurylib::{transfer::receiver::StatechainInfoResponsePayload, wallet::CoinStatus};
+    use mercurylib::{
+        bip448_statechain::signing_api::{
+            Bip448CompressedPublicKey, Bip448StatechainInfoResponsePayloadV1,
+        },
+        wallet::CoinStatus,
+    };
 
     #[test]
     fn bip448_message_error_does_not_discard_prior_success() {
@@ -364,8 +369,10 @@ mod tests {
         attempt(&fixture, &pool, &mut coin, &mut activities, Rc::clone(&transport)).await.unwrap();
         let mut wallet = test_wallet(vec![coin.clone()]); wallet.activities = activities;
         crate::sqlite_manager::insert_wallet(&pool, &wallet).await.unwrap();
-        let mut statechain_info: StatechainInfoResponsePayload = serde_json::from_str(INFO).unwrap();
-        statechain_info.enclave_public_key = coin.server_pubkey.clone().unwrap();
+        let mut statechain_info: Bip448StatechainInfoResponsePayloadV1 =
+            serde_json::from_str(INFO).unwrap();
+        statechain_info.enclave_public_key =
+            Bip448CompressedPublicKey::try_from(coin.server_pubkey.as_deref().unwrap()).unwrap();
         let (endpoint, server) = mock_execute_endpoints(vec![fixture.mailbox], Some(serde_json::to_string(&statechain_info).unwrap())).await;
         let config = test_client_config(endpoint, pool.clone());
         let result = execute(&config, "wallet").await;

@@ -337,10 +337,10 @@ async fn bip448_sign_second_fails_closed_while_lockbox_status_is_unavailable() -
     common::lockbox::start_token_stack_lockbox_service(&lockbox_client).await?;
 
     let unavailable = unavailable_result.context("failed to call mercury sign/second")?;
-    assert_eq!(unavailable.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(unavailable.status(), StatusCode::BAD_GATEWAY);
     let exact_retry =
         exact_retry_while_unavailable.context("failed exact retry while unavailable")?;
-    assert_eq!(exact_retry.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(exact_retry.status(), StatusCode::BAD_GATEWAY);
     let conflict = conflict_while_unavailable.context("failed conflict retry while unavailable")?;
     assert_eq!(conflict.status(), StatusCode::CONFLICT);
 

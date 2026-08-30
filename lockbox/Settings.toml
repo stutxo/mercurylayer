@@ -1,12 +1,14 @@
 [general]
 database_connection_string = "postgresql://postgres:postgres@localhost/enclave"
+database_path = "./lockbox.sqlite3"
 server_port = 18080
-key_manager = "filesystem" # "google_kms", "hashicorp_container, "hashicorp_api", "filesystem"
+bind_address = "127.0.0.1"
+key_manager = "filesystem" # "google_kms", "hashicorp_container", "hashicorp_api", or "filesystem"
 [filesystem]
 seed_filepath = "./seed"
 [gcloud]
-project_id = "mercury-441416"
-project_number = "100600525477"
+project_id = ""
+project_number = ""
 location_id = "global"
 [secretmanager]
 key_name = "encrypted-key"
@@ -21,7 +23,7 @@ project_id = ""
 app_name = ""
 secret_name = ""
 [hashicorp_container]
-token = "2bbz80mr1zm0tfrjwxyq7f48ofgky848"
+token = ""
 url = "http://127.0.0.1:8200"
 path = "mercury-seed"
 mount_point = "secret"

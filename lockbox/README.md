@@ -1,21 +1,33 @@
 # BIP448 lockbox service
 
-The lockbox is a Crow HTTP service backed by PostgreSQL. It stores sealed
-server key material in `generated_public_key` and idempotent BIP448 signing
-rounds in `bip448_nonce_state`.
+The lockbox is a Crow HTTP service backed by PostgreSQL or an embedded SQLite
+database. It stores sealed server key material, idempotent BIP448 signing
+rounds, and replay-safe key-update receipts.
 
 ## Retained routes
 
-These are the complete application routes declared by `start_server`:
+These are the complete application routes declared by `start_server`. With
+`LOCKBOX_REQUIRE_AUTH=1`, every route except `POST /verify_statechain` requires
+`Authorization: Bearer <LOCKBOX_AUTH_TOKEN>`. The Docker image defaults
+`LOCKBOX_REQUIRE_AUTH` to `1` and refuses to start without a 64-hex
+`LOCKBOX_AUTH_TOKEN`; set `LOCKBOX_REQUIRE_AUTH=0` explicitly to run an
+unauthenticated local instance.
+Standalone configuration binds to `127.0.0.1`; the container sets
+`LOCKBOX_BIND_ADDRESS=0.0.0.0` so the enclave proxy can reach it. Override
+`LOCKBOX_BIND_ADDRESS` only behind an authenticated or attested transport.
+The public verification route rejects request bodies larger than 4096 bytes.
 
 | Method and path | Request | Success response |
 | --- | --- | --- |
 | `GET /` | none | plain text `Hello, Crow!` |
+| `GET /health/ready` | none | JSON `status` |
 | `POST /get_public_key` | JSON `statechain_id` | JSON `server_pubkey` |
-| `POST /bip448/get_public_nonce` | JSON `statechain_id`, `signing_id` | JSON `server_pubnonce` |
-| `POST /bip448/get_partial_signature` | JSON `statechain_id`, `signing_id`, `negate_seckey`, `session`, `server_pub_nonce` | JSON `partial_sig` |
+| `POST /verify_statechain` | JSON `statechain_id`, `challenge` | JSON echoed identifiers and `server_pubkey` |
+| `GET /bip448/state/<statechain_id>` | path `statechain_id` | JSON BIP448 state |
+| `POST /bip448/get_public_nonce` | statechain/signing IDs plus expected generation and server key | JSON `server_pubnonce` |
+| `POST /bip448/get_partial_signature` | signing material plus expected generation and server key | JSON `partial_sig` |
 | `GET /signature_count/<statechain_id>` | path `statechain_id` | JSON `sig_count` |
-| `POST /keyupdate` | JSON `statechain_id`, `t2`, `x1` | JSON `server_pubkey` |
+| `POST /keyupdate` | versioned update, expected state, `t2`, and `x1` | JSON replay-safe update receipt |
 | `DELETE /delete_statechain/<statechain_id>` | path `statechain_id` | plain text `Statechain deleted.` |
 
 `signing_id` is a 32-byte hexadecimal value and is stored in canonical
@@ -44,11 +56,25 @@ the deletion route and does not change canonical state history. The first
 durable `SecondArmed` phase is exit-only even when the response is lost because
 the second request may already have reached this service.
 
-`DELETE /delete_statechain/<statechain_id>` deletes rows from both lockbox
-tables in a database transaction. The documentation makes no claim that a
-server share is verifiably erased from every storage layer.
+`DELETE /delete_statechain/<statechain_id>` deletes the generated key and
+cascades to nonce and key-update receipt rows in one database transaction. The
+documentation makes no claim that a server share is verifiably erased from
+every storage layer.
 
-The exact table definitions are in the [database reference](../docs/server_db.md).
+The PostgreSQL definitions are in the
+[database reference](../docs/server_db.md); the Enclavia SQLite schema is in
+`src/sqlite_db_manager.cpp`.
+
+## Enclavia embedded storage
+
+Production Enclavia packaging and deployment are maintained separately so
+credentials and infrastructure do not live in this protocol repository.
+
+The image stores `lockbox.seed` and `lockbox.sqlite3` together under `/data`,
+uses durable rollback-journal commits, fails closed when only one file exists,
+and verifies that the database belongs to the wrapping seed. The Enclavia
+creation script requires synchronizer-backed anti-rollback storage and deny-all
+egress. This remains a disposable, no-funds beta proof.
 
 ## Cooperative duplicate-sweep boundaries
 
@@ -95,8 +121,10 @@ The exact table definitions are in the [database reference](../docs/server_db.md
   completion while server state remains, and one found only after deletion may
   be unrecoverable. The receiver key-update crash boundary remains unrepaired.
 - Use fresh databases: the client schema has twelve application tables;
-  Mercury has six and lockbox has two. The CLI has sixteen commands, including
-  exact flag `--force-send-with-duplicates`; the intended ignored matrix has
-  58 direct entries in eight binaries. This is an Inquisition-dependent proof
+  Mercury has six, and the Lockbox has three application tables plus SQLite
+  seed-verifier metadata when using embedded storage. The CLI has sixteen
+  commands, including exact flag `--force-send-with-duplicates`; the intended
+  ignored matrix has 58 direct entries in eight binaries. This is an
+  Inquisition-dependent proof
   of concept, with no automatic stale-state watcher, Bitcoin mainnet support,
   or production-use claim. Tests establish only their direct assertions.

@@ -35,6 +35,8 @@ pub(super) use report::StatusReport;
 
 const READY_DEADLINE: Duration = Duration::from_secs(120);
 const READY_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+const LOCKBOX_TEST_AUTHORIZATION: &str =
+    "Bearer 27ed987bfb1a1bd671735842063e48b3e6b694d35b2f45333d3d6457077ef31c";
 
 trait BuildVerifier<R: CommandRunner> {
     fn verify(

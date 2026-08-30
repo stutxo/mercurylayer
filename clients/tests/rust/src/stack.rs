@@ -44,7 +44,7 @@ const SERVICES: [&str; 8] = [
     "vault-init",
     "lockbox",
     "inquisition",
-    "token-server-v2",
+    "token-server",
     "mercury-server",
 ];
 
@@ -152,7 +152,7 @@ impl StackConfig {
                 wallet_name: "mercury_test".into(),
                 wallet_db: repo_root.join("clients/tests/rust/wallet.db"),
                 mercury_image: "mercurylayer/mercury-server:bip448-test-local".into(),
-                token_image: "mercurylayer/token-server-v2:bip448-test-local".into(),
+                token_image: "mercurylayer/token-server:bip448-test-local".into(),
                 lockbox_image: "mercurylayer/lockbox:bip448-test-local".into(),
                 lockbox_rng_image: "mercurylayer/lockbox:bip448-test-local-rng-mercurylayer".into(),
                 core_rpc_port: 18443,
@@ -224,7 +224,7 @@ impl StackConfig {
         )?;
         validate_image(
             &env["ML_TEST_TOKEN_IMAGE"],
-            "mercurylayer/token-server-v2:bip448-test-",
+            "mercurylayer/token-server:bip448-test-",
         )?;
         let lockbox_fingerprint = validate_image(
             &env["ML_TEST_LOCKBOX_IMAGE"],
@@ -492,7 +492,7 @@ mod tests {
             ("ML_TEST_LOCKBOX_DB_PORT".into(), "23004".into()),
             ("ML_TEST_MERCURY_DB_PORT".into(), "23003".into()),
             ("ML_TEST_MERCURY_IMAGE".into(), "mercurylayer/mercury-server:bip448-test-0123456789abcdef".into()),
-            ("ML_TEST_TOKEN_IMAGE".into(), "mercurylayer/token-server-v2:bip448-test-1111111111111111".into()),
+            ("ML_TEST_TOKEN_IMAGE".into(), "mercurylayer/token-server:bip448-test-1111111111111111".into()),
             ("ML_TEST_LOCKBOX_IMAGE".into(), "mercurylayer/lockbox:bip448-test-abcdef0123456789".into()),
             ("ML_TEST_LOCKBOX_RNG_IMAGE".into(), format!("mercurylayer/lockbox:bip448-test-abcdef0123456789-rng-{project}")),
             ("ML_SETTINGS_FILE".into(), run.join("Settings.toml").display().to_string()),
@@ -509,7 +509,7 @@ mod tests {
         assert_eq!(c.wallet_db(), c.repo_root().join("clients/tests/rust/wallet.db"));
         assert_eq!((c.mercury_port(), c.token_port(), c.lockbox_port(), c.mercury_db_port(), c.lockbox_db_port()), (8000, 8001, 18080, 5432, 5433));
         assert_eq!((c.core_rpc_port(), c.core_p2p_port(), c.vault_port()), (18443, 18444, 8200));
-        assert_eq!((c.mercury_image(), c.token_image(), c.lockbox_image(), c.lockbox_rng_image()), ("mercurylayer/mercury-server:bip448-test-local", "mercurylayer/token-server-v2:bip448-test-local", "mercurylayer/lockbox:bip448-test-local", "mercurylayer/lockbox:bip448-test-local-rng-mercurylayer"));
+        assert_eq!((c.mercury_image(), c.token_image(), c.lockbox_image(), c.lockbox_rng_image()), ("mercurylayer/mercury-server:bip448-test-local", "mercurylayer/token-server:bip448-test-local", "mercurylayer/lockbox:bip448-test-local", "mercurylayer/lockbox:bip448-test-local-rng-mercurylayer"));
         assert!(c.token_compose_file().is_absolute() && c.lockbox_compose_file().is_absolute());
     }
     #[test]
@@ -615,7 +615,7 @@ mod tests {
             ),
             (
                 "ML_TEST_TOKEN_IMAGE",
-                "mercurylayer/token-server-v2:bip448-test-ABCDEF0123456789",
+                "mercurylayer/token-server:bip448-test-ABCDEF0123456789",
             ),
             (
                 "ML_TEST_LOCKBOX_IMAGE",

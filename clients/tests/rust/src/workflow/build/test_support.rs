@@ -46,6 +46,7 @@ impl TempRepository {
     }
 
     fn populate(&self) {
+        self.write(".dockerignore", b"target\n**/Settings.toml\n");
         self.write("Cargo.lock", b"lock\n");
         self.write("Rocket.toml", b"[default]\n");
         self.write("server/Dockerfile", b"FROM scratch\nCOPY server /server\n");
@@ -54,11 +55,11 @@ impl TempRepository {
         self.write("lib/Cargo.toml", b"[package]\nname='fixture'\n");
         self.write("lib/src/lib.rs", b"pub fn fixture() {}\n");
         self.write(
-            "token-server-v2/Dockerfile",
-            b"FROM scratch\nCOPY token-server-v2 /token\n",
+            "token-server/Dockerfile",
+            b"FROM scratch\nCOPY token-server /token\n",
         );
-        self.write("token-server-v2/src/main.rs", b"fn main() {}\n");
-        self.write("token-server-v2/.dockerignore", b"Settings.toml\n");
+        self.write("token-server/src/main.rs", b"fn main() {}\n");
+        self.write("token-server/.dockerignore", b"Settings.toml\n");
         self.write("lockbox/.dockerignore", b"Settings.toml\nbuild/**\n");
         self.write(
             "lockbox/Dockerfile",

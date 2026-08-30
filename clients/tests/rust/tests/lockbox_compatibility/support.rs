@@ -6,7 +6,7 @@ pub(super) async fn generation_bound_receiver_request(
     recipient_secret: &SecretKey,
     x1: [u8; 32],
     t2: [u8; 32],
-) -> Result<TransferReceiverRequestPayloadV2> {
+) -> Result<TransferReceiverRequestPayloadV1> {
     let secp = Secp256k1::new();
     let generation = SecretKey::from_secret_bytes(x1)?.public_key(&secp);
     let live = lockbox::get_bip448_state(lockbox_client, statechain_id).await?;
@@ -19,8 +19,8 @@ pub(super) async fn generation_bound_receiver_request(
     let recipient_unlock_auth_sig = Bip448SchnorrSignature::try_from(
         schnorr::sign(&unlock_digest, &keypair).to_string().as_str(),
     )?;
-    let mut request = TransferReceiverRequestPayloadV2 {
-        protocol_version: Bip448ProtocolVersionV2,
+    let mut request = TransferReceiverRequestPayloadV1 {
+        protocol_version: Bip448ProtocolVersionV1,
         operation_id: Bip448OperationId::from_bytes(t2),
         statechain_id: Bip448StatechainId::try_from(statechain_id)?,
         t2: Bip448SecretScalar::from_bytes(t2)?,

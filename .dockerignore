@@ -1,0 +1,37 @@
+# Keep root-context Rust service builds small and deterministic.
+.git/
+.github/
+
+# Local build outputs and dependency caches.
+target/
+**/target/
+build/
+**/build/
+node_modules/
+**/node_modules/
+__pycache__/
+**/__pycache__/
+.pytest_cache/
+**/.pytest_cache/
+.venv/
+**/.venv/
+web-wallet/pkg/
+
+data_bitcoin_regtest/
+
+# Local configuration and secrets must not enter the build context.
+.env
+.env.*
+**/.env
+**/.env.*
+**/Settings.toml
+**/*.db*
+**/*.sqlite*
+
+# Editor and OS metadata.
+.DS_Store
+**/.DS_Store
+.vscode/
+**/.vscode/
+*.swp
+*.swo

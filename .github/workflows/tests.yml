@@ -4,11 +4,42 @@ on:
   push:
     branches:
       - dev
+      - rebindable_statechains
+      - feature/bip448-web-wallet-mutinynet
   pull_request:
     branches:
       - dev
+      - rebindable_statechains
+
+permissions:
+  contents: read
 
 jobs:
+  web-wallet:
+    name: BIP448 web wallet
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web-wallet/package-lock.json
+      - name: Install browser test dependencies
+        working-directory: web-wallet
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build Rust/WASM wallet image
+        run: docker build --file web-wallet/Dockerfile --tag mercury-bip448-web-wallet:e2e .
+      - name: Exercise unilateral exit in Chromium
+        working-directory: web-wallet
+        run: npm run test:e2e
+
   test:
     name: test
     runs-on: ubuntu-latest

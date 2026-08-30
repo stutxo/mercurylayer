@@ -1,3 +1,5 @@
+use mercurylib::transfer::bip448::BIP448_TRANSFER_MESSAGE_VERSION;
+
 use super::support::*;
 use super::*;
 
@@ -105,7 +107,7 @@ async fn accepted_prefix_message(
     Ok((
         coin.auth_pubkey.clone(),
         Bip448TransferMsg {
-            msg_version: 2,
+            msg_version: BIP448_TRANSFER_MESSAGE_VERSION,
             statechain_id: fixture.statechain_id.clone(),
             transfer_signature: "11".repeat(64),
             sender_user_public_key: coin.user_pubkey.clone(),

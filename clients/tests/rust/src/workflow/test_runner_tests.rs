@@ -75,7 +75,7 @@ fn spec(metadata: &StackMetadata) -> ProjectSpec {
         ImageMap::new(
             metadata.project(),
             "mercurylayer/mercury-server:bip448-test-aaaaaaaaaaaaaaaa",
-            "mercurylayer/token-server-v2:bip448-test-bbbbbbbbbbbbbbbb",
+            "mercurylayer/token-server:bip448-test-bbbbbbbbbbbbbbbb",
             "mercurylayer/lockbox:bip448-test-cccccccccccccccc",
             "mercurylayer/lockbox:bip448-test-cccccccccccccccc-rng-runner_test",
         )

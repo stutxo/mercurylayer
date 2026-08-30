@@ -85,6 +85,12 @@ pub(super) fn compose_command(
                 .with_context(|| format!("managed Compose environment is missing {key}"))?,
         );
     }
+    command = command.env(
+        "LOCKBOX_AUTH_TOKEN",
+        super::LOCKBOX_TEST_AUTHORIZATION
+            .strip_prefix("Bearer ")
+            .expect("Lockbox test authorization must use the Bearer scheme"),
+    );
     Ok(command)
 }
 

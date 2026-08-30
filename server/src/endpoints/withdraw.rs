@@ -3,37 +3,27 @@ use std::{fmt::Display, future::Future};
 use rocket::{http::Status, response::status, serde::json::Json, State};
 use serde_json::{json, Value};
 
-use super::outbound_request_timeout;
 use crate::server::StateChainEntity;
 
 enum LockboxDeleteOutcome {
-    Response {
-        status: reqwest::StatusCode,
-        body: String,
-    },
+    Response { status: u16, body: String },
     TransportFailure(String),
-    BodyReadFailure(String),
 }
 
 fn classify_lockbox_delete_response(outcome: &LockboxDeleteOutcome) -> Result<(), String> {
     match outcome {
         LockboxDeleteOutcome::Response { status, body }
-            if status.is_success() && body == "Statechain deleted." =>
+            if (200..300).contains(status) && body == "Statechain deleted." =>
         {
             Ok(())
         }
-        LockboxDeleteOutcome::Response { status, body } if !status.is_success() => Err(format!(
-            "lockbox delete_statechain returned {}: {}",
-            status.as_u16(),
-            body
-        )),
+        LockboxDeleteOutcome::Response { status, body } if !(200..300).contains(status) => Err(
+            format!("lockbox delete_statechain returned {status}: {body}"),
+        ),
         LockboxDeleteOutcome::Response { status, body } => Err(format!(
-            "lockbox delete_statechain returned unexpected successful response {}: {}",
-            status.as_u16(),
-            body
+            "lockbox delete_statechain returned unexpected successful response {status}: {body}"
         )),
         LockboxDeleteOutcome::TransportFailure(message) => Err(message.clone()),
-        LockboxDeleteOutcome::BodyReadFailure(message) => Err(message.clone()),
     }
 }
 
@@ -115,8 +105,6 @@ pub async fn withdraw_complete(
         return status::Custom(signature_failure_status, Json(response_body));
     }
 
-    let config = crate::server_config::ServerConfig::load();
-
     let enclave_index = crate::database::utils::get_enclave_index_from_database(
         &statechain_entity.pool,
         &statechain_id,
@@ -124,7 +112,7 @@ pub async fn withdraw_complete(
     .await;
 
     let enclave_index = match enclave_index {
-        Some(index) => index,
+        Some(index) => index as usize,
         None => {
             let response_body = json!({
                 "message": format!("Enclave index for statechain {} ID not found.", statechain_id)
@@ -133,42 +121,47 @@ pub async fn withdraw_complete(
             return status::Custom(Status::InternalServerError, Json(response_body));
         }
     };
+    if statechain_entity
+        .config
+        .enclaves
+        .get(enclave_index)
+        .is_none()
+    {
+        return status::Custom(
+            Status::InternalServerError,
+            Json(json!({
+                "message": format!("Enclave index {enclave_index} is not configured.")
+            })),
+        );
+    }
 
-    let enclave_index = enclave_index as usize;
-
-    let lockbox_endpoint = config.enclaves.get(enclave_index).unwrap().url.clone();
-    let path = "delete_statechain";
-
-    let client = statechain_entity.inner().http_client.clone();
-    let request = client
-        .delete(&format!("{}/{}/{}", lockbox_endpoint, path, statechain_id))
-        .timeout(outbound_request_timeout());
-
-    let lockbox_outcome = match request.send().await {
-        Ok(response) => {
-            let response_status = response.status();
-            match response.text().await {
-                Ok(body) => LockboxDeleteOutcome::Response {
-                    status: response_status,
-                    body,
-                },
-                Err(err) => LockboxDeleteOutcome::BodyReadFailure(err.to_string()),
-            }
-        }
-        Err(err) => LockboxDeleteOutcome::TransportFailure(err.to_string()),
+    let lockbox_outcome = match statechain_entity
+        .lockboxes
+        .delete_raw(
+            enclave_index,
+            &format!("/delete_statechain/{statechain_id}"),
+        )
+        .await
+    {
+        Ok(response) => LockboxDeleteOutcome::Response {
+            status: response.status,
+            body: response.body,
+        },
+        Err(error) => LockboxDeleteOutcome::TransportFailure(error.to_string()),
     };
 
-    if let Err(message) = delete_mercury_statechain_after_lockbox(lockbox_outcome, || {
+    if let Err(error) = delete_mercury_statechain_after_lockbox(lockbox_outcome, || {
         delete_statechain_db(&statechain_entity.pool, &statechain_id)
     })
     .await
     {
+        log::error!("Lockbox statechain deletion failed: {error}");
         let response_body = json!({
-            "error": "Internal Server Error",
-            "message": message,
+            "error": "Bad Gateway",
+            "message": "Signing enclave request failed.",
         });
 
-        return status::Custom(Status::InternalServerError, Json(response_body));
+        return status::Custom(Status::BadGateway, Json(response_body));
     }
 
     let response_body = json!({
@@ -210,7 +203,7 @@ mod tests {
         let delete_called = Cell::new(false);
         let result = block_on(delete_mercury_statechain_after_lockbox(
             LockboxDeleteOutcome::Response {
-                status: reqwest::StatusCode::OK,
+                status: 200,
                 body: "Statechain deleted.".to_string(),
             },
             || async {
@@ -232,15 +225,13 @@ mod tests {
 
     #[test]
     fn every_lockbox_delete_non_success_rejects_before_mercury_delete() {
-        for status_code in 100..=599 {
-            let status = reqwest::StatusCode::from_u16(status_code).unwrap();
-            if status.is_success() {
+        for status in 100..=599 {
+            if (200..300).contains(&status) {
                 continue;
             }
-
             assert_rejected_before_mercury_delete(LockboxDeleteOutcome::Response {
                 status,
-                body: "Statechain deleted.".to_string(),
+                body: "failure".to_string(),
             });
         }
     }
@@ -248,16 +239,9 @@ mod tests {
     #[test]
     fn unexpected_lockbox_delete_success_body_rejects_before_mercury_delete() {
         assert_rejected_before_mercury_delete(LockboxDeleteOutcome::Response {
-            status: reqwest::StatusCode::OK,
+            status: 200,
             body: "unexpected".to_string(),
         });
-    }
-
-    #[test]
-    fn lockbox_delete_body_read_failure_rejects_before_mercury_delete() {
-        assert_rejected_before_mercury_delete(LockboxDeleteOutcome::BodyReadFailure(
-            "lockbox body read failed".to_string(),
-        ));
     }
 
     #[test]
@@ -265,7 +249,7 @@ mod tests {
         let delete_called = Cell::new(false);
         let result = block_on(delete_mercury_statechain_after_lockbox(
             LockboxDeleteOutcome::Response {
-                status: reqwest::StatusCode::OK,
+                status: 200,
                 body: "Statechain deleted.".to_string(),
             },
             || async {

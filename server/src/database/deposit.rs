@@ -6,6 +6,12 @@ pub struct TokenInfo {
     pub spent: bool,
 }
 
+pub struct ExistingDeposit {
+    pub token_id: String,
+    pub server_public_key: Vec<u8>,
+    pub statechain_id: String,
+}
+
 pub async fn get_token_info(pool: &sqlx::PgPool, token_id: &str) -> Option<TokenInfo> {
     let row = sqlx::query(
         "SELECT confirmed, spent \
@@ -46,21 +52,35 @@ pub async fn set_token_spent(pool: &sqlx::PgPool, token_id: &str) {
     transaction.commit().await.unwrap();
 }
 
-pub async fn check_existing_key(pool: &sqlx::PgPool, auth_key: &XOnlyPublicKey) -> bool {
+pub async fn get_existing_deposit(
+    pool: &sqlx::PgPool,
+    auth_key: &XOnlyPublicKey,
+) -> Result<Option<ExistingDeposit>, sqlx::Error> {
     let row = sqlx::query(
-        "SELECT 1 \
-        FROM statechain_data \
-        WHERE auth_xonly_public_key = $1",
+        "SELECT token_id, server_public_key, statechain_id \
+         FROM statechain_data \
+         WHERE auth_xonly_public_key = $1",
     )
-    .bind(&auth_key.serialize())
-    .fetch_one(pool)
-    .await;
-
-    match row {
-        Ok(_) => true,
-        Err(sqlx::Error::RowNotFound) => false,
-        Err(_) => false,
-    }
+    .bind(auth_key.serialize())
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let token_id = row
+        .try_get::<Option<String>, _>(0)?
+        .ok_or_else(|| sqlx::Error::Protocol("existing deposit token ID is null".to_string()))?;
+    let server_public_key = row
+        .try_get::<Option<Vec<u8>>, _>(1)?
+        .ok_or_else(|| sqlx::Error::Protocol("existing deposit server key is null".to_string()))?;
+    let statechain_id = row.try_get::<Option<String>, _>(2)?.ok_or_else(|| {
+        sqlx::Error::Protocol("existing deposit statechain ID is null".to_string())
+    })?;
+    Ok(Some(ExistingDeposit {
+        token_id,
+        server_public_key,
+        statechain_id,
+    }))
 }
 
 pub async fn insert_new_deposit(

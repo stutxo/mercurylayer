@@ -568,7 +568,7 @@ pub(super) fn require_v2_message_without_duplicate_field(raw: &str) -> Result<Bi
         "BIP448 transfer wire message unexpectedly contains duplicate metadata"
     );
     let message: Bip448TransferMsg = serde_json::from_value(json)?;
-    assert_eq!(message.msg_version, 2);
+    assert_eq!(message.msg_version, 1);
     assert_eq!(serde_json::to_string(&message)?, raw);
     Ok(message)
 }

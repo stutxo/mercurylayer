@@ -148,7 +148,7 @@ The direct verifier is part of `verify`; there is no separate single-stack
 verification step. It checks:
 
 - the exact 11 generated `Settings.toml` keys and a 200 Mercury `/info/config`
-  response of `{"batchtimeout":20,"version":"0.2.1"}`;
+  response of `{"batchtimeout":20,"version":"0.1.0"}`;
 - lexical source inventories of 18 Mercury/token and seven lockbox routes;
 - the SHA-pinned 12-table client SQLite migration, complete columns, table
   SQL/CHECKs, three partial unique indexes, zero foreign keys, no legacy backup
@@ -211,3 +211,26 @@ environment. They exercise regtest BIP448 proof-of-concept behavior only: they
 do not support Bitcoin mainnet, establish full legacy parity, or make a
 production-readiness or production-safety claim. Test success establishes only
 the assertions and invariants named by the current Rust MATRIX and verifier.
+
+## Browser wallet and unilateral package path
+
+The focused browser checks are separate from the authoritative regtest MATRIX:
+
+```sh
+cargo test --locked --package mercury-web-wallet
+docker build --file web-wallet/Dockerfile \
+  --tag mercury-bip448-web-wallet:local .
+docker run --rm -p 127.0.0.1:3000:8080 \
+  mercury-bip448-web-wallet:local
+```
+
+The wallet test constructs valid signed BIP448 `U` and `S` recovery parents,
+builds and signs their CPFP children, proves exact retry bytes, and enforces the
+challenge-delay boundary against a recording package backend. The live UI uses
+the same code and submits topologically ordered JSON to Mutinynet Esplora
+`POST /txs/package`.
+
+A funded live run additionally requires two confirmed fee UTXOs and the real
+144-block delay. Follow [`web-wallet/README.md`](web-wallet/README.md); record
+the four transaction IDs and their Mutinynet confirmations as demonstration
+evidence.

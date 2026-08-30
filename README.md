@@ -1,15 +1,36 @@
 # Mercury Layer BIP448 prototype
 
-This repository is a proof-of-concept statechain implementation built around
-BIP448 transaction templates and the consensus rules available in the pinned
-Bitcoin Inquisition environment. It contains:
+This repository is a proof-of-concept implementation of
+[Mercury Layer](https://mercurylayer.com/), a Bitcoin layer 2 for private,
+instant off-chain payments using blind-signing statechains. It extends the
+protocol with [BIP448](https://github.com/bitcoin/bips/blob/master/bip-0448.md)
+transaction templates and the consensus rules available in the pinned Bitcoin
+Inquisition environment. It contains:
 
 - the Rust Mercury HTTP server and shared protocol library;
-- the Rust wallet library and `client-rust` command-line application;
+- the Rust CLI and static Rust/WASM BIP448 Mutinynet wallet;
 - the C++ lockbox service for sealed key shares, BIP448 nonces, partial
   signatures, key updates, and signature counts;
 - the optional token HTTP server; and
 - unit tests plus ignored Docker/Inquisition integration suites.
+
+> [!WARNING]
+> This is a Mutinynet research prototype. Do not use mainnet or funds with real
+> value. The browser wallet stores its seed phrase and signing material
+> unencrypted in `localStorage`.
+
+**Live demo:** [bip448.cash](https://bip448.cash/)
+
+## How BIP448 makes signatures rebindable
+
+`OP_TEMPLATEHASH` commits to a spending transaction's version, locktime,
+sequences, outputs, and input position, while deliberately omitting the
+previous outpoint. `OP_CHECKSIGFROMSTACK` verifies a Schnorr signature over
+that template hash, and `OP_INTERNALKEY` supplies the Taproot output's
+aggregate internal key. Together they let an authorized update transaction be
+rebound to a compatible earlier state output instead of one fixed txid. In
+this statechain construction, the newest state can therefore replace an older
+state before its delayed settlement becomes valid.
 
 Repeated payments to an accepted BIP448 aggregate funding script are tracked
 as cooperative duplicate bindings. They do not create extra public wallet
@@ -21,10 +42,30 @@ Start with [Usage.md](Usage.md), use [Test.md](Test.md) for the executable test
 matrix, and read the [BIP448 protocol description](docs/bip448_rebindable_statechains.md).
 The [documentation index](docs/README.md) links the API, database, client,
 batch/latch, token, and test references.
+Report vulnerabilities according to [SECURITY.md](SECURITY.md).
 
 The annotated tag `bip448-legacy-inclusive-baseline` preserves the older,
 legacy-inclusive source tree for historical inspection. It is not a claim that
 the current implementation reproduces every behavior in that tree.
+
+## Enclavia Lockbox on Mutinynet
+
+The BIP448 Mercury coordinator can run on signet against a separately deployed
+Enclavia Lockbox. Mercury pins the enclave's PCR0/1/2 measurements, verifies
+attestation through the Enclavia SDK, and sends signing requests through the
+encrypted direct channel.
+
+Production deployment assets are maintained separately in a private repository
+so this tree stays focused on protocol, service, wallet, and test code.
+
+The public Mutinynet wallet and Mercury API are available at
+[bip448.cash](https://bip448.cash/). They are disposable test infrastructure;
+availability and persisted server state are not guaranteed.
+
+The browser wallet at [`web-wallet/`](web-wallet/) creates BIP448 deposits,
+directly verifies the Enclavia Lockbox's Nitro attestation, pinned PCRs, and
+coin server share, and demonstrates the complete `U → challenge delay → S`
+unilateral exit with Mutinynet package relay.
 
 ## Cooperative duplicate-sweep boundaries
 
@@ -73,6 +114,6 @@ the current implementation reproduces every behavior in that tree.
 - Use fresh databases: the client schema has twelve application tables;
   Mercury has six and lockbox has two. The CLI has sixteen commands, including
   exact flag `--force-send-with-duplicates`; the intended ignored matrix has
-  58 direct entries in eight binaries. This is an Inquisition-dependent proof
+  59 direct entries in eight binaries. This is an Inquisition-dependent proof
   of concept, with no automatic stale-state watcher, Bitcoin mainnet support,
   or production-use claim. Tests establish only their direct assertions.

@@ -131,7 +131,7 @@ parent cases are:
 - `bip448_duplicate_transfer_requires_ack_and_receiver_rediscovers` asserts
   that omission of `--force-send-with-duplicates` produces the warning with no
   tested sender/server/signature side effect, then that forced transfer keeps
-  the canonical v2 message amount/outpoint and the receiver's height-0 scan
+  the canonical v1 message amount/outpoint and the receiver's height-0 scan
   reconstructs and displays the exact two duplicates under receiver-local
   indices before its tested sweeps and canonical close.
 - `bip448_duplicate_same_wallet_cancel_reassigns_current_owner` asserts the

@@ -8,6 +8,7 @@ const MUSIG_SESSION_MAGIC: [u8; 4] = [0x9d, 0xed, 0xe9, 0x17];
 
 pub mod bip448_sign;
 pub mod deposit;
+pub mod health;
 pub mod lightning_latch;
 pub mod transfer_receiver;
 pub mod transfer_sender;

@@ -29,7 +29,7 @@ enum Commands {
     },
     /// Print the wallet-derived BIP448 recovery fee address
     Bip448RecoveryFeeAddress { wallet_name: String },
-    /// Submit a BIP448 recovery parent and anchor CPFP child via Bitcoin Core submitpackage
+    /// Submit a BIP448 recovery parent and anchor CPFP child through the configured chain backend
     BroadcastBip448RecoveryPackage {
         wallet_name: String,
         statechain_id: String,

@@ -2,14 +2,14 @@ use std::str::FromStr;
 
 use mercurylib::bip448_statechain::signing_api::{
     Bip448AppliedStatus, Bip448CanonicalScalar, Bip448CompressedPublicKey,
-    Bip448HandoffErrorResponsePayloadV2, Bip448KeyUpdateAppliedReceiptPayloadV2,
-    Bip448LockboxKeyUpdateRequestPayloadV2, Bip448LockboxStateResponsePayloadV2,
-    Bip448ProtocolVersionV2, Bip448PublicNonce, Bip448SecretScalar, Bip448StatechainId,
-    Bip448StatechainInfoResponsePayloadV2, Bip448StatechainInfoV2,
+    Bip448HandoffErrorResponsePayloadV1, Bip448KeyUpdateAppliedReceiptPayloadV1,
+    Bip448LockboxKeyUpdateRequestPayloadV1, Bip448LockboxStateResponsePayloadV1,
+    Bip448ProtocolVersionV1, Bip448PublicNonce, Bip448SecretScalar, Bip448StatechainId,
+    Bip448StatechainInfoResponsePayloadV1, Bip448StatechainInfoV1,
 };
 use mercurylib::transfer::receiver::{
     GetMsgAddrResponsePayload, StatechainInfoResponsePayload, TransferReceiverError,
-    TransferReceiverErrorResponsePayload, TransferReceiverRequestPayloadV2,
+    TransferReceiverErrorResponsePayload, TransferReceiverRequestPayloadV1,
     TransferUnlockRequestPayload,
 };
 use rocket::{http::Status, response::status, serde::json::Json, State};
@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 use crate::server::StateChainEntity;
 
-use super::{is_batch_expired, outbound_request_timeout};
+use super::is_batch_expired;
 
 fn internal_server_error_response(message: String) -> status::Custom<Json<Value>> {
     status::Custom(
@@ -27,6 +27,14 @@ fn internal_server_error_response(message: String) -> status::Custom<Json<Value>
             "error": "Internal Server Error",
             "message": message,
         })),
+    )
+}
+
+fn signing_enclave_failure(detail: impl std::fmt::Display) -> status::Custom<Json<Value>> {
+    log::error!("Signing enclave request failed: {detail}");
+    status::Custom(
+        Status::BadGateway,
+        Json(json!({ "message": "Signing enclave request failed." })),
     )
 }
 
@@ -45,37 +53,37 @@ fn lockbox_state_divergence_response() -> status::Custom<Json<Value>> {
     )
 }
 
-fn lockbox_error_response(
-    status_code: reqwest::StatusCode,
-    body: String,
-) -> status::Custom<Json<Value>> {
-    if status_code == reqwest::StatusCode::CONFLICT {
-        return match serde_json::from_str::<Bip448HandoffErrorResponsePayloadV2>(&body) {
+fn lockbox_error_response(status_code: u16, body: String) -> status::Custom<Json<Value>> {
+    if status_code == 409 {
+        return match serde_json::from_str::<Bip448HandoffErrorResponsePayloadV1>(&body) {
             Ok(error) => status::Custom(Status::Conflict, Json(json!(error))),
-            Err(_) => internal_server_error_response(
-                "lockbox returned a malformed BIP448 conflict".to_string(),
-            ),
+            Err(error) => signing_enclave_failure(format!(
+                "Lockbox returned a malformed BIP448 conflict: {error}"
+            )),
         };
     }
-    let message = format!("lockbox returned {}", status_code.as_u16());
-    let status = match status_code.as_u16() {
+    let status = match status_code {
         400 => Status::BadRequest,
         404 => Status::NotFound,
-        _ => Status::InternalServerError,
+        _ => {
+            return signing_enclave_failure(format!(
+                "Lockbox returned unexpected status {status_code}: {body}"
+            ))
+        }
     };
 
     status::Custom(
         status,
         Json(json!({
             "error": "Lockbox Error",
-            "message": message,
+            "message": format!("lockbox returned {status_code}"),
         })),
     )
 }
 
 fn parse_lockbox_keyupdate_response(
     value: &str,
-) -> Result<Bip448KeyUpdateAppliedReceiptPayloadV2, String> {
+) -> Result<Bip448KeyUpdateAppliedReceiptPayloadV1, String> {
     serde_json::from_str(value)
         .map_err(|err| format!("failed to parse lockbox keyupdate response: {err}"))
 }
@@ -96,41 +104,35 @@ async fn observe_locked_bip448_state(
     statechain_entity: &StateChainEntity,
     statechain_id: &Bip448StatechainId,
     locked: &crate::database::transfer_receiver::LockedStatechainGeneration,
-) -> Result<Bip448LockboxStateResponsePayloadV2, status::Custom<Json<Value>>> {
+) -> Result<Bip448LockboxStateResponsePayloadV1, status::Custom<Json<Value>>> {
     let enclave_index = usize::try_from(locked.enclave_index).map_err(|_| {
         internal_server_error_response("Enclave index for statechain ID not found.".to_string())
     })?;
-    let enclave = statechain_entity
+    if statechain_entity
         .config
         .enclaves
         .get(enclave_index)
-        .ok_or_else(|| {
-            internal_server_error_response("Enclave index for statechain ID not found.".to_string())
-        })?;
-    let request = statechain_entity
-        .http_client
-        .get(format!(
-            "{}/bip448/state/{}",
-            enclave.url,
-            statechain_id.as_str()
-        ))
-        .timeout(outbound_request_timeout());
-    let response = request
-        .send()
+        .is_none()
+    {
+        return Err(internal_server_error_response(
+            "Enclave index for statechain ID not found.".to_string(),
+        ));
+    }
+    let response = statechain_entity
+        .lockboxes
+        .get_raw(
+            enclave_index,
+            &format!("/bip448/state/{}", statechain_id.as_str()),
+        )
         .await
-        .map_err(|err| internal_server_error_response(err.to_string()))?;
-    let response_status = response.status();
-    let text = response
-        .text()
-        .await
-        .map_err(|err| internal_server_error_response(err.to_string()))?;
-    if !response_status.is_success() {
+        .map_err(signing_enclave_failure)?;
+    if !(200..300).contains(&response.status) {
         return Err(lockbox_state_divergence_response());
     }
-    let observed: Bip448LockboxStateResponsePayloadV2 =
-        serde_json::from_str(&text).map_err(|err| {
-            internal_server_error_response(format!(
-                "failed to parse lockbox BIP448 state response: {err}"
+    let observed: Bip448LockboxStateResponsePayloadV1 = serde_json::from_str(&response.body)
+        .map_err(|error| {
+            signing_enclave_failure(format!(
+                "failed to parse Lockbox BIP448 state response: {error}"
             ))
         })?;
     if observed.statechain_id != *statechain_id {
@@ -157,9 +159,9 @@ fn parse_bip448_generation_tag(value: Option<&str>) -> Option<PublicKey> {
 }
 
 fn validate_keyupdate_receipt(
-    request: &Bip448LockboxKeyUpdateRequestPayloadV2,
+    request: &Bip448LockboxKeyUpdateRequestPayloadV1,
     transfer_generation: &PublicKey,
-    receipt: &Bip448KeyUpdateAppliedReceiptPayloadV2,
+    receipt: &Bip448KeyUpdateAppliedReceiptPayloadV1,
 ) -> Result<PublicKey, String> {
     let expected_resulting_generation = request
         .expected_key_generation
@@ -201,10 +203,10 @@ fn validate_keyupdate_receipt(
 }
 
 fn completed_keyupdate_replay_receipt(
-    request: &Bip448LockboxKeyUpdateRequestPayloadV2,
+    request: &Bip448LockboxKeyUpdateRequestPayloadV1,
     transfer_generation: &PublicKey,
-    current: &Bip448LockboxStateResponsePayloadV2,
-) -> Result<Bip448KeyUpdateAppliedReceiptPayloadV2, String> {
+    current: &Bip448LockboxStateResponsePayloadV1,
+) -> Result<Bip448KeyUpdateAppliedReceiptPayloadV1, String> {
     let resulting_generation = request
         .expected_key_generation
         .get()
@@ -216,8 +218,8 @@ fn completed_keyupdate_replay_receipt(
     {
         return Err("completed BIP448 keyupdate does not match current lockbox state".to_string());
     }
-    let receipt = Bip448KeyUpdateAppliedReceiptPayloadV2 {
-        protocol_version: Bip448ProtocolVersionV2,
+    let receipt = Bip448KeyUpdateAppliedReceiptPayloadV1 {
+        protocol_version: Bip448ProtocolVersionV1,
         operation_id: request.operation_id,
         statechain_id: request.statechain_id.clone(),
         status: Bip448AppliedStatus,
@@ -303,15 +305,15 @@ pub async fn statechain_info(
                 Ok(value) => value,
                 Err(err) => return internal_server_error_response(err.to_string()),
             };
-            typed_history.push(Bip448StatechainInfoV2 {
+            typed_history.push(Bip448StatechainInfoV1 {
                 statechain_id: history_statechain_id,
                 server_pubnonce,
                 challenge,
                 tx_n: item.tx_n,
             });
         }
-        json!(Bip448StatechainInfoResponsePayloadV2 {
-            protocol_version: Bip448ProtocolVersionV2,
+        json!(Bip448StatechainInfoResponsePayloadV1 {
+            protocol_version: Bip448ProtocolVersionV1,
             enclave_public_key: mercury_server_pubkey,
             num_sigs: observed.sig_count,
             lockbox_key_generation: observed.key_generation,
@@ -433,9 +435,9 @@ mod tests {
     };
 
     fn keyupdate_fixture() -> (
-        Bip448LockboxKeyUpdateRequestPayloadV2,
+        Bip448LockboxKeyUpdateRequestPayloadV1,
         PublicKey,
-        Bip448KeyUpdateAppliedReceiptPayloadV2,
+        Bip448KeyUpdateAppliedReceiptPayloadV1,
     ) {
         let secp = Secp256k1::new();
         let previous = SecretKey::from_secret_bytes([3; 32])
@@ -449,8 +451,8 @@ mod tests {
             .unwrap()
             .combine(&transfer_generation.negate())
             .unwrap();
-        let request = Bip448LockboxKeyUpdateRequestPayloadV2 {
-            protocol_version: Bip448ProtocolVersionV2,
+        let request = Bip448LockboxKeyUpdateRequestPayloadV1 {
+            protocol_version: Bip448ProtocolVersionV1,
             operation_id: Bip448OperationId::from_bytes([0x11; 32]),
             statechain_id: Bip448StatechainId::try_from("statechain-receipt-test").unwrap(),
             t2: Bip448SecretScalar::from_bytes(t2.to_secret_bytes()).unwrap(),
@@ -460,8 +462,8 @@ mod tests {
             expected_server_pubkey: Bip448CompressedPublicKey::from_bytes(previous.serialize())
                 .unwrap(),
         };
-        let receipt = Bip448KeyUpdateAppliedReceiptPayloadV2 {
-            protocol_version: Bip448ProtocolVersionV2,
+        let receipt = Bip448KeyUpdateAppliedReceiptPayloadV1 {
+            protocol_version: Bip448ProtocolVersionV1,
             operation_id: request.operation_id,
             statechain_id: request.statechain_id.clone(),
             status: Bip448AppliedStatus,
@@ -482,7 +484,7 @@ mod tests {
     #[test]
     fn lockbox_conflict_stays_a_public_conflict() {
         let response = lockbox_error_response(
-            reqwest::StatusCode::CONFLICT,
+            409,
             r#"{"code":"bip448_signature_count_mismatch","message":"BIP448 request conflicts with current state","expected_sig_count":2,"actual_sig_count":3}"#.to_string(),
         );
 
@@ -584,8 +586,8 @@ mod tests {
     #[test]
     fn completed_keyupdate_replay_requires_matching_live_n_g_and_s() {
         let (request, transfer_generation, receipt) = keyupdate_fixture();
-        let current = Bip448LockboxStateResponsePayloadV2 {
-            protocol_version: Bip448ProtocolVersionV2,
+        let current = Bip448LockboxStateResponsePayloadV1 {
+            protocol_version: Bip448ProtocolVersionV1,
             statechain_id: request.statechain_id.clone(),
             sig_count: request.expected_sig_count,
             key_generation: receipt.resulting_key_generation,
@@ -657,7 +659,7 @@ mod tests {
 )]
 pub async fn transfer_receiver(
     statechain_entity: &State<StateChainEntity>,
-    transfer_receiver_request_payload: Json<TransferReceiverRequestPayloadV2>,
+    transfer_receiver_request_payload: Json<TransferReceiverRequestPayloadV1>,
 ) -> status::Custom<Json<Value>> {
     let payload = transfer_receiver_request_payload.0;
     let statechain_id = payload.statechain_id.as_str().to_owned();
@@ -773,8 +775,8 @@ pub async fn transfer_receiver(
             return generation_error();
         }
     };
-    let key_update_request = Bip448LockboxKeyUpdateRequestPayloadV2 {
-        protocol_version: Bip448ProtocolVersionV2,
+    let key_update_request = Bip448LockboxKeyUpdateRequestPayloadV1 {
+        protocol_version: Bip448ProtocolVersionV1,
         operation_id: payload.operation_id,
         statechain_id: payload.statechain_id,
         t2: payload.t2,
@@ -883,58 +885,49 @@ pub async fn transfer_receiver(
             );
         }
     };
-    let Some(enclave) = statechain_entity.config.enclaves.get(enclave_index) else {
+    if statechain_entity
+        .config
+        .enclaves
+        .get(enclave_index)
+        .is_none()
+    {
         let _ = transaction.rollback().await;
         return internal_server_error_response(
             "Enclave index for statechain ID not found.".to_string(),
         );
-    };
-    let lockbox_endpoint = enclave.url.clone();
-    let path = "keyupdate";
+    }
 
-    let client = statechain_entity.inner().http_client.clone();
-    let request = client
-        .post(&format!("{}/{}", lockbox_endpoint, path))
-        .timeout(outbound_request_timeout());
-
-    let value = match request.json(&key_update_request).send().await {
-        Ok(response) => {
-            let response_status = response.status();
-            let text = match response.text().await {
-                Ok(text) => text,
-                Err(err) => {
-                    let _ = transaction.rollback().await;
-                    return internal_server_error_response(err.to_string());
-                }
-            };
-
-            if !response_status.is_success() {
-                let _ = transaction.rollback().await;
-                return lockbox_error_response(response_status, text);
-            }
-
-            text
-        }
-        Err(err) => {
+    let response = match statechain_entity
+        .lockboxes
+        .post_json_raw(enclave_index, "/keyupdate", &key_update_request)
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
             let _ = transaction.rollback().await;
-            return internal_server_error_response(err.to_string());
+            return signing_enclave_failure(error);
         }
     };
+    if !(200..300).contains(&response.status) {
+        let _ = transaction.rollback().await;
+        return lockbox_error_response(response.status, response.body);
+    }
+    let value = response.body;
 
-    let receipt: Bip448KeyUpdateAppliedReceiptPayloadV2 =
+    let receipt: Bip448KeyUpdateAppliedReceiptPayloadV1 =
         match parse_lockbox_keyupdate_response(value.as_str()) {
             Ok(response) => response,
-            Err(err) => {
+            Err(error) => {
                 let _ = transaction.rollback().await;
-                return internal_server_error_response(err);
+                return signing_enclave_failure(error);
             }
         };
     let server_pubkey =
         match validate_keyupdate_receipt(&key_update_request, &x1_generation, &receipt) {
             Ok(key) => key,
-            Err(err) => {
+            Err(error) => {
                 let _ = transaction.rollback().await;
-                return internal_server_error_response(err);
+                return signing_enclave_failure(error);
             }
         };
 

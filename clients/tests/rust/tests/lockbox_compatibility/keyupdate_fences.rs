@@ -348,12 +348,28 @@ pub(super) async fn assert_sender_and_update_generation_fences(
         post_mercury_json(mercury_client, "transfer/sender", &unauthenticated_sender).await?;
     assert_json_response(
         &unauthenticated_response,
-        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::UNAUTHORIZED,
         json!({"message":"Signature does not match authentication key."}),
     )?;
     ensure!(
         load_transfer_generation(mercury_pool, &statechain_id).await? == replay_row,
         "unauthenticated sender request mutated the replay row"
+    );
+    let mut missing_sender = request.clone();
+    missing_sender["statechain_id"] = json!(format!("missing-{}", uuid::Uuid::new_v4()));
+    missing_sender["auth_sig"] = json!("not-a-signature");
+    let missing_sender_response =
+        post_mercury_json(mercury_client, "transfer/sender", &missing_sender).await?;
+    assert_json_response(
+        &missing_sender_response,
+        StatusCode::NOT_FOUND,
+        json!({
+            "message":"Statechain not found. If this coin predates the current Lockbox deployment, it cannot be transferred offchain; use its saved on-chain recovery transaction."
+        }),
+    )?;
+    ensure!(
+        load_transfer_generation(mercury_pool, &statechain_id).await? == replay_row,
+        "missing-statechain sender request mutated the replay row"
     );
 
     let (_wallet, competing_coin) = mercury::create_deposited_coin(mercury_client).await?;
@@ -481,8 +497,10 @@ pub(super) async fn assert_sender_and_update_generation_fences(
         "message":"Transfer message generation does not match current state."
     });
     let authentication_error = json!({
-        "error":"Internal Server Error",
         "message":"Signature does not match authentication key."
+    });
+    let statechain_not_found_error = json!({
+        "message":"Statechain not found. If this coin predates the current Lockbox deployment, it cannot be transferred offchain; use its saved on-chain recovery transaction."
     });
     let mut missing_x1 = randomized_update.clone();
     missing_x1
@@ -563,8 +581,8 @@ pub(super) async fn assert_sender_and_update_generation_fences(
     .await?;
     assert_json_response(
         &statechain_substitution_response,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        generation_error.clone(),
+        StatusCode::NOT_FOUND,
+        statechain_not_found_error,
     )?;
     let mut ciphertext_substitution = randomized_update.clone();
     ciphertext_substitution["enc_transfer_msg"] = json!(hex::encode([0xaa, 0xbb]));
@@ -576,7 +594,7 @@ pub(super) async fn assert_sender_and_update_generation_fences(
     .await?;
     assert_json_response(
         &ciphertext_substitution_response,
-        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::UNAUTHORIZED,
         authentication_error,
     )?;
     ensure!(

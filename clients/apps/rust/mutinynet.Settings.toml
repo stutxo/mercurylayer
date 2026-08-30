@@ -1,0 +1,8 @@
+statechain_entity = "https://bip448.cash"
+chain_backend = "explorer"
+explorer_url = "https://mutinynet.com/api"
+network = "signet"
+fee_rate_tolerance = 5
+database_file = "mutinynet-wallet.db"
+confirmation_target = 2
+max_fee_rate = 10

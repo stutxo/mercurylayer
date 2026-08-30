@@ -1,0 +1,36 @@
+[package]
+name = "mercury-web-wallet"
+version = "0.1.0"
+edition = "2021"
+description = "BIP448 Mutinynet browser wallet and unilateral-exit demonstrator"
+repository = "https://github.com/stutxo/mercurylayer"
+publish = false
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Oz", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bitcoin = { git = "https://github.com/w0xlt/rust-bitcoin", branch = "inquisition-bip448-support-0.30.2", version = "0.30.2", features = ["serde", "base64", "rand-std", "std"], default-features = false }
+console_error_panic_hook = "0.1.7"
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+hex = "0.4.3"
+js-sys = "0.3"
+mercurylib = { path = "../lib" }
+secp256k1 = { git = "https://github.com/w0xlt/rust-secp256k1.git", branch = "mercury-blinded-musig-port", features = ["rand-std", "bitcoin_hashes", "std"] }
+serde = { version = "1.0", features = ["derive"] }
+serde-wasm-bindgen = "0.6.5"
+serde_json = "1.0"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["AbortController", "AbortSignal", "Headers", "Request", "RequestCache", "RequestInit", "Response", "Storage", "Window"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+enclavia = "0.2.0"
+
+[dev-dependencies]
+critical-section = { version = "1", features = ["std"] }
+tokio = { version = "1", features = ["macros", "rt"] }

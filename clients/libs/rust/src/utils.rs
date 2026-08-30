@@ -2,7 +2,7 @@ use crate::client_config::ClientConfig;
 use anyhow::{anyhow, Context, Ok, Result};
 use chrono::Utc;
 use mercurylib::{
-    bip448_statechain::signing_api::Bip448StatechainInfoResponsePayloadV2,
+    bip448_statechain::signing_api::Bip448StatechainInfoResponsePayloadV1,
     transfer::receiver::StatechainInfoResponsePayload, wallet::Activity,
     withdraw::WithdrawCompletePayload,
 };
@@ -38,14 +38,14 @@ pub async fn get_statechain_info(
         .with_context(|| format!("invalid BIP448 statechain info response for {statechain_id}"))
 }
 
-pub(crate) async fn get_bip448_statechain_info_v2(
+pub(crate) async fn get_bip448_statechain_info_v1(
     statechain_id: &str,
     client_config: &ClientConfig,
-) -> Result<Option<Bip448StatechainInfoResponsePayloadV2>> {
+) -> Result<Option<Bip448StatechainInfoResponsePayloadV1>> {
     let (status, body) = fetch_statechain_info(statechain_id, client_config).await?;
 
-    parse_bip448_statechain_info_v2_response(status, &body)
-        .with_context(|| format!("invalid BIP448 v2 state response for {statechain_id}"))
+    parse_bip448_statechain_info_v1_response(status, &body)
+        .with_context(|| format!("invalid BIP448 v1 state response for {statechain_id}"))
 }
 
 async fn fetch_statechain_info(
@@ -84,17 +84,17 @@ fn parse_statechain_info_response(
     Ok(Some(response))
 }
 
-fn parse_bip448_statechain_info_v2_response(
+fn parse_bip448_statechain_info_v1_response(
     status: StatusCode,
     body: &str,
-) -> Result<Option<Bip448StatechainInfoResponsePayloadV2>> {
+) -> Result<Option<Bip448StatechainInfoResponsePayloadV1>> {
     if status == StatusCode::NOT_FOUND && body == BIP448_STATECHAIN_MISSING_BODY {
         return Ok(None);
     }
     if !status.is_success() {
-        return Err(anyhow!("BIP448 v2 state returned HTTP {status}"));
+        return Err(anyhow!("BIP448 v1 state returned HTTP {status}"));
     }
-    let response = serde_json::from_str(body).context("BIP448 v2 state returned malformed JSON")?;
+    let response = serde_json::from_str(body).context("BIP448 v1 state returned malformed JSON")?;
     Ok(Some(response))
 }
 
@@ -166,9 +166,9 @@ mod tests {
     }
 
     #[test]
-    fn exact_v2_state_observation_parses_live_n_g_and_s() {
-        let body = r#"{"protocol_version":2,"enclave_public_key":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","num_sigs":2,"lockbox_key_generation":4,"statechain_info":[],"x1_pub":"02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"}"#;
-        let observed = parse_bip448_statechain_info_v2_response(StatusCode::OK, body)
+    fn exact_v1_state_observation_parses_live_n_g_and_s() {
+        let body = r#"{"protocol_version":1,"enclave_public_key":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","num_sigs":2,"lockbox_key_generation":4,"statechain_info":[],"x1_pub":"02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"}"#;
+        let observed = parse_bip448_statechain_info_v1_response(StatusCode::OK, body)
             .unwrap()
             .unwrap();
 
@@ -181,15 +181,15 @@ mod tests {
     }
 
     #[test]
-    fn v2_state_errors_do_not_echo_response_bodies() {
+    fn v1_state_errors_do_not_echo_response_bodies() {
         let private_body = r#"{"transaction":"never-log-this"}"#;
-        let status_error = parse_bip448_statechain_info_v2_response(
+        let status_error = parse_bip448_statechain_info_v1_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             private_body,
         )
         .unwrap_err();
         let parse_error =
-            parse_bip448_statechain_info_v2_response(StatusCode::OK, private_body).unwrap_err();
+            parse_bip448_statechain_info_v1_response(StatusCode::OK, private_body).unwrap_err();
 
         assert!(!status_error.to_string().contains(private_body));
         assert!(!parse_error.to_string().contains(private_body));

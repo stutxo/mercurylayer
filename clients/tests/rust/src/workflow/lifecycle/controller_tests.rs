@@ -49,7 +49,7 @@ fn verifier_restart_is_one_exact_mercury_only_compose_argv_and_failure_stops() {
             "mercury-server",
         ]
     );
-    assert_eq!(runner.seen[0].environment.len(), 12);
+    assert_eq!(runner.seen[0].environment.len(), 13);
     assert!(!strings(&runner.seen[0].args)
         .iter()
         .any(|arg| matches!(arg.as_str(), "build" | "pull" | "lockbox")));
@@ -112,7 +112,7 @@ fn up_uses_one_exact_compose_argv_and_repeated_up_preserves_container_ids() {
             "never"
         ]
     );
-    assert_eq!(compose.environment.len(), 12);
+    assert_eq!(compose.environment.len(), 13);
     assert_eq!(
         compose.environment[OsStr::new("ML_TEST_MERCURY_PORT")],
         "24000"
@@ -120,6 +120,10 @@ fn up_uses_one_exact_compose_argv_and_repeated_up_preserves_container_ids() {
     assert_eq!(
         compose.environment[OsStr::new("ML_TEST_CORE_RPC_PORT")],
         "24005"
+    );
+    assert_eq!(
+        compose.environment[OsStr::new("LOCKBOX_AUTH_TOKEN")],
+        "27ed987bfb1a1bd671735842063e48b3e6b694d35b2f45333d3d6457077ef31c"
     );
     assert_direct_argv_only(&docker);
 }
@@ -129,7 +133,7 @@ fn up_rejects_partial_topology_without_compose_mutation() {
     let root = Path::new("/repo");
     let metadata = metadata(root);
     let mut docker = MockDocker::exact();
-    docker.shape = StackShape::Missing("token-server-v2");
+    docker.shape = StackShape::Missing("token-server");
     let mut host = MockHost::new(false);
     let mut verifier = StubVerifier::new();
 

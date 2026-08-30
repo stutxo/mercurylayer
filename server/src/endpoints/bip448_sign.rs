@@ -21,8 +21,8 @@
 
 use mercurylib::bip448_statechain::signing_api::{
     validate_negate_seckey_flag, validate_signing_id, Bip448BlindedSession,
-    Bip448CompressedPublicKey, Bip448LockboxPartialSignatureRequestPayloadV2,
-    Bip448LockboxSignFirstRequestPayloadV2, Bip448LockboxStateResponsePayloadV2,
+    Bip448CompressedPublicKey, Bip448LockboxPartialSignatureRequestPayloadV1,
+    Bip448LockboxSignFirstRequestPayloadV1, Bip448LockboxStateResponsePayloadV1,
     Bip448NegateSeckeyFlag, Bip448PartialSignatureRequestPayload, Bip448PublicNonce,
     Bip448SignFirstRequestPayload, Bip448SignFirstResponsePayload,
     Bip448SignatureCountResponsePayload, Bip448SigningId, Bip448StatechainId,
@@ -32,10 +32,10 @@ use secp256k1::XOnlyPublicKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::{challenge_from_session_hex, error_response, outbound_request_timeout};
+use super::{challenge_from_session_hex, error_response};
 use crate::database::bip448_sign::{Bip448IncompleteSignatureRecord, Bip448SignatureRecord};
 use crate::endpoints::utils::SignatureValidationError;
-use crate::server::StateChainEntity;
+use crate::{lockbox_client::LockboxResponse, server::StateChainEntity};
 
 fn normalize_hex_wire_value(value: &str) -> String {
     value
@@ -133,8 +133,8 @@ pub fn classify_sign_second(
     }
 }
 
-fn lockbox_status_to_rocket(status: reqwest::StatusCode) -> Status {
-    match status.as_u16() {
+fn lockbox_status_to_rocket(status: u16) -> Status {
+    match status {
         400 => Status::BadRequest,
         404 => Status::NotFound,
         409 => Status::Conflict,
@@ -142,20 +142,29 @@ fn lockbox_status_to_rocket(status: reqwest::StatusCode) -> Status {
     }
 }
 
-async fn lockbox_response_text(
-    response: reqwest::Response,
-) -> Result<String, status::Custom<Json<Value>>> {
-    let status = response.status();
-    let text = response
-        .text()
-        .await
-        .map_err(|err| error_response(Status::InternalServerError, err.to_string()))?;
+fn signing_enclave_failure() -> status::Custom<Json<Value>> {
+    error_response(
+        Status::BadGateway,
+        "Signing enclave request failed.".to_string(),
+    )
+}
 
-    if !status.is_success() {
-        return Err(error_response(lockbox_status_to_rocket(status), text));
+fn lockbox_response_text(response: LockboxResponse) -> Result<String, status::Custom<Json<Value>>> {
+    if (200..300).contains(&response.status) {
+        return Ok(response.body);
     }
-
-    Ok(text)
+    if matches!(response.status, 400 | 404 | 409) {
+        return Err(error_response(
+            lockbox_status_to_rocket(response.status),
+            response.body,
+        ));
+    }
+    log::error!(
+        "Lockbox returned unexpected status {}: {}",
+        response.status,
+        response.body
+    );
+    Err(signing_enclave_failure())
 }
 
 fn parse_lockbox_signature_count(value: &str) -> Result<u64, String> {
@@ -289,53 +298,46 @@ async fn observe_locked_bip448_state(
     statechain_entity: &StateChainEntity,
     statechain_id: &Bip448StatechainId,
     locked: &crate::database::transfer_receiver::LockedStatechainGeneration,
-) -> Result<(String, Bip448LockboxStateResponsePayloadV2), status::Custom<Json<Value>>> {
+) -> Result<(usize, Bip448LockboxStateResponsePayloadV1), status::Custom<Json<Value>>> {
     let enclave_index = usize::try_from(locked.enclave_index).map_err(|_| {
         error_response(
             Status::InternalServerError,
             "Enclave index for statechain ID not found.".to_string(),
         )
     })?;
-    let enclave = statechain_entity
+    if statechain_entity
         .config
         .enclaves
         .get(enclave_index)
-        .ok_or_else(|| {
-            error_response(
-                Status::InternalServerError,
-                format!("Enclave index {enclave_index} is not configured."),
-            )
-        })?;
-    let lockbox_endpoint = enclave.url.clone();
-    let request = statechain_entity
-        .http_client
-        .get(format!(
-            "{}/bip448/state/{}",
-            lockbox_endpoint,
-            statechain_id.as_str()
-        ))
-        .timeout(outbound_request_timeout());
-    let response = request
-        .send()
-        .await
-        .map_err(|err| error_response(Status::InternalServerError, err.to_string()))?;
-    let response_status = response.status();
-    let value = response
-        .text()
-        .await
-        .map_err(|err| error_response(Status::InternalServerError, err.to_string()))?;
-    if !response_status.is_success() {
+        .is_none()
+    {
         return Err(error_response(
             Status::InternalServerError,
-            "lockbox BIP448 state is unavailable for an existing Mercury statechain".to_string(),
+            format!("Enclave index {enclave_index} is not configured."),
         ));
     }
-    let observed: Bip448LockboxStateResponsePayloadV2 =
-        serde_json::from_str(&value).map_err(|err| {
-            error_response(
-                Status::InternalServerError,
-                format!("failed to parse lockbox BIP448 state response: {err}"),
-            )
+
+    let response = statechain_entity
+        .lockboxes
+        .get_raw(
+            enclave_index,
+            &format!("/bip448/state/{}", statechain_id.as_str()),
+        )
+        .await
+        .map_err(|error| {
+            log::error!("failed to observe Lockbox BIP448 state: {error}");
+            signing_enclave_failure()
+        })?;
+    let value = lockbox_response_text(response).map_err(|_| {
+        error_response(
+            Status::InternalServerError,
+            "lockbox BIP448 state is unavailable for an existing Mercury statechain".to_string(),
+        )
+    })?;
+    let observed: Bip448LockboxStateResponsePayloadV1 =
+        serde_json::from_str(&value).map_err(|error| {
+            log::error!("failed to parse Lockbox BIP448 state response: {error}");
+            signing_enclave_failure()
         })?;
     if observed.statechain_id != *statechain_id {
         return Err(error_response(
@@ -350,7 +352,7 @@ async fn observe_locked_bip448_state(
         ));
     }
 
-    Ok((lockbox_endpoint, observed))
+    Ok((enclave_index, observed))
 }
 
 #[post(
@@ -407,7 +409,7 @@ pub async fn bip448_sign_first(
     ) {
         return response;
     }
-    let (lockbox_endpoint, lockbox_state) =
+    let (enclave_index, lockbox_state) =
         match observe_locked_bip448_state(statechain_entity, &statechain_id, &locked).await {
             Ok(observed) => observed,
             Err(response) => return response,
@@ -573,11 +575,6 @@ pub async fn bip448_sign_first(
 
         let path = "bip448/get_public_nonce";
 
-        let client = statechain_entity.http_client.clone();
-        let request = client
-            .post(&format!("{}/{}", lockbox_endpoint, path))
-            .timeout(outbound_request_timeout());
-
         if !crate::database::signing_nonce::bip448_signing_nonce_lease_matches(
             &mut *handoff_fence,
             &payload.statechain_id,
@@ -596,14 +593,18 @@ pub async fn bip448_sign_first(
             return pending_nonce_response();
         }
 
-        let lockbox_payload = Bip448LockboxSignFirstRequestPayloadV2 {
+        let lockbox_payload = Bip448LockboxSignFirstRequestPayloadV1 {
             statechain_id,
             signing_id: lockbox_signing_id,
             expected_key_generation: lockbox_state.key_generation,
             expected_server_pubkey: lockbox_state.server_pubkey,
         };
-        let value = match request.json(&lockbox_payload).send().await {
-            Ok(response) => match lockbox_response_text(response).await {
+        let value = match statechain_entity
+            .lockboxes
+            .post_json_raw(enclave_index, path, &lockbox_payload)
+            .await
+        {
+            Ok(response) => match lockbox_response_text(response) {
                 Ok(text) => text,
                 Err(response) => {
                     cleanup_bip448_sign_first_reservation(
@@ -616,7 +617,7 @@ pub async fn bip448_sign_first(
                     return response;
                 }
             },
-            Err(err) => {
+            Err(error) => {
                 cleanup_bip448_sign_first_reservation(
                     &mut *handoff_fence,
                     &payload.statechain_id,
@@ -624,13 +625,14 @@ pub async fn bip448_sign_first(
                     &lease_token,
                 )
                 .await;
-                return error_response(Status::InternalServerError, err.to_string());
+                log::error!("Lockbox sign-first request failed: {error}");
+                return signing_enclave_failure();
             }
         };
 
         let response: Bip448SignFirstResponsePayload = match serde_json::from_str(value.as_str()) {
             Ok(response) => response,
-            Err(err) => {
+            Err(error) => {
                 cleanup_bip448_sign_first_reservation(
                     &mut *handoff_fence,
                     &payload.statechain_id,
@@ -638,7 +640,8 @@ pub async fn bip448_sign_first(
                     &lease_token,
                 )
                 .await;
-                return error_response(Status::InternalServerError, err.to_string());
+                log::error!("failed to parse Lockbox sign-first response: {error}");
+                return signing_enclave_failure();
             }
         };
 
@@ -901,23 +904,18 @@ pub async fn bip448_sign_second(
             };
         }
     }
-    let (lockbox_endpoint, lockbox_state) =
+    let (enclave_index, lockbox_state) =
         match observe_locked_bip448_state(statechain_entity, &statechain_id, &locked).await {
             Ok(observed) => observed,
             Err(response) => return response,
         };
     let path = "bip448/get_partial_signature";
 
-    let client = statechain_entity.http_client.clone();
-    let request = client
-        .post(&format!("{}/{}", lockbox_endpoint, path))
-        .timeout(outbound_request_timeout());
-
     // Once this request is attempted, failures are indeterminate from
     // Mercury's point of view. The lockbox is authoritative for BIP448 exact
     // replay/conflict by opaque signing_id; Mercury must not clear/reopen the
     // challenge after this point.
-    let lockbox_payload = Bip448LockboxPartialSignatureRequestPayloadV2 {
+    let lockbox_payload = Bip448LockboxPartialSignatureRequestPayloadV1 {
         statechain_id,
         signing_id: lockbox_signing_id,
         negate_seckey: lockbox_negate_seckey,
@@ -926,15 +924,18 @@ pub async fn bip448_sign_second(
         expected_key_generation: lockbox_state.key_generation,
         expected_server_pubkey: lockbox_state.server_pubkey,
     };
-    let value = match request.json(&lockbox_payload).send().await {
-        Ok(response) => match lockbox_response_text(response).await {
+    let value = match statechain_entity
+        .lockboxes
+        .post_json_raw(enclave_index, path, &lockbox_payload)
+        .await
+    {
+        Ok(response) => match lockbox_response_text(response) {
             Ok(text) => text,
-            Err(response) => {
-                return response;
-            }
+            Err(response) => return response,
         },
-        Err(err) => {
-            return error_response(Status::InternalServerError, err.to_string());
+        Err(error) => {
+            log::error!("Lockbox sign-second request failed: {error}");
+            return signing_enclave_failure();
         }
     };
 
@@ -945,8 +946,9 @@ pub async fn bip448_sign_second(
 
     let response: PartialSignatureResponsePayload = match serde_json::from_str(value.as_str()) {
         Ok(response) => response,
-        Err(err) => {
-            return error_response(Status::InternalServerError, err.to_string());
+        Err(error) => {
+            log::error!("failed to parse Lockbox sign-second response: {error}");
+            return signing_enclave_failure();
         }
     };
 
@@ -1040,34 +1042,34 @@ pub async fn bip448_signature_count(
         }
     };
 
-    let Some(enclave) = config.enclaves.get(enclave_index) else {
+    if config.enclaves.get(enclave_index).is_none() {
         return error_response(
             Status::InternalServerError,
             format!("Enclave index {} is not configured.", enclave_index),
         );
-    };
+    }
 
-    let lockbox_endpoint = enclave.url.clone();
-    let path = "signature_count";
-
-    let client = statechain_entity.http_client.clone();
-    let request = client
-        .get(&format!("{}/{}/{}", lockbox_endpoint, path, statechain_id))
-        .timeout(outbound_request_timeout());
-
-    let value = match request.send().await {
-        Ok(response) => match lockbox_response_text(response).await {
+    let value = match statechain_entity
+        .lockboxes
+        .get_raw(enclave_index, &format!("/signature_count/{statechain_id}"))
+        .await
+    {
+        Ok(response) => match lockbox_response_text(response) {
             Ok(text) => text,
             Err(response) => return response,
         },
-        Err(err) => {
-            return error_response(Status::InternalServerError, err.to_string());
+        Err(error) => {
+            log::error!("Lockbox signature-count request failed: {error}");
+            return signing_enclave_failure();
         }
     };
 
     let sig_count = match parse_lockbox_signature_count(value.as_str()) {
         Ok(sig_count) => sig_count,
-        Err(message) => return error_response(Status::InternalServerError, message),
+        Err(error) => {
+            log::error!("failed to parse Lockbox signature-count response: {error}");
+            return signing_enclave_failure();
+        }
     };
 
     let response = Bip448SignatureCountResponsePayload { sig_count };
@@ -1289,9 +1291,6 @@ mod tests {
 
     #[test]
     fn lockbox_status_maps_signature_count_not_found_to_not_found() {
-        assert_eq!(
-            lockbox_status_to_rocket(reqwest::StatusCode::NOT_FOUND),
-            Status::NotFound
-        );
+        assert_eq!(lockbox_status_to_rocket(404), Status::NotFound);
     }
 }

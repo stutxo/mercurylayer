@@ -14,7 +14,7 @@ pub const STACK_SCHEMA_VERSION: u32 = 1;
 pub const WORKFLOW_NAME: &str = "bip448-test";
 
 pub const MERCURY_IMAGE_PREFIX: &str = "mercurylayer/mercury-server:bip448-test-";
-pub const TOKEN_IMAGE_PREFIX: &str = "mercurylayer/token-server-v2:bip448-test-";
+pub const TOKEN_IMAGE_PREFIX: &str = "mercurylayer/token-server:bip448-test-";
 pub const LOCKBOX_IMAGE_PREFIX: &str = "mercurylayer/lockbox:bip448-test-";
 pub const INQUISITION_IMAGE: &str = "mercurylayer/bitcoin-inquisition:f536586";
 
@@ -434,7 +434,7 @@ pub const COMPONENTS: &[ComponentConfig] = &[
         images: &[],
     },
     ComponentConfig {
-        service: "token-server-v2",
+        service: "token-server",
         compose_files: TOKEN_SERVERS,
         ports: &[PortRole::Token],
         images: &[ImageRole::Token],
@@ -1210,7 +1210,7 @@ mod tests {
                 "vault-init",
                 "lockbox",
                 "inquisition",
-                "token-server-v2",
+                "token-server",
                 "mercury-server",
             ]
         );
@@ -1257,7 +1257,7 @@ mod tests {
         let images = ImageMap::new(
             &project,
             "mercurylayer/mercury-server:bip448-test-0123456789abcdef",
-            "mercurylayer/token-server-v2:bip448-test-1111111111111111",
+            "mercurylayer/token-server:bip448-test-1111111111111111",
             "mercurylayer/lockbox:bip448-test-abcdef0123456789",
             "mercurylayer/lockbox:bip448-test-abcdef0123456789-rng-workflow_roundtrip",
         )
@@ -1326,7 +1326,7 @@ mod tests {
         let valid = ImageMap::new(
             &project,
             "mercurylayer/mercury-server:bip448-test-0123456789abcdef",
-            "mercurylayer/token-server-v2:bip448-test-1111111111111111",
+            "mercurylayer/token-server:bip448-test-1111111111111111",
             "mercurylayer/lockbox:bip448-test-abcdef0123456789",
             "mercurylayer/lockbox:bip448-test-abcdef0123456789-rng-images_1",
         )

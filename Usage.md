@@ -9,8 +9,9 @@ RUSTUP_TOOLCHAIN=1.92.0 cargo run -p client-rust -- <COMMAND>
 The client loads `Settings.toml` by default. `ML_SETTINGS_FILE` selects another
 settings file; an explicit extension or path is used as written, otherwise
 `.toml` is appended. `ML_NETWORK=regtest` selects
-`regtest.Settings.toml` when `ML_SETTINGS_FILE` is unset. The only supported
-`chain_backend` value is `core`.
+`regtest.Settings.toml` when `ML_SETTINGS_FILE` is unset. `chain_backend`
+supports authenticated Bitcoin Core RPC (`core`) and Esplora (`explorer`);
+the latter requires `explorer_url`.
 
 ## Complete command surface
 

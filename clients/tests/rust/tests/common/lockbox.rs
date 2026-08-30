@@ -6,11 +6,11 @@ use mercurylib::{
     bip448_statechain::{
         signing::{CsfsSigningParticipant, CsfsSigningRole, CsfsSigningSession},
         signing_api::{
-            Bip448BlindedSession, Bip448KeyUpdateAppliedReceiptPayloadV2,
-            Bip448LockboxKeyUpdateRequestPayloadV2, Bip448LockboxPartialSignatureRequestPayload,
-            Bip448LockboxPartialSignatureRequestPayloadV2, Bip448LockboxSignFirstRequestPayload,
-            Bip448LockboxSignFirstRequestPayloadV2, Bip448LockboxStateResponsePayloadV2,
-            Bip448NegateSeckeyFlag, Bip448OperationId, Bip448ProtocolVersionV2, Bip448PublicNonce,
+            Bip448BlindedSession, Bip448KeyUpdateAppliedReceiptPayloadV1,
+            Bip448LockboxKeyUpdateRequestPayloadV1, Bip448LockboxPartialSignatureRequestPayload,
+            Bip448LockboxPartialSignatureRequestPayloadV1, Bip448LockboxSignFirstRequestPayload,
+            Bip448LockboxSignFirstRequestPayloadV1, Bip448LockboxStateResponsePayloadV1,
+            Bip448NegateSeckeyFlag, Bip448OperationId, Bip448ProtocolVersionV1, Bip448PublicNonce,
             Bip448SecretScalar, Bip448SigningId, Bip448StatechainId,
         },
     },
@@ -31,6 +31,19 @@ use uuid::Uuid;
 use super::stack::{self, ComposeFile};
 
 const READY_TIMEOUT_SECONDS: u64 = 180;
+
+/// Fixed regtest-only token matching the default in docker-compose-lockbox.yml
+/// and docker-compose-token-servers.yml. Not a secret; override both sides with
+/// the LOCKBOX_AUTH_TOKEN environment variable.
+const DEFAULT_AUTH_TOKEN: &str = "27ed987bfb1a1bd671735842063e48b3e6b694d35b2f45333d3d6457077ef31c";
+
+fn authorization_header() -> String {
+    let token = std::env::var("LOCKBOX_AUTH_TOKEN")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_AUTH_TOKEN.to_string());
+    format!("Bearer {token}")
+}
 
 pub fn url() -> &'static str {
     stack::current().lockbox_url()
@@ -107,7 +120,12 @@ pub fn normalize_hex(value: &str) -> String {
 
 pub async fn wait_until_ready(client: &Client) -> Result<()> {
     for _ in 0..READY_TIMEOUT_SECONDS {
-        if let Ok(response) = client.get(format!("{}/", url())).send().await {
+        if let Ok(response) = client
+            .get(format!("{}/", url()))
+            .header(reqwest::header::AUTHORIZATION, authorization_header())
+            .send()
+            .await
+        {
             if response.status() == StatusCode::OK {
                 let body = response.text().await.unwrap_or_default();
                 if body.contains("Hello, Crow!") {
@@ -125,6 +143,7 @@ pub async fn wait_until_ready(client: &Client) -> Result<()> {
 pub async fn post_json(client: &Client, path: &str, body: Value) -> Result<Response> {
     client
         .post(format!("{}/{}", url(), path))
+        .header(reqwest::header::AUTHORIZATION, authorization_header())
         .json(&body)
         .send()
         .await
@@ -134,6 +153,7 @@ pub async fn post_json(client: &Client, path: &str, body: Value) -> Result<Respo
 pub async fn post_raw_json(client: &Client, path: &str, body: String) -> Result<Response> {
     client
         .post(format!("{}/{}", url(), path))
+        .header(reqwest::header::AUTHORIZATION, authorization_header())
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(body)
         .send()
@@ -144,6 +164,7 @@ pub async fn post_raw_json(client: &Client, path: &str, body: String) -> Result<
 pub async fn get(client: &Client, path: &str) -> Result<Response> {
     client
         .get(format!("{}/{}", url(), path))
+        .header(reqwest::header::AUTHORIZATION, authorization_header())
         .send()
         .await
         .with_context(|| format!("failed GET {}", path))
@@ -152,6 +173,7 @@ pub async fn get(client: &Client, path: &str) -> Result<Response> {
 pub async fn delete(client: &Client, path: &str) -> Result<Response> {
     client
         .delete(format!("{}/{}", url(), path))
+        .header(reqwest::header::AUTHORIZATION, authorization_header())
         .send()
         .await
         .with_context(|| format!("failed DELETE {}", path))
@@ -189,7 +211,7 @@ pub async fn bip448_get_public_nonce(
 pub async fn get_bip448_state(
     client: &Client,
     statechain_id: &str,
-) -> Result<Bip448LockboxStateResponsePayloadV2> {
+) -> Result<Bip448LockboxStateResponsePayloadV1> {
     let response = get(client, &format!("bip448/state/{statechain_id}")).await?;
     ensure_success(response, "bip448/state").await
 }
@@ -200,7 +222,7 @@ pub async fn bip448_sign_first_request_value(
 ) -> Result<Value> {
     let state = get_bip448_state(client, &payload.statechain_id).await?;
     Ok(serde_json::to_value(
-        Bip448LockboxSignFirstRequestPayloadV2 {
+        Bip448LockboxSignFirstRequestPayloadV1 {
             statechain_id: Bip448StatechainId::new(payload.statechain_id.clone())?,
             signing_id: Bip448SigningId::try_from(payload.signing_id.as_str())?,
             expected_key_generation: state.key_generation,
@@ -215,7 +237,7 @@ pub async fn bip448_partial_request_value(
 ) -> Result<Value> {
     let state = get_bip448_state(client, &payload.statechain_id).await?;
     Ok(serde_json::to_value(
-        Bip448LockboxPartialSignatureRequestPayloadV2 {
+        Bip448LockboxPartialSignatureRequestPayloadV1 {
             statechain_id: Bip448StatechainId::new(payload.statechain_id.clone())?,
             signing_id: Bip448SigningId::try_from(payload.signing_id.as_str())?,
             negate_seckey: Bip448NegateSeckeyFlag::try_from(payload.negate_seckey)?,
@@ -425,12 +447,12 @@ pub async fn build_keyupdate_request(
     statechain_id: &str,
     t2_bytes: [u8; 32],
     x1_bytes: [u8; 32],
-) -> Result<Bip448LockboxKeyUpdateRequestPayloadV2> {
+) -> Result<Bip448LockboxKeyUpdateRequestPayloadV1> {
     let state = get_bip448_state(client, statechain_id).await?;
     let mut operation_id = [0_u8; 32];
     rand::rng().fill_bytes(&mut operation_id);
-    Ok(Bip448LockboxKeyUpdateRequestPayloadV2 {
-        protocol_version: Bip448ProtocolVersionV2,
+    Ok(Bip448LockboxKeyUpdateRequestPayloadV1 {
+        protocol_version: Bip448ProtocolVersionV1,
         operation_id: Bip448OperationId::from_bytes(operation_id),
         statechain_id: Bip448StatechainId::new(statechain_id.to_owned())?,
         t2: Bip448SecretScalar::from_bytes(t2_bytes)?,
@@ -443,8 +465,8 @@ pub async fn build_keyupdate_request(
 
 pub async fn keyupdate_request(
     client: &Client,
-    request: &Bip448LockboxKeyUpdateRequestPayloadV2,
-) -> Result<Bip448KeyUpdateAppliedReceiptPayloadV2> {
+    request: &Bip448LockboxKeyUpdateRequestPayloadV1,
+) -> Result<Bip448KeyUpdateAppliedReceiptPayloadV1> {
     let response = post_json(client, "keyupdate", serde_json::to_value(request)?).await?;
     ensure_success(response, "keyupdate").await
 }

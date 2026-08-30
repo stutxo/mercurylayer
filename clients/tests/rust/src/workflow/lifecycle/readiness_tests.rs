@@ -25,13 +25,17 @@ fn ready_retries_only_bounded_connection_misses_then_returns_exact_status() {
     assert_eq!(host.sleeps, 1);
     assert_eq!(verifier.calls, 1);
     assert_eq!(docker.compose_calls("up") + docker.compose_calls("down"), 0);
+    assert!(host.requests.iter().all(|(port, path, _)| {
+        (*port == metadata.ports().mercury) == (path == "/info/config")
+    }));
+    assert!(host.requests.contains(&(
+        metadata.ports().lockbox,
+        "/health/ready".into(),
+        Some(super::LOCKBOX_TEST_AUTHORIZATION.into()),
+    )));
     assert!(host
         .requests
-        .iter()
-        .all(|(port, path)| (*port == metadata.ports().mercury) == (path == "/info/config")));
-    for port in [metadata.ports().lockbox, metadata.ports().token] {
-        assert!(host.requests.contains(&(port, "/".into())));
-    }
+        .contains(&(metadata.ports().token, "/".into(), None)));
 }
 
 #[test]
@@ -72,7 +76,7 @@ fn mercury_config_accepts_the_exact_reviewed_response() {
     let mut host = MockHost::new(false);
     host.mercury_response = HttpResponse {
         status: 200,
-        body: json!({"batchtimeout": 20, "version": "0.2.1"}),
+        body: json!({"batchtimeout": 20, "version": "0.1.0"}),
     };
     let mut verifier = StubVerifier::new();
 
@@ -80,31 +84,48 @@ fn mercury_config_accepts_the_exact_reviewed_response() {
     assert!(report.runtime.all_services_ready);
     assert!(host
         .requests
-        .contains(&(metadata.ports().mercury, "/info/config".into())));
+        .contains(&(metadata.ports().mercury, "/info/config".into(), None,)));
+}
+
+#[test]
+fn lockbox_readiness_rejects_an_unauthenticated_or_malformed_health_response() {
+    let root = Path::new("/repo");
+    let metadata = metadata(root);
+    let mut docker = MockDocker::exact();
+    let mut host = MockHost::new(false);
+    host.lockbox_response = HttpResponse {
+        status: 401,
+        body: json!({"message": "Unauthorized"}),
+    };
+    let mut verifier = StubVerifier::new();
+
+    let error = ready_with(root, &metadata, &mut docker, &mut host, &mut verifier).unwrap_err();
+    assert!(format!("{error:#}").contains("malformed /health/ready"));
+    assert_eq!(host.sleeps, 0);
 }
 
 #[test]
 fn mercury_config_rejects_status_shape_types_values_and_fields() {
     let root = Path::new("/repo");
     let metadata = metadata(root);
-    let exact = json!({"batchtimeout": 20, "version": "0.2.1"});
+    let exact = json!({"batchtimeout": 20, "version": "0.1.0"});
     let rejected = [
         ("other 2xx", 204, exact.clone()),
         ("missing field", 200, json!({"batchtimeout": 20})),
         (
             "extra field",
             200,
-            json!({"batchtimeout": 20, "version": "0.2.1", "extra": true}),
+            json!({"batchtimeout": 20, "version": "0.1.0", "extra": true}),
         ),
         (
             "batchtimeout type",
             200,
-            json!({"batchtimeout": "20", "version": "0.2.1"}),
+            json!({"batchtimeout": "20", "version": "0.1.0"}),
         ),
         (
             "batchtimeout value",
             200,
-            json!({"batchtimeout": 21, "version": "0.2.1"}),
+            json!({"batchtimeout": 21, "version": "0.1.0"}),
         ),
         (
             "version type",
@@ -114,10 +135,10 @@ fn mercury_config_rejects_status_shape_types_values_and_fields() {
         (
             "version value",
             200,
-            json!({"batchtimeout": 20, "version": "0.2.2"}),
+            json!({"batchtimeout": 20, "version": "0.1.1"}),
         ),
         ("malformed JSON", 200, Value::String("{bad-json".into())),
-        ("nonobject JSON", 200, json!([20, "0.2.1"])),
+        ("nonobject JSON", 200, json!([20, "0.1.0"])),
     ];
 
     for (case, status, body) in rejected {

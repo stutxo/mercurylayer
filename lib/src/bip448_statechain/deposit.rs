@@ -249,7 +249,7 @@ fn recovery_script_from_coin(
         None,
         network,
     );
-    if recovery_address != expected {
+    if recovery_address.script_pubkey() != expected.script_pubkey() {
         return Err(Bip448DepositError::RecoveryAddressMismatch);
     }
 
@@ -372,6 +372,22 @@ mod tests {
             address.funding_update_script,
             script_hex(&script::funding_update_leaf())
         );
+    }
+
+    #[test]
+    fn signet_recovery_address_compares_by_script_not_ambiguous_tb_network_tag() {
+        let secp = Secp256k1::new();
+        let mut wallet = sample_wallet();
+        wallet.network = "signet".to_string();
+        wallet.settings.network = "signet".to_string();
+        let mut coin = wallet.get_new_coin().unwrap();
+        let server_secret_key = SecretKey::from_secret_bytes([7u8; 32]).unwrap();
+        let server_pubkey = server_secret_key.public_key(&secp);
+        let user_pubkey = PublicKey::from_str(&coin.user_pubkey).unwrap();
+        coin.server_pubkey = Some(server_pubkey.to_string());
+        coin.aggregated_pubkey = Some(user_pubkey.combine(&server_pubkey).unwrap().to_string());
+
+        assert!(create_deposit_address(&coin, "signet").is_ok());
     }
 
     #[test]

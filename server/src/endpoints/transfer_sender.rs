@@ -9,6 +9,8 @@ use serde_json::{json, Value};
 
 use crate::server::StateChainEntity;
 
+const STATECHAIN_NOT_FOUND_MESSAGE: &str = "Statechain not found. If this coin predates the current Lockbox deployment, it cannot be transferred offchain; use its saved on-chain recovery transaction.";
+
 #[post(
     "/transfer/sender",
     format = "json",
@@ -44,9 +46,15 @@ pub async fn transfer_sender(
 
     let x1 = match result {
         Ok(crate::database::transfer_sender::InsertTransferResult::Success(x1)) => x1,
+        Ok(crate::database::transfer_sender::InsertTransferResult::StatechainNotFound) => {
+            return status::Custom(
+                Status::NotFound,
+                Json(json!({"message": STATECHAIN_NOT_FOUND_MESSAGE})),
+            );
+        }
         Ok(crate::database::transfer_sender::InsertTransferResult::AuthenticationFailed) => {
             return status::Custom(
-                Status::InternalServerError,
+                Status::Unauthorized,
                 Json(json!({"message": "Signature does not match authentication key."})),
             );
         }
@@ -123,11 +131,18 @@ pub async fn transfer_update_msg(
 
     match result {
         Ok(crate::database::transfer_sender::UpdateTransferMessageResult::Success) => {}
+        Ok(crate::database::transfer_sender::UpdateTransferMessageResult::StatechainNotFound) => {
+            return status::Custom(
+                Status::NotFound,
+                Json(json!({
+                    "message": STATECHAIN_NOT_FOUND_MESSAGE
+                })),
+            );
+        }
         Ok(crate::database::transfer_sender::UpdateTransferMessageResult::AuthenticationFailed) => {
             return status::Custom(
-                Status::InternalServerError,
+                Status::Unauthorized,
                 Json(json!({
-                    "error": "Internal Server Error",
                     "message": "Signature does not match authentication key."
                 })),
             );

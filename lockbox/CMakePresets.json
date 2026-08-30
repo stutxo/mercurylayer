@@ -3,10 +3,34 @@
     "configurePresets": [
       {
         "name": "vcpkg",
+        "displayName": "vcpkg fast default",
         "generator": "Ninja",
         "binaryDir": "${sourceDir}/build",
         "cacheVariables": {
-          "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+          "CMAKE_BUILD_TYPE": "Release",
+          "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+          "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/vcpkg-triplets",
+          "LOCKBOX_ENABLE_GOOGLE_KMS": "OFF"
+        }
+      },
+      {
+        "name": "vcpkg-google-kms",
+        "displayName": "vcpkg with Google KMS",
+        "inherits": "vcpkg",
+        "binaryDir": "${sourceDir}/build-google-kms",
+        "cacheVariables": {
+          "LOCKBOX_ENABLE_GOOGLE_KMS": "ON",
+          "VCPKG_MANIFEST_FEATURES": "google-kms"
+        }
+      },
+      {
+        "name": "vcpkg-sqlite",
+        "displayName": "vcpkg with embedded SQLite",
+        "inherits": "vcpkg",
+        "binaryDir": "${sourceDir}/build-sqlite",
+        "cacheVariables": {
+          "LOCKBOX_DATABASE_BACKEND": "sqlite",
+          "LOCKBOX_BUILD_TESTS": "ON"
         }
       }
     ]

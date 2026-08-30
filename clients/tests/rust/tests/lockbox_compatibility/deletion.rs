@@ -322,12 +322,13 @@ pub(super) async fn mercury_withdraw_complete_preserves_rows_when_lockbox_delete
         let (mercury_status, mercury_body) =
             response_status_and_body(mercury_delete, "mercury outage completion").await?;
         ensure!(
-            mercury_status == StatusCode::INTERNAL_SERVER_ERROR,
+            mercury_status == StatusCode::BAD_GATEWAY,
             "Mercury completion during lockbox outage returned {mercury_status}: {mercury_body}"
         );
         ensure!(
-            mercury_body.contains("lockbox delete_statechain returned 500"),
-            "Mercury did not classify the lockbox 500 before deletion: {mercury_body}"
+            mercury_body.contains("Signing enclave request failed.")
+                && !mercury_body.contains("delete_statechain"),
+            "Mercury exposed the lockbox failure detail: {mercury_body}"
         );
 
         let preserved_rows =

@@ -13,13 +13,29 @@ environment variable taking precedence:
 | --- | --- | --- |
 | `network` | `BITCOIN_NETWORK` | string |
 | `batch_timeout` | `BATCH_TIMEOUT` | unsigned integer seconds |
-| `enclaves` | `ENCLAVES` | array of `{ url, allow_deposit }`; the environment value is JSON |
+| `enclaves` | `ENCLAVES` | array of enclave objects; the environment value is JSON |
 | `db_user` | `DB_USER` | string |
 | `db_password` | `DB_PASSWORD` | string |
 | `db_host` | `DB_HOST` | string |
 | `db_port` | `DB_PORT` | unsigned 16-bit integer |
 | `db_name` | `DB_NAME` | string |
 | `token_server_url` | `TOKEN_SERVER_URL` | optional string |
+
+Each enclave object requires `url` and `allow_deposit`. Direct Enclavia
+`ws://`/`wss://` transports also require 96-hex `pcr0`, `pcr1`, and `pcr2`
+measurements. `debug` and `allow_unattested` default to `false`.
+
+Every Lockbox transport requires a 64-hex `LOCKBOX_AUTH_TOKEN` environment
+variable. Cleartext `http://` is accepted only when `network = "regtest"`.
+Outside regtest, unattested `https://` requires an explicit
+`allow_unattested = true`; production and hosted signet deployments should use
+an attested `ws://` or `wss://` endpoint instead. Debug attestation is refused
+unless the network is exactly `regtest` and
+`MERCURY_ALLOW_DEBUG_ENCLAVES=1`; `debug = true` is never valid for HTTP(S).
+Mercury verifies authenticated Lockbox readiness before serving requests and
+keeps the SDK's attested channel for normal traffic. Transient transport
+failures re-establish attestation and retry only exact replay-safe requests;
+the normal path remains one Lockbox request.
 
 When `token_server_url` is set, `/deposit/get_token` proxies token generation
 to that service. When it is absent, the local path creates a free,
@@ -66,6 +82,11 @@ the locked current-owner authentication row, an exact active
 of allocating another share. That guarantee applies while no different
 authenticated request has replaced the server's one-row transfer generation;
 a consumed `key_updated = true` generation is not replayed.
+
+Both `/transfer/sender` and `/transfer/update_msg` return `404` when the
+statechain is absent and `401` when the current owner's signature is invalid.
+An absent coin from an earlier Lockbox deployment must use its saved on-chain
+recovery transaction; it cannot be initialized on the replacement Lockbox.
 
 The three later transfer mutations bind to that exact generation:
 
@@ -139,6 +160,6 @@ canonical withdrawal can close the statechain.
 - Use fresh databases: the client schema has twelve application tables;
   Mercury has six and lockbox has two. The CLI has sixteen commands, including
   exact flag `--force-send-with-duplicates`; the intended ignored matrix has
-  58 direct entries in eight binaries. This is an Inquisition-dependent proof
+  59 direct entries in eight binaries. This is an Inquisition-dependent proof
   of concept, with no automatic stale-state watcher, Bitcoin mainnet support,
   or production-use claim. Tests establish only their direct assertions.

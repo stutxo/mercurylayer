@@ -8,8 +8,8 @@ use crate::{
 use anyhow::Result;
 use bitcoin::{Address, Transaction, Txid};
 use mercurylib::{
-    bip448_statechain::signing_api::Bip448KeyUpdateAppliedReceiptPayloadV2, error::MercuryError,
-    transfer::receiver::TransferReceiverRequestPayloadV2, utils::get_network, wallet::CoinStatus,
+    bip448_statechain::signing_api::Bip448KeyUpdateAppliedReceiptPayloadV1, error::MercuryError,
+    transfer::receiver::TransferReceiverRequestPayloadV1, utils::get_network, wallet::CoinStatus,
 };
 use reqwest::StatusCode;
 
@@ -181,7 +181,7 @@ pub struct TransferReceiveRequestResult {
 #[derive(Debug)]
 enum Bip448TransferReceiverPostResult {
     BatchLocked,
-    Applied(Bip448KeyUpdateAppliedReceiptPayloadV2),
+    Applied(Bip448KeyUpdateAppliedReceiptPayloadV1),
 }
 
 fn parse_transfer_receiver_response(
@@ -204,7 +204,7 @@ fn parse_transfer_receiver_response(
     }
 
     if status == StatusCode::OK {
-        let response: Bip448KeyUpdateAppliedReceiptPayloadV2 = serde_json::from_str(value)
+        let response: Bip448KeyUpdateAppliedReceiptPayloadV1 = serde_json::from_str(value)
             .map_err(|_| anyhow::anyhow!("BIP448 transfer receiver returned malformed JSON"))?;
         return Ok(Bip448TransferReceiverPostResult::Applied(response));
     }
@@ -216,7 +216,7 @@ fn parse_transfer_receiver_response(
 
 async fn send_transfer_receiver_request_payload(
     client_config: &ClientConfig,
-    transfer_receiver_request_payload: &TransferReceiverRequestPayloadV2,
+    transfer_receiver_request_payload: &TransferReceiverRequestPayloadV1,
 ) -> Result<Bip448TransferReceiverPostResult> {
     let path = "transfer/receiver";
 
@@ -362,8 +362,8 @@ mod tests {
     }
 
     #[test]
-    fn v2_receiver_response_parses_typed_receipt_and_batch_lock() {
-        let receipt = r#"{"protocol_version":2,"operation_id":"1111111111111111111111111111111111111111111111111111111111111111","statechain_id":"statechain","status":"applied","accepted_sig_count":2,"previous_key_generation":0,"resulting_key_generation":1,"previous_server_pubkey":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","resulting_server_pubkey":"02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5","transfer_generation_pubkey":"02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"}"#;
+    fn v1_receiver_response_parses_typed_receipt_and_batch_lock() {
+        let receipt = r#"{"protocol_version":1,"operation_id":"1111111111111111111111111111111111111111111111111111111111111111","statechain_id":"statechain","status":"applied","accepted_sig_count":2,"previous_key_generation":0,"resulting_key_generation":1,"previous_server_pubkey":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","resulting_server_pubkey":"02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5","transfer_generation_pubkey":"02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"}"#;
         let applied = parse_transfer_receiver_response(StatusCode::OK, receipt).unwrap();
         let Bip448TransferReceiverPostResult::Applied(applied) = applied else {
             panic!("typed receipt parsed as a batch lock");

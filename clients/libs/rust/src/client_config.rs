@@ -12,12 +12,12 @@ use crate::chain::{ChainClient, CoreRpcAuth, CoreRpcConfig};
 pub struct ClientConfig {
     /// Active lockbox server addresses
     pub statechain_entity: String,
-    /// Selected blockchain backend. Only `core` is supported.
+    /// Selected blockchain backend (`core` or Mutinynet `explorer`).
     pub chain_backend: String,
     /// Active chain backend client
     pub chain_client: ChainClient,
-    /// Bitcoin Core RPC url
-    pub core_rpc_url: Option<String>,
+    /// Chain endpoint. This is Bitcoin Core RPC for `core` and Esplora for `explorer`.
+    pub chain_endpoint: Option<String>,
     /// Bitcoin Core RPC auth strategy, e.g. `userpass` or `cookie`
     pub core_rpc_auth: Option<String>,
     /// Bitcoin Core RPC username when using password auth
@@ -123,7 +123,7 @@ fn build_core_rpc_config(
 
 fn ensure_supported_chain_backend(chain_backend: &str) -> Result<()> {
     match chain_backend {
-        "core" => Ok(()),
+        "core" | "explorer" => Ok(()),
         other => Err(anyhow!("Unsupported chain backend: {}", other)),
     }
 }
@@ -148,7 +148,11 @@ impl ClientConfig {
             .get_string("chain_backend")
             .unwrap_or_else(|_| "core".to_string());
         ensure_supported_chain_backend(&chain_backend).unwrap();
-        let core_rpc_url = settings.get_string("core_rpc_url").ok();
+        let chain_endpoint = match chain_backend.as_str() {
+            "core" => settings.get_string("core_rpc_url").ok(),
+            "explorer" => settings.get_string("explorer_url").ok(),
+            _ => unreachable!("validated chain backend"),
+        };
         let core_rpc_auth = settings.get_string("core_rpc_auth").ok();
         let core_rpc_user = settings.get_string("core_rpc_user").ok();
         let core_rpc_password = settings.get_string("core_rpc_password").ok();
@@ -192,23 +196,31 @@ impl ClientConfig {
             _ => panic!("Invalid network name"),
         };
 
-        // Create Core/Inquisition chain client
-
-        let core_rpc_config = build_core_rpc_config(
-            &core_rpc_url,
-            &core_rpc_auth,
-            &core_rpc_user,
-            &core_rpc_password,
-            &core_rpc_cookie_file,
-        )
+        let chain_client = match chain_backend.as_str() {
+            "core" => ChainClient::new(
+                build_core_rpc_config(
+                    &chain_endpoint,
+                    &core_rpc_auth,
+                    &core_rpc_user,
+                    &core_rpc_password,
+                    &core_rpc_cookie_file,
+                )
+                .unwrap(),
+            ),
+            "explorer" => ChainClient::new_explorer(
+                chain_endpoint
+                    .clone()
+                    .expect("Explorer backend selected without explorer_url"),
+            ),
+            _ => unreachable!("validated chain backend"),
+        }
         .unwrap();
-        let chain_client = ChainClient::new(core_rpc_config).unwrap();
 
         ClientConfig {
             statechain_entity,
             chain_backend,
             chain_client,
-            core_rpc_url,
+            chain_endpoint,
             core_rpc_auth,
             core_rpc_user,
             core_rpc_password,
@@ -236,4 +248,21 @@ impl ClientConfig {
 pub async fn load() -> ClientConfig {
     let client_config = ClientConfig::load().await;
     client_config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chain_backend_allowlist_includes_core_and_explorer() {
+        assert!(ensure_supported_chain_backend("core").is_ok());
+        assert!(ensure_supported_chain_backend("explorer").is_ok());
+        assert_eq!(
+            ensure_supported_chain_backend("electrum")
+                .unwrap_err()
+                .to_string(),
+            "Unsupported chain backend: electrum"
+        );
+    }
 }

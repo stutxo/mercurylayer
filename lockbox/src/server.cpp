@@ -1,18 +1,27 @@
 #include "server.h"
 #include <crow.h>
+#include <openssl/crypto.h>
 #include <secp256k1.h>
 #include <secp256k1_musig.h>
 #include "utils.h"
 #include "enclave.h"
+#ifdef LOCKBOX_ENABLE_GOOGLE_KMS
 #include "google_key_manager.h"
+#endif
 #include "hashicorp_api_key_manager.h"
 #include "hashicorp_container_key_manager.h"
 #include "filesystem_key_manager.h"
 #include "db_manager.h"
+#include "request_auth.h"
 #include <toml++/toml.h>
 #include <algorithm>
 #include <array>
 #include <chrono>
+#ifdef __linux__
+#include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
+#endif
 #include <cstdint>
 #include <iostream>
 #include <limits>
@@ -39,13 +48,60 @@ namespace lockbox {
     const std::vector<std::string> KEYUPDATE_KEYS = {
         "expected_key_generation", "expected_server_pubkey", "expected_sig_count", "operation_id",
         "protocol_version", "statechain_id", "t2", "x1"};
+    const std::vector<std::string> VERIFY_KEYS = {"challenge", "statechain_id"};
+    constexpr std::size_t MAX_PUBLIC_VERIFY_BODY_BYTES = 4096;
 
     using SecpPtr = std::unique_ptr<secp256k1_context, decltype(&secp256k1_context_destroy)>;
+    crow::response unauthorized_response() {
+        crow::response response(401, R"({"message":"Unauthorized"})");
+        response.set_header("Content-Type", "application/json");
+        response.set_header("WWW-Authenticate", "Bearer");
+        return response;
+    }
 
     struct EncryptedBufferGuard {
         utils::chacha20_poly1305_encrypted_data& value;
         ~EncryptedBufferGuard() { delete[] value.data; value.data = nullptr; }
     };
+
+    struct SeedGuard {
+        explicit SeedGuard(std::vector<uint8_t>& seed) : value(seed) {
+#ifdef __linux__
+            if (!value.empty() && ::mlock(value.data(), value.size()) != 0) {
+                OPENSSL_cleanse(value.data(), value.size());
+                throw std::runtime_error("Failed to lock the Lockbox seed in memory.");
+            }
+#endif
+        }
+
+        ~SeedGuard() {
+            OPENSSL_cleanse(value.data(), value.size());
+#ifdef __linux__
+            if (!value.empty()) {
+                ::munlock(value.data(), value.size());
+            }
+#endif
+        }
+
+        std::vector<uint8_t>& value;
+    };
+    struct KeyupdateSecretGuard {
+        db_manager::Bip448KeyupdateRequest& value;
+        ~KeyupdateSecretGuard() {
+            OPENSSL_cleanse(value.t2.data(), value.t2.size());
+            OPENSSL_cleanse(value.x1.data(), value.x1.size());
+        }
+    };
+
+    void harden_process_secrets() {
+#ifdef __linux__
+        const struct rlimit no_core_dumps {0, 0};
+        if (::setrlimit(RLIMIT_CORE, &no_core_dumps) != 0 ||
+            ::prctl(PR_SET_DUMPABLE, 0) != 0) {
+            throw std::runtime_error("Failed to disable Lockbox process memory disclosure.");
+        }
+#endif
+    }
 
     std::string lower_hex(const unsigned char* data, std::size_t size) {
         constexpr char digits[] = "0123456789abcdef";
@@ -177,7 +233,7 @@ namespace lockbox {
 
     bool parse_keyupdate(const crow::json::rvalue& body, db_manager::Bip448KeyupdateRequest& request) {
         std::uint64_t version = 0;
-        return exact_object(body, KEYUPDATE_KEYS) && read_u64(body, "protocol_version", version) && version == 2
+        return exact_object(body, KEYUPDATE_KEYS) && read_u64(body, "protocol_version", version) && version == 1
             && read_string(body, "operation_id", request.operation_id) && canonical_hex(request.operation_id, 64)
             && read_statechain_id(body, request.statechain_id) && read_scalar(body, "t2", request.t2)
             && read_scalar(body, "x1", request.x1)
@@ -231,6 +287,32 @@ namespace lockbox {
         } catch (const std::exception&) { return crow::response(500, "Failed to generate key"); }
     }
 
+    crow::response verify_statechain(
+        const std::string& statechain_id,
+        const std::string& challenge
+    ) {
+        bool found = false;
+        db_manager::Bip448PublicKey server_public_key{};
+        std::string error_message;
+        if (!db_manager::get_statechain_public_key(
+                statechain_id,
+                found,
+                server_public_key.data(),
+                server_public_key.size(),
+                error_message)) {
+            CROW_LOG_ERROR << "Failed to verify statechain: " << error_message;
+            return crow::response(500, "Failed to verify statechain.");
+        }
+        if (!found) return crow::response(404, "Statechain not found.");
+
+        crow::json::wvalue body;
+        body["statechain_id"] = statechain_id;
+        body["challenge"] = challenge;
+        body["server_pubkey"] =
+            lower_hex(server_public_key.data(), server_public_key.size());
+        return json_response(200, std::move(body));
+    }
+
     crow::response generate_bip448_public_nonce(const db_manager::Bip448SignFirstRequest& request, unsigned char* seed) {
         const auto result = db_manager::execute_bip448_sign_first(request, seed);
         if (result.outcome != db_manager::Bip448Outcome::Applied && result.outcome != db_manager::Bip448Outcome::ExactReplay) {
@@ -257,7 +339,7 @@ namespace lockbox {
         if (!result.receipt) return crow::response(500, "BIP448 receipt missing");
         const auto& receipt = *result.receipt;
         crow::json::wvalue body;
-        body["protocol_version"] = 2; body["operation_id"] = receipt.operation_id;
+        body["protocol_version"] = 1; body["operation_id"] = receipt.operation_id;
         body["statechain_id"] = receipt.statechain_id; body["status"] = "applied";
         body["accepted_sig_count"] = static_cast<std::uint64_t>(receipt.accepted_sig_count);
         body["previous_key_generation"] = static_cast<std::uint64_t>(receipt.previous_key_generation);
@@ -295,76 +377,118 @@ namespace lockbox {
         }
     }
 
-    void initializeDatabase() {
+    void initializeDatabase(
+        const std::vector<uint8_t>& seed,
+        bool allow_initialization
+    ) {
         const auto start_time = std::chrono::steady_clock::now();
         const auto timeout_duration = std::chrono::minutes(3);
         std::string error_message;
 
         while (true) {
             error_message.clear();
-            if (db_manager::initialize_database(error_message)) {
+            if (db_manager::initialize_database(
+                    error_message,
+                    seed.data(),
+                    seed.size(),
+                    allow_initialization)) {
                 return;
             }
 
+#ifdef LOCKBOX_DATABASE_BACKEND_SQLITE
+            throw std::runtime_error(error_message);
+#else
             if (error_message == "incompatible legacy lockbox database") {
                 throw std::runtime_error(error_message);
             }
-
-            auto current_time = std::chrono::steady_clock::now();
-            if (current_time - start_time >= timeout_duration) {
-                throw std::runtime_error("Failed to initialize lockbox database after 3 minutes of retries: " + error_message);
+            if (std::chrono::steady_clock::now() - start_time >= timeout_duration) {
+                throw std::runtime_error(
+                    "Failed to initialize lockbox database after 3 minutes of retries: " +
+                    error_message
+                );
             }
-
             std::this_thread::sleep_for(std::chrono::seconds(5));
+#endif
         }
     }
 
     void start_server() {
+        harden_process_secrets();
+#ifdef LOCKBOX_ENABLE_TEST_RNG
+        std::cerr
+            << "[lockbox] WARNING: deterministic test RNG support is compiled into this binary; "
+               "never use it with real funds."
+            << std::endl;
+#endif
+        const auto key_provider = getKeyManager();
+        const auto authenticator = request_auth::Authenticator::from_environment();
+        std::cout << "[lockbox] request authentication="
+                  << (authenticator.enabled() ? "required" : "disabled") << std::endl;
+
+        bool allow_database_initialization = true;
+#ifdef LOCKBOX_DATABASE_BACKEND_SQLITE
+        if (key_provider != "filesystem") {
+            throw std::runtime_error("The SQLite backend requires the filesystem key manager.");
+        }
+        allow_database_initialization =
+            filesystem_key_manager::embedded_storage_needs_initialization();
+#endif
 
         std::vector<uint8_t> seed;
-
-        auto key_provider = getKeyManager();
-
         if (key_provider == "filesystem") {
-
             std::cout << "Using filesystem key manager" << std::endl;
-
             seed = filesystem_key_manager::get_seed();
         } else if (key_provider == "google_kms") {
-
+#ifdef LOCKBOX_ENABLE_GOOGLE_KMS
             std::cout << "Using Google KMS key manager" << std::endl;
-
             seed = key_manager::get_seed();
+#else
+            throw std::runtime_error(
+                "Google KMS key manager was not built. "
+                "Rebuild with -DLOCKBOX_ENABLE_GOOGLE_KMS=ON."
+            );
+#endif
         } else if (key_provider == "hashicorp_api") {
-
             std::cout << "Using Hashicorp API key manager" << std::endl;
-
             seed = hashicorp_api_key_manager::get_seed();
         } else if (key_provider == "hashicorp_container") {
-
             std::cout << "Using Hashicorp container key manager" << std::endl;
-
             seed = getHashicorpContainerSeed();
         } else {
             throw std::runtime_error("Invalid key manager: " + key_provider);
         }
+        SeedGuard seed_guard{seed};
 
-        /* std::string seed_hex = utils::key_to_string(seed.data(), seed.size());
+        initializeDatabase(seed, allow_database_initialization);
 
-        std::cout << "Seed:       " << seed_hex << std::endl; */
-
-        initializeDatabase();
-
-        // Initialize Crow HTTP server
         crow::SimpleApp app;
-
         // Define a simple route
-        CROW_ROUTE(app, "/")([](){
-            return "Hello, Crow!";
+        CROW_ROUTE(app, "/")([&authenticator](const crow::request& req) {
+            if (!authenticator.authorized(req.get_header_value("Authorization"))) {
+                return unauthorized_response();
+            }
+            return crow::response(200, "Hello, Crow!");
+        });
+
+        CROW_ROUTE(app, "/health/ready")([&authenticator](const crow::request& req) {
+            if (!authenticator.authorized(req.get_header_value("Authorization"))) {
+                return unauthorized_response();
+            }
+            std::string error_message;
+            if (!db_manager::database_is_ready(error_message)) {
+                CROW_LOG_ERROR << "Lockbox database is not ready: " << error_message;
+                return crow::response(503, "Lockbox database is not ready.");
+            }
+            crow::json::wvalue body;
+            body["status"] = "ready";
+            return json_response(200, std::move(body));
         });
 
         CROW_ROUTE(app, "/get_public_key")
-        .methods("POST"_method)([&seed](const crow::request& req) {
+        .methods("POST"_method)([&seed, &authenticator](const crow::request& req) {
+            if (!authenticator.authorized(req.get_header_value("Authorization"))) {
+                return unauthorized_response();
+            }
             auto req_body = crow::json::load(req.body);
             if (!req_body) return crow::response(400);
             if (req_body.count("statechain_id") == 0)
@@ -374,7 +498,10 @@ namespace lockbox {
         });
 
         CROW_ROUTE(app, "/bip448/get_public_nonce")
-        .methods("POST"_method)([&seed](const crow::request& req) {
+        .methods("POST"_method)([&seed, &authenticator](const crow::request& req) {
+            if (!authenticator.authorized(req.get_header_value("Authorization"))) {
+                return unauthorized_response();
+            }
             auto req_body = crow::json::load(req.body);
             db_manager::Bip448SignFirstRequest request;
             if (!req_body || !parse_sign_first(req_body, request)) return crow::response(400, "Invalid BIP448 request");
@@ -382,7 +509,10 @@ namespace lockbox {
         });
 
         CROW_ROUTE(app, "/bip448/get_partial_signature")
-        .methods("POST"_method)([&seed](const crow::request& req) {
+        .methods("POST"_method)([&seed, &authenticator](const crow::request& req) {
+            if (!authenticator.authorized(req.get_header_value("Authorization"))) {
+                return unauthorized_response();
+            }
             auto req_body = crow::json::load(req.body);
             db_manager::Bip448SignSecondRequest request;
             if (!req_body || !parse_sign_second(req_body, request)) return crow::response(400, "Invalid BIP448 request");
@@ -390,50 +520,99 @@ namespace lockbox {
         });
 
         CROW_ROUTE(app,"/signature_count/<string>")
-        ([](std::string statechain_id) {
+        ([&authenticator](const crow::request& req, std::string statechain_id) {
+            if (!authenticator.authorized(req.get_header_value("Authorization"))) {
+                return unauthorized_response();
+            }
             const auto result = db_manager::observe_bip448_state(statechain_id);
-            if (result.outcome == db_manager::Bip448Outcome::NotFound) return crow::response(404, "Signature count not found.");
-            if (result.outcome != db_manager::Bip448Outcome::Applied || !result.state) return result_error(result);
-            crow::json::wvalue body; body["sig_count"] = static_cast<std::uint64_t>(result.state->sig_count);
+            if (result.outcome == db_manager::Bip448Outcome::NotFound) {
+                return crow::response(404, "Signature count not found.");
+            }
+            if (result.outcome != db_manager::Bip448Outcome::Applied || !result.state) {
+                return result_error(result);
+            }
+            crow::json::wvalue body;
+            body["sig_count"] = static_cast<std::uint64_t>(result.state->sig_count);
             return json_response(200, std::move(body));
         });
 
+        CROW_ROUTE(app, "/verify_statechain")
+        .methods("POST"_method)([](const crow::request& req) {
+            if (req.body.size() > MAX_PUBLIC_VERIFY_BODY_BYTES) {
+                return crow::response(413, "Request body too large.");
+            }
+            auto body = crow::json::load(req.body);
+            std::string statechain_id;
+            std::string challenge;
+            if (!body || !exact_object(body, VERIFY_KEYS) ||
+                !read_statechain_id(body, statechain_id) ||
+                !read_string(body, "challenge", challenge) ||
+                !canonical_hex(challenge, 64)) {
+                return crow::response(
+                    400,
+                    "Invalid parameters. They must be a statechain_id and 32-byte hex challenge."
+                );
+            }
+            return verify_statechain(statechain_id, challenge);
+        });
+
         CROW_ROUTE(app,"/bip448/state/<string>")
-        ([](std::string statechain_id) {
+        ([&authenticator](const crow::request& req, std::string statechain_id) {
+            if (!authenticator.authorized(req.get_header_value("Authorization"))) {
+                return unauthorized_response();
+            }
             const auto result = db_manager::observe_bip448_state(statechain_id);
-            if (result.outcome != db_manager::Bip448Outcome::Applied || !result.state) return result_error(result);
+            if (result.outcome != db_manager::Bip448Outcome::Applied || !result.state) {
+                return result_error(result);
+            }
             crow::json::wvalue body;
-            body["protocol_version"] = 2; body["statechain_id"] = result.state->statechain_id;
+            body["protocol_version"] = 1;
+            body["statechain_id"] = result.state->statechain_id;
             body["sig_count"] = static_cast<std::uint64_t>(result.state->sig_count);
             body["key_generation"] = static_cast<std::uint64_t>(result.state->key_generation);
-            body["server_pubkey"] = lower_hex(result.state->server_pubkey.data(), result.state->server_pubkey.size());
+            body["server_pubkey"] =
+                lower_hex(result.state->server_pubkey.data(), result.state->server_pubkey.size());
             return json_response(200, std::move(body));
         });
 
         CROW_ROUTE(app, "/keyupdate")
-        .methods("POST"_method)([&seed](const crow::request& req) {
+        .methods("POST"_method)([&seed, &authenticator](const crow::request& req) {
+            if (!authenticator.authorized(req.get_header_value("Authorization"))) {
+                return unauthorized_response();
+            }
             auto req_body = crow::json::load(req.body);
             db_manager::Bip448KeyupdateRequest request;
+            KeyupdateSecretGuard request_guard{request};
             if (!req_body || !parse_keyupdate(req_body, request)) return crow::response(400, "Invalid BIP448 request");
             return keyupdate(request, seed.data());
         });
 
         CROW_ROUTE(app,"/delete_statechain/<string>")
-        .methods("DELETE"_method)([](std::string statechain_id) {
+        .methods("DELETE"_method)([&authenticator](
+            const crow::request& req,
+            std::string statechain_id
+        ) {
+            if (!authenticator.authorized(req.get_header_value("Authorization"))) {
+                return unauthorized_response();
+            }
             const auto result = db_manager::delete_statechain(statechain_id);
-            if (result.outcome == db_manager::Bip448Outcome::Applied
-                || result.outcome == db_manager::Bip448Outcome::ExactReplay) return crow::response(200, "Statechain deleted.");
+            if (result.outcome == db_manager::Bip448Outcome::Applied ||
+                result.outcome == db_manager::Bip448Outcome::ExactReplay) {
+                return crow::response(200, "Statechain deleted.");
+            }
             return result_error(result);
         });
 
         uint16_t server_port = 0;
+        std::string bind_address;
 
         try {
             server_port = utils::getServerPort();
-        } catch (const std::exception& e) {
-            throw std::runtime_error("Failed to get enclave port");
+            bind_address = utils::getStringConfigVar(utils::SERVER_BIND_ADDRESS);
+        } catch (const std::exception&) {
+            throw std::runtime_error("Failed to configure enclave listener");
         }
-        
-        app.port(server_port).multithreaded().run();
+
+        app.bindaddr(bind_address).port(server_port).multithreaded().run();
     }
 } // namespace lockbox

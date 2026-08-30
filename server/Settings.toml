@@ -8,23 +8,9 @@ db_name = "mercury"
 token_server_url = "http://localhost:8001" # URL of the token server (optional)
 
 [[enclaves]]
-url = "http://0.0.0.0:18080"
+url = "http://127.0.0.1:18080"
 allow_deposit = true
 
-[[enclaves]]
-url = "http://0.0.0.0:18080"
-allow_deposit = false
-
-[[enclaves]]
-url = "http://0.0.0.0:18080"
-allow_deposit = true
-
-[[enclaves]]
-url = "http://0.0.0.0:18080"
-allow_deposit = true
-
-[[enclaves]]
-url = "http://0.0.0.0:18080"
-allow_deposit = true
-
-# env var: ENCLAVES='[{"url": "http://0.0.0.0:18080", "allow_deposit": true}, {"url": "http://0.0.0.0:18080", "allow_deposit": false}]'
+# For local regtest only. Every transport also requires a 64-hex
+# LOCKBOX_AUTH_TOKEN environment variable.
+# env var: ENCLAVES='[{"url":"http://127.0.0.1:18080","allow_deposit":true}]'

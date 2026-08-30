@@ -4,9 +4,9 @@ use anyhow::{anyhow, Result};
 use bitcoin::{consensus::deserialize, Network, OutPoint, PrivateKey, Transaction, Txid};
 use mercurylib::{
     bip448_statechain::signing_api::{
-        Bip448CompressedPublicKey, Bip448KeyUpdateAppliedReceiptPayloadV2, Bip448OperationId,
-        Bip448ProtocolVersionV2, Bip448SchnorrSignature, Bip448SecretScalar, Bip448StatechainId,
-        Bip448StatechainInfoResponsePayloadV2,
+        Bip448CompressedPublicKey, Bip448KeyUpdateAppliedReceiptPayloadV1, Bip448OperationId,
+        Bip448ProtocolVersionV1, Bip448SchnorrSignature, Bip448SecretScalar, Bip448StatechainId,
+        Bip448StatechainInfoResponsePayloadV1,
     },
     transfer::{
         bip448::{
@@ -14,7 +14,7 @@ use mercurylib::{
             Bip448TransferMsg,
         },
         receiver::{
-            StatechainInfo, StatechainInfoResponsePayload, TransferReceiverRequestPayloadV2,
+            StatechainInfo, StatechainInfoResponsePayload, TransferReceiverRequestPayloadV1,
         },
         TxOutpoint,
     },
@@ -106,7 +106,7 @@ pub(crate) fn expected_server_pubkey(
 }
 
 pub(super) fn statechain_info_for_verification(
-    observed: &Bip448StatechainInfoResponsePayloadV2,
+    observed: &Bip448StatechainInfoResponsePayloadV1,
 ) -> Result<StatechainInfoResponsePayload> {
     Ok(StatechainInfoResponsePayload {
         enclave_public_key: hex::encode(observed.enclave_public_key.as_bytes()),
@@ -128,10 +128,10 @@ pub(super) fn statechain_info_for_verification(
 pub(super) fn create_receiver_request(
     verified: &Bip448VerifiedTransfer,
     coin: &mercurylib::wallet::Coin,
-    observed: &Bip448StatechainInfoResponsePayloadV2,
+    observed: &Bip448StatechainInfoResponsePayloadV1,
     operation_id: Bip448OperationId,
     recipient_unlock_auth_sig: Bip448SchnorrSignature,
-) -> Result<TransferReceiverRequestPayloadV2> {
+) -> Result<TransferReceiverRequestPayloadV1> {
     let receiver_secret = PrivateKey::from_wif(&coin.user_privkey)?.inner;
     let t1 = Scalar::from_be_bytes(verified.msg.t1)?;
     let t2 = receiver_secret.negate().add_tweak(&t1)?;
@@ -146,8 +146,8 @@ pub(super) fn create_receiver_request(
             "BIP448 verified transfer generation does not match live state"
         ));
     }
-    let mut request = TransferReceiverRequestPayloadV2 {
-        protocol_version: Bip448ProtocolVersionV2,
+    let mut request = TransferReceiverRequestPayloadV1 {
+        protocol_version: Bip448ProtocolVersionV1,
         operation_id,
         statechain_id: Bip448StatechainId::try_from(verified.msg.statechain_id.as_str())?,
         t2: Bip448SecretScalar::from_bytes(t2_bytes)?,
@@ -164,9 +164,9 @@ pub(super) fn create_receiver_request(
 }
 
 pub(super) fn verify_keyupdate_receipt(
-    request: &TransferReceiverRequestPayloadV2,
-    receipt: &Bip448KeyUpdateAppliedReceiptPayloadV2,
-    live_after: &Bip448StatechainInfoResponsePayloadV2,
+    request: &TransferReceiverRequestPayloadV1,
+    receipt: &Bip448KeyUpdateAppliedReceiptPayloadV1,
+    live_after: &Bip448StatechainInfoResponsePayloadV1,
 ) -> Result<PublicKey> {
     let resulting_generation = request
         .expected_key_generation
@@ -228,14 +228,15 @@ mod tests {
     use secp256k1::{PublicKey, Secp256k1, SecretKey};
 
     fn receiver_request_fixture() -> (
-        TransferReceiverRequestPayloadV2,
-        Bip448KeyUpdateAppliedReceiptPayloadV2,
-        Bip448StatechainInfoResponsePayloadV2,
+        TransferReceiverRequestPayloadV1,
+        Bip448KeyUpdateAppliedReceiptPayloadV1,
+        Bip448StatechainInfoResponsePayloadV1,
     ) {
         let fixture = fixture();
         let observed = observed_info();
-        let legacy = statechain_info_for_verification(&observed).unwrap();
-        let verified = Bip448VerifiedTransfer::new(fixture.msg, &legacy, fixture.facts).unwrap();
+        let verification_info = statechain_info_for_verification(&observed).unwrap();
+        let verified =
+            Bip448VerifiedTransfer::new(fixture.msg, &verification_info, fixture.facts).unwrap();
         let auth_secret = PrivateKey::from_wif(&fixture.coin.auth_privkey)
             .unwrap()
             .inner;
@@ -304,9 +305,11 @@ mod tests {
         let fixture = fixture();
         let mut observed = observed_info();
         observed.num_sigs = Bip448SignatureCount::new(observed.num_sigs.get() + 1);
-        let legacy = statechain_info_for_verification(&observed).unwrap();
+        let verification_info = statechain_info_for_verification(&observed).unwrap();
 
-        assert!(Bip448VerifiedTransfer::new(fixture.msg, &legacy, fixture.facts).is_err());
+        assert!(
+            Bip448VerifiedTransfer::new(fixture.msg, &verification_info, fixture.facts).is_err()
+        );
     }
 
     #[test]

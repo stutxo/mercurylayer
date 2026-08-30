@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     bip448_statechain::signing_api::{
-        Bip448CompressedPublicKey, Bip448KeyGeneration, Bip448OperationId, Bip448ProtocolVersionV2,
+        Bip448CompressedPublicKey, Bip448KeyGeneration, Bip448OperationId, Bip448ProtocolVersionV1,
         Bip448SchnorrSignature, Bip448SecretScalar, Bip448SignatureCount, Bip448StatechainId,
         Bip448WireError,
     },
@@ -25,14 +25,6 @@ pub struct TransferUnlockRequestPayload {
     /// the locked transfer row's `x1`. It is a generation tag, not an
     /// authentication identity.
     pub auth_pub_key: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TransferReceiverRequestPayload {
-    pub statechain_id: String,
-    pub batch_data: Option<String>,
-    pub t2: String,
-    pub auth_sig: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -81,13 +73,12 @@ pub struct StatechainInfoResponsePayload {
 }
 
 const BIP448_TRANSFER_UNLOCK_DOMAIN: &[u8] = b"BIP448/transfer-unlock/v1\0";
-const BIP448_TRANSFER_RECEIVER_DOMAIN: &[u8] = b"BIP448/transfer-receiver/v1\0";
-const BIP448_TRANSFER_RECEIVER_V2_DOMAIN: &[u8] = b"BIP448/transfer-receiver/v2\0";
+const BIP448_TRANSFER_RECEIVER_V1_DOMAIN: &[u8] = b"BIP448/transfer-receiver/v1\0";
 
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct TransferReceiverRequestPayloadV2 {
-    pub protocol_version: Bip448ProtocolVersionV2,
+pub struct TransferReceiverRequestPayloadV1 {
+    pub protocol_version: Bip448ProtocolVersionV1,
     pub operation_id: Bip448OperationId,
     pub statechain_id: Bip448StatechainId,
     pub t2: Bip448SecretScalar,
@@ -99,13 +90,13 @@ pub struct TransferReceiverRequestPayloadV2 {
     pub auth_sig: Bip448SchnorrSignature,
 }
 
-impl TransferReceiverRequestPayloadV2 {
+impl TransferReceiverRequestPayloadV1 {
     pub fn canonical_auth_preimage(&self) -> Result<Vec<u8>, Bip448WireError> {
         let statechain_id = self.statechain_id.as_str().as_bytes();
         let statechain_id_len = u32::try_from(statechain_id.len())
             .map_err(|_| Bip448WireError::StatechainIdLengthOverflow)?;
         let mut preimage = Vec::with_capacity(
-            BIP448_TRANSFER_RECEIVER_V2_DOMAIN.len()
+            BIP448_TRANSFER_RECEIVER_V1_DOMAIN.len()
                 + 32
                 + 4
                 + statechain_id.len()
@@ -116,7 +107,7 @@ impl TransferReceiverRequestPayloadV2 {
                 + 33
                 + 64,
         );
-        preimage.extend_from_slice(BIP448_TRANSFER_RECEIVER_V2_DOMAIN);
+        preimage.extend_from_slice(BIP448_TRANSFER_RECEIVER_V1_DOMAIN);
         preimage.extend_from_slice(self.operation_id.as_bytes());
         preimage.extend_from_slice(&statechain_id_len.to_be_bytes());
         preimage.extend_from_slice(statechain_id);
@@ -167,21 +158,6 @@ pub fn bip448_transfer_unlock_auth_digest(
     preimage.extend_from_slice(BIP448_TRANSFER_UNLOCK_DOMAIN);
     preimage.push(role.as_byte());
     append_statechain_id(&mut preimage, statechain_id)?;
-    preimage.extend_from_slice(&x1_generation_pubkey.serialize());
-    Ok(sha256::Hash::hash(&preimage).to_byte_array())
-}
-
-pub fn bip448_transfer_receiver_auth_digest(
-    statechain_id: &str,
-    t2: &[u8; 32],
-    x1_generation_pubkey: &PublicKey,
-) -> Result<[u8; 32], MercuryError> {
-    let mut preimage = Vec::with_capacity(
-        BIP448_TRANSFER_RECEIVER_DOMAIN.len() + 4 + statechain_id.len() + 32 + 33,
-    );
-    preimage.extend_from_slice(BIP448_TRANSFER_RECEIVER_DOMAIN);
-    append_statechain_id(&mut preimage, statechain_id)?;
-    preimage.extend_from_slice(t2);
     preimage.extend_from_slice(&x1_generation_pubkey.serialize());
     Ok(sha256::Hash::hash(&preimage).to_byte_array())
 }
@@ -418,73 +394,37 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bip448_receiver_digest_is_domain_state_t2_and_generation_bound() {
-        let generation = PublicKey::from_str(
-            "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
-        )
-        .unwrap();
-        let other_generation = PublicKey::from_str(
-            "02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
-        )
-        .unwrap();
-        let t2 = [0x42; 32];
-        let digest =
-            bip448_transfer_receiver_auth_digest("statechain-vector", &t2, &generation).unwrap();
-
-        assert_eq!(
-            hex::encode(digest),
-            "e8185081251d8a4b31f3e4d90eb4eb063bf19a6bda669fb8380beefefa87d81b"
-        );
-        assert_ne!(
-            digest,
-            bip448_transfer_receiver_auth_digest("statechain-vector-2", &t2, &generation).unwrap()
-        );
-        let mut other_t2 = t2;
-        other_t2[0] ^= 1;
-        assert_ne!(
-            digest,
-            bip448_transfer_receiver_auth_digest("statechain-vector", &other_t2, &generation)
-                .unwrap()
-        );
-        assert_ne!(
-            digest,
-            bip448_transfer_receiver_auth_digest("statechain-vector", &t2, &other_generation)
-                .unwrap()
-        );
-    }
-
-    const V2_OPERATION_ID: &str =
+    const V1_OPERATION_ID: &str =
         "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
-    const V2_TRANSFER_KEY: &str =
+    const V1_TRANSFER_KEY: &str =
         "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
-    const V2_SERVER_KEY: &str =
+    const V1_SERVER_KEY: &str =
         "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
-    const V2_RECIPIENT_SIGNATURE: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f";
+    const V1_RECIPIENT_SIGNATURE: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f";
 
-    fn v2_signature(byte: u8) -> Bip448SchnorrSignature {
+    fn v1_signature(byte: u8) -> Bip448SchnorrSignature {
         Bip448SchnorrSignature::try_from(hex::encode([byte; 64]).as_str()).unwrap()
     }
 
-    fn v2_request() -> TransferReceiverRequestPayloadV2 {
-        TransferReceiverRequestPayloadV2 {
-            protocol_version: Bip448ProtocolVersionV2,
-            operation_id: Bip448OperationId::try_from(V2_OPERATION_ID).unwrap(),
-            statechain_id: Bip448StatechainId::try_from("statechain-vector-v2").unwrap(),
+    fn v1_request() -> TransferReceiverRequestPayloadV1 {
+        TransferReceiverRequestPayloadV1 {
+            protocol_version: Bip448ProtocolVersionV1,
+            operation_id: Bip448OperationId::try_from(V1_OPERATION_ID).unwrap(),
+            statechain_id: Bip448StatechainId::try_from("statechain-vector-v1").unwrap(),
             t2: Bip448SecretScalar::from_bytes([0x11; 32]).unwrap(),
-            transfer_generation_pubkey: Bip448CompressedPublicKey::try_from(V2_TRANSFER_KEY)
+            transfer_generation_pubkey: Bip448CompressedPublicKey::try_from(V1_TRANSFER_KEY)
                 .unwrap(),
             expected_sig_count: Bip448SignatureCount::new(0x0102_0304_0506_0708),
             expected_key_generation: Bip448KeyGeneration::new(0x1112_1314_1516_1718),
-            expected_server_pubkey: Bip448CompressedPublicKey::try_from(V2_SERVER_KEY).unwrap(),
-            recipient_unlock_auth_sig: Bip448SchnorrSignature::try_from(V2_RECIPIENT_SIGNATURE)
+            expected_server_pubkey: Bip448CompressedPublicKey::try_from(V1_SERVER_KEY).unwrap(),
+            recipient_unlock_auth_sig: Bip448SchnorrSignature::try_from(V1_RECIPIENT_SIGNATURE)
                 .unwrap(),
-            auth_sig: v2_signature(0x11),
+            auth_sig: v1_signature(0x11),
         }
     }
 
-    fn v2_json_keys(
-        request: &TransferReceiverRequestPayloadV2,
+    fn v1_json_keys(
+        request: &TransferReceiverRequestPayloadV1,
     ) -> std::collections::BTreeSet<String> {
         serde_json::to_value(request)
             .unwrap()
@@ -496,11 +436,11 @@ mod tests {
     }
 
     #[test]
-    fn bip448_receiver_v2_digest_matches_independent_literal_vector() {
-        const PREIMAGE_HEX: &str = "4249503434382f7472616e736665722d72656365697665722f763200000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f000000147374617465636861696e2d766563746f722d763211111111111111111111111111111111111111111111111111111111111111110279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817980102030405060708111213141516171802c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f";
-        const DIGEST_HEX: &str = "16ede35157adf3b73226f6af70c94ba28fcb50792648fb3debfe7da966fae813";
+    fn bip448_receiver_v1_digest_matches_independent_literal_vector() {
+        const PREIMAGE_HEX: &str = "4249503434382f7472616e736665722d72656365697665722f763100000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f000000147374617465636861696e2d766563746f722d763111111111111111111111111111111111111111111111111111111111111111110279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817980102030405060708111213141516171802c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f";
+        const DIGEST_HEX: &str = "4c8d62e5c359f376daf517e3c644be69933abc2a0dfbe055f4e7a9c8ec0fc6da";
 
-        let request = v2_request();
+        let request = v1_request();
         assert_eq!(
             hex::encode(request.canonical_auth_preimage().unwrap()),
             PREIMAGE_HEX
@@ -509,8 +449,8 @@ mod tests {
     }
 
     #[test]
-    fn bip448_receiver_v2_digest_binds_every_preimage_field_only() {
-        let request = v2_request();
+    fn bip448_receiver_v1_digest_binds_every_preimage_field_only() {
+        let request = v1_request();
         let digest = request.auth_digest().unwrap();
         let mut mutations = Vec::new();
 
@@ -525,7 +465,7 @@ mod tests {
         mutations.push(changed);
         let mut changed = request.clone();
         changed.transfer_generation_pubkey =
-            Bip448CompressedPublicKey::try_from(V2_SERVER_KEY).unwrap();
+            Bip448CompressedPublicKey::try_from(V1_SERVER_KEY).unwrap();
         mutations.push(changed);
         let mut changed = request.clone();
         changed.expected_sig_count =
@@ -542,10 +482,10 @@ mod tests {
         mutations.push(changed);
         let mut changed = request.clone();
         changed.expected_server_pubkey =
-            Bip448CompressedPublicKey::try_from(V2_TRANSFER_KEY).unwrap();
+            Bip448CompressedPublicKey::try_from(V1_TRANSFER_KEY).unwrap();
         mutations.push(changed);
         let mut changed = request.clone();
-        changed.recipient_unlock_auth_sig = v2_signature(0x12);
+        changed.recipient_unlock_auth_sig = v1_signature(0x12);
         mutations.push(changed);
 
         for changed in mutations {
@@ -553,15 +493,15 @@ mod tests {
         }
 
         let mut changed_auth_sig = request.clone();
-        changed_auth_sig.auth_sig = v2_signature(0x22);
+        changed_auth_sig.auth_sig = v1_signature(0x22);
         assert_eq!(changed_auth_sig.auth_digest().unwrap(), digest);
     }
 
     #[test]
-    fn bip448_receiver_v2_json_has_exact_key_set_and_no_forbidden_metadata() {
-        let request = v2_request();
+    fn bip448_receiver_v1_json_has_exact_key_set_and_no_forbidden_metadata() {
+        let request = v1_request();
         assert_eq!(
-            v2_json_keys(&request),
+            v1_json_keys(&request),
             [
                 "auth_sig",
                 "expected_key_generation",
@@ -597,7 +537,7 @@ mod tests {
         ] {
             assert!(
                 !json.contains(forbidden),
-                "v2 receiver request exposed forbidden sentinel {forbidden}: {json}"
+                "v1 receiver request exposed forbidden sentinel {forbidden}: {json}"
             );
         }
         for forbidden_value in [
@@ -610,34 +550,34 @@ mod tests {
     }
 
     #[test]
-    fn bip448_receiver_v2_rejects_unknown_missing_null_and_normalized_hex() {
-        let request = v2_request();
+    fn bip448_receiver_v1_rejects_unknown_missing_null_and_normalized_hex() {
+        let request = v1_request();
         let value = serde_json::to_value(&request).unwrap();
         let fields: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
 
         let mut unknown = value.clone();
         unknown["batch_data"] = serde_json::json!("forbidden");
-        assert!(serde_json::from_value::<TransferReceiverRequestPayloadV2>(unknown).is_err());
+        assert!(serde_json::from_value::<TransferReceiverRequestPayloadV1>(unknown).is_err());
 
         for field in &fields {
             let mut missing = value.clone();
             missing.as_object_mut().unwrap().remove(field);
             assert!(
-                serde_json::from_value::<TransferReceiverRequestPayloadV2>(missing).is_err(),
+                serde_json::from_value::<TransferReceiverRequestPayloadV1>(missing).is_err(),
                 "missing field {field} was accepted"
             );
 
             let mut null = value.clone();
             null[field] = serde_json::Value::Null;
             assert!(
-                serde_json::from_value::<TransferReceiverRequestPayloadV2>(null).is_err(),
+                serde_json::from_value::<TransferReceiverRequestPayloadV1>(null).is_err(),
                 "explicit null for {field} was accepted"
             );
         }
 
         let mut wrong_version = value.clone();
-        wrong_version["protocol_version"] = serde_json::json!(1);
-        assert!(serde_json::from_value::<TransferReceiverRequestPayloadV2>(wrong_version).is_err());
+        wrong_version["protocol_version"] = serde_json::json!(2);
+        assert!(serde_json::from_value::<TransferReceiverRequestPayloadV1>(wrong_version).is_err());
 
         for field in [
             "operation_id",
@@ -655,7 +595,7 @@ mod tests {
             };
             uppercase[field] = serde_json::json!(uppercase_value);
             assert!(
-                serde_json::from_value::<TransferReceiverRequestPayloadV2>(uppercase).is_err(),
+                serde_json::from_value::<TransferReceiverRequestPayloadV1>(uppercase).is_err(),
                 "uppercase field {field} was normalized"
             );
         }

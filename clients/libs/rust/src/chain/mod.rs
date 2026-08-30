@@ -1,21 +1,24 @@
 mod core;
+mod explorer;
 
+#[cfg(feature = "test-hooks")]
+use parking_lot::Mutex;
 use std::str::FromStr;
 
 use anyhow::{anyhow, Context, Result};
 use bitcoin::{BlockHash, Transaction, Txid};
 use serde_json::Value;
 
-use self::core::CoreChainClient;
 pub use self::core::{ChainTransaction, ChainTxOut, DescriptorActivity, ScanBlocksResult};
 pub(crate) use self::core::{CoreRpcAuth, CoreRpcConfig};
+use self::{core::CoreChainClient, explorer::ExplorerChainClient};
 
 #[cfg(feature = "test-hooks")]
-static SCAN_BLOCKS_CALLS: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+static SCAN_BLOCKS_CALLS: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
 
 #[cfg(feature = "test-hooks")]
 pub fn take_scan_blocks_calls() -> Vec<(u32, u32)> {
-    std::mem::take(&mut *SCAN_BLOCKS_CALLS.lock().unwrap())
+    std::mem::take(&mut *SCAN_BLOCKS_CALLS.lock())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,8 +29,13 @@ pub struct ChainUtxo {
     pub height: u32,
 }
 
+enum ChainBackend {
+    Core(CoreChainClient),
+    Explorer(ExplorerChainClient),
+}
+
 pub struct ChainClient {
-    core: CoreChainClient,
+    backend: ChainBackend,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,22 +46,37 @@ pub enum BroadcastTxStatus {
 impl ChainClient {
     pub fn new(core_rpc_config: CoreRpcConfig) -> Result<Self> {
         Ok(Self {
-            core: CoreChainClient::new(core_rpc_config)?,
+            backend: ChainBackend::Core(CoreChainClient::new(core_rpc_config)?),
+        })
+    }
+
+    pub fn new_explorer(url: String) -> Result<Self> {
+        Ok(Self {
+            backend: ChainBackend::Explorer(ExplorerChainClient::new(url)?),
         })
     }
 
     pub fn tip_height(&self) -> Result<u32> {
-        self.core.tip_height()
+        match &self.backend {
+            ChainBackend::Core(client) => client.tip_height(),
+            ChainBackend::Explorer(client) => client.tip_height(),
+        }
     }
 
     pub fn median_time_past(&self) -> Result<u32> {
-        self.core.median_time_past()
+        match &self.backend {
+            ChainBackend::Core(client) => client.median_time_past(),
+            ChainBackend::Explorer(client) => client.median_time_past(),
+        }
     }
 
     pub fn estimate_fee_sat_per_vbyte(&self, number_blocks: usize) -> Result<f64> {
-        let fee_rate_btc_per_kb = self.core.estimate_fee_btc_per_kb(number_blocks)?;
-
-        Ok(normalize_fee_rate_sats_per_byte(fee_rate_btc_per_kb))
+        match &self.backend {
+            ChainBackend::Core(client) => Ok(normalize_fee_rate_sats_per_byte(
+                client.estimate_fee_btc_per_kb(number_blocks)?,
+            )),
+            ChainBackend::Explorer(client) => client.estimate_fee_sat_per_vbyte(number_blocks),
+        }
     }
 
     pub fn get_tx_out(
@@ -62,11 +85,17 @@ impl ChainClient {
         vout: u32,
         include_mempool: bool,
     ) -> Result<Option<ChainTxOut>> {
-        self.core.get_tx_out(txid, vout, include_mempool)
+        match &self.backend {
+            ChainBackend::Core(client) => client.get_tx_out(txid, vout, include_mempool),
+            ChainBackend::Explorer(client) => client.get_tx_out(txid, vout, include_mempool),
+        }
     }
 
     pub fn get_block_hash(&self, height: u32) -> Result<BlockHash> {
-        self.core.get_block_hash(height)
+        match &self.backend {
+            ChainBackend::Core(client) => client.get_block_hash(height),
+            ChainBackend::Explorer(client) => client.get_block_hash(height),
+        }
     }
 
     pub(crate) fn get_stored_tx_out(
@@ -81,7 +110,6 @@ impl ChainClient {
         if parsed.to_string() != txid {
             return Ok(None);
         }
-
         self.get_tx_out(&parsed, vout, include_mempool)
     }
 
@@ -92,12 +120,15 @@ impl ChainClient {
         stop_height: u32,
     ) -> Result<ScanBlocksResult> {
         #[cfg(feature = "test-hooks")]
-        SCAN_BLOCKS_CALLS
-            .lock()
-            .unwrap()
-            .push((start_height, stop_height));
-        self.core
-            .scan_blocks(descriptors, start_height, stop_height)
+        SCAN_BLOCKS_CALLS.lock().push((start_height, stop_height));
+        match &self.backend {
+            ChainBackend::Core(client) => {
+                client.scan_blocks(descriptors, start_height, stop_height)
+            }
+            ChainBackend::Explorer(client) => {
+                client.scan_blocks(descriptors, start_height, stop_height)
+            }
+        }
     }
 
     pub fn descriptor_activity(
@@ -106,28 +137,49 @@ impl ChainClient {
         descriptors: &[String],
         include_mempool: bool,
     ) -> Result<Vec<DescriptorActivity>> {
-        self.core
-            .descriptor_activity(block_hashes, descriptors, include_mempool)
+        match &self.backend {
+            ChainBackend::Core(client) => {
+                client.descriptor_activity(block_hashes, descriptors, include_mempool)
+            }
+            ChainBackend::Explorer(client) => {
+                client.descriptor_activity(block_hashes, descriptors, include_mempool)
+            }
+        }
     }
 
     pub fn get_raw_tx(&self, txid: &Txid) -> Result<Vec<u8>> {
-        self.core.get_raw_tx(txid)
+        match &self.backend {
+            ChainBackend::Core(client) => client.get_raw_tx(txid),
+            ChainBackend::Explorer(client) => client.get_raw_tx(txid),
+        }
     }
 
     pub fn transaction_confirmations(&self, txid: &Txid) -> Result<Option<u32>> {
-        self.core.transaction_confirmations(txid)
+        match &self.backend {
+            ChainBackend::Core(client) => client.transaction_confirmations(txid),
+            ChainBackend::Explorer(client) => client.transaction_confirmations(txid),
+        }
     }
 
     pub fn exact_transaction(&self, txid: &Txid) -> Result<Option<ChainTransaction>> {
-        self.core.exact_transaction(txid)
+        match &self.backend {
+            ChainBackend::Core(client) => client.exact_transaction(txid),
+            ChainBackend::Explorer(client) => client.exact_transaction(txid),
+        }
     }
 
     pub fn broadcast_tx(&self, tx_bytes: &[u8]) -> Result<Txid> {
-        self.core.broadcast_tx(tx_bytes)
+        match &self.backend {
+            ChainBackend::Core(client) => client.broadcast_tx(tx_bytes),
+            ChainBackend::Explorer(client) => client.broadcast_tx(tx_bytes),
+        }
     }
 
     pub fn submit_package(&self, txs: &[Vec<u8>]) -> Result<Value> {
-        self.core.submit_package(txs)
+        match &self.backend {
+            ChainBackend::Core(client) => client.submit_package(txs),
+            ChainBackend::Explorer(client) => client.submit_package(txs),
+        }
     }
 }
 

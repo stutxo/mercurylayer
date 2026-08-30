@@ -1,11 +1,14 @@
 services:
 
+  # Fixed Vault credentials and seed are deterministic regtest fixtures only.
+  # Never reuse them for signet, mainnet, or any deployment holding value.
+
   vault:
     image: hashicorp/vault
     environment:
       - VAULT_DEV_ROOT_TOKEN_ID=2bbz80mr1zm0tfrjwxyq7f48ofgky848
     ports:
-      - "${ML_TEST_VAULT_PORT:-8200}:8200"
+      - "127.0.0.1:${ML_TEST_VAULT_PORT:-8200}:8200"
 
   vault-init:
     image: curlimages/curl
@@ -48,8 +51,11 @@ services:
       - HASHICORP_CONTAINER_MOUNT_POINT=secret
       - HASHICORP_CONTAINER_KEY_NAME=seed
       - LOCKBOX_TEST_RNG_SEED=${LOCKBOX_TEST_RNG_SEED:-}
+      # Auth is required by default; this is a fixed regtest-only token, not a secret.
+      - LOCKBOX_REQUIRE_AUTH=1
+      - LOCKBOX_AUTH_TOKEN=${LOCKBOX_AUTH_TOKEN:-27ed987bfb1a1bd671735842063e48b3e6b694d35b2f45333d3d6457077ef31c}
     ports:
-      - "${ML_TEST_LOCKBOX_PORT:-18080}:18080"
+      - "127.0.0.1:${ML_TEST_LOCKBOX_PORT:-18080}:18080"
 
   mercury-server:
     build:
@@ -68,8 +74,9 @@ services:
       DB_NAME: mercury
       BATCH_TIMEOUT: 20
       ENCLAVES: '[{"url": "http://lockbox:18080", "allow_deposit": true}]'
+      LOCKBOX_AUTH_TOKEN: ${LOCKBOX_AUTH_TOKEN:-27ed987bfb1a1bd671735842063e48b3e6b694d35b2f45333d3d6457077ef31c}
     ports:
-      - "${ML_TEST_MERCURY_PORT:-8000}:8000"
+      - "127.0.0.1:${ML_TEST_MERCURY_PORT:-8000}:8000"
 
   db_lockbox:
     image: postgres:16.2
@@ -77,7 +84,7 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: enclave
     ports:
-      - "${ML_TEST_LOCKBOX_DB_PORT:-5433}:5432"
+      - "127.0.0.1:${ML_TEST_LOCKBOX_DB_PORT:-5433}:5432"
     volumes:
       - postgres_lockbox_data:/var/lib/postgresql/data
 
@@ -87,7 +94,7 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: mercury
     ports:
-      - "${ML_TEST_MERCURY_DB_PORT:-5432}:5432"
+      - "127.0.0.1:${ML_TEST_MERCURY_DB_PORT:-5432}:5432"
     volumes:
       - postgres_server_data:/var/lib/postgresql/data
 

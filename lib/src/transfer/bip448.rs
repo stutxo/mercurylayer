@@ -177,6 +177,8 @@ impl Bip448VerifiedRecoveryState {
     }
 }
 
+pub const BIP448_TRANSFER_MESSAGE_VERSION: u32 = 1;
+
 /// BIP448 transfer message. Receivers validate signed update/settlement
 /// templates rather than backup-transaction history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -477,7 +479,7 @@ pub fn verify_bip448_transfer_msg(
 ) -> Result<(), Bip448TransferVerifyError> {
     let secp = Secp256k1::new();
     let expected_fee_bump_policy = Bip448FeeBumpPolicy::ZeroFeeEphemeralAnchor;
-    if msg.msg_version != 2 {
+    if msg.msg_version != BIP448_TRANSFER_MESSAGE_VERSION {
         return Err(Bip448TransferVerifyError::UnsupportedMessageVersion);
     }
     let network = Network::from_str(&msg.network)
@@ -1247,7 +1249,7 @@ mod tests {
             ),
         };
         let msg = Bip448TransferMsg {
-            msg_version: 2,
+            msg_version: BIP448_TRANSFER_MESSAGE_VERSION,
             statechain_id: "statechain".to_string(),
             transfer_signature: transfer_signature.to_string(),
             sender_user_public_key: sender_pubkey.to_string(),
@@ -1299,7 +1301,7 @@ mod tests {
     fn transfer_message_serialization_round_trips_without_backup_transactions() {
         let latest_state = latest_state();
         let msg = Bip448TransferMsg {
-            msg_version: 2,
+            msg_version: BIP448_TRANSFER_MESSAGE_VERSION,
             statechain_id: "statechain".to_string(),
             transfer_signature: "ab".repeat(64),
             sender_user_public_key: "02".to_string() + &"12".repeat(32),
@@ -1358,7 +1360,7 @@ mod tests {
         let (latest_state, funding_outpoint, recovery_script) =
             reconstructible_latest_state(&secp, &aggregate_secret, &aggregate_pubkey);
         let msg = Bip448TransferMsg {
-            msg_version: 2,
+            msg_version: BIP448_TRANSFER_MESSAGE_VERSION,
             statechain_id: "statechain".to_string(),
             transfer_signature: "ab".repeat(64),
             sender_user_public_key: "02".to_string() + &"12".repeat(32),
@@ -1465,7 +1467,7 @@ mod tests {
             Bip448CsfsKeyMetadata::from_aggregate_pubkey(&secp, &aggregate_pub);
 
         let msg = Bip448TransferMsg {
-            msg_version: 2,
+            msg_version: BIP448_TRANSFER_MESSAGE_VERSION,
             statechain_id: "statechain".to_string(),
             transfer_signature: "ab".repeat(64),
             sender_user_public_key: "02".to_string() + &"12".repeat(32),
@@ -1909,7 +1911,7 @@ mod tests {
             reconstructible_latest_state(&secp, &aggregate_secret, &aggregate_pub);
 
         let msg = Bip448TransferMsg {
-            msg_version: 2,
+            msg_version: BIP448_TRANSFER_MESSAGE_VERSION,
             statechain_id: "statechain".to_string(),
             transfer_signature: "ab".repeat(64),
             sender_user_public_key: "02".to_string() + &"12".repeat(32),
@@ -2142,7 +2144,7 @@ mod tests {
             FUTURE_LOCKTIME,
         );
         let msg = Bip448TransferMsg {
-            msg_version: 2,
+            msg_version: BIP448_TRANSFER_MESSAGE_VERSION,
             statechain_id: "statechain".to_string(),
             transfer_signature: "ab".repeat(64),
             sender_user_public_key: "02".to_string() + &"12".repeat(32),
@@ -2209,7 +2211,7 @@ mod tests {
         uppercase_funding_outpoint.txid.make_ascii_uppercase();
 
         let msg = Bip448TransferMsg {
-            msg_version: 2,
+            msg_version: BIP448_TRANSFER_MESSAGE_VERSION,
             statechain_id: "statechain".to_string(),
             transfer_signature: "ab".repeat(64),
             sender_user_public_key: "02".to_string() + &"12".repeat(32),

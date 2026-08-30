@@ -1,5 +1,8 @@
 services:
 
+  # Fixed Vault credentials and seed are deterministic regtest fixtures only.
+  # Never reuse them for signet, mainnet, or any deployment holding value.
+
   inquisition:
     build:
       context: ./docker/bitcoin-inquisition
@@ -8,8 +11,8 @@ services:
         BITCOIN_INQUISITION_COMMIT: f5365867662091c2dbf1b2d438b8bb477a3dcb6f
     image: mercurylayer/bitcoin-inquisition:f536586
     ports:
-      - "${ML_TEST_CORE_RPC_PORT:-18443}:18443"
-      - "${ML_TEST_CORE_P2P_PORT:-18444}:18444"
+      - "127.0.0.1:${ML_TEST_CORE_RPC_PORT:-18443}:18443"
+      - "127.0.0.1:${ML_TEST_CORE_P2P_PORT:-18444}:18444"
     volumes:
       - bitcoin_inquisition_data:/data
     command:
@@ -37,7 +40,7 @@ services:
     environment:
       - VAULT_DEV_ROOT_TOKEN_ID=2bbz80mr1zm0tfrjwxyq7f48ofgky848
     ports:
-      - "${ML_TEST_VAULT_PORT:-8200}:8200"
+      - "127.0.0.1:${ML_TEST_VAULT_PORT:-8200}:8200"
 
   vault-init:
     image: curlimages/curl
@@ -77,14 +80,17 @@ services:
       - HASHICORP_CONTAINER_PATH=mercury-seed
       - HASHICORP_CONTAINER_MOUNT_POINT=secret
       - HASHICORP_CONTAINER_KEY_NAME=seed
+      # Auth is required by default; this is a fixed regtest-only token, not a secret.
+      - LOCKBOX_REQUIRE_AUTH=1
+      - LOCKBOX_AUTH_TOKEN=${LOCKBOX_AUTH_TOKEN:-27ed987bfb1a1bd671735842063e48b3e6b694d35b2f45333d3d6457077ef31c}
     ports:
-      - "${ML_TEST_LOCKBOX_PORT:-18080}:18080"
+      - "127.0.0.1:${ML_TEST_LOCKBOX_PORT:-18080}:18080"
 
-  token-server-v2:
+  token-server:
     build:
       context: .
-      dockerfile: ./token-server-v2/Dockerfile
-    image: "${ML_TEST_TOKEN_IMAGE:-mercurylayer/token-server-v2:bip448-test-local}"
+      dockerfile: ./token-server/Dockerfile
+    image: "${ML_TEST_TOKEN_IMAGE:-mercurylayer/token-server:bip448-test-local}"
     environment:
       PUBLIC_KEY_DESCRIPTOR: wpkh([656a457c/84'/1'/0']tpubDCTXiLu1wcqUwQK6QMPPUTBzbRjsqMABzCvd5vG22KGoA95cTG1VkszQQJyx24UP8KEJVKrKRDRtUPodHVV59CfNqUkXjKUagowHJVSWq4C/0/*)#vn0n5xcd
       BITCOIN_NETWORK: regtest
@@ -102,7 +108,7 @@ services:
       DB_PORT: 5432
       DB_NAME: mercury
     ports:
-      - "${ML_TEST_TOKEN_PORT:-8001}:8001"
+      - "127.0.0.1:${ML_TEST_TOKEN_PORT:-8001}:8001"
     depends_on:
       db_server:
         condition: service_started
@@ -117,7 +123,7 @@ services:
     depends_on:
       - db_server
       - lockbox
-      - token-server-v2
+      - token-server
     environment:
       BITCOIN_NETWORK: regtest
       DB_USER: postgres
@@ -127,9 +133,10 @@ services:
       DB_NAME: mercury
       BATCH_TIMEOUT: 20
       ENCLAVES: '[{"url": "http://lockbox:18080", "allow_deposit": true}]'
-      TOKEN_SERVER_URL: http://token-server-v2:8001
+      LOCKBOX_AUTH_TOKEN: ${LOCKBOX_AUTH_TOKEN:-27ed987bfb1a1bd671735842063e48b3e6b694d35b2f45333d3d6457077ef31c}
+      TOKEN_SERVER_URL: http://token-server:8001
     ports:
-      - "${ML_TEST_MERCURY_PORT:-8000}:8000"
+      - "127.0.0.1:${ML_TEST_MERCURY_PORT:-8000}:8000"
 
   db_lockbox:
     image: postgres:16.2
@@ -137,7 +144,7 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: enclave
     ports:
-      - "${ML_TEST_LOCKBOX_DB_PORT:-5433}:5432"
+      - "127.0.0.1:${ML_TEST_LOCKBOX_DB_PORT:-5433}:5432"
     volumes:
       - postgres_lockbox_data:/var/lib/postgresql/data
 
@@ -147,7 +154,7 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: mercury
     ports:
-      - "${ML_TEST_MERCURY_DB_PORT:-5432}:5432"
+      - "127.0.0.1:${ML_TEST_MERCURY_DB_PORT:-5432}:5432"
     volumes:
       - postgres_server_data:/var/lib/postgresql/data
 

@@ -737,7 +737,7 @@ mod tests {
             statechain_entity: "http://127.0.0.1:1".to_string(),
             chain_backend: "core".to_string(),
             chain_client,
-            core_rpc_url: Some("http://127.0.0.1:1".to_string()),
+            chain_endpoint: Some("http://127.0.0.1:1".to_string()),
             core_rpc_auth: Some("none".to_string()),
             core_rpc_user: None,
             core_rpc_password: None,

@@ -323,7 +323,7 @@ pub(super) async fn concurrent_exact_bip448_partial_replays_increment_signature_
         assert_eq!(sign_status, StatusCode::CONFLICT);
         assert_eq!(key_status, StatusCode::OK);
         let applied_receipt = serde_json::from_str::<
-            mercurylib::bip448_statechain::signing_api::Bip448KeyUpdateAppliedReceiptPayloadV2,
+            mercurylib::bip448_statechain::signing_api::Bip448KeyUpdateAppliedReceiptPayloadV1,
         >(&key_response_body)?;
         assert_eq!(race_state.sig_count.get(), 0);
         assert_eq!(race_state.key_generation.get(), 1);

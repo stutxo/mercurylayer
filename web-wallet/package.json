@@ -1,0 +1,11 @@
+{
+  "name": "mercury-bip448-web-wallet-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:e2e": "playwright test; code=$?; docker rm -f mercury-bip448-web-wallet-e2e >/dev/null 2>&1 || true; exit $code"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1"
+  }
+}

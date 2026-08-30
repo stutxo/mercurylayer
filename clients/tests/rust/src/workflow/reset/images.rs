@@ -150,7 +150,7 @@ fn valid_staging_tag(tag: &str, project: &Project) -> bool {
     matches!(
         (repository, artifact),
         ("mercurylayer/mercury-server", "mercury")
-            | ("mercurylayer/token-server-v2", "token")
+            | ("mercurylayer/token-server", "token")
             | ("mercurylayer/lockbox", "lockbox")
             | ("mercurylayer/lockbox", "lockbox-rng")
             | ("mercurylayer/bitcoin-inquisition", "inquisition")

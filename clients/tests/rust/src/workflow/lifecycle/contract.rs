@@ -12,7 +12,7 @@ pub(super) const SERVICES: [&str; 8] = [
     "vault-init",
     "lockbox",
     "inquisition",
-    "token-server-v2",
+    "token-server",
     "mercury-server",
 ];
 
@@ -37,6 +37,7 @@ pub(super) enum ReadinessKind {
     Postgres(&'static str),
     Vault,
     HttpConfig,
+    Lockbox,
     HttpAlive,
     Inquisition,
     None,
@@ -64,7 +65,7 @@ pub(super) fn expected_from_verified(build: &VerifiedBuild) -> ExpectedImages {
         ("vault-init".into(), unresolved("curlimages/curl")),
         ("lockbox".into(), resolved(&build.lockbox)),
         ("inquisition".into(), resolved(&build.inquisition)),
-        ("token-server-v2".into(), resolved(&build.token)),
+        ("token-server".into(), resolved(&build.token)),
         ("mercury-server".into(), resolved(&build.mercury)),
     ])
 }
@@ -84,7 +85,7 @@ pub(super) fn expected_from_metadata(metadata: &StackMetadata) -> ExpectedImages
         expected.insert("mercury-server".into(), stored(image));
     }
     if let Some(image) = images.token() {
-        expected.insert("token-server-v2".into(), stored(image));
+        expected.insert("token-server".into(), stored(image));
     }
     if let Some(images) = images.lockbox() {
         expected.insert("lockbox".into(), stored(images.production()));
@@ -155,7 +156,8 @@ pub(super) fn service_readiness(service: &str) -> Result<ReadinessKind> {
         "db_lockbox" => ReadinessKind::Postgres("enclave"),
         "vault" => ReadinessKind::Vault,
         "vault-init" => ReadinessKind::None,
-        "lockbox" | "token-server-v2" => ReadinessKind::HttpAlive,
+        "lockbox" => ReadinessKind::Lockbox,
+        "token-server" => ReadinessKind::HttpAlive,
         "mercury-server" => ReadinessKind::HttpConfig,
         "inquisition" => ReadinessKind::Inquisition,
         _ => anyhow::bail!("unknown lifecycle service {service:?}"),
@@ -189,10 +191,7 @@ pub(super) fn expected_ports(
             "inquisition",
             BTreeMap::from([("18443/tcp", ports.core_rpc), ("18444/tcp", ports.core_p2p)]),
         ),
-        (
-            "token-server-v2",
-            BTreeMap::from([("8001/tcp", ports.token)]),
-        ),
+        ("token-server", BTreeMap::from([("8001/tcp", ports.token)])),
         (
             "mercury-server",
             BTreeMap::from([("8000/tcp", ports.mercury)]),
@@ -212,7 +211,7 @@ pub(super) fn service_port(metadata: &StackMetadata, service: &str) -> Result<u1
     match service {
         "vault" => Ok(ports.vault),
         "lockbox" => Ok(ports.lockbox),
-        "token-server-v2" => Ok(ports.token),
+        "token-server" => Ok(ports.token),
         "mercury-server" => Ok(ports.mercury),
         _ => Err(anyhow::anyhow!("service {service:?} has no HTTP endpoint"))
             .context("resolve lifecycle HTTP port"),

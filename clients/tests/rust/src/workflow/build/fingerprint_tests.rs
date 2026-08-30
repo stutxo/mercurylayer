@@ -8,25 +8,32 @@ use super::inputs::{component_paths, DockerIgnore, InputComponent};
 use super::test_support::TempRepository;
 
 #[test]
-fn repository_root_dockerignore_must_be_absent_for_root_contexts() {
-    let absent = TempRepository::new();
-    validate_contract(absent.path()).unwrap();
-
+fn repository_root_dockerignore_must_be_regular_and_parseable() {
     let regular = TempRepository::new();
-    regular.write(".dockerignore", b"target\n");
-    assert!(validate_contract(regular.path()).is_err());
+    validate_contract(regular.path()).unwrap();
+
+    let absent = TempRepository::new();
+    fs::remove_file(absent.path().join(".dockerignore")).unwrap();
+    assert!(validate_contract(absent.path()).is_err());
 
     let directory = TempRepository::new();
+    fs::remove_file(directory.path().join(".dockerignore")).unwrap();
     fs::create_dir(directory.path().join(".dockerignore")).unwrap();
     assert!(validate_contract(directory.path()).is_err());
 
     let linked = TempRepository::new();
+    fs::remove_file(linked.path().join(".dockerignore")).unwrap();
     symlink("Cargo.lock", linked.path().join(".dockerignore")).unwrap();
     assert!(validate_contract(linked.path()).is_err());
 
     let special = TempRepository::new();
+    fs::remove_file(special.path().join(".dockerignore")).unwrap();
     let _socket = UnixListener::bind(special.path().join(".dockerignore")).unwrap();
     assert!(validate_contract(special.path()).is_err());
+
+    let malformed = TempRepository::new();
+    malformed.write(".dockerignore", b"!\n");
+    assert!(validate_contract(malformed.path()).is_err());
 }
 
 #[test]
@@ -37,6 +44,7 @@ fn component_path_sets_match_the_four_build_contracts() {
     assert_eq!(
         paths(InputComponent::Mercury),
         path_list(&[
+            ".dockerignore",
             "Cargo.lock",
             "Rocket.toml",
             "lib/Cargo.toml",
@@ -49,10 +57,11 @@ fn component_path_sets_match_the_four_build_contracts() {
     assert_eq!(
         paths(InputComponent::Token),
         path_list(&[
+            ".dockerignore",
             "Cargo.lock",
-            "token-server-v2/.dockerignore",
-            "token-server-v2/Dockerfile",
-            "token-server-v2/src/main.rs",
+            "token-server/.dockerignore",
+            "token-server/Dockerfile",
+            "token-server/src/main.rs",
         ])
     );
     assert_eq!(
@@ -73,24 +82,55 @@ fn component_path_sets_match_the_four_build_contracts() {
 }
 
 #[test]
+fn root_dockerignore_controls_root_context_fingerprints() {
+    let repo = TempRepository::new();
+    let mercury = hash_component(repo.path(), InputComponent::Mercury).unwrap();
+    let token = hash_component(repo.path(), InputComponent::Token).unwrap();
+
+    repo.write("server/Settings.toml", b"ignored server settings\n");
+    repo.write("token-server/Settings.toml", b"ignored token settings\n");
+    assert_eq!(
+        mercury,
+        hash_component(repo.path(), InputComponent::Mercury).unwrap()
+    );
+    assert_eq!(
+        token,
+        hash_component(repo.path(), InputComponent::Token).unwrap()
+    );
+
+    repo.write(
+        ".dockerignore",
+        b"target\n**/Settings.toml\nadditional-cache\n",
+    );
+    assert_ne!(
+        mercury,
+        hash_component(repo.path(), InputComponent::Mercury).unwrap()
+    );
+    assert_ne!(
+        token,
+        hash_component(repo.path(), InputComponent::Token).unwrap()
+    );
+}
+
+#[test]
 fn fingerprints_include_content_mode_path_and_untracked_files() {
     let repo = TempRepository::new();
     let baseline = hash_component(repo.path(), InputComponent::Token).unwrap();
 
-    repo.write("token-server-v2/src/main.rs", b"fn main() { changed(); }\n");
+    repo.write("token-server/src/main.rs", b"fn main() { changed(); }\n");
     let content_changed = hash_component(repo.path(), InputComponent::Token).unwrap();
     assert_ne!(baseline, content_changed);
 
-    let source = repo.path().join("token-server-v2/src/main.rs");
+    let source = repo.path().join("token-server/src/main.rs");
     fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
     let mode_changed = hash_component(repo.path(), InputComponent::Token).unwrap();
     assert_ne!(content_changed, mode_changed);
 
-    fs::rename(&source, repo.path().join("token-server-v2/src/renamed.rs")).unwrap();
+    fs::rename(&source, repo.path().join("token-server/src/renamed.rs")).unwrap();
     let path_changed = hash_component(repo.path(), InputComponent::Token).unwrap();
     assert_ne!(mode_changed, path_changed);
 
-    repo.write("token-server-v2/untracked.input", b"untracked bytes\n");
+    repo.write("token-server/untracked.input", b"untracked bytes\n");
     let untracked_changed = hash_component(repo.path(), InputComponent::Token).unwrap();
     assert_ne!(path_changed, untracked_changed);
 }
@@ -102,7 +142,7 @@ fn fingerprints_include_empty_directories_without_changing_file_hashes() {
     let component_before = hash_component(repo.path(), InputComponent::Token).unwrap();
     let files_before = hash_paths(repo.path(), &paths, b"file-semantics", &[]).unwrap();
 
-    fs::create_dir(repo.path().join("token-server-v2/empty-input")).unwrap();
+    fs::create_dir(repo.path().join("token-server/empty-input")).unwrap();
 
     assert_ne!(
         component_before,
@@ -125,7 +165,7 @@ fn fingerprints_include_directory_modes_without_changing_file_hashes() {
     let component_before = hash_component(repo.path(), InputComponent::Token).unwrap();
     let files_before = hash_paths(repo.path(), &paths, b"file-semantics", &[]).unwrap();
 
-    let directory = repo.path().join("token-server-v2/src");
+    let directory = repo.path().join("token-server/src");
     let original_mode = fs::symlink_metadata(&directory)
         .unwrap()
         .permissions()

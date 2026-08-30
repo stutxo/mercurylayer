@@ -6,6 +6,7 @@ use sqlx::Row;
 #[derive(Debug, Eq, PartialEq)]
 pub enum InsertTransferResult {
     Success([u8; 32]),
+    StatechainNotFound,
     AuthenticationFailed,
     StatecoinBatchLocked(String),
     ExpiredBatchTime(String),
@@ -14,6 +15,7 @@ pub enum InsertTransferResult {
 #[derive(Debug, Eq, PartialEq)]
 pub enum UpdateTransferMessageResult {
     Success,
+    StatechainNotFound,
     AuthenticationFailed,
     GenerationMismatch,
 }
@@ -158,7 +160,7 @@ pub async fn insert_new_transfer_or_replay_exact(
     let Some(owner_auth_key) = get_locked_statechain_auth_key(connection, statechain_id).await?
     else {
         transaction.rollback().await?;
-        return Ok(InsertTransferResult::AuthenticationFailed);
+        return Ok(InsertTransferResult::StatechainNotFound);
     };
     let signature_valid = crate::endpoints::utils::try_verify_statechain_signature(
         signed_statechain_id,
@@ -252,7 +254,7 @@ pub async fn update_transfer_msg_for_generation_exact(
         get_locked_statechain_auth_key(&mut *transaction, statechain_id).await?
     else {
         transaction.rollback().await?;
-        return Ok(UpdateTransferMessageResult::GenerationMismatch);
+        return Ok(UpdateTransferMessageResult::StatechainNotFound);
     };
 
     let digest = mercurylib::transfer::sender::bip448_transfer_update_msg_auth_digest(

@@ -1,16 +1,14 @@
-use std::fs;
-use std::io::ErrorKind;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use sha2::{Digest, Sha256};
 
 use super::super::model::{BuildFingerprints, BuildSource, ComposeHashes, INQUISITION_IMAGE};
 use super::inputs::{
-    component_records, directory_metadata, read_regular, regular_metadata, InputComponent,
-    InputKind, InputRecord,
+    component_records, directory_metadata, read_regular, regular_metadata, root_dockerignore,
+    InputComponent, InputKind, InputRecord,
 };
 use super::{run_checked, ArgvCommand, CommandRunner, INQUISITION_BUILD_ARG, INQUISITION_COMMIT};
 
@@ -77,18 +75,7 @@ pub(super) fn snapshot(repo_root: &Path, runner: &mut impl CommandRunner) -> Res
 }
 
 pub(super) fn validate_contract(repo_root: &Path) -> Result<()> {
-    let root_ignore = repo_root.join(".dockerignore");
-    match fs::symlink_metadata(&root_ignore) {
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!("inspect forbidden root Docker ignore {}", root_ignore.display())
-            })
-        }
-        Ok(_) => bail!(
-            "repository-root .dockerignore must be absent because Mercury and token use root build contexts"
-        ),
-    }
+    let _ = root_dockerignore(repo_root)?;
 
     let token_compose = read_regular(repo_root, Path::new("docker-compose-token-servers.yml"))?;
     let token_compose =

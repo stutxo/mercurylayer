@@ -106,7 +106,7 @@ async fn transfer_bip448_receiver(
     wallet_name: &str,
     activities: &mut Vec<Activity>,
 ) -> Result<super::super::Bip448ReceiveOutcome> {
-    let observed = utils::get_bip448_statechain_info_v2(&msg.statechain_id, client_config)
+    let observed = utils::get_bip448_statechain_info_v1(&msg.statechain_id, client_config)
         .await?
         .ok_or_else(|| anyhow!("Statechain info not found"))?;
     let statechain_info = statechain_info_for_verification(&observed)?;
@@ -199,7 +199,7 @@ async fn transfer_bip448_receiver(
                 }
                 super::super::Bip448TransferReceiverPostResult::Applied(receipt) => {
                     let live_after =
-                        utils::get_bip448_statechain_info_v2(&post_statechain_id, client_config)
+                        utils::get_bip448_statechain_info_v1(&post_statechain_id, client_config)
                             .await?
                             .ok_or_else(|| anyhow!("BIP448 state disappeared after keyupdate"))?;
                     let server_pubkey =
@@ -351,23 +351,22 @@ pub(in crate::transfer_receiver) mod test_support {
         bip448_statechain::{
             script,
             signing_api::{
-                Bip448AppliedStatus, Bip448CanonicalScalar, Bip448CompressedPublicKey,
-                Bip448KeyGeneration, Bip448KeyUpdateAppliedReceiptPayloadV2, Bip448OperationId,
-                Bip448ProtocolVersionV2, Bip448PublicNonce, Bip448SchnorrSignature,
-                Bip448SignatureCount, Bip448StatechainId, Bip448StatechainInfoResponsePayloadV2,
-                Bip448StatechainInfoV2,
+                Bip448AppliedStatus, Bip448CompressedPublicKey, Bip448KeyGeneration,
+                Bip448KeyUpdateAppliedReceiptPayloadV1, Bip448OperationId, Bip448ProtocolVersionV1,
+                Bip448SchnorrSignature, Bip448SignatureCount, Bip448StatechainId,
+                Bip448StatechainInfoResponsePayloadV1,
             },
         },
         encode_sc_address,
-        transfer::receiver::{StatechainInfoResponsePayload, TransferReceiverRequestPayloadV2},
+        transfer::receiver::TransferReceiverRequestPayloadV1,
         wallet::{Settings, Wallet},
     };
     use secp256k1::{schnorr, KeyPair, Secp256k1, SecretKey};
     use sqlx::sqlite::SqlitePoolOptions;
 
     // Cryptographically valid two-state transfer vector with deterministic keys and nonces.
-    pub(in crate::transfer_receiver) const MSG: &str = r#"{"msg_version":2,"statechain_id":"statechain","transfer_signature":"bf5840f84f3ac32690da6c53ebec7f99fab14ddf5a6318476ff072971e82ab558dd4e81145cec932de46230fea378bdf431efbfec70335337f457c17c075a8fe","sender_user_public_key":"02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337","receiver_user_public_key":"0362c0a046dacce86ddd0343c6d3c7c79c2208ba0d9c9cf24a6d046d21d21f90f7","server_public_key":"03462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b","aggregate_pubkey":"02989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f","funding_outpoint":{"txid":"4242424242424242424242424242424242424242424242424242424242424242","vout":0,"value_sats":100000},"latest_state_number":2,"challenge_delay":144,"amount_sats":100000,"network":"regtest","value_schedule":{"funding_value_sats":100000,"update_input_value_sats":100000,"update_state_output_value_sats":100000,"settlement_input_value_sats":100000,"settlement_recovery_output_value_sats":100000},"latest_state":{"state_number":2,"state_locktime":1000000005,"challenge_delay":144,"update_tx":"03000000000101424242424242424242424242424242424242424242424242424242424242424200000000000000000002a086010000000000225120f99f4d961c7c21602831c6d649a4ea38201af79c05d0991d16d90829fdadb45400000000000000000451024e73034065baa3ef9d33105e31878e408fa9ffd32f2545ca635720a86abecc6edffae0310f6d946e034e65b1b58c1a51e98f49aa553920437775a1aab26422538579297f03cecbcc21c1989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f05ca9a3b","settlement_tx":"0300000000010123c27b49882b8977be9f7bf669f513351fdd151d241c9f7749db49bc2a9ae40300000000009000000002a0860100000000002251209a09f771892f1be2e77ac302ff88d53afdc94e3ad79f66a6065bcf343378a14d00000000000000000451024e730223201345b09228120c17a2e1e0690f9dfb9b15b59b1f7debd52a0acac6b4dcb66c72ce8741c0989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f017f96e5b2074130b4d846e4bbf1c794346f38b6c90f6b2d7bcf85ac4b2d13e005ca9a3b","update_template_hash":"70e2849f02b3e921cda139949d9f68771e007317387e7ef60515231440fd1e52","settlement_template_hash":"1345b09228120c17a2e1e0690f9dfb9b15b59b1f7debd52a0acac6b4dcb66c72","state_output_script_pubkey":"5120f99f4d961c7c21602831c6d649a4ea38201af79c05d0991d16d90829fdadb454","funding_update_script":"cecbcc","funding_update_control_block":"c1989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f","state_update_script":"0406ca9a3bb175cecbcc","state_update_control_block":"c0989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6fd8d16b3760c57c7267b789d8a1cd2ffe9c5978025537629273b460aba53ab90c","state_settlement_script":"201345b09228120c17a2e1e0690f9dfb9b15b59b1f7debd52a0acac6b4dcb66c72ce87","state_settlement_control_block":"c0989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f017f96e5b2074130b4d846e4bbf1c794346f38b6c90f6b2d7bcf85ac4b2d13e0","csfs_key_metadata":{"aggregate_pubkey_parity_odd":false,"negate_seckey":false},"signing_metadata":{"role":"funding_update","signing_id":"0202020202020202020202020202020202020202020202020202020202020202","client_public_nonce":"03bc02445e1111ebf1f103c6ff2cf62c214fec48d0084a65c482e99ce73ba198de03d28c76d8f858a659d37f4abd1505f8931c45077ba71a5274adde79bc8aae06f3","server_public_nonce":"035f10ef76a0174cdb766a68b3439e22bcf24dc277497b37205bab3766e32a6899038f6a8fc25318cc9887a6e8cadbe7cac425174b884599058ce8b2f78c6e8fbd70","blinding_factor":"1616161616161616161616161616161616161616161616161616161616161616","update_template_hash":"70e2849f02b3e921cda139949d9f68771e007317387e7ef60515231440fd1e52","update_signature":"65baa3ef9d33105e31878e408fa9ffd32f2545ca635720a86abecc6edffae0310f6d946e034e65b1b58c1a51e98f49aa553920437775a1aab26422538579297f","server_signature_count":2},"fee_bump_policy":"zero_fee_ephemeral_anchor","value_schedule":{"funding_value_sats":100000,"update_input_value_sats":100000,"update_state_output_value_sats":100000,"settlement_input_value_sats":100000,"settlement_recovery_output_value_sats":100000},"anchors":[{"tx_role":"funding_update","output_index":1,"value_sats":0,"script_pubkey":"51024e73"},{"tx_role":"settlement","output_index":1,"value_sats":0,"script_pubkey":"51024e73"}],"cpfp_child_templates":[]},"server_signature_count":2,"t1":[9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9],"state_history":[{"state_number":1,"state_locktime":999999995,"owner_public_key":"02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337","update_template_hash":"381f652c451fde1f0eef1f979592ba5a418376e2316b738614b28c69e9400490","settlement_template_hash":"0e81168589cdd3d3e91d4e9e8f6d0fccd95bb0825393626e74164e23f5220126","update_signature":"f5fe9372be09b258db29877d816469c1a921b8dcb778ef23af00e969459d8416ce63f43466445e8958cc66b1ed431d934675738cf66da4a33ef8d48a6b58fcae","client_public_nonce":"0303d4415fc74e49a480db2ee554566f625b2d4b1af82b6e262c433374859e9efb033eee3c4e3493e97110f0a4c0a4d4d4d5f272f980782234a46dc5a7f01b019ee0","server_public_nonce":"039f31d027e17b6be6aace5fd20d1119f131f226777884bc423fb262dc037b38e302b2890303451ceffd050fcb0ee9db960c4b05755f5b533ef9535cbe25b6a4b533","blinding_factor":"1515151515151515151515151515151515151515151515151515151515151515"},{"state_number":2,"state_locktime":1000000005,"owner_public_key":"0362c0a046dacce86ddd0343c6d3c7c79c2208ba0d9c9cf24a6d046d21d21f90f7","update_template_hash":"70e2849f02b3e921cda139949d9f68771e007317387e7ef60515231440fd1e52","settlement_template_hash":"1345b09228120c17a2e1e0690f9dfb9b15b59b1f7debd52a0acac6b4dcb66c72","update_signature":"65baa3ef9d33105e31878e408fa9ffd32f2545ca635720a86abecc6edffae0310f6d946e034e65b1b58c1a51e98f49aa553920437775a1aab26422538579297f","client_public_nonce":"03bc02445e1111ebf1f103c6ff2cf62c214fec48d0084a65c482e99ce73ba198de03d28c76d8f858a659d37f4abd1505f8931c45077ba71a5274adde79bc8aae06f3","server_public_nonce":"035f10ef76a0174cdb766a68b3439e22bcf24dc277497b37205bab3766e32a6899038f6a8fc25318cc9887a6e8cadbe7cac425174b884599058ce8b2f78c6e8fbd70","blinding_factor":"1616161616161616161616161616161616161616161616161616161616161616"}]}"#;
-    pub(in crate::transfer_receiver) const INFO: &str = r#"{"enclave_public_key":"03462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b","num_sigs":2,"statechain_info":[{"statechain_id":"statechain","server_pubnonce":"039f31d027e17b6be6aace5fd20d1119f131f226777884bc423fb262dc037b38e302b2890303451ceffd050fcb0ee9db960c4b05755f5b533ef9535cbe25b6a4b533","challenge":"c92315f66e51c7fe79055243762996a9e250782ddd53adf6c6c958dc928a6d7b","tx_n":1},{"statechain_id":"statechain","server_pubnonce":"035f10ef76a0174cdb766a68b3439e22bcf24dc277497b37205bab3766e32a6899038f6a8fc25318cc9887a6e8cadbe7cac425174b884599058ce8b2f78c6e8fbd70","challenge":"ac31ec275e2e9d4e9fc62ed0f9d9f558800def734bd267fb2e260a283d606b93","tx_n":2}],"x1_pub":"03f006a18d5653c4edf5391ff23a61f03ff83d237e880ee61187fa9f379a028e0a"}"#;
+    pub(in crate::transfer_receiver) const MSG: &str = r#"{"msg_version":1,"statechain_id":"statechain","transfer_signature":"bf5840f84f3ac32690da6c53ebec7f99fab14ddf5a6318476ff072971e82ab558dd4e81145cec932de46230fea378bdf431efbfec70335337f457c17c075a8fe","sender_user_public_key":"02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337","receiver_user_public_key":"0362c0a046dacce86ddd0343c6d3c7c79c2208ba0d9c9cf24a6d046d21d21f90f7","server_public_key":"03462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b","aggregate_pubkey":"02989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f","funding_outpoint":{"txid":"4242424242424242424242424242424242424242424242424242424242424242","vout":0,"value_sats":100000},"latest_state_number":2,"challenge_delay":144,"amount_sats":100000,"network":"regtest","value_schedule":{"funding_value_sats":100000,"update_input_value_sats":100000,"update_state_output_value_sats":100000,"settlement_input_value_sats":100000,"settlement_recovery_output_value_sats":100000},"latest_state":{"state_number":2,"state_locktime":1000000005,"challenge_delay":144,"update_tx":"03000000000101424242424242424242424242424242424242424242424242424242424242424200000000000000000002a086010000000000225120f99f4d961c7c21602831c6d649a4ea38201af79c05d0991d16d90829fdadb45400000000000000000451024e73034065baa3ef9d33105e31878e408fa9ffd32f2545ca635720a86abecc6edffae0310f6d946e034e65b1b58c1a51e98f49aa553920437775a1aab26422538579297f03cecbcc21c1989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f05ca9a3b","settlement_tx":"0300000000010123c27b49882b8977be9f7bf669f513351fdd151d241c9f7749db49bc2a9ae40300000000009000000002a0860100000000002251209a09f771892f1be2e77ac302ff88d53afdc94e3ad79f66a6065bcf343378a14d00000000000000000451024e730223201345b09228120c17a2e1e0690f9dfb9b15b59b1f7debd52a0acac6b4dcb66c72ce8741c0989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f017f96e5b2074130b4d846e4bbf1c794346f38b6c90f6b2d7bcf85ac4b2d13e005ca9a3b","update_template_hash":"70e2849f02b3e921cda139949d9f68771e007317387e7ef60515231440fd1e52","settlement_template_hash":"1345b09228120c17a2e1e0690f9dfb9b15b59b1f7debd52a0acac6b4dcb66c72","state_output_script_pubkey":"5120f99f4d961c7c21602831c6d649a4ea38201af79c05d0991d16d90829fdadb454","funding_update_script":"cecbcc","funding_update_control_block":"c1989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f","state_update_script":"0406ca9a3bb175cecbcc","state_update_control_block":"c0989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6fd8d16b3760c57c7267b789d8a1cd2ffe9c5978025537629273b460aba53ab90c","state_settlement_script":"201345b09228120c17a2e1e0690f9dfb9b15b59b1f7debd52a0acac6b4dcb66c72ce87","state_settlement_control_block":"c0989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f017f96e5b2074130b4d846e4bbf1c794346f38b6c90f6b2d7bcf85ac4b2d13e0","csfs_key_metadata":{"aggregate_pubkey_parity_odd":false,"negate_seckey":false},"signing_metadata":{"role":"funding_update","signing_id":"0202020202020202020202020202020202020202020202020202020202020202","client_public_nonce":"03bc02445e1111ebf1f103c6ff2cf62c214fec48d0084a65c482e99ce73ba198de03d28c76d8f858a659d37f4abd1505f8931c45077ba71a5274adde79bc8aae06f3","server_public_nonce":"035f10ef76a0174cdb766a68b3439e22bcf24dc277497b37205bab3766e32a6899038f6a8fc25318cc9887a6e8cadbe7cac425174b884599058ce8b2f78c6e8fbd70","blinding_factor":"1616161616161616161616161616161616161616161616161616161616161616","update_template_hash":"70e2849f02b3e921cda139949d9f68771e007317387e7ef60515231440fd1e52","update_signature":"65baa3ef9d33105e31878e408fa9ffd32f2545ca635720a86abecc6edffae0310f6d946e034e65b1b58c1a51e98f49aa553920437775a1aab26422538579297f","server_signature_count":2},"fee_bump_policy":"zero_fee_ephemeral_anchor","value_schedule":{"funding_value_sats":100000,"update_input_value_sats":100000,"update_state_output_value_sats":100000,"settlement_input_value_sats":100000,"settlement_recovery_output_value_sats":100000},"anchors":[{"tx_role":"funding_update","output_index":1,"value_sats":0,"script_pubkey":"51024e73"},{"tx_role":"settlement","output_index":1,"value_sats":0,"script_pubkey":"51024e73"}],"cpfp_child_templates":[]},"server_signature_count":2,"t1":[9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9],"state_history":[{"state_number":1,"state_locktime":999999995,"owner_public_key":"02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337","update_template_hash":"381f652c451fde1f0eef1f979592ba5a418376e2316b738614b28c69e9400490","settlement_template_hash":"0e81168589cdd3d3e91d4e9e8f6d0fccd95bb0825393626e74164e23f5220126","update_signature":"f5fe9372be09b258db29877d816469c1a921b8dcb778ef23af00e969459d8416ce63f43466445e8958cc66b1ed431d934675738cf66da4a33ef8d48a6b58fcae","client_public_nonce":"0303d4415fc74e49a480db2ee554566f625b2d4b1af82b6e262c433374859e9efb033eee3c4e3493e97110f0a4c0a4d4d4d5f272f980782234a46dc5a7f01b019ee0","server_public_nonce":"039f31d027e17b6be6aace5fd20d1119f131f226777884bc423fb262dc037b38e302b2890303451ceffd050fcb0ee9db960c4b05755f5b533ef9535cbe25b6a4b533","blinding_factor":"1515151515151515151515151515151515151515151515151515151515151515"},{"state_number":2,"state_locktime":1000000005,"owner_public_key":"0362c0a046dacce86ddd0343c6d3c7c79c2208ba0d9c9cf24a6d046d21d21f90f7","update_template_hash":"70e2849f02b3e921cda139949d9f68771e007317387e7ef60515231440fd1e52","settlement_template_hash":"1345b09228120c17a2e1e0690f9dfb9b15b59b1f7debd52a0acac6b4dcb66c72","update_signature":"65baa3ef9d33105e31878e408fa9ffd32f2545ca635720a86abecc6edffae0310f6d946e034e65b1b58c1a51e98f49aa553920437775a1aab26422538579297f","client_public_nonce":"03bc02445e1111ebf1f103c6ff2cf62c214fec48d0084a65c482e99ce73ba198de03d28c76d8f858a659d37f4abd1505f8931c45077ba71a5274adde79bc8aae06f3","server_public_nonce":"035f10ef76a0174cdb766a68b3439e22bcf24dc277497b37205bab3766e32a6899038f6a8fc25318cc9887a6e8cadbe7cac425174b884599058ce8b2f78c6e8fbd70","blinding_factor":"1616161616161616161616161616161616161616161616161616161616161616"}]}"#;
+    pub(in crate::transfer_receiver) const INFO: &str = r#"{"protocol_version":1,"enclave_public_key":"03462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b","num_sigs":2,"lockbox_key_generation":0,"statechain_info":[{"statechain_id":"statechain","server_pubnonce":"039f31d027e17b6be6aace5fd20d1119f131f226777884bc423fb262dc037b38e302b2890303451ceffd050fcb0ee9db960c4b05755f5b533ef9535cbe25b6a4b533","challenge":"c92315f66e51c7fe79055243762996a9e250782ddd53adf6c6c958dc928a6d7b","tx_n":1},{"statechain_id":"statechain","server_pubnonce":"035f10ef76a0174cdb766a68b3439e22bcf24dc277497b37205bab3766e32a6899038f6a8fc25318cc9887a6e8cadbe7cac425174b884599058ce8b2f78c6e8fbd70","challenge":"ac31ec275e2e9d4e9fc62ed0f9d9f558800def734bd267fb2e260a283d606b93","tx_n":2}],"x1_pub":"03f006a18d5653c4edf5391ff23a61f03ff83d237e880ee61187fa9f379a028e0a"}"#;
     // ECIES plaintext is {"msg_version":1,"statechain_id":"statechain"} under auth key [8; 32].
     pub(in crate::transfer_receiver) const MISSING_SIGNATURE: &str = "0450bfa93d1d7eccf21e821b47555b35717c7581539a802dbce4e2681e947f9ed1265b32fb0f3168723723f59ac9acda6a5e3aa93ae3da95b2f6c466abac1f9c02d4a0b843668195f2fc903b94f884316ecbe86fd73a02a26c8202c2f98e3189b6a065c5444ba47420e7c54e8f68986f32ca7a456ba17f5ba14ce0ded13d738e391ba33a2afe2ad28f8f61c0e9c96f";
     #[rustfmt::skip]
@@ -421,38 +420,16 @@ pub(in crate::transfer_receiver) mod test_support {
 
     #[rustfmt::skip]
     pub(in crate::transfer_receiver) fn test_client_config(endpoint: String, pool: sqlx::Pool<sqlx::Sqlite>) -> ClientConfig {
-        ClientConfig { statechain_entity: endpoint.clone(), chain_backend: "core".to_string(), chain_client: ChainClient::new(CoreRpcConfig { url: endpoint.clone(), auth: CoreRpcAuth::None }).unwrap(), core_rpc_url: Some(endpoint), core_rpc_auth: Some("none".to_string()), core_rpc_user: None, core_rpc_password: None, core_rpc_cookie_file: None, network: Network::Regtest, fee_rate_tolerance: 0.05, confirmation_target: 1, pool, tor_proxy: None, max_fee_rate: 100.0 }
+        ClientConfig { statechain_entity: endpoint.clone(), chain_backend: "core".to_string(), chain_client: ChainClient::new(CoreRpcConfig { url: endpoint.clone(), auth: CoreRpcAuth::None }).unwrap(), chain_endpoint: Some(endpoint), core_rpc_auth: Some("none".to_string()), core_rpc_user: None, core_rpc_password: None, core_rpc_cookie_file: None, network: Network::Regtest, fee_rate_tolerance: 0.05, confirmation_target: 1, pool, tor_proxy: None, max_fee_rate: 100.0 }
     }
 
-    pub(in crate::transfer_receiver) fn observed_info() -> Bip448StatechainInfoResponsePayloadV2 {
-        let legacy: StatechainInfoResponsePayload = serde_json::from_str(INFO).unwrap();
-        Bip448StatechainInfoResponsePayloadV2 {
-            protocol_version: Bip448ProtocolVersionV2,
-            enclave_public_key: Bip448CompressedPublicKey::try_from(
-                legacy.enclave_public_key.as_str(),
-            )
-            .unwrap(),
-            num_sigs: Bip448SignatureCount::new(u64::from(legacy.num_sigs)),
-            lockbox_key_generation: Bip448KeyGeneration::new(0),
-            statechain_info: legacy
-                .statechain_info
-                .into_iter()
-                .map(|item| Bip448StatechainInfoV2 {
-                    statechain_id: Bip448StatechainId::try_from(item.statechain_id.as_str())
-                        .unwrap(),
-                    server_pubnonce: Bip448PublicNonce::try_from(item.server_pubnonce.as_str())
-                        .unwrap(),
-                    challenge: Bip448CanonicalScalar::try_from(item.challenge.as_str()).unwrap(),
-                    tx_n: item.tx_n,
-                })
-                .collect(),
-            x1_pub: Bip448CompressedPublicKey::try_from(legacy.x1_pub.unwrap().as_str()).unwrap(),
-        }
+    pub(in crate::transfer_receiver) fn observed_info() -> Bip448StatechainInfoResponsePayloadV1 {
+        serde_json::from_str(INFO).unwrap()
     }
 
     pub(in crate::transfer_receiver) fn applied_receipt(
-        request: &TransferReceiverRequestPayloadV2,
-    ) -> Bip448KeyUpdateAppliedReceiptPayloadV2 {
+        request: &TransferReceiverRequestPayloadV1,
+    ) -> Bip448KeyUpdateAppliedReceiptPayloadV1 {
         let secp = Secp256k1::new();
         let previous = PublicKey::from_slice(request.expected_server_pubkey.as_bytes()).unwrap();
         let t2 = SecretKey::from_secret_bytes(*request.t2.as_bytes()).unwrap();
@@ -463,8 +440,8 @@ pub(in crate::transfer_receiver) mod test_support {
             .unwrap()
             .combine(&transfer_generation.negate())
             .unwrap();
-        Bip448KeyUpdateAppliedReceiptPayloadV2 {
-            protocol_version: Bip448ProtocolVersionV2,
+        Bip448KeyUpdateAppliedReceiptPayloadV1 {
+            protocol_version: Bip448ProtocolVersionV1,
             operation_id: request.operation_id,
             statechain_id: request.statechain_id.clone(),
             status: Bip448AppliedStatus,
@@ -482,7 +459,7 @@ pub(in crate::transfer_receiver) mod test_support {
 
     #[derive(Default)]
     #[rustfmt::skip]
-    pub(in crate::transfer_receiver) struct Transport { pub(in crate::transfer_receiver) server: String, pub(in crate::transfer_receiver) sig_count: u64, pub(in crate::transfer_receiver) generation: u64, pub(in crate::transfer_receiver) crash_before: bool, pub(in crate::transfer_receiver) lose_response: bool, pub(in crate::transfer_receiver) crash_after: bool, pub(in crate::transfer_receiver) corrupt_receipt: bool, pub(in crate::transfer_receiver) corrupt_live_after: bool, pub(in crate::transfer_receiver) verifies: u32, pub(in crate::transfer_receiver) unlocks: u32, pub(in crate::transfer_receiver) posts: u32, pub(in crate::transfer_receiver) requests: Vec<TransferReceiverRequestPayloadV2> }
+    pub(in crate::transfer_receiver) struct Transport { pub(in crate::transfer_receiver) server: String, pub(in crate::transfer_receiver) sig_count: u64, pub(in crate::transfer_receiver) generation: u64, pub(in crate::transfer_receiver) crash_before: bool, pub(in crate::transfer_receiver) lose_response: bool, pub(in crate::transfer_receiver) crash_after: bool, pub(in crate::transfer_receiver) corrupt_receipt: bool, pub(in crate::transfer_receiver) corrupt_live_after: bool, pub(in crate::transfer_receiver) verifies: u32, pub(in crate::transfer_receiver) unlocks: u32, pub(in crate::transfer_receiver) posts: u32, pub(in crate::transfer_receiver) requests: Vec<TransferReceiverRequestPayloadV1> }
     #[rustfmt::skip]
     pub(in crate::transfer_receiver) fn transport() -> Rc<RefCell<Transport>> {
         let info = observed_info();
@@ -584,15 +561,6 @@ pub(in crate::transfer_receiver) mod test_support {
         use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener};
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let statechain_info = statechain_info.map(|value| {
-            if serde_json::from_str::<Bip448StatechainInfoResponsePayloadV2>(&value).is_ok() { return value; }
-            let legacy: StatechainInfoResponsePayload = serde_json::from_str(&value).unwrap();
-            let mut observed = observed_info();
-            observed.enclave_public_key = Bip448CompressedPublicKey::try_from(legacy.enclave_public_key.as_str()).unwrap();
-            observed.num_sigs = Bip448SignatureCount::new(u64::from(legacy.num_sigs));
-            observed.lockbox_key_generation = Bip448KeyGeneration::new(1);
-            serde_json::to_string(&observed).unwrap()
-        });
         let task = tokio::spawn(async move {
             let mailbox = serde_json::json!({"list_enc_transfer_msg": mailbox}).to_string();
             let mut rpc_calls = 0;

@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Mercury Layer BIP448 prototype API
-  version: 0.2.1
+  version: 0.1.0
   description: |
     This contract describes the functional Rocket routes mounted by the
     Mercury server and token server in this repository.
@@ -271,6 +271,10 @@ paths:
                 $ref: '#/components/schemas/TransferSenderResponse'
         '400':
           $ref: '#/components/responses/MessageError'
+        '401':
+          $ref: '#/components/responses/MessageError'
+        '404':
+          $ref: '#/components/responses/MessageError'
         '500':
           $ref: '#/components/responses/MessageError'
 
@@ -295,6 +299,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/UpdatedResponse'
+        '401':
+          $ref: '#/components/responses/MessageError'
+        '404':
+          $ref: '#/components/responses/MessageError'
         '500':
           $ref: '#/components/responses/MessageError'
 

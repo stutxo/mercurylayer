@@ -1,37 +1,69 @@
-# Use an explicit Rust toolchain that supports current dependency editions.
-FROM rust:1.92-bullseye AS builder
+# syntax=docker/dockerfile:1.7
 
-# Install Rust, protobuf compiler, and library dependencies
-RUN apt-get update && apt-get install -y curl build-essential protobuf-compiler libprotobuf-dev pkg-config libssl-dev
-ENV RUSTUP_TOOLCHAIN=1.92.0
+FROM rust:1.92-bookworm AS builder
 
-# Create a working directory
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        libprotobuf-dev \
+        libssl-dev \
+        pkg-config \
+        protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_TOOLCHAIN=1.92.0 \
+    CARGO_TARGET_DIR=/mercurylayer/server/target
+
 WORKDIR /mercurylayer
 
-RUN printf '%s\n' \
-  '[workspace]' \
-  'members = ["server", "lib"]' \
-  'resolver = "2"' \
-  '' \
-  '[patch.crates-io]' \
-  'secp256k1 = { git = "https://github.com/w0xlt/rust-secp256k1.git", branch = "mercury-blinded-musig-port" }' \
-  > ./Cargo.toml
-COPY ./Cargo.lock ./Cargo.lock
+COPY Cargo.toml ./Cargo.toml
+COPY Cargo.lock ./Cargo.lock
+COPY clients/apps/rust/Cargo.toml ./clients/apps/rust/Cargo.toml
+COPY clients/libs/rust/Cargo.toml ./clients/libs/rust/Cargo.toml
+COPY clients/tests/rust/Cargo.toml ./clients/tests/rust/Cargo.toml
+COPY lib/Cargo.toml ./lib/Cargo.toml
+COPY server/Cargo.toml ./server/Cargo.toml
+COPY token-server/Cargo.toml ./token-server/Cargo.toml
+COPY web-wallet/Cargo.toml ./web-wallet/Cargo.toml
+RUN mkdir -p \
+        clients/apps/rust/src \
+        clients/libs/rust/src \
+        clients/tests/rust/src \
+        lib/src \
+        server/src \
+        token-server/src \
+        web-wallet/src \
+    && printf 'fn main() {}\n' > clients/apps/rust/src/main.rs \
+    && printf '// dependency cache placeholder\n' > clients/libs/rust/src/lib.rs \
+    && printf 'fn main() {}\n' > clients/tests/rust/src/main.rs \
+    && printf '// dependency cache placeholder\n' > lib/src/lib.rs \
+    && printf 'fn main() {}\n' > server/src/main.rs \
+    && printf 'fn main() {}\n' > token-server/src/main.rs \
+    && printf '// dependency cache placeholder\n' > web-wallet/src/lib.rs \
+    && cargo build --release --locked --package mercury-server --bin mercury-server
 
-# Copy the server source code
-COPY ./server ./server
-# Remove Settings.toml file
-RUN rm -f ./server/Settings.toml
-COPY ./lib ./lib
-COPY ./Rocket.toml ./server/Rocket.toml
+COPY server/src ./server/src
+COPY server/migrations ./server/migrations
+COPY lib/src ./lib/src
+RUN find server/src lib/src -type f -exec touch {} + \
+    && cargo build --release --locked --package mercury-server --bin mercury-server \
+    && test -x server/target/release/mercury-server
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        libssl3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 mercury \
+    && useradd --system --uid 10001 --gid mercury --home-dir /nonexistent mercury
 
 WORKDIR /mercurylayer/server
+COPY --chown=mercury:mercury --from=builder /mercurylayer/server/target/release/mercury-server ./target/release/mercury-server
+COPY --chown=mercury:mercury Rocket.toml ./Rocket.toml
 
-# RUN cargo build --verbose
-
-# # Build your Rust project. Since the source files are now present,
-# # the Rust compiler should be able to find and compile them.
-RUN CARGO_TARGET_DIR=target  cargo build --release
-
-# # Command to run the server by default when the container starts
-CMD ["cargo", "run", "--bin", "mercury-server"]
+USER mercury
+EXPOSE 8000
+CMD ["./target/release/mercury-server"]

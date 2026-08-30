@@ -1,2 +1,7 @@
+.env
+.env.*
 Settings.toml
 build/**
+vcpkg_installed/**
+.cache/**
+.git/**

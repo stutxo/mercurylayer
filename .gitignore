@@ -1,5 +1,11 @@
 /target
 .vscode
-/server/.env
-/token-server-v2/.env
+.env
+.env.*
+!.env.example
+!**/.env.example
 /data_bitcoin_regtest
+*.db*
+*.sqlite*
+/lockbox/seed
+**/__pycache__/

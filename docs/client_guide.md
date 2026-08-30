@@ -214,7 +214,7 @@ For BIP448, update-message `x1_pub`, unlock `auth_pub_key`, and receiver
 ciphertext hash; the unlock signature binds its current-owner/recipient role,
 statechain ID, and generation, and `auth_pub_key` is not the authentication
 key; the receiver signature binds statechain ID, exact `t2`, and generation.
-The transfer message remains version 2 and contains only canonical
+The transfer message is version 1 and contains only canonical
 funding/value facts; it does not carry duplicate inventory.
 
 After key update and accepted wallet/state persistence, the receiver performs
