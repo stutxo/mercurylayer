@@ -46,6 +46,7 @@ export async function installWalletHarness(page, options) {
   const state = {
     mercuryRequests: [],
     chainRequests: [],
+    enclaveRequests: [],
     packages: [],
     broadcasts: [],
     completions: [],
@@ -148,6 +149,31 @@ export async function installWalletHarness(page, options) {
       return fulfill(route, attempt.txid);
     }
     return route.fulfill({ status: 500, body: `unexpected Mutinynet request: ${request.method()} ${path}` });
+  });
+
+  await page.route(`${deployment.enclaviaProxyUrl}/**`, async (route) => {
+    const request = route.request();
+    const path = relativePath(deployment.enclaviaProxyUrl, request.url());
+    const body = requestBody(request);
+    state.enclaveRequests.push({ method: request.method(), path, body });
+
+    const custom = await options.onEnclave?.({ route, request, path, body, state });
+    if (await fulfill(route, custom)) return;
+
+    if (request.method() === "POST" && path === "attest") {
+      return fulfill(route, { body: { message: "attested" } });
+    }
+    if (request.method() === "POST" && path === "verify_statechain") {
+      return fulfill(route, {
+        body: {
+          statechain_id: body?.statechain_id,
+          challenge: body?.challenge,
+          server_pubkey:
+            options.enclaveServerPubkey ?? walletCoin?.server_pubkey ?? GENERATOR_PUBLIC_KEY,
+        },
+      });
+    }
+    return route.fulfill({ status: 500, body: `unexpected enclave request: ${request.method()} ${path}` });
   });
 
   return state;

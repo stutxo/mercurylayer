@@ -105,6 +105,7 @@ impl BrowserBackend {
         Ok(ApiResponse { status, body })
     }
 
+    #[cfg(not(feature = "e2e-harness"))]
     async fn connect_enclave(
         endpoint: &str,
         pcrs: [&str; 3],
@@ -147,6 +148,7 @@ impl Backend for BrowserBackend {
             .await
     }
 
+    #[cfg(not(feature = "e2e-harness"))]
     async fn attest_enclave(
         &self,
         endpoint: &str,
@@ -157,6 +159,28 @@ impl Backend for BrowserBackend {
         Ok(())
     }
 
+    /// e2e-harness builds reach the Playwright-hosted enclave stand-in over
+    /// plain HTTP; the attested Noise channel itself is covered by the Rust
+    /// integration suites against a real lockbox.
+    #[cfg(feature = "e2e-harness")]
+    async fn attest_enclave(
+        &self,
+        endpoint: &str,
+        _pcrs: [&str; 3],
+        _debug: bool,
+    ) -> Result<(), String> {
+        let response = self.post_json(endpoint, "attest", "{}").await?;
+        if response.is_success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "enclave attestation failed with {}: {}",
+                response.status, response.body
+            ))
+        }
+    }
+
+    #[cfg(not(feature = "e2e-harness"))]
     async fn verify_enclave_statechain(
         &self,
         endpoint: &str,
@@ -185,6 +209,23 @@ impl Backend for BrowserBackend {
                 .map_err(|error| error.to_string())?
                 .to_string(),
         })
+    }
+
+    #[cfg(feature = "e2e-harness")]
+    async fn verify_enclave_statechain(
+        &self,
+        endpoint: &str,
+        _pcrs: [&str; 3],
+        _debug: bool,
+        statechain_id: &str,
+        challenge: &str,
+    ) -> Result<ApiResponse, String> {
+        let body = serde_json::json!({
+            "statechain_id": statechain_id,
+            "challenge": challenge,
+        });
+        self.post_json(endpoint, "verify_statechain", &body.to_string())
+            .await
     }
 
     fn checkpoint(&self, snapshot: &str) -> Result<(), String> {

@@ -499,15 +499,17 @@ impl<B: Backend> WalletClient<B> {
         if !pending.delivered {
             return Ok(None);
         }
-        let observed: Bip448StatechainInfoResponsePayloadV1 = get_json(
-            &self.backend,
-            &self.snapshot.deployment.mercury_url,
-            &format!("info/statechain/{}", pending.statechain_id),
-            "outgoing statecoin ownership",
-        )
-        .await?;
-        let current_server =
-            PublicKey::from_slice(observed.enclave_public_key.as_bytes()).map_err(error_string)?;
+        // H1: the deletion below destroys the sender's unilateral-exit and
+        // recovery material, so the ownership observation must come from the
+        // attested enclave channel; a Mercury-proxied info/statechain response
+        // could claim the receiver's share before the enclave applied it.
+        let (attested_server, _) = self
+            .prove_enclave_server_share(&pending.statechain_id)
+            .await
+            .map_err(|error| {
+                format!("outgoing statecoin ownership enclave proof failed: {error}")
+            })?;
+        let current_server = PublicKey::from_str(&attested_server).map_err(error_string)?;
         let message = pending
             .message
             .as_ref()
@@ -1156,6 +1158,17 @@ impl<B: Backend> WalletClient<B> {
         {
             return Err("incoming key update produced an unexpected server share".to_string());
         }
+        // C2: the receipt and the live state above are both Mercury-proxied, and
+        // Mercury saw `t2`, so it can fabricate algebraically consistent values
+        // without the enclave ever applying the update. Confirm against the
+        // enclave directly before persisting the received coin.
+        let (attested_server, _) = self
+            .prove_enclave_server_share(&message.statechain_id)
+            .await
+            .map_err(|error| format!("incoming key update enclave proof failed: {error}"))?;
+        if attested_server != normalize_hex(&resulting_server.to_string()) {
+            return Err("signing enclave did not apply the incoming key update".to_string());
+        }
         let facts = transfer_chain_facts(
             self,
             &message,
@@ -1619,6 +1632,11 @@ mod tests {
         nonces: BTreeMap<String, ProtocolNonce>,
         partials: BTreeMap<String, String>,
         mailboxes: BTreeMap<String, Vec<String>>,
+        // When true, the Mercury face claims key updates applied (receipt and
+        // info/statechain) while the enclave face keeps reporting the previous
+        // share — a compromised-Mercury forgery the wallet must reject.
+        forge_key_updates: bool,
+        forged_rotation: Option<(PublicKey, u64)>,
     }
 
     #[derive(Clone)]
@@ -1670,6 +1688,8 @@ mod tests {
                     key_generation: 0,
                     x1_secret: None,
                     transfer_counter: 0,
+                    forge_key_updates: false,
+                    forged_rotation: None,
                     rows: vec![serde_json::json!({
                         "statechain_id": "statechain",
                         "server_pubnonce": metadata.server_public_nonce,
@@ -1703,11 +1723,14 @@ mod tests {
                 .as_ref()
                 .map(|secret| PublicKey::from_secret_key(&Secp256k1::new(), secret))
                 .unwrap_or(enclave_public_key);
+            let (claimed_public_key, claimed_generation) = state
+                .forged_rotation
+                .unwrap_or((enclave_public_key, state.key_generation));
             serde_json::json!({
                 "protocol_version": 1,
-                "enclave_public_key": enclave_public_key.to_string(),
+                "enclave_public_key": claimed_public_key.to_string(),
                 "num_sigs": state.signature_count,
-                "lockbox_key_generation": state.key_generation,
+                "lockbox_key_generation": claimed_generation,
                 "statechain_info": state.rows,
                 "x1_pub": x1_pub.to_string()
             })
@@ -1903,8 +1926,13 @@ mod tests {
                         .map_err(error_string)?;
                     let resulting_public =
                         PublicKey::from_secret_key(&Secp256k1::new(), &resulting_secret);
-                    state.server_secret = resulting_secret;
-                    state.key_generation = state.key_generation.checked_add(1).unwrap();
+                    let claimed_generation = state.key_generation.checked_add(1).unwrap();
+                    if state.forge_key_updates {
+                        state.forged_rotation = Some((resulting_public, claimed_generation));
+                    } else {
+                        state.server_secret = resulting_secret;
+                        state.key_generation = claimed_generation;
+                    }
                     serde_json::json!({
                         "protocol_version": 1,
                         "operation_id": request["operation_id"],
@@ -1912,7 +1940,7 @@ mod tests {
                         "status": "applied",
                         "accepted_sig_count": state.signature_count,
                         "previous_key_generation": previous_generation,
-                        "resulting_key_generation": state.key_generation,
+                        "resulting_key_generation": claimed_generation,
                         "previous_server_pubkey": previous_public.to_string(),
                         "resulting_server_pubkey": resulting_public.to_string(),
                         "transfer_generation_pubkey": request["transfer_generation_pubkey"]
@@ -1922,6 +1950,29 @@ mod tests {
                 _ => return Err(format!("unexpected protocol POST {path}")),
             };
             Ok(Self::response(response))
+        }
+
+        // The mock enclave reports the same authoritative share its Mercury
+        // face serves from `state_info`, including post-keyupdate rotations.
+        async fn verify_enclave_statechain(
+            &self,
+            _endpoint: &str,
+            _pcrs: [&str; 3],
+            _debug: bool,
+            statechain_id: &str,
+            challenge: &str,
+        ) -> Result<ApiResponse, String> {
+            assert_eq!(statechain_id, "statechain");
+            let state = self.state.borrow();
+            let server_pubkey = PublicKey::from_secret_key(&Secp256k1::new(), &state.server_secret);
+            Ok(Self::response(
+                serde_json::json!({
+                    "statechain_id": statechain_id,
+                    "challenge": challenge,
+                    "server_pubkey": server_pubkey.to_string(),
+                })
+                .to_string(),
+            ))
         }
 
         fn checkpoint(&self, snapshot: &str) -> Result<(), String> {
@@ -2058,6 +2109,86 @@ mod tests {
         assert_eq!(backend.state.borrow().signature_count, 3);
         assert_eq!(backend.state.borrow().key_generation, 1);
         assert_all_protocol_checkpoints_restore(&backend);
+    }
+
+    #[tokio::test]
+    async fn forged_keyupdate_receipt_is_rejected_by_the_enclave_proof() {
+        let backend = ProtocolBackend::new();
+        backend.state.borrow_mut().forge_key_updates = true;
+        let mut sender = WalletClient::from_snapshot(
+            include_str!("../tests/fixtures/recovery-ready.json"),
+            backend.clone(),
+        )
+        .unwrap();
+        let mut recipient = empty_recipient(backend.clone()).await;
+        let transfer_address = recipient.create_transfer_address().unwrap().address;
+        sender
+            .send_statecoin("statechain", &transfer_address)
+            .await
+            .unwrap();
+
+        // Mercury serves a fully consistent forged receipt and live state, but
+        // the enclave never applied the update: the receive must fail closed
+        // and the coin must not be persisted.
+        let received = recipient.sync_transfers().await.unwrap();
+        assert!(received.accepted_statechain_ids.is_empty());
+        assert!(
+            received.warnings.iter().any(|warning| {
+                warning.contains("signing enclave did not apply the incoming key update")
+            }),
+            "unexpected warnings: {:?}",
+            received.warnings
+        );
+        assert!(recipient.snapshot.statechain("statechain").is_none());
+        assert!(!recipient
+            .snapshot
+            .wallet
+            .coins
+            .iter()
+            .any(|coin| { coin.statechain_id.as_deref() == Some("statechain") }));
+        assert!(recipient.snapshot.pending_incoming_transfer.is_some());
+
+        // The sender's recovery material survives: the enclave still reports
+        // the sender's share, so reconciliation makes no progress.
+        let reconciled = sender.sync_transfers().await.unwrap();
+        assert!(reconciled.warnings.is_empty());
+        assert!(reconciled.accepted_statechain_ids.is_empty());
+        assert!(sender.snapshot.statechain("statechain").is_some());
+        assert!(sender.snapshot.state_histories.contains_key("statechain"));
+        assert!(sender.snapshot.pending_outgoing_transfer.is_some());
+        assert_eq!(backend.state.borrow().key_generation, 0);
+    }
+
+    #[tokio::test]
+    async fn sender_state_survives_until_the_enclave_confirms_rotation() {
+        let backend = ProtocolBackend::new();
+        let mut sender = WalletClient::from_snapshot(
+            include_str!("../tests/fixtures/recovery-ready.json"),
+            backend.clone(),
+        )
+        .unwrap();
+        let mut recipient = empty_recipient(backend.clone()).await;
+        let transfer_address = recipient.create_transfer_address().unwrap().address;
+        sender
+            .send_statecoin("statechain", &transfer_address)
+            .await
+            .unwrap();
+
+        // The recipient never processes the transfer; the enclave still holds
+        // the sender's share. Reconciliation must retain every recovery
+        // artifact rather than trusting message delivery.
+        let progress = sender.sync_transfers().await.unwrap();
+        assert!(progress.warnings.is_empty());
+        assert!(progress.accepted_statechain_ids.is_empty());
+        assert!(sender.snapshot.statechain("statechain").is_some());
+        assert!(sender.snapshot.state_histories.contains_key("statechain"));
+        assert!(sender.snapshot.pending_outgoing_transfer.is_some());
+        assert!(sender
+            .snapshot
+            .wallet
+            .coins
+            .iter()
+            .any(|coin| { coin.statechain_id.as_deref() == Some("statechain") }));
     }
 
     #[derive(Clone, Default)]

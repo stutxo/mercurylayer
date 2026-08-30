@@ -9,6 +9,11 @@ RUN rustup target add wasm32-unknown-unknown \
     && cargo install wasm-pack --version 0.13.1 --locked
 
 ENV CC_wasm32_unknown_unknown=clang
+# Browser e2e images build with WEB_WALLET_FEATURES=e2e-harness so the
+# Playwright harness can stand in for the enclave; production builds leave
+# this empty and keep the attested Enclavia SDK channel.
+ARG WEB_WALLET_FEATURES=""
+ENV WEB_WALLET_FEATURES="${WEB_WALLET_FEATURES}"
 WORKDIR /workspace
 COPY . .
 RUN web-wallet/build.sh \

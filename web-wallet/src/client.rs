@@ -534,6 +534,21 @@ impl<B: Backend> WalletClient<B> {
         coin.statechain_id = Some(initialized.statechain_id.clone());
         coin.signed_statechain_id = Some(initialized.signed_statechain_id);
         coin.server_pubkey = Some(initialized.server_pubkey);
+        // H2: never expose a funding address before the signing enclave itself
+        // confirms, over the attested channel, that it holds the server share
+        // Mercury advertised. A compromised Mercury could otherwise substitute
+        // its own share and steal the funding output after a later transfer.
+        let expected_server = normalize_hex(&required(&coin.server_pubkey, "server key")?);
+        let (attested_server, _) = self
+            .prove_enclave_server_share(&initialized.statechain_id)
+            .await
+            .map_err(|error| format!("deposit server share enclave proof failed: {error}"))?;
+        if attested_server != expected_server {
+            return Err(
+                "Mercury reported a deposit server share the signing enclave does not hold"
+                    .to_string(),
+            );
+        }
         let address =
             bip448_deposit::create_deposit_address(&coin, NETWORK).map_err(error_string)?;
         coin.amount = Some(amount);
@@ -1330,15 +1345,18 @@ impl<B: Backend> WalletClient<B> {
         Ok(result)
     }
 
-    pub async fn verify_enclave(
-        &mut self,
+    /// Query the signing enclave directly over the attested Enclavia channel and
+    /// return the server share it currently holds for `statechain_id`, along with
+    /// the challenge that was echoed. This is the only wallet-side source of
+    /// enclave state that Mercury cannot read or forge; every ownership
+    /// transition must be confirmed through it rather than through
+    /// Mercury-proxied responses.
+    pub(crate) async fn prove_enclave_server_share(
+        &self,
         statechain_id: &str,
-    ) -> Result<EnclaveVerification, String> {
-        let deployment = self.snapshot.deployment.clone();
-        validate_enclave_configuration(&deployment)?;
-        let coin = current_wallet_coin(&self.snapshot.wallet.coins, statechain_id)?;
-        let expected_server_pubkey = normalize_hex(&required(&coin.server_pubkey, "server key")?);
-
+    ) -> Result<(String, String), String> {
+        let deployment = &self.snapshot.deployment;
+        validate_enclave_configuration(deployment)?;
         let mut challenge_bytes = [0u8; 32];
         getrandom_03::fill(&mut challenge_bytes).map_err(error_string)?;
         let challenge = hex::encode(challenge_bytes);
@@ -1363,9 +1381,21 @@ impl<B: Backend> WalletClient<B> {
                 "Lockbox proof did not echo the requested statechain and challenge".to_string(),
             );
         }
-        if normalize_hex(&proof.server_pubkey) != expected_server_pubkey {
+        Ok((normalize_hex(&proof.server_pubkey), challenge))
+    }
+
+    pub async fn verify_enclave(
+        &mut self,
+        statechain_id: &str,
+    ) -> Result<EnclaveVerification, String> {
+        let coin = current_wallet_coin(&self.snapshot.wallet.coins, statechain_id)?;
+        let expected_server_pubkey = normalize_hex(&required(&coin.server_pubkey, "server key")?);
+        let (proven_server_pubkey, challenge) =
+            self.prove_enclave_server_share(statechain_id).await?;
+        if proven_server_pubkey != expected_server_pubkey {
             return Err("Lockbox key does not match the wallet server share".to_string());
         }
+        let deployment = &self.snapshot.deployment;
         let pcr0 = normalize_hex(&deployment.expected_pcr0);
         let pcr1 = normalize_hex(&deployment.expected_pcr1);
         let pcr2 = normalize_hex(&deployment.expected_pcr2);
@@ -2319,6 +2349,7 @@ mod tests {
 
     struct DepositRetryBackend {
         responses: Vec<String>,
+        server_pubkey: String,
         posts: std::rc::Rc<std::cell::Cell<u32>>,
     }
 
@@ -2342,6 +2373,25 @@ mod tests {
                 .ok_or_else(|| "unexpected extra deposit request".to_string())?;
             self.posts.set(self.posts.get() + 1);
             Ok(ApiResponse { status: 200, body })
+        }
+
+        async fn verify_enclave_statechain(
+            &self,
+            _endpoint: &str,
+            _pcrs: [&str; 3],
+            _debug: bool,
+            statechain_id: &str,
+            challenge: &str,
+        ) -> Result<ApiResponse, String> {
+            Ok(ApiResponse {
+                status: 200,
+                body: serde_json::json!({
+                    "statechain_id": statechain_id,
+                    "challenge": challenge,
+                    "server_pubkey": self.server_pubkey,
+                })
+                .to_string(),
+            })
         }
 
         fn checkpoint(&self, _snapshot: &str) -> Result<(), String> {
@@ -2379,6 +2429,7 @@ mod tests {
         let posts = std::rc::Rc::new(std::cell::Cell::new(0));
         let backend = DepositRetryBackend {
             responses: vec![response],
+            server_pubkey: server_key.to_string(),
             posts: posts.clone(),
         };
         let mut client = WalletClient { snapshot, backend };
@@ -2581,6 +2632,26 @@ mod tests {
             Ok(Self::response(response))
         }
 
+        async fn verify_enclave_statechain(
+            &self,
+            _endpoint: &str,
+            _pcrs: [&str; 3],
+            _debug: bool,
+            statechain_id: &str,
+            challenge: &str,
+        ) -> Result<ApiResponse, String> {
+            assert_eq!(statechain_id, "deposit-statechain");
+            let server_pubkey = PublicKey::from_secret_key(&Secp256k1::new(), &self.server_secret);
+            Ok(Self::response(
+                json!({
+                    "statechain_id": statechain_id,
+                    "challenge": challenge,
+                    "server_pubkey": server_pubkey.to_string(),
+                })
+                .to_string(),
+            ))
+        }
+
         fn checkpoint(&self, snapshot: &str) -> Result<(), String> {
             self.checkpoints.borrow_mut().push(snapshot.to_string());
             Ok(())
@@ -2666,6 +2737,7 @@ mod tests {
         let posts = Rc::new(Cell::new(0));
         let backend = DepositRetryBackend {
             responses: vec![response("first-statechain"), response("second-statechain")],
+            server_pubkey: server_pubkey.clone(),
             posts: posts.clone(),
         };
         let mut client = WalletClient { snapshot, backend };
@@ -2702,11 +2774,49 @@ mod tests {
             &exported,
             DepositRetryBackend {
                 responses: Vec::new(),
+                server_pubkey: server_pubkey.clone(),
                 posts: Rc::new(Cell::new(0)),
             },
         )
         .unwrap();
         assert_eq!(restored.snapshot.pending_deposits.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn deposit_rejects_a_server_share_the_enclave_does_not_hold() {
+        let (mut snapshot, _) = recovery_fixture();
+        snapshot.wallet.coins.clear();
+        snapshot.statechains.clear();
+        let advertised = SecretKey::from_secret_bytes([9; 32])
+            .unwrap()
+            .public_key(&Secp256k1::new());
+        let substituted = SecretKey::from_secret_bytes([10; 32])
+            .unwrap()
+            .public_key(&Secp256k1::new());
+        let response = serde_json::to_string(&DepositMsg1Response {
+            server_pubkey: advertised.to_string(),
+            statechain_id: "ab".repeat(16),
+        })
+        .unwrap();
+        let backend = DepositRetryBackend {
+            responses: vec![response],
+            server_pubkey: substituted.to_string(),
+            posts: Rc::new(Cell::new(0)),
+        };
+        let mut client = WalletClient { snapshot, backend };
+
+        assert_eq!(
+            client
+                .create_deposit_with_token(1_500, Some("token".to_string()))
+                .await
+                .unwrap_err(),
+            "Mercury reported a deposit server share the signing enclave does not hold"
+        );
+        // The pending deposit stays retryable: no statechain ID or funding
+        // address from the unattested response was persisted.
+        let pending = &client.snapshot.pending_deposits[0];
+        assert!(pending.coin.statechain_id.is_none());
+        assert!(pending.coin.aggregated_address.is_none());
     }
 
     #[derive(Clone, Default)]

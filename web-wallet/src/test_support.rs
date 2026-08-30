@@ -63,7 +63,19 @@ impl Step {
             },
         }
     }
+
+    /// Script the server share the mock enclave reports for the next direct
+    /// `verify_statechain` proof. The mock echoes the request's statechain ID
+    /// and challenge, so only the key needs scripting.
+    pub fn enclave_proof(server_pubkey: impl Into<String>) -> Self {
+        Self::text(Method::PostJson, ENCLAVE_VERIFY_PATH, server_pubkey)
+    }
 }
+
+/// Scripted path used for enclave attestation calls in tests.
+pub const ENCLAVE_ATTEST_PATH: &str = "enclave/attest";
+/// Scripted path used for direct enclave statechain proofs in tests.
+pub const ENCLAVE_VERIFY_PATH: &str = "enclave/verify_statechain";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservedRequest {
@@ -154,6 +166,55 @@ impl Backend for ScriptedBackend {
         body: &str,
     ) -> Result<ApiResponse, String> {
         self.respond(Method::PostText, base_url, path, Some(body))
+    }
+
+    async fn attest_enclave(
+        &self,
+        endpoint: &str,
+        _pcrs: [&str; 3],
+        _debug: bool,
+    ) -> Result<(), String> {
+        let response = self.respond(Method::PostJson, endpoint, ENCLAVE_ATTEST_PATH, None)?;
+        if response.is_success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "enclave attestation failed with {}: {}",
+                response.status, response.body
+            ))
+        }
+    }
+
+    async fn verify_enclave_statechain(
+        &self,
+        endpoint: &str,
+        _pcrs: [&str; 3],
+        _debug: bool,
+        statechain_id: &str,
+        challenge: &str,
+    ) -> Result<ApiResponse, String> {
+        let request = serde_json::json!({
+            "statechain_id": statechain_id,
+            "challenge": challenge,
+        });
+        let response = self.respond(
+            Method::PostJson,
+            endpoint,
+            ENCLAVE_VERIFY_PATH,
+            Some(&request.to_string()),
+        )?;
+        if !response.is_success() {
+            return Ok(response);
+        }
+        let body = serde_json::json!({
+            "statechain_id": statechain_id,
+            "challenge": challenge,
+            "server_pubkey": response.body.trim(),
+        });
+        Ok(ApiResponse {
+            status: 200,
+            body: body.to_string(),
+        })
     }
 
     fn checkpoint(&self, snapshot: &str) -> Result<(), String> {

@@ -12,6 +12,12 @@ wasm-opt = ["-Oz", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Browser e2e builds only: replaces the attested Enclavia SDK channel with
+# plain HTTP calls the Playwright harness can route. Never enabled for the
+# production image; the Dockerfile takes it as an explicit build argument.
+e2e-harness = []
+
 [dependencies]
 bitcoin = { git = "https://github.com/w0xlt/rust-bitcoin", branch = "inquisition-bip448-support-0.30.2", version = "0.30.2", features = ["serde", "base64", "rand-std", "std"], default-features = false }
 console_error_panic_hook = "0.1.7"

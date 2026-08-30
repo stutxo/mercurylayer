@@ -35,7 +35,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Build Rust/WASM wallet image
-        run: docker build --file web-wallet/Dockerfile --tag mercury-bip448-web-wallet:e2e .
+        run: docker build --file web-wallet/Dockerfile --build-arg WEB_WALLET_FEATURES=e2e-harness --tag mercury-bip448-web-wallet:e2e .
       - name: Exercise unilateral exit in Chromium
         working-directory: web-wallet
         run: npm run test:e2e

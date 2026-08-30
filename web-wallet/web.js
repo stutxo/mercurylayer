@@ -409,11 +409,8 @@ function renderSendStatecoin(current) {
       : sent
         ? "Statecoin sent"
         : "Pending transfer";
-    cancel.textContent = cancellation
-      ? "Resume cancellation"
-      : sent
-        ? "Undo before recipient syncs"
-        : "Cancel transfer";
+    cancel.classList.toggle("hidden", sent && !cancellation);
+    cancel.textContent = cancellation ? "Resume cancellation" : "Cancel transfer";
     cancel.classList.toggle("danger", !sent);
     cancel.disabled = busy || Boolean(runtimeProblem)
       || (!cancellation && (!pendingCoin?.canCancelTransfer || Boolean(pending.batchId)));

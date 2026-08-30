@@ -197,9 +197,15 @@ persisted checkpoint.
 ```sh
 npm ci --prefix web-wallet
 npx --prefix web-wallet playwright install chromium
-docker build --file web-wallet/Dockerfile --tag mercury-bip448-web-wallet:e2e .
+docker build --file web-wallet/Dockerfile \
+  --build-arg WEB_WALLET_FEATURES=e2e-harness \
+  --tag mercury-bip448-web-wallet:e2e .
 npm --prefix web-wallet run test:e2e
 ```
+
+The `e2e-harness` build argument swaps the attested Enclavia SDK channel for
+plain HTTP calls the Playwright harness can stand in for; production images
+must be built without it.
 
 Set `UPDATE_WEB_WALLET_FIXTURES=1` when intentionally regenerating the fixture;
 the Rust unit test otherwise rejects fixture drift.

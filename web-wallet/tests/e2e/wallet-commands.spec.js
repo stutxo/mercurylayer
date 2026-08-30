@@ -655,6 +655,35 @@ test("unused deposit addresses stay recoverable in the compact mobile onboard pa
   await expect(page.locator(".pending-deposit-address")).toHaveText(secondAddress);
 });
 
+test("deposit halts when the enclave does not hold the advertised share", async ({ page }) => {
+  const snapshot = blankFixture();
+  const state = await installWalletHarness(page, {
+    snapshot,
+    enclaveServerPubkey: "02" + "22".repeat(32),
+    onMercury({ request, path }) {
+      if (request.method() === "POST" && path === "deposit/init/pod") {
+        return {
+          body: {
+            server_pubkey: generatorPublicKey,
+            statechain_id: "unattested-deposit",
+          },
+        };
+      }
+    },
+  });
+  await loadSnapshot(page, snapshot);
+
+  await page.locator("#deposit-amount").fill("2500");
+  await page.locator("#deposit-form button[type=submit]").click();
+  await expect(page.locator("#status")).toContainText(
+    "server share the signing enclave does not hold",
+  );
+  expect(state.enclaveRequests.some((entry) => entry.path === "verify_statechain")).toBe(true);
+  const saved = await storedSnapshot(page);
+  expect(saved.pending_deposits[0].coin.statechain_id).toBeNull();
+  expect(saved.pending_deposits[0].coin.aggregated_address).toBeNull();
+});
+
 test("receive lists each one-time address exactly once on mobile", async ({ page }) => {
   const snapshot = blankFixture();
   await page.setViewportSize({ width: 390, height: 844 });
@@ -870,6 +899,8 @@ test("send journals the recipient and resumes after interruption", async ({ page
   await expect(page.locator("#status")).toContainText("intentional e2e signing boundary");
   await expect(page.locator("#pending-transfer")).toBeVisible();
   await expect(page.locator("#pending-transfer-recipient")).toHaveText(recipient);
+  await expect(page.locator("#cancel-transfer")).toBeVisible();
+  await expect(page.locator("#cancel-transfer")).toHaveText("Cancel transfer");
   const senderInit = state.mercuryRequests.find((entry) => entry.path === "transfer/sender");
   expect(senderInit.body.statechain_id).toBe("statechain");
   expect(senderInit.body.batch_id).toBeNull();
@@ -917,10 +948,7 @@ test("send journals the recipient and resumes after interruption", async ({ page
   await expect(page.locator("#pending-transfer-detail")).toContainText(
     "Sent · completes when recipient wallet syncs",
   );
-  await expect(page.locator("#cancel-transfer")).toHaveText(
-    "Undo before recipient syncs",
-  );
-  await expect(page.locator("#cancel-transfer")).not.toHaveClass(/danger/);
+  await expect(page.locator("#cancel-transfer")).toBeHidden();
 });
 
 test("cooperative withdrawal preserves its irreversible signing journal", async ({ page }) => {
