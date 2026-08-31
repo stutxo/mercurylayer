@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cerrno>
 #include <climits>
 #include <cctype>
@@ -349,8 +350,11 @@ CREATE TABLE lockbox_metadata (
             return result;
         }
 
-        void configure_connection(sqlite3* database) {
-            std::string journal_mode = query_text(database, "PRAGMA journal_mode=DELETE;");
+        void configure_connection(sqlite3* database, bool initialize_journal_mode) {
+            std::string journal_mode = query_text(
+                database,
+                initialize_journal_mode ? "PRAGMA journal_mode=DELETE;" : "PRAGMA journal_mode;"
+            );
             std::transform(
                 journal_mode.begin(),
                 journal_mode.end(),
@@ -406,7 +410,7 @@ CREATE TABLE lockbox_metadata (
                     if (sqlite3_busy_timeout(database_, kBusyTimeoutMilliseconds) != SQLITE_OK) {
                         throw_sqlite_error(database_, "Unable to configure SQLite busy timeout");
                     }
-                    configure_connection(database_);
+                    configure_connection(database_, create);
                 } catch (...) {
                     sqlite3_close(database_);
                     database_ = nullptr;
@@ -1194,24 +1198,71 @@ CREATE TABLE lockbox_metadata (
         }
     }
 
-    bool save_generated_public_key(
-        const utils::chacha20_poly1305_encrypted_data& encrypted_keypair,
-        const unsigned char* server_public_key,
-        std::size_t server_public_key_size,
+    GeneratedKeyResult get_or_create_generated_public_key(
         const std::string& statechain_id,
-        std::string& error_message
+        const GeneratedKeyFactory& generate_key
     ) {
-        error_message.clear();
-        if (!valid_statechain_id(statechain_id) || server_public_key == nullptr ||
-            server_public_key_size != BIP448_PUBLIC_KEY_SIZE) {
-            error_message = "Invalid generated-key input.";
-            return false;
+        GeneratedKeyResult result;
+        if (!valid_statechain_id(statechain_id) || !generate_key) {
+            result.outcome = GeneratedKeyOutcome::InvalidInput;
+            result.failure_phase = "input";
+            return result;
         }
+
+        const auto elapsed_us = [](const auto started) {
+            return static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - started
+                ).count()
+            );
+        };
+        std::string phase = "open";
         try {
-            const auto sealed_keypair = serialize_blob(encrypted_keypair);
+            auto started = std::chrono::steady_clock::now();
             Database database(get_database_path(), false);
-            validate_schema(database.get());
+            result.timings.open_us = elapsed_us(started);
+
+            phase = "transaction";
+            started = std::chrono::steady_clock::now();
             Transaction transaction(database.get());
+            result.timings.transaction_us = elapsed_us(started);
+
+            phase = "read";
+            started = std::chrono::steady_clock::now();
+            Statement existing(
+                database.get(),
+                "SELECT public_key FROM generated_public_key WHERE statechain_id=?1;"
+            );
+            existing.bind_text(1, statechain_id);
+            const int existing_step = existing.step();
+            result.timings.read_us = elapsed_us(started);
+            if (existing_step == SQLITE_ROW) {
+                if (!column_array(existing.get(), 0, result.server_pubkey)
+                    || existing.step() != SQLITE_DONE) {
+                    result.failure_phase = "read";
+                    return result;
+                }
+                result.outcome = GeneratedKeyOutcome::Existing;
+                phase = "commit";
+                started = std::chrono::steady_clock::now();
+                transaction.commit();
+                result.timings.commit_us = elapsed_us(started);
+                return result;
+            }
+            if (existing_step != SQLITE_DONE) {
+                throw std::runtime_error("SQLite generated-key lookup did not complete.");
+            }
+
+            phase = "generate";
+            auto generated = generate_key();
+            EncryptedBufferGuard guard{generated.encrypted_keypair};
+            result.key_generation_us = generated.key_generation_us;
+
+            phase = "serialize";
+            const auto sealed_keypair = serialize_blob(generated.encrypted_keypair);
+
+            phase = "insert";
+            started = std::chrono::steady_clock::now();
             Statement statement(
                 database.get(),
                 "INSERT INTO generated_public_key "
@@ -1219,18 +1270,27 @@ CREATE TABLE lockbox_metadata (
             );
             statement.bind_text(1, statechain_id);
             statement.bind_blob(2, sealed_keypair.data(), sealed_keypair.size());
-            statement.bind_blob(3, server_public_key, server_public_key_size);
+            statement.bind_blob(
+                3,
+                generated.server_pubkey.data(),
+                generated.server_pubkey.size()
+            );
             if (statement.step() != SQLITE_DONE || sqlite3_changes(database.get()) != 1) {
                 throw std::runtime_error("SQLite generated-key insert did not complete.");
             }
+            result.timings.insert_us = elapsed_us(started);
+            result.server_pubkey = generated.server_pubkey;
+            result.outcome = GeneratedKeyOutcome::Created;
+
+            phase = "commit";
+            started = std::chrono::steady_clock::now();
             transaction.commit();
-            return true;
-        } catch (const std::exception& error) {
-            set_error(error_message, error);
-            return false;
-        } catch (...) {
-            set_unknown_error(error_message);
-            return false;
+            result.timings.commit_us = elapsed_us(started);
+            return result;
+        } catch (const std::exception&) {
+            result.outcome = GeneratedKeyOutcome::StorageFailure;
+            result.failure_phase = phase;
+            return result;
         }
     }
 
@@ -1250,7 +1310,6 @@ CREATE TABLE lockbox_metadata (
         }
         try {
             Database database(get_database_path(), false);
-            validate_schema(database.get());
             Statement statement(
                 database.get(),
                 "SELECT public_key FROM generated_public_key WHERE statechain_id=?1;"
@@ -1282,7 +1341,6 @@ CREATE TABLE lockbox_metadata (
         }
         try {
             Database database(get_database_path(), false);
-            validate_schema(database.get());
             Statement statement(
                 database.get(),
                 "SELECT sig_count,key_generation,public_key "
@@ -1326,7 +1384,6 @@ CREATE TABLE lockbox_metadata (
         }
         try {
             Database database(get_database_path(), false);
-            validate_schema(database.get());
             Transaction transaction(database.get());
             LockedParent parent;
             if (!load_parent(database.get(), request.statechain_id, parent)) {
@@ -1405,7 +1462,6 @@ CREATE TABLE lockbox_metadata (
         }
         try {
             Database database(get_database_path(), false);
-            validate_schema(database.get());
             Transaction transaction(database.get());
             LockedParent parent;
             if (!load_parent(database.get(), request.statechain_id, parent)) {
@@ -1531,7 +1587,6 @@ CREATE TABLE lockbox_metadata (
         }
         try {
             Database database(get_database_path(), false);
-            validate_schema(database.get());
             Transaction transaction(database.get());
             LockedParent parent;
             if (!load_parent(database.get(), request.statechain_id, parent)) {
@@ -1701,7 +1756,6 @@ CREATE TABLE lockbox_metadata (
         }
         try {
             Database database(get_database_path(), false);
-            validate_schema(database.get());
             Transaction transaction(database.get());
             Statement statement(
                 database.get(),

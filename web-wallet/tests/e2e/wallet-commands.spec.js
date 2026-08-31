@@ -279,6 +279,10 @@ test("About remains available while a wallet command is in progress", async ({ p
   await expect(closeAbout).toBeEnabled();
   await closeAbout.click();
   await expect(about).toBeHidden();
+  await expect(page.locator("#status")).toHaveText(
+    /Still working \(\d+s\): Waiting for the signing enclave\. The pending deposit remains retryable\./,
+    { timeout: 5_000 },
+  );
 
   releaseDeposit();
   await expect(page.locator("#status")).toHaveText("Deposit address created.");

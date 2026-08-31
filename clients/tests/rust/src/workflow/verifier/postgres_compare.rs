@@ -55,87 +55,89 @@ pub(super) fn catalog(service: &str, expected: &PgCatalog, actual: &PgCatalog) -
     Ok(())
 }
 
-pub(super) fn mercury_migrations(actual: &[MigrationRow], expected_checksum: &str) -> Result<()> {
+pub(super) fn mercury_migrations(
+    actual: &[MigrationRow],
+    expected: &[(i64, &str, &str)],
+) -> Result<()> {
     let service = "Mercury";
     let dimension = "migrations";
     let object = "migration-row";
-    if actual.is_empty() {
-        return Err(mismatch(
-            service, dimension, object, 0, "object", &"present", &"missing",
-        ));
-    }
-    if actual.len() > 1 {
-        return Err(mismatch(
+    for (index, &(expected_version, expected_description, expected_checksum)) in
+        expected.iter().enumerate()
+    {
+        let Some(row) = actual.get(index) else {
+            return Err(mismatch(
+                service, dimension, object, index, "object", &"present", &"missing",
+            ));
+        };
+        compare_field(
             service,
             dimension,
             object,
-            1,
-            "object",
-            &"absent",
-            &"unexpected",
-        ));
-    }
-    let row = &actual[0];
-    compare_field(
-        service,
-        dimension,
-        object,
-        0,
-        "version",
-        &1_i64,
-        &row.version,
-    )?;
-    if row.description != "bip448 schema" {
-        return Err(mismatch(
+            index,
+            "version",
+            &expected_version,
+            &row.version,
+        )?;
+        compare_field(
             service,
             dimension,
             object,
-            0,
+            index,
             "description",
-            &"bip448 schema",
-            &row.description,
-        ));
-    }
-    compare_field(
-        service,
-        dimension,
-        object,
-        0,
-        "success",
-        &true,
-        &row.success,
-    )?;
-    if row.installed_on.trim().is_empty() {
-        return Err(mismatch(
+            &expected_description,
+            &row.description.as_str(),
+        )?;
+        compare_field(
             service,
             dimension,
             object,
-            0,
-            "installed_on",
-            &"non-empty",
-            &row.installed_on,
-        ));
-    }
-    if row.checksum_hex != expected_checksum {
-        return Err(mismatch(
+            index,
+            "success",
+            &true,
+            &row.success,
+        )?;
+        if row.installed_on.trim().is_empty() {
+            return Err(mismatch(
+                service,
+                dimension,
+                object,
+                index,
+                "installed_on",
+                &"non-empty",
+                &row.installed_on,
+            ));
+        }
+        compare_field(
             service,
             dimension,
             object,
-            0,
+            index,
             "checksum_hex",
             &expected_checksum,
-            &row.checksum_hex,
-        ));
+            &row.checksum_hex.as_str(),
+        )?;
+        if row.execution_time < 0 {
+            return Err(mismatch(
+                service,
+                dimension,
+                object,
+                index,
+                "execution_time",
+                &">= 0",
+                &row.execution_time,
+            ));
+        }
     }
-    if row.execution_time < 0 {
+    if let Some(row) = actual.get(expected.len()) {
         return Err(mismatch(
             service,
             dimension,
             object,
-            0,
-            "execution_time",
-            &">= 0",
-            &row.execution_time,
+            expected.len(),
+            "object",
+            &"absent",
+            &format!("unexpected migration version {}", row.version),
         ));
     }
     Ok(())

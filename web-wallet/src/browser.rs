@@ -1,3 +1,10 @@
+#[cfg(not(feature = "e2e-harness"))]
+use std::future::Future;
+
+#[cfg(not(feature = "e2e-harness"))]
+use futures_util::future::{select, Either};
+#[cfg(not(feature = "e2e-harness"))]
+use gloo_timers::future::TimeoutFuture;
 use js_sys::Date;
 use wasm_bindgen::{closure::Closure, JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
@@ -9,6 +16,8 @@ use crate::{
 };
 
 const REQUEST_TIMEOUT_MS: i32 = 65_000;
+#[cfg(not(feature = "e2e-harness"))]
+const DIRECT_ENCLAVE_TIMEOUT_MS: u32 = 20_000;
 
 struct AbortTimeout {
     window: web_sys::Window,
@@ -19,6 +28,23 @@ struct AbortTimeout {
 impl Drop for AbortTimeout {
     fn drop(&mut self) {
         self.window.clear_timeout_with_handle(self.timeout_id);
+    }
+}
+
+#[cfg(not(feature = "e2e-harness"))]
+async fn with_direct_enclave_timeout<T, F>(operation: &'static str, future: F) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    let timeout = TimeoutFuture::new(DIRECT_ENCLAVE_TIMEOUT_MS);
+    futures_util::pin_mut!(future);
+    futures_util::pin_mut!(timeout);
+    match select(future, timeout).await {
+        Either::Left((result, _)) => result,
+        Either::Right(((), _)) => Err(format!(
+            "{operation} timed out after {} seconds",
+            DIRECT_ENCLAVE_TIMEOUT_MS / 1_000
+        )),
     }
 }
 
@@ -92,13 +118,13 @@ impl BrowserBackend {
 
         let response = JsFuture::from(window.fetch_with_request(&request))
             .await
-            .map_err(js_error)?
+            .map_err(|error| fetch_error(error, &abort_controller, &url))?
             .dyn_into::<Response>()
             .map_err(js_error)?;
         let status = response.status();
         let body = JsFuture::from(response.text().map_err(js_error)?)
             .await
-            .map_err(js_error)?
+            .map_err(|error| fetch_error(error, &abort_controller, &url))?
             .as_string()
             .ok_or_else(|| "HTTP response was not text".to_string())?;
 
@@ -155,7 +181,11 @@ impl Backend for BrowserBackend {
         pcrs: [&str; 3],
         debug: bool,
     ) -> Result<(), String> {
-        Self::connect_enclave(endpoint, pcrs, debug).await?;
+        with_direct_enclave_timeout(
+            "direct enclave attestation",
+            Self::connect_enclave(endpoint, pcrs, debug),
+        )
+        .await?;
         Ok(())
     }
 
@@ -189,26 +219,29 @@ impl Backend for BrowserBackend {
         statechain_id: &str,
         challenge: &str,
     ) -> Result<ApiResponse, String> {
-        let client = Self::connect_enclave(endpoint, pcrs, debug).await?;
-        let body = serde_json::to_vec(&serde_json::json!({
-            "statechain_id": statechain_id,
-            "challenge": challenge,
-        }))
-        .map_err(|error| error.to_string())?;
-        let response = client
-            .post("/verify_statechain")
-            .header("Content-Type", "application/json")
-            .body(body)
-            .send()
-            .await
-            .map_err(|error| format!("direct Lockbox statechain proof failed: {error}"))?;
-        Ok(ApiResponse {
-            status: response.status(),
-            body: response
-                .text()
-                .map_err(|error| error.to_string())?
-                .to_string(),
+        with_direct_enclave_timeout("direct Lockbox statechain proof", async {
+            let client = Self::connect_enclave(endpoint, pcrs, debug).await?;
+            let body = serde_json::to_vec(&serde_json::json!({
+                "statechain_id": statechain_id,
+                "challenge": challenge,
+            }))
+            .map_err(|error| error.to_string())?;
+            let response = client
+                .post("/verify_statechain")
+                .header("Content-Type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .map_err(|error| format!("direct Lockbox statechain proof failed: {error}"))?;
+            Ok(ApiResponse {
+                status: response.status(),
+                body: response
+                    .text()
+                    .map_err(|error| error.to_string())?
+                    .to_string(),
+            })
         })
+        .await
     }
 
     #[cfg(feature = "e2e-harness")]
@@ -244,6 +277,17 @@ impl Backend for BrowserBackend {
             .to_iso_string()
             .as_string()
             .unwrap_or_else(|| "unknown".to_string())
+    }
+}
+
+fn fetch_error(value: JsValue, abort_controller: &AbortController, url: &str) -> String {
+    if abort_controller.signal().aborted() {
+        format!(
+            "HTTP request to {url} timed out after {} seconds",
+            REQUEST_TIMEOUT_MS / 1_000
+        )
+    } else {
+        js_error(value)
     }
 }
 

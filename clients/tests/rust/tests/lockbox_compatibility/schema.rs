@@ -201,6 +201,7 @@ pub(super) async fn fresh_mercury_schema_has_exact_bip448_tables_and_lease_colum
         tables,
         vec![
             "bip448_signature_data",
+            "deposit_initialization",
             "lightning_latch",
             "signing_nonce_leases",
             "statechain_data",
@@ -208,6 +209,55 @@ pub(super) async fn fresh_mercury_schema_has_exact_bip448_tables_and_lease_colum
             "tokens",
         ]
     );
+
+    let reservation_columns = sqlx::query_scalar::<_, String>(
+        "SELECT column_name FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'deposit_initialization' \
+         ORDER BY ordinal_position",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        reservation_columns,
+        vec![
+            "token_id",
+            "auth_xonly_public_key",
+            "statechain_id",
+            "enclave_index",
+            "server_public_key",
+            "status",
+            "created_at",
+            "updated_at",
+        ]
+    );
+    let reservation_constraints = sqlx::query_scalar::<_, String>(
+        "SELECT constraint_name FROM information_schema.table_constraints \
+         WHERE table_schema = 'public' AND table_name = 'deposit_initialization' \
+           AND constraint_name LIKE 'deposit_initialization_%' \
+         ORDER BY constraint_name",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        reservation_constraints,
+        vec![
+            "deposit_initialization_auth_key_length",
+            "deposit_initialization_enclave_index_nonnegative",
+            "deposit_initialization_pkey",
+            "deposit_initialization_server_key_length",
+            "deposit_initialization_statechain_id_key",
+            "deposit_initialization_status_key_check",
+            "deposit_initialization_token_id_fkey",
+        ]
+    );
+    let mutable_auth_unique_constraints: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.table_constraints \
+         WHERE table_schema = 'public' AND table_name = 'statechain_data' \
+           AND constraint_name = 'statechain_data_auth_xonly_public_key_ukey'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(mutable_auth_unique_constraints, 0);
 
     let lease_columns = sqlx::query_scalar::<_, String>(
         "SELECT column_name FROM information_schema.columns \

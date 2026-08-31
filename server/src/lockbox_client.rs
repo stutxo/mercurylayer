@@ -1,7 +1,10 @@
-use std::{env, time::Duration};
+use std::{env, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, bail, Context, Result};
-use rocket::tokio::{sync::RwLock, time::timeout};
+use rocket::tokio::{
+    sync::RwLock,
+    time::{interval_at, timeout, Instant, MissedTickBehavior},
+};
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::server_config::Enclave;
@@ -11,12 +14,44 @@ const LOCKBOX_READY_ATTEMPTS: usize = 3;
 const LOCKBOX_REQUEST_ATTEMPTS: usize = 3;
 const LOCKBOX_OPERATION_TIMEOUT: Duration = Duration::from_secs(8);
 const LOCKBOX_AUTH_TOKEN_HEX_LENGTH: usize = 64;
+const LOCKBOX_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10 * 60);
+const LOCKBOX_KEEPALIVE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+const LOCKBOX_KEEPALIVE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy)]
 enum Method {
     Get,
     Post,
     Delete,
+}
+
+#[derive(Clone, Copy)]
+enum HealthCheck {
+    Live,
+    Ready,
+}
+
+impl HealthCheck {
+    fn path(self) -> &'static str {
+        match self {
+            Self::Live => "/health/live",
+            Self::Ready => "/health/ready",
+        }
+    }
+
+    fn expected_status(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Ready => "ready",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Live => "liveness",
+            Self::Ready => "readiness",
+        }
+    }
 }
 
 struct EnclaviaSession {
@@ -44,9 +79,14 @@ pub struct LockboxResponse {
     pub body: String,
 }
 
-pub struct LockboxClients {
+struct LockboxClientsInner {
     clients: Vec<Transport>,
     authorization: String,
+}
+
+#[derive(Clone)]
+pub struct LockboxClients {
+    inner: Arc<LockboxClientsInner>,
 }
 
 enum TransportConfig {
@@ -100,9 +140,15 @@ impl LockboxClients {
                     }
                 }
                 TransportConfig::Enclavia { url, pcrs, debug } => {
-                    let client =
-                        connect_enclavia_when_ready(&url, &pcrs, debug, &authorization, index)
-                            .await?;
+                    let client = connect_enclavia_after_health_check(
+                        &url,
+                        &pcrs,
+                        debug,
+                        &authorization,
+                        index,
+                        HealthCheck::Ready,
+                    )
+                    .await?;
                     if debug {
                         log::warn!(
                             "lockbox enclave {index} uses debug attestation under the explicit \
@@ -125,14 +171,113 @@ impl LockboxClients {
             clients.push(transport);
         }
 
-        Ok(Self {
-            clients,
-            authorization,
-        })
+        let clients = Self {
+            inner: Arc::new(LockboxClientsInner {
+                clients,
+                authorization,
+            }),
+        };
+        clients.spawn_attested_keepalive();
+        Ok(clients)
     }
 
     pub fn len(&self) -> usize {
-        self.clients.len()
+        self.inner.clients.len()
+    }
+
+    fn spawn_attested_keepalive(&self) {
+        if !self
+            .inner
+            .clients
+            .iter()
+            .any(|transport| matches!(transport, Transport::Enclavia(_)))
+        {
+            return;
+        }
+
+        let inner = Arc::downgrade(&self.inner);
+        rocket::tokio::spawn(async move {
+            let mut timer = interval_at(
+                Instant::now() + LOCKBOX_KEEPALIVE_INTERVAL,
+                LOCKBOX_KEEPALIVE_INTERVAL,
+            );
+            timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                timer.tick().await;
+                let Some(inner) = inner.upgrade() else {
+                    return;
+                };
+                Self { inner }.keep_attested_sessions_alive().await;
+            }
+        });
+    }
+
+    async fn keep_attested_sessions_alive(&self) {
+        for enclave_index in 0..self.inner.clients.len() {
+            if !matches!(self.inner.clients[enclave_index], Transport::Enclavia(_)) {
+                continue;
+            }
+
+            let health = self.check_liveness_once(enclave_index).await;
+            if health.is_ok() {
+                log::debug!("kept Lockbox enclave {enclave_index} attested channel active");
+                continue;
+            }
+
+            log::warn!(
+                "Lockbox enclave {enclave_index} keepalive failed: {}; reconnecting and \
+                 re-attesting",
+                health.unwrap_err()
+            );
+            match timeout(
+                LOCKBOX_KEEPALIVE_RECOVERY_TIMEOUT,
+                self.recover_attested_session(enclave_index),
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    log::info!("Lockbox enclave {enclave_index} attested channel recovered")
+                }
+                Ok(Err(error)) => log::error!(
+                    "Lockbox enclave {enclave_index} attested channel recovery failed: {error}"
+                ),
+                Err(_) => log::error!(
+                    "Lockbox enclave {enclave_index} attested channel recovery timed out after \
+                     {:.3}s",
+                    LOCKBOX_KEEPALIVE_RECOVERY_TIMEOUT.as_secs_f64()
+                ),
+            }
+        }
+    }
+    async fn check_liveness_once(&self, enclave_index: usize) -> Result<()> {
+        let response = self
+            .get_raw_once(
+                enclave_index,
+                HealthCheck::Live.path(),
+                LOCKBOX_KEEPALIVE_ATTEMPT_TIMEOUT,
+            )
+            .await?;
+        validate_health_response(response, enclave_index, HealthCheck::Live)
+    }
+
+    pub async fn recover_attested_session(&self, enclave_index: usize) -> Result<()> {
+        let transport = self.inner.clients.get(enclave_index).ok_or_else(|| {
+            anyhow!(
+                "lockbox enclave index {enclave_index} is out of range (configured: {})",
+                self.inner.clients.len()
+            )
+        })?;
+        let Transport::Enclavia(transport) = transport else {
+            return Ok(());
+        };
+        let generation = transport.session.read().await.generation;
+        replace_enclavia_session(
+            transport,
+            generation,
+            &self.inner.authorization,
+            enclave_index,
+        )
+        .await
     }
 
     pub async fn get(&self, enclave_index: usize, path: &str) -> Result<LockboxResponse> {
@@ -144,14 +289,21 @@ impl LockboxClients {
         self.send_raw(enclave_index, Method::Get, path, None).await
     }
 
-    pub async fn post_json<B, R>(&self, enclave_index: usize, path: &str, payload: &B) -> Result<R>
-    where
-        B: Serialize + ?Sized,
-        R: DeserializeOwned,
-    {
-        let response = self.post_json_raw(enclave_index, path, payload).await?;
-        let response = require_success(response, enclave_index, &normalized_path(path))?;
-        decode_json(response, enclave_index, path)
+    pub async fn get_raw_once(
+        &self,
+        enclave_index: usize,
+        path: &str,
+        operation_timeout: Duration,
+    ) -> Result<LockboxResponse> {
+        self.send_raw_with_options(
+            enclave_index,
+            Method::Get,
+            path,
+            None,
+            operation_timeout,
+            false,
+        )
+        .await
     }
 
     pub async fn post_json_raw<B>(
@@ -168,6 +320,32 @@ impl LockboxClients {
             .await
     }
 
+    pub async fn post_json_once<B, R>(
+        &self,
+        enclave_index: usize,
+        path: &str,
+        payload: &B,
+        operation_timeout: Duration,
+    ) -> Result<R>
+    where
+        B: Serialize + ?Sized,
+        R: DeserializeOwned,
+    {
+        let body = serde_json::to_vec(payload).context("serializing lockbox request as JSON")?;
+        let response = self
+            .send_raw_with_options(
+                enclave_index,
+                Method::Post,
+                path,
+                Some(body),
+                operation_timeout,
+                false,
+            )
+            .await?;
+        let response = require_success(response, enclave_index, &normalized_path(path))?;
+        decode_json(response, enclave_index, path)
+    }
+
     pub async fn delete_raw(&self, enclave_index: usize, path: &str) -> Result<LockboxResponse> {
         self.send_raw(enclave_index, Method::Delete, path, None)
             .await
@@ -180,10 +358,30 @@ impl LockboxClients {
         path: &str,
         body: Option<Vec<u8>>,
     ) -> Result<LockboxResponse> {
-        let client = self.clients.get(enclave_index).ok_or_else(|| {
+        self.send_raw_with_options(
+            enclave_index,
+            method,
+            path,
+            body,
+            LOCKBOX_OPERATION_TIMEOUT,
+            true,
+        )
+        .await
+    }
+
+    async fn send_raw_with_options(
+        &self,
+        enclave_index: usize,
+        method: Method,
+        path: &str,
+        body: Option<Vec<u8>>,
+        operation_timeout: Duration,
+        allow_retries: bool,
+    ) -> Result<LockboxResponse> {
+        let client = self.inner.clients.get(enclave_index).ok_or_else(|| {
             anyhow!(
                 "lockbox enclave index {enclave_index} is out of range (configured: {})",
-                self.clients.len()
+                self.inner.clients.len()
             )
         })?;
         let path = normalized_path(path);
@@ -195,8 +393,9 @@ impl LockboxClients {
                     Method::Get => client.get(&url),
                     Method::Post => client.post(&url),
                     Method::Delete => client.delete(&url),
-                };
-                request = request.header(reqwest::header::AUTHORIZATION, &self.authorization);
+                }
+                .timeout(operation_timeout);
+                request = request.header(reqwest::header::AUTHORIZATION, &self.inner.authorization);
                 if let Some(body) = body {
                     request = request
                         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -220,8 +419,10 @@ impl LockboxClients {
                     method,
                     &path,
                     body.as_deref(),
-                    &self.authorization,
+                    &self.inner.authorization,
                     enclave_index,
+                    operation_timeout,
+                    allow_retries,
                 )
                 .await?
             }
@@ -237,9 +438,16 @@ async fn send_enclavia_request(
     body: Option<&[u8]>,
     authorization: &str,
     enclave_index: usize,
+    operation_timeout: Duration,
+    allow_retries: bool,
 ) -> Result<LockboxResponse> {
     let replay_safe = enclavia_request_is_replay_safe(method, path);
-    for attempt in 1..=LOCKBOX_REQUEST_ATTEMPTS {
+    let attempts = if allow_retries {
+        LOCKBOX_REQUEST_ATTEMPTS
+    } else {
+        1
+    };
+    for attempt in 1..=attempts {
         let (generation, client) = {
             let session = transport.session.read().await;
             (session.generation, session.client.clone())
@@ -256,7 +464,7 @@ async fn send_enclavia_request(
                 .body(body);
         }
 
-        let (error, timed_out) = match timeout(LOCKBOX_OPERATION_TIMEOUT, request.send()).await {
+        let (error, timed_out) = match timeout(operation_timeout, request.send()).await {
             Ok(Ok(response)) => {
                 let status = response.status();
                 let body = response
@@ -277,13 +485,16 @@ async fn send_enclavia_request(
             Err(_) => (
                 anyhow!(
                     "lockbox request {path} through attested enclave {enclave_index} timed out \
-                     after {}s",
-                    LOCKBOX_OPERATION_TIMEOUT.as_secs()
+                     after {:.3}s",
+                    operation_timeout.as_secs_f64()
                 ),
                 true,
             ),
         };
 
+        if !allow_retries {
+            return Err(error);
+        }
         let recovery_error = if timed_out {
             replace_enclavia_session(transport, generation, authorization, enclave_index)
                 .await
@@ -291,7 +502,7 @@ async fn send_enclavia_request(
         } else {
             None
         };
-        if !replay_safe || attempt == LOCKBOX_REQUEST_ATTEMPTS {
+        if !replay_safe || attempt == attempts {
             return match recovery_error {
                 Some(recovery_error) => Err(error.context(format!(
                     "attested channel recovery also failed: {recovery_error}"
@@ -302,17 +513,17 @@ async fn send_enclavia_request(
         match recovery_error {
             Some(recovery_error) => log::warn!(
                 "lockbox request {path} through attested enclave {enclave_index} failed on \
-                 attempt {attempt}/{LOCKBOX_REQUEST_ATTEMPTS}: {error}; channel recovery also \
-                 failed: {recovery_error}; retrying the exact request"
+                 attempt {attempt}/{attempts}: {error}; channel recovery also failed: \
+                 {recovery_error}; retrying the exact request"
             ),
             None => log::warn!(
                 "lockbox request {path} through attested enclave {enclave_index} failed on \
-                 attempt {attempt}/{LOCKBOX_REQUEST_ATTEMPTS}: {error}; retrying the exact request"
+                 attempt {attempt}/{attempts}: {error}; retrying the exact request"
             ),
         }
     }
 
-    unreachable!("LOCKBOX_REQUEST_ATTEMPTS is nonzero")
+    unreachable!("the lockbox request attempt count is nonzero")
 }
 
 async fn replace_enclavia_session(
@@ -325,12 +536,13 @@ async fn replace_enclavia_session(
     if session.generation != failed_generation {
         return Ok(());
     }
-    let client = connect_enclavia_when_ready(
+    let client = connect_enclavia_after_health_check(
         &transport.url,
         &transport.pcrs,
         transport.debug,
         authorization,
         enclave_index,
+        HealthCheck::Live,
     )
     .await?;
     session.client = client;
@@ -351,12 +563,13 @@ fn enclavia_request_is_replay_safe(method: Method, path: &str) -> bool {
     }
 }
 
-async fn connect_enclavia_when_ready(
+async fn connect_enclavia_after_health_check(
     url: &str,
     pcrs: &enclavia::Pcrs,
     debug: bool,
     authorization: &str,
     enclave_index: usize,
+    health_check: HealthCheck,
 ) -> Result<enclavia::Client> {
     let mut last_error = None;
     for attempt in 1..=LOCKBOX_READY_ATTEMPTS {
@@ -370,32 +583,34 @@ async fn connect_enclavia_when_ready(
                     format!("connecting to and attesting lockbox enclave {enclave_index} at {url}")
                 })?;
             let response = client
-                .get("/health/ready")
+                .get(health_check.path())
                 .header("Authorization", authorization)
                 .send()
                 .await
                 .with_context(|| {
-                    format!("checking readiness of lockbox enclave {enclave_index}")
+                    format!(
+                        "checking {} of lockbox enclave {enclave_index}",
+                        health_check.name()
+                    )
                 })?;
-            let status = response.status();
-            let body = response
-                .text()
-                .context("decoding lockbox readiness response as UTF-8")?;
-            if status != 200 {
-                bail!("lockbox enclave {enclave_index} readiness returned HTTP {status}: {body}");
-            }
-            let readiness: serde_json::Value =
-                serde_json::from_str(body).context("decoding lockbox readiness response")?;
-            if readiness.get("status").and_then(serde_json::Value::as_str) != Some("ready") {
-                bail!("lockbox enclave {enclave_index} returned an unexpected readiness response");
-            }
+            let response = LockboxResponse {
+                status: response.status(),
+                body: response
+                    .text()
+                    .with_context(|| {
+                        format!("decoding lockbox {} response as UTF-8", health_check.name())
+                    })?
+                    .to_owned(),
+            };
+            validate_health_response(response, enclave_index, health_check)?;
             Ok::<_, anyhow::Error>(client)
         })
         .await;
         let result = match result {
             Ok(result) => result,
             Err(_) => Err(anyhow!(
-                "lockbox enclave {enclave_index} readiness attempt {attempt} timed out after {}s",
+                "lockbox enclave {enclave_index} {} attempt {attempt} timed out after {}s",
+                health_check.name(),
                 LOCKBOX_READY_ATTEMPT_TIMEOUT.as_secs()
             )),
         };
@@ -404,8 +619,9 @@ async fn connect_enclavia_when_ready(
             Err(error) => {
                 if attempt < LOCKBOX_READY_ATTEMPTS {
                     log::warn!(
-                        "lockbox enclave {enclave_index} readiness attempt \
-                         {attempt}/{LOCKBOX_READY_ATTEMPTS} failed: {error}"
+                        "lockbox enclave {enclave_index} {} attempt \
+                         {attempt}/{LOCKBOX_READY_ATTEMPTS} failed: {error}",
+                        health_check.name()
                     );
                 }
                 last_error = Some(error);
@@ -413,14 +629,40 @@ async fn connect_enclavia_when_ready(
         }
     }
 
-    Err(last_error.unwrap_or_else(|| anyhow!("lockbox enclave readiness failed"))).with_context(
+    Err(last_error.unwrap_or_else(|| anyhow!("lockbox enclave health check failed"))).with_context(
         || {
             format!(
-                "lockbox enclave {enclave_index} did not become ready after \
-                 {LOCKBOX_READY_ATTEMPTS} attempts"
+                "lockbox enclave {enclave_index} did not pass {} after \
+                 {LOCKBOX_READY_ATTEMPTS} attempts",
+                health_check.name()
             )
         },
     )
+}
+fn validate_health_response(
+    response: LockboxResponse,
+    enclave_index: usize,
+    health_check: HealthCheck,
+) -> Result<()> {
+    if response.status != 200 {
+        bail!(
+            "lockbox enclave {enclave_index} {} returned HTTP {}: {}",
+            health_check.name(),
+            response.status,
+            response.body
+        );
+    }
+    let health: serde_json::Value = serde_json::from_str(&response.body)
+        .with_context(|| format!("decoding lockbox {} response", health_check.name()))?;
+    if health.get("status").and_then(serde_json::Value::as_str)
+        != Some(health_check.expected_status())
+    {
+        bail!(
+            "lockbox enclave {enclave_index} returned an unexpected {} response",
+            health_check.name()
+        );
+    }
+    Ok(())
 }
 
 fn require_success(
@@ -572,6 +814,10 @@ fn normalized_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rocket::tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     fn enclave(url: &str) -> Enclave {
         Enclave {
@@ -675,7 +921,6 @@ mod tests {
     #[test]
     fn retries_only_known_replay_safe_operations() {
         assert!(enclavia_request_is_replay_safe(Method::Get, "/any"));
-        assert!(enclavia_request_is_replay_safe(Method::Delete, "/any"));
         assert!(enclavia_request_is_replay_safe(
             Method::Post,
             "/get_public_key"
@@ -693,6 +938,52 @@ mod tests {
             Method::Post,
             "/unknown_mutation"
         ));
+    }
+
+    #[test]
+    fn liveness_probe_uses_the_authenticated_shared_transport() {
+        let runtime = rocket::tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let auth_token = "ab".repeat(32);
+            let expected_authorization = format!("authorization: bearer {auth_token}");
+            let server = rocket::tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 1024];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    request.extend_from_slice(&chunk[..read]);
+                    if read == 0 || request.windows(4).any(|part| part == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(request.starts_with("get /health/live http/1.1\r\n"));
+                assert!(request.contains(&expected_authorization));
+
+                let body = r#"{"status":"live"}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+
+            let clients = LockboxClients::connect(
+                &[enclave(&format!("http://{address}"))],
+                Some(&auth_token),
+                "regtest",
+            )
+            .await
+            .unwrap();
+            clients.check_liveness_once(0).await.unwrap();
+            server.await.unwrap();
+        });
     }
 
     #[test]

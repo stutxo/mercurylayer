@@ -97,13 +97,29 @@ async function executeWalletOperation(operation, lockOptions = {}) {
   }, lockOptions);
 }
 
-async function run(label, operation) {
+async function run(label, operation, {
+  slowLabel = null,
+  slowAfterMs = 3_000,
+} = {}) {
   if (busy || runtimeProblem) return false;
   if (syncPromise) await syncPromise;
   if (busy || runtimeProblem) return false;
   busy = true;
   setStatus(`Working: ${label}…`, "busy");
   setDisabled(true);
+  const startedAt = performance.now();
+  let slowTimer = null;
+  let elapsedTimer = null;
+  if (slowLabel) {
+    const updateSlowStatus = () => {
+      const elapsedSeconds = Math.max(1, Math.floor((performance.now() - startedAt) / 1_000));
+      setStatus(`Still working (${elapsedSeconds}s): ${slowLabel}`, "busy");
+    };
+    slowTimer = window.setTimeout(() => {
+      updateSlowStatus();
+      elapsedTimer = window.setInterval(updateSlowStatus, 1_000);
+    }, slowAfterMs);
+  }
   try {
     const command = await executeWalletOperation(operation);
     const outcome = command.outcome;
@@ -121,6 +137,8 @@ async function run(label, operation) {
     console.error(error);
     return false;
   } finally {
+    if (slowTimer !== null) window.clearTimeout(slowTimer);
+    if (elapsedTimer !== null) window.clearInterval(elapsedTimer);
     busy = false;
     setDisabled(false);
     render();
@@ -821,6 +839,8 @@ byId("deposit-form").addEventListener("submit", async (event) => {
     const deposit = await activeWallet.createDepositWithToken(amount, undefined);
     selectedPendingDepositKey = deposit.statechainId;
     return { message: "Deposit address created." };
+  }, {
+    slowLabel: "Waiting for the signing enclave. The pending deposit remains retryable.",
   });
 });
 

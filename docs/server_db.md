@@ -1,11 +1,11 @@
 # Fresh database schemas
 
-The current prototype is bootstrapped from one consolidated Mercury migration,
-two lockbox table initializers, and one consolidated client SQLite migration.
+The current prototype is bootstrapped from two Mercury migrations, two lockbox
+table initializers, and one consolidated client SQLite migration.
 Use empty databases and a new wallet file. These definitions are not an
 upgrade path for an older deployment, and no data migration is implemented.
 
-## Mercury PostgreSQL: six tables
+## Mercury PostgreSQL: seven tables
 
 `server/migrations/0001_bip448_schema.sql` creates exactly the following six
 tables and one partial unique index:
@@ -98,6 +98,40 @@ WHERE server_partial_sig IS NULL;
 `server_public_key` in `statechain_data` has both the inline unique constraint
 and the explicitly named unique constraint shown above; the documentation
 preserves that literal migration shape.
+`server/migrations/0002_deposit_initialization.sql` creates the seventh table:
+
+```sql
+CREATE TABLE deposit_initialization (
+    token_id varchar PRIMARY KEY,
+    auth_xonly_public_key bytea NOT NULL,
+    statechain_id varchar NOT NULL UNIQUE,
+    enclave_index integer NOT NULL,
+    server_public_key bytea NULL,
+    status varchar NOT NULL DEFAULT 'pending',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT deposit_initialization_token_id_fkey
+        FOREIGN KEY (token_id) REFERENCES tokens(token_id),
+    CONSTRAINT deposit_initialization_auth_key_length
+        CHECK (octet_length(auth_xonly_public_key) = 32),
+    CONSTRAINT deposit_initialization_server_key_length
+        CHECK (server_public_key IS NULL OR octet_length(server_public_key) = 33),
+    CONSTRAINT deposit_initialization_enclave_index_nonnegative
+        CHECK (enclave_index >= 0),
+    CONSTRAINT deposit_initialization_status_key_check CHECK (
+        (status = 'pending' AND server_public_key IS NULL)
+        OR (status = 'completed' AND server_public_key IS NOT NULL)
+    )
+);
+```
+
+The token ID is the immutable retry identity. A pending row holds the stable
+statechain ID and Lockbox index but is not an active statechain. After Lockbox
+key creation, one transaction inserts the complete `statechain_data` row,
+marks the token spent, and changes the reservation to `completed`. Completed
+rows retain the original response for exact retries while current ownership
+still matches it. There is deliberately no automatic expiry: an uncertain
+reservation must be reconciled with Lockbox before it can be removed.
 
 ## Lockbox PostgreSQL: two tables
 
@@ -607,7 +641,7 @@ a Mercury table. `coverage_start_height` and monotonically increasing
   completion while server state remains, and one found only after deletion may
   be unrecoverable. The receiver key-update crash boundary remains unrepaired.
 - Use fresh databases: the client schema has twelve application tables;
-  Mercury has six and lockbox has two. The CLI has sixteen commands, including
+  Mercury has seven and lockbox has two. The CLI has sixteen commands, including
   exact flag `--force-send-with-duplicates`; the intended ignored matrix has
   58 direct entries in eight binaries. This is an Inquisition-dependent proof
   of concept, with no automatic stale-state watcher, Bitcoin mainnet support,

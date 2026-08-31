@@ -5,6 +5,7 @@
 #include <sqlite3.h>
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cerrno>
 #include <cstring>
@@ -13,6 +14,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <sys/stat.h>
@@ -105,13 +107,21 @@ private:
     sqlite3* database_ = nullptr;
 };
 
-struct GeneratedKeyGuard {
-    utils::chacha20_poly1305_encrypted_data& encrypted;
-    ~GeneratedKeyGuard() {
-        delete[] encrypted.data;
-        encrypted.data = nullptr;
-    }
-};
+db_manager::GeneratedKeyMaterial generate_key_material(
+    const std::array<unsigned char, 32>& seed
+) {
+    auto generated = enclave::generate_new_keypair(
+        const_cast<unsigned char*>(seed.data())
+    );
+    db_manager::GeneratedKeyMaterial material;
+    material.encrypted_keypair = generated.encrypted_data;
+    std::copy(
+        std::begin(generated.server_pubkey),
+        std::end(generated.server_pubkey),
+        material.server_pubkey.begin()
+    );
+    return material;
+}
 
 std::array<unsigned char, 32> test_seed(unsigned char marker = 0x42) {
     std::array<unsigned char, 32> seed{};
@@ -203,36 +213,85 @@ void test_bip448_backend(const std::filesystem::path& directory) {
         );
     }
 
-    auto generated = enclave::generate_new_keypair(const_cast<unsigned char*>(seed.data()));
-    GeneratedKeyGuard generated_guard{generated.encrypted_data};
+    std::atomic<std::size_t> initial_factory_calls{0};
     const std::string statechain_id = "bip448-sqlite-state";
-    require(
-        db_manager::save_generated_public_key(
-            generated.encrypted_data,
-            generated.server_pubkey,
-            sizeof(generated.server_pubkey),
-            statechain_id,
-            error),
-        "Generated key save failed: " + error
+    const auto created = db_manager::get_or_create_generated_public_key(
+        statechain_id,
+        [&] {
+            initial_factory_calls.fetch_add(1);
+            return generate_key_material(seed);
+        }
     );
-    auto duplicate = enclave::generate_new_keypair(const_cast<unsigned char*>(seed.data()));
-    GeneratedKeyGuard duplicate_guard{duplicate.encrypted_data};
     require(
-        !db_manager::save_generated_public_key(
-            duplicate.encrypted_data,
-            duplicate.server_pubkey,
-            sizeof(duplicate.server_pubkey),
-            statechain_id,
-            error),
+        created.outcome == db_manager::GeneratedKeyOutcome::Created,
+        "Generated key save did not report creation."
+    );
+    require(initial_factory_calls.load() == 1, "Initial key factory did not run exactly once.");
+    const auto initial_key = created.server_pubkey;
+
+    std::atomic<std::size_t> replay_factory_calls{0};
+    const auto replayed = db_manager::get_or_create_generated_public_key(
+        statechain_id,
+        [&]() -> db_manager::GeneratedKeyMaterial {
+            replay_factory_calls.fetch_add(1);
+            throw std::runtime_error("replay unexpectedly generated another key");
+        }
+    );
+    require(
+        replayed.outcome == db_manager::GeneratedKeyOutcome::Existing,
+        "Duplicate statechain ID was not treated as an idempotent replay."
+    );
+    require(
+        replayed.server_pubkey == initial_key,
         "Duplicate statechain ID replaced its durable key."
     );
+    require(replay_factory_calls.load() == 0, "Exact replay invoked the key factory.");
 
-    db_manager::Bip448PublicKey initial_key{};
-    std::copy(
-        std::begin(generated.server_pubkey),
-        std::end(generated.server_pubkey),
-        initial_key.begin()
+    constexpr std::size_t concurrent_requests = 8;
+    std::atomic<std::size_t> concurrent_factory_calls{0};
+    std::array<db_manager::GeneratedKeyResult, concurrent_requests> concurrent_results{};
+    std::vector<std::thread> workers;
+    workers.reserve(concurrent_requests);
+    for (std::size_t index = 0; index < concurrent_requests; ++index) {
+        workers.emplace_back([&, index] {
+            concurrent_results[index] = db_manager::get_or_create_generated_public_key(
+                "bip448-concurrent-state",
+                [&] {
+                    concurrent_factory_calls.fetch_add(1);
+                    return generate_key_material(seed);
+                }
+            );
+        });
+    }
+    for (auto& worker : workers) worker.join();
+
+    std::size_t concurrent_creations = 0;
+    const auto concurrent_key = concurrent_results.front().server_pubkey;
+    for (const auto& result : concurrent_results) {
+        require(
+            result.outcome == db_manager::GeneratedKeyOutcome::Created
+                || result.outcome == db_manager::GeneratedKeyOutcome::Existing,
+            "Concurrent idempotent key storage failed during phase " + result.failure_phase + "."
+        );
+        require(result.server_pubkey == concurrent_key, "Concurrent replay returned another key.");
+        if (result.outcome == db_manager::GeneratedKeyOutcome::Created) {
+            ++concurrent_creations;
+        }
+    }
+    require(concurrent_creations == 1, "Concurrent key storage did not create exactly one key.");
+    require(
+        concurrent_factory_calls.load() == 1,
+        "Concurrent SQLite replay generated more than one candidate key."
     );
+
+    std::cout
+        << "SQLite generated-key timing (us): open=" << created.timings.open_us
+        << " transaction=" << created.timings.transaction_us
+        << " read=" << created.timings.read_us
+        << " insert=" << created.timings.insert_us
+        << " commit=" << created.timings.commit_us
+        << std::endl;
+
     auto observed = db_manager::observe_bip448_state(statechain_id);
     require(observed.outcome == db_manager::Bip448Outcome::Applied, "State was not observed.");
     require(observed.state.has_value(), "Observed state is missing.");

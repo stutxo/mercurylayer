@@ -61,10 +61,18 @@ that Noise handshake, and requires exact PCR0/1/2 matches. **Verify coin** uses
 the same direct attested channel to send a fresh random challenge and
 statechain ID to the Lockbox. The browser requires the response to echo both
 values and to return the server share already recorded with the wallet coin.
-Mercury neither sees that encrypted request nor supplies the proof response;
-it can deny its separate service but cannot forge a successful direct proof.
+The browser is not given Mercury's Lockbox bearer token: every Lockbox route
+except this read-only proof rejects browser requests as unauthorized. Mercury
+neither sees the encrypted proof request nor supplies its response; it can
+deny its separate service but cannot forge a successful direct proof.
 Cached proofs without the direct-verification method marker are discarded on
 load rather than relabeled; the rest of the `v1` wallet snapshot stays intact.
+
+Direct attestation and statechain proof operations are each bounded at 20
+seconds. Mercury HTTP calls are bounded at 65 seconds. A deposit that exceeds
+three seconds keeps the operation disabled but replaces the generic busy text
+with elapsed time and an explicit reminder that its persisted pending deposit
+can be retried.
 
 ## Offchain send and receive
 

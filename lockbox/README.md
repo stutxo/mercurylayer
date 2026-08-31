@@ -16,12 +16,20 @@ Standalone configuration binds to `127.0.0.1`; the container sets
 `LOCKBOX_BIND_ADDRESS=0.0.0.0` so the enclave proxy can reach it. Override
 `LOCKBOX_BIND_ADDRESS` only behind an authenticated or attested transport.
 The public verification route rejects request bodies larger than 4096 bytes.
+The browser receives the attested endpoint and PCR measurements, but never the
+Lockbox bearer token. It can open the encrypted channel and technically send
+an HTTP request to any path; the application admits only
+`POST /verify_statechain` without the token. Key creation, signing, key
+rotation, deletion, state observation, readiness, and liveness remain
+Mercury-only operations.
+
 
 | Method and path | Request | Success response |
 | --- | --- | --- |
 | `GET /` | none | plain text `Hello, Crow!` |
+| `GET /health/live` | none | JSON `status: live`; does not touch storage |
 | `GET /health/ready` | none | JSON `status` |
-| `POST /get_public_key` | JSON `statechain_id` | JSON `server_pubkey` |
+| `POST /get_public_key` | JSON `statechain_id` | JSON `server_pubkey`, idempotent `storage_outcome`, and microsecond phase timings |
 | `POST /verify_statechain` | JSON `statechain_id`, `challenge` | JSON echoed identifiers and `server_pubkey` |
 | `GET /bip448/state/<statechain_id>` | path `statechain_id` | JSON BIP448 state |
 | `POST /bip448/get_public_nonce` | statechain/signing IDs plus expected generation and server key | JSON `server_pubnonce` |
@@ -47,6 +55,16 @@ the saved partial signature; a different public nonce, challenge, or negation
 flag for the same identifier returns a conflict. These database and route
 checks make retries idempotent within the implemented service. They do not
 provide an external attestation about deletion or operational security.
+
+`POST /get_public_key` creates at most one durable key for a `statechain_id`.
+The database transaction checks for an existing row before invoking the key
+factory, so a sequential exact replay does not generate or encrypt a throwaway
+secret. Same-statechain creators are serialized and an exact replay returns
+the originally stored public key with `storage_outcome: existing`; it never
+replaces the sealed key. The response also reports `key_generation_us` and
+storage timings for `open`, `transaction`, `read`, `insert`, and `commit`.
+Storage failures expose only a stable phase name, not database paths or
+backend error text.
 
 The durable client gives every canonical or duplicate key-path spend a fresh
 opaque `signing_id` and reuses its exact stored first- and second-round JSON on
@@ -121,7 +139,7 @@ egress. This remains a disposable, no-funds beta proof.
   completion while server state remains, and one found only after deletion may
   be unrecoverable. The receiver key-update crash boundary remains unrepaired.
 - Use fresh databases: the client schema has twelve application tables;
-  Mercury has six, and the Lockbox has three application tables plus SQLite
+  Mercury has seven, and the Lockbox has three application tables plus SQLite
   seed-verifier metadata when using embedded storage. The CLI has sixteen
   commands, including exact flag `--force-send-with-duplicates`; the intended
   ignored matrix has 58 direct entries in eight binaries. This is an

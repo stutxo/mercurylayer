@@ -1,4 +1,7 @@
-use std::str::FromStr;
+use std::{
+    str::FromStr,
+    time::{Duration, Instant},
+};
 
 use crate::{server::StateChainEntity, server_config::Enclave};
 use bitcoin::hashes::{sha256, Hash};
@@ -282,8 +285,23 @@ struct GetPublicKeyRequestPayload {
 }
 
 #[derive(Debug, Deserialize)]
+struct StorageTimingPayload {
+    open: u64,
+    transaction: u64,
+    read: u64,
+    insert: u64,
+    commit: u64,
+}
+
+#[derive(Debug, Deserialize)]
 struct GetPublicKeyResponsePayload {
     server_pubkey: String,
+    #[serde(default)]
+    storage_outcome: Option<String>,
+    #[serde(default)]
+    key_generation_us: Option<u64>,
+    #[serde(default)]
+    storage_timing_us: Option<StorageTimingPayload>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -292,21 +310,41 @@ struct ObservedPublicKeyPayload {
     server_pubkey: String,
 }
 
+#[derive(Clone, Copy)]
+struct DepositKeyRequestPolicy {
+    request_timeout: Duration,
+    recovery_timeout: Duration,
+    retry_timeout: Duration,
+    observation_window: Duration,
+    observation_attempt_timeout: Duration,
+    observation_delay: Duration,
+    observation_max_delay: Duration,
+}
+
+const DEPOSIT_KEY_REQUEST_POLICY: DepositKeyRequestPolicy = DepositKeyRequestPolicy {
+    request_timeout: Duration::from_secs(5),
+    recovery_timeout: Duration::from_secs(3),
+    retry_timeout: Duration::from_secs(5),
+    observation_window: Duration::from_secs(12),
+    observation_attempt_timeout: Duration::from_secs(3),
+    observation_delay: Duration::from_millis(250),
+    observation_max_delay: Duration::from_secs(2),
+};
+
 async fn observe_deposit_public_key(
     lockboxes: &crate::lockbox_client::LockboxClients,
     enclave_index: usize,
     statechain_id: &str,
+    attempt_timeout: Duration,
 ) -> Result<Option<GetPublicKeyResponsePayload>, String> {
-    let response = match lockboxes
-        .get_raw(enclave_index, &format!("/bip448/state/{statechain_id}"))
+    let response = lockboxes
+        .get_raw_once(
+            enclave_index,
+            &format!("/bip448/state/{statechain_id}"),
+            attempt_timeout,
+        )
         .await
-    {
-        Ok(response) => response,
-        Err(error) => {
-            log::warn!("Lockbox state observation failed after key request: {error}");
-            return Ok(None);
-        }
-    };
+        .map_err(|error| error.to_string())?;
     if response.status == 404 || response.status == 409 {
         return Ok(None);
     }
@@ -323,7 +361,31 @@ async fn observe_deposit_public_key(
     }
     Ok(Some(GetPublicKeyResponsePayload {
         server_pubkey: observed.server_pubkey,
+        storage_outcome: None,
+        key_generation_us: None,
+        storage_timing_us: None,
     }))
+}
+
+fn log_key_storage_diagnostics(
+    enclave_index: usize,
+    statechain_id: &str,
+    response: &GetPublicKeyResponsePayload,
+) {
+    if let Some(timings) = &response.storage_timing_us {
+        log::info!(
+            "Lockbox generated key for statechain {statechain_id} on enclave {enclave_index}: \
+             outcome={} key_generation_us={} storage_us={{open:{},transaction:{},read:{},\
+             insert:{},commit:{}}}",
+            response.storage_outcome.as_deref().unwrap_or("unreported"),
+            response.key_generation_us.unwrap_or_default(),
+            timings.open,
+            timings.transaction,
+            timings.read,
+            timings.insert,
+            timings.commit,
+        );
+    }
 }
 
 async fn request_deposit_public_key(
@@ -331,30 +393,128 @@ async fn request_deposit_public_key(
     enclave_index: usize,
     payload: &GetPublicKeyRequestPayload,
 ) -> Result<GetPublicKeyResponsePayload, String> {
-    // A transient transport failure may replay this exact statechain ID. The
-    // Lockbox's unique statechain key prevents duplicate durable keys; an
-    // uncertain or duplicate response is resolved from durable state below.
+    request_deposit_public_key_with_policy(
+        lockboxes,
+        enclave_index,
+        payload,
+        DEPOSIT_KEY_REQUEST_POLICY,
+    )
+    .await
+}
+
+async fn request_deposit_public_key_with_policy(
+    lockboxes: &crate::lockbox_client::LockboxClients,
+    enclave_index: usize,
+    payload: &GetPublicKeyRequestPayload,
+    policy: DepositKeyRequestPolicy,
+) -> Result<GetPublicKeyResponsePayload, String> {
     let request = lockboxes
-        .post_json(enclave_index, "/get_public_key", payload)
+        .post_json_once(
+            enclave_index,
+            "/get_public_key",
+            payload,
+            policy.request_timeout,
+        )
         .await;
     let request_error = match request {
-        Ok(response) => return Ok(response),
-        Err(error) => error,
+        Ok(response) => {
+            log_key_storage_diagnostics(enclave_index, &payload.statechain_id, &response);
+            return Ok(response);
+        }
+        Err(error) => error.to_string(),
     };
 
     log::warn!(
-        "Lockbox key request failed: {request_error}; checking durable state for a committed key"
+        "Lockbox key request failed: {request_error}; recovering the attested channel before an \
+         exact idempotent retry"
     );
-    match observe_deposit_public_key(lockboxes, enclave_index, &payload.statechain_id).await {
-        Ok(Some(observed)) => Ok(observed),
-        Ok(None) => Err(format!(
-            "Lockbox key request failed: {request_error}; no durable key was observed"
-        )),
-        Err(observation_error) => Err(format!(
-            "Lockbox key request failed: {request_error}; durable state observation failed: \
-             {observation_error}"
-        )),
+    let recovery_error = match rocket::tokio::time::timeout(
+        policy.recovery_timeout,
+        lockboxes.recover_attested_session(enclave_index),
+    )
+    .await
+    {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => {
+            let error = error.to_string();
+            log::warn!("Lockbox attested channel recovery failed before key retry: {error}");
+            Some(error)
+        }
+        Err(_) => {
+            let error = format!(
+                "timed out after {:.3}s",
+                policy.recovery_timeout.as_secs_f64()
+            );
+            log::warn!("Lockbox attested channel recovery {error} before key retry");
+            Some(error)
+        }
+    };
+
+    let retry = lockboxes
+        .post_json_once(
+            enclave_index,
+            "/get_public_key",
+            payload,
+            policy.retry_timeout,
+        )
+        .await;
+    let retry_error = match retry {
+        Ok(response) => {
+            log_key_storage_diagnostics(enclave_index, &payload.statechain_id, &response);
+            return Ok(response);
+        }
+        Err(error) => error.to_string(),
+    };
+    log::warn!(
+        "Exact Lockbox key retry failed: {retry_error}; observing durable state without another \
+         mutation"
+    );
+
+    let deadline = Instant::now() + policy.observation_window;
+    let mut last_observation_error = None;
+    let mut observation_delay = policy.observation_delay.min(policy.observation_max_delay);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let attempt_timeout = policy.observation_attempt_timeout.min(remaining);
+        match observe_deposit_public_key(
+            lockboxes,
+            enclave_index,
+            &payload.statechain_id,
+            attempt_timeout,
+        )
+        .await
+        {
+            Ok(Some(observed)) => return Ok(observed),
+            Ok(None) => {}
+            Err(error) => {
+                log::warn!("Lockbox durable key observation failed: {error}");
+                last_observation_error = Some(error);
+            }
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        rocket::tokio::time::sleep(observation_delay.min(remaining)).await;
+        observation_delay = observation_delay
+            .saturating_mul(2)
+            .min(policy.observation_max_delay);
     }
+
+    let recovery_detail = recovery_error
+        .map(|error| format!("; channel recovery failed: {error}"))
+        .unwrap_or_default();
+    let observation_detail = last_observation_error
+        .map(|error| format!("; last durable state observation failed: {error}"))
+        .unwrap_or_default();
+    Err(format!(
+        "Lockbox key request failed: {request_error}; exact retry failed: {retry_error}\
+         {recovery_detail}; no durable key was observed{observation_detail}"
+    ))
 }
 
 fn parse_deposit_authorization(
@@ -366,6 +526,64 @@ fn parse_deposit_authorization(
     let signed_token_id = Signature::from_str(signed_token_id)
         .map_err(|_| "Token signature is invalid.".to_string())?;
     Ok((auth_key, signed_token_id))
+}
+
+fn completed_deposit_response(
+    server_public_key: &[u8],
+    statechain_id: &str,
+) -> status::Custom<Json<Value>> {
+    let server_public_key = match PublicKey::from_slice(server_public_key) {
+        Ok(key) => key,
+        Err(error) => {
+            log::error!("stored deposit server public key is malformed: {error}");
+            return deposit_internal_error(
+                "Stored deposit server public key is malformed.".to_string(),
+            );
+        }
+    };
+    status::Custom(
+        Status::Ok,
+        Json(json!(mercurylib::deposit::DepositMsg1Response {
+            server_pubkey: server_public_key.to_string(),
+            statechain_id: statechain_id.to_owned(),
+        })),
+    )
+}
+
+fn deposit_initialization_matches_auth(
+    initialization: &crate::database::deposit::DepositInitialization,
+    auth_key: &XOnlyPublicKey,
+) -> bool {
+    initialization.auth_xonly_public_key.as_slice() == auth_key.serialize().as_slice()
+}
+
+async fn completed_deposit_replay_response(
+    statechain_entity: &StateChainEntity,
+    initialization: &crate::database::deposit::DepositInitialization,
+) -> status::Custom<Json<Value>> {
+    let Some(server_public_key) = initialization.server_public_key.as_deref() else {
+        return deposit_internal_error(
+            "Completed deposit initialization has no server public key.".to_string(),
+        );
+    };
+    match crate::database::deposit::completed_deposit_is_current(
+        &statechain_entity.pool,
+        initialization,
+    )
+    .await
+    {
+        Ok(true) => completed_deposit_response(server_public_key, &initialization.statechain_id),
+        Ok(false) => status::Custom(
+            Status::Conflict,
+            Json(json!({
+                "message": "The completed deposit no longer matches current statecoin ownership."
+            })),
+        ),
+        Err(error) => {
+            log::error!("failed to validate completed deposit replay: {error}");
+            deposit_internal_error("Failed to validate completed deposit replay.".to_string())
+        }
+    }
 }
 
 #[post("/deposit/init/pod", format = "json", data = "<deposit_msg1>")]
@@ -394,39 +612,32 @@ pub async fn post_deposit(
         return status::Custom(Status::InternalServerError, Json(response_body));
     }
 
-    match crate::database::deposit::get_existing_deposit(&statechain_entity.pool, &auth_key).await {
+    let pending_deposit = match crate::database::deposit::get_deposit_initialization(
+        &statechain_entity.pool,
+        &token_id,
+    )
+    .await
+    {
         Ok(Some(existing)) => {
-            if existing.token_id != token_id {
+            if !deposit_initialization_matches_auth(&existing, &auth_key) {
                 return status::Custom(
-                    Status::BadRequest,
+                    Status::Conflict,
                     Json(json!({
-                        "message": "The authentication key is already assigned to a statecoin."
+                        "message": "The token is reserved for a different deposit authorization."
                     })),
                 );
             }
-            let server_public_key = match PublicKey::from_slice(&existing.server_public_key) {
-                Ok(key) => key,
-                Err(error) => {
-                    log::error!("stored deposit server public key is malformed: {error}");
-                    return deposit_internal_error(
-                        "Stored deposit server public key is malformed.".to_string(),
-                    );
-                }
-            };
-            return status::Custom(
-                Status::Ok,
-                Json(json!(mercurylib::deposit::DepositMsg1Response {
-                    server_pubkey: server_public_key.to_string(),
-                    statechain_id: existing.statechain_id,
-                })),
-            );
+            if existing.completed {
+                return completed_deposit_replay_response(statechain_entity, &existing).await;
+            }
+            Some(existing)
         }
-        Ok(None) => {}
+        Ok(None) => None,
         Err(error) => {
-            log::error!("failed to load existing deposit: {error}");
-            return deposit_internal_error("Failed to load existing deposit.".to_string());
+            log::error!("failed to load deposit initialization: {error}");
+            return deposit_internal_error("Failed to load deposit initialization.".to_string());
         }
-    }
+    };
 
     let token_info =
         crate::database::deposit::get_token_info(&statechain_entity.pool, &token_id).await;
@@ -443,11 +654,33 @@ pub async fn post_deposit(
     let token_info = token_info.unwrap();
 
     if token_info.spent {
-        let response_body = json!({
-            "message": "Token already spent."
-        });
-
-        return status::Custom(Status::Gone, Json(response_body));
+        match crate::database::deposit::get_deposit_initialization(
+            &statechain_entity.pool,
+            &token_id,
+        )
+        .await
+        {
+            Ok(Some(existing))
+                if deposit_initialization_matches_auth(&existing, &auth_key)
+                    && existing.completed =>
+            {
+                return completed_deposit_replay_response(statechain_entity, &existing).await;
+            }
+            Ok(Some(existing)) if deposit_initialization_matches_auth(&existing, &auth_key) => {
+                return deposit_internal_error(
+                    "A spent token has an incomplete deposit initialization.".to_string(),
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                log::error!("failed to recheck completed deposit: {error}");
+                return deposit_internal_error("Failed to recheck completed deposit.".to_string());
+            }
+        }
+        return status::Custom(
+            Status::Gone,
+            Json(json!({ "message": "Token already spent." })),
+        );
     }
 
     if !token_info.confirmed {
@@ -479,21 +712,76 @@ pub async fn post_deposit(
         }
     }
 
-    let statechain_id = uuid::Uuid::new_v4().as_simple().to_string();
-
-    let enclave_index =
-        match select_deposit_enclave(&statechain_id, &statechain_entity.config.enclaves) {
-            Ok(index) => index,
-            Err(error) => {
-                log::error!("no Lockbox accepts deposits: {error}");
-                return status::Custom(
-                    Status::ServiceUnavailable,
-                    Json(json!({
-                        "message": "No signing enclave is available for deposits."
-                    })),
-                );
+    let reservation = match pending_deposit {
+        Some(existing) => existing,
+        None => {
+            let candidate_statechain_id = uuid::Uuid::new_v4().as_simple().to_string();
+            let candidate_enclave_index = match select_deposit_enclave(
+                &candidate_statechain_id,
+                &statechain_entity.config.enclaves,
+            ) {
+                Ok(index) => index,
+                Err(error) => {
+                    log::error!("no Lockbox accepts deposits: {error}");
+                    return status::Custom(
+                        Status::ServiceUnavailable,
+                        Json(json!({
+                            "message": "No signing enclave is available for deposits."
+                        })),
+                    );
+                }
+            };
+            let candidate_enclave_index_i32 = match i32::try_from(candidate_enclave_index) {
+                Ok(index) => index,
+                Err(_) => {
+                    log::error!("selected Lockbox index does not fit in the database");
+                    return deposit_internal_error(
+                        "Selected signing enclave index is invalid.".to_string(),
+                    );
+                }
+            };
+            match crate::database::deposit::reserve_deposit_initialization(
+                &statechain_entity.pool,
+                &token_id,
+                &auth_key,
+                &candidate_statechain_id,
+                candidate_enclave_index_i32,
+            )
+            .await
+            {
+                Ok(existing) => existing,
+                Err(error) => {
+                    log::error!("failed to reserve deposit initialization: {error}");
+                    return deposit_internal_error(
+                        "Failed to reserve deposit initialization.".to_string(),
+                    );
+                }
             }
-        };
+        }
+    };
+
+    if !deposit_initialization_matches_auth(&reservation, &auth_key) {
+        return status::Custom(
+            Status::Conflict,
+            Json(json!({
+                "message": "The token is reserved for a different deposit authorization."
+            })),
+        );
+    }
+    if reservation.completed {
+        return completed_deposit_replay_response(statechain_entity, &reservation).await;
+    }
+    let enclave_index = match usize::try_from(reservation.enclave_index) {
+        Ok(index) if index < statechain_entity.lockboxes.len() => index,
+        _ => {
+            log::error!(
+                "deposit reservation references unavailable Lockbox index {}",
+                reservation.enclave_index
+            );
+            return deposit_internal_error("Reserved signing enclave is unavailable.".to_string());
+        }
+    };
+    let statechain_id = reservation.statechain_id;
 
     let payload = GetPublicKeyRequestPayload {
         statechain_id: statechain_id.clone(),
@@ -538,17 +826,21 @@ pub async fn post_deposit(
         }
     };
 
-    crate::database::deposit::insert_new_deposit(
+    if let Err(error) = crate::database::deposit::complete_deposit_initialization(
         &statechain_entity.pool,
         &token_id,
         &auth_key,
-        &server_pubkey,
         &statechain_id,
-        enclave_index as i32,
+        reservation.enclave_index,
+        &server_pubkey,
     )
-    .await;
-
-    crate::database::deposit::set_token_spent(&statechain_entity.pool, &token_id).await;
+    .await
+    {
+        log::error!("failed to complete deposit initialization: {error}");
+        return deposit_internal_error(
+            "Failed to complete deposit initialization. Retry the pending deposit.".to_string(),
+        );
+    }
 
     let deposit_msg1_response = mercurylib::deposit::DepositMsg1Response {
         server_pubkey: server_pubkey.to_string(),
@@ -565,7 +857,7 @@ mod tests {
     use super::*;
     use std::{
         sync::{
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
         },
         time::{Duration, Instant},
@@ -625,7 +917,7 @@ mod tests {
     }
 
     #[test]
-    fn key_request_waits_for_slow_success_and_bounds_a_stalled_response() {
+    fn key_request_retries_exactly_then_observes_if_the_retry_is_ambiguous() {
         let runtime = rocket::tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -635,39 +927,55 @@ mod tests {
             let address = listener.local_addr().unwrap();
             let post_requests = Arc::new(AtomicUsize::new(0));
             let observation_requests = Arc::new(AtomicUsize::new(0));
+            let stalled_key_committed = Arc::new(AtomicBool::new(false));
             let server_posts = Arc::clone(&post_requests);
             let server_observations = Arc::clone(&observation_requests);
+            let server_committed = Arc::clone(&stalled_key_committed);
             let server = rocket::tokio::spawn(async move {
                 loop {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     let posts = Arc::clone(&server_posts);
                     let observations = Arc::clone(&server_observations);
+                    let committed = Arc::clone(&server_committed);
                     rocket::tokio::spawn(async move {
                         let request_line = read_http_request_line(&mut stream).await;
-                        let body = if request_line.starts_with("POST /get_public_key ") {
-                            let request_number = posts.fetch_add(1, Ordering::SeqCst) + 1;
-                            let delay = if request_number == 1 {
-                                Duration::from_millis(5_100)
+                        let (status, body) =
+                            if request_line.starts_with("POST /get_public_key ") {
+                                let request_number = posts.fetch_add(1, Ordering::SeqCst) + 1;
+                                let delay = match request_number {
+                                    1 | 3 => Duration::from_millis(30),
+                                    2 | 4 | 5 => Duration::from_millis(150),
+                                    _ => panic!("unexpected get_public_key request"),
+                                };
+                                rocket::tokio::time::sleep(delay).await;
+                                if request_number == 5 {
+                                    committed.store(true, Ordering::SeqCst);
+                                }
+                                (
+                                    "200 OK",
+                                    r#"{"server_pubkey":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"}"#.to_string(),
+                                )
+                            } else if request_line.starts_with(
+                                "GET /bip448/state/observed-statechain ",
+                            ) {
+                                observations.fetch_add(1, Ordering::SeqCst);
+                                if committed.load(Ordering::SeqCst) {
+                                    (
+                                        "200 OK",
+                                        r#"{"statechain_id":"observed-statechain","server_pubkey":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"}"#.to_string(),
+                                    )
+                                } else {
+                                    ("404 Not Found", "{}".to_string())
+                                }
                             } else {
-                                Duration::from_secs(20)
+                                panic!("unexpected mock Lockbox request: {request_line}");
                             };
-                            rocket::tokio::time::sleep(delay).await;
-                            r#"{"server_pubkey":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"}"#.to_string()
-                        } else if request_line.starts_with(
-                            "GET /bip448/state/stalled-statechain ",
-                        ) {
-                            observations.fetch_add(1, Ordering::SeqCst);
-                            rocket::tokio::time::sleep(Duration::from_secs(3)).await;
-                            r#"{"statechain_id":"stalled-statechain","server_pubkey":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"}"#.to_string()
-                        } else {
-                            panic!("unexpected mock Lockbox request: {request_line}");
-                        };
                         let response = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                             body.len()
                         );
-                        stream.write_all(response.as_bytes()).await.unwrap();
-                        stream.shutdown().await.unwrap();
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        let _ = stream.shutdown().await;
                     });
                 }
             });
@@ -680,13 +988,23 @@ mod tests {
             )
             .await
             .unwrap();
+            let policy = DepositKeyRequestPolicy {
+                request_timeout: Duration::from_millis(100),
+                recovery_timeout: Duration::from_millis(25),
+                retry_timeout: Duration::from_millis(100),
+                observation_window: Duration::from_millis(500),
+                observation_attempt_timeout: Duration::from_millis(75),
+                observation_delay: Duration::from_millis(20),
+                observation_max_delay: Duration::from_millis(80),
+            };
             let payload = GetPublicKeyRequestPayload {
                 statechain_id: "slow-statechain".to_string(),
             };
 
-            let response = request_deposit_public_key(&clients, 0, &payload)
-                .await
-                .unwrap();
+            let response =
+                request_deposit_public_key_with_policy(&clients, 0, &payload, policy)
+                    .await
+                    .unwrap();
             assert_eq!(
                 response.server_pubkey,
                 "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
@@ -694,22 +1012,38 @@ mod tests {
             assert_eq!(post_requests.load(Ordering::SeqCst), 1);
             assert_eq!(observation_requests.load(Ordering::SeqCst), 0);
 
-            let stalled_payload = GetPublicKeyRequestPayload {
-                statechain_id: "stalled-statechain".to_string(),
+            let retried_payload = GetPublicKeyRequestPayload {
+                statechain_id: "retried-statechain".to_string(),
             };
-            let started = Instant::now();
-            let stalled_response =
-                request_deposit_public_key(&clients, 0, &stalled_payload)
+            let retry_started = Instant::now();
+            let retried_response =
+                request_deposit_public_key_with_policy(&clients, 0, &retried_payload, policy)
                     .await
                     .unwrap();
-            let elapsed = started.elapsed();
+            let retry_elapsed = retry_started.elapsed();
+            assert_eq!(retried_response.server_pubkey, response.server_pubkey);
+            assert!(retry_elapsed >= Duration::from_millis(120));
+            assert!(retry_elapsed < Duration::from_millis(300));
+            assert_eq!(post_requests.load(Ordering::SeqCst), 3);
+            assert_eq!(observation_requests.load(Ordering::SeqCst), 0);
+
+            stalled_key_committed.store(false, Ordering::SeqCst);
+            let observed_payload = GetPublicKeyRequestPayload {
+                statechain_id: "observed-statechain".to_string(),
+            };
+            let observation_started = Instant::now();
+            let observed_response =
+                request_deposit_public_key_with_policy(&clients, 0, &observed_payload, policy)
+                    .await
+                    .unwrap();
+            let observation_elapsed = observation_started.elapsed();
             server.abort();
 
-            assert_eq!(stalled_response.server_pubkey, response.server_pubkey);
-            assert!(elapsed >= Duration::from_secs(10));
-            assert!(elapsed < Duration::from_secs(15));
-            assert_eq!(post_requests.load(Ordering::SeqCst), 2);
-            assert_eq!(observation_requests.load(Ordering::SeqCst), 1);
+            assert_eq!(observed_response.server_pubkey, response.server_pubkey);
+            assert!(observation_elapsed >= Duration::from_millis(240));
+            assert!(observation_elapsed < Duration::from_millis(500));
+            assert_eq!(post_requests.load(Ordering::SeqCst), 5);
+            assert!(observation_requests.load(Ordering::SeqCst) >= 2);
         });
     }
 

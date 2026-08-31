@@ -156,8 +156,19 @@ pub async fn create_deposited_coin(client: &Client) -> Result<(Wallet, Coin)> {
         pay_token_if_required(&token)?;
         let deposit_msg1 = deposit::create_deposit_msg1(&coin, &token.token_id)?;
 
-        match deposit_init(client, &deposit_msg1).await {
-            Ok(response) => {
+        let (first, second) = tokio::join!(
+            deposit_init(client, &deposit_msg1),
+            deposit_init(client, &deposit_msg1),
+        );
+        match (first, second) {
+            (Ok(response), Ok(concurrent)) => {
+                if response.statechain_id != concurrent.statechain_id
+                    || response.server_pubkey != concurrent.server_pubkey
+                {
+                    return Err(anyhow!(
+                        "concurrent exact deposit requests returned different statechains"
+                    ));
+                }
                 let init = deposit::handle_deposit_msg_1_response(&coin, &response)?;
 
                 coin.statechain_id = Some(init.statechain_id);
@@ -166,8 +177,21 @@ pub async fn create_deposited_coin(client: &Client) -> Result<(Wallet, Coin)> {
 
                 return Ok((wallet, coin));
             }
-            Err(err) if err.to_string().contains("already assigned to a statecoin") => continue,
-            Err(err) => return Err(err),
+            (Err(first), Err(second))
+                if first
+                    .to_string()
+                    .contains("already assigned to a statecoin")
+                    && second
+                        .to_string()
+                        .contains("already assigned to a statecoin") =>
+            {
+                continue;
+            }
+            (first, second) => {
+                return Err(anyhow!(
+                    "concurrent deposit initialization failed: first={first:?}, second={second:?}"
+                ));
+            }
         }
     }
 

@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{ensure, Context, Result};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha384};
 
 use super::postgres_columns::{ColumnSpec, LOCKBOX_COLUMNS, MERCURY_COLUMNS};
 use super::postgres_compare;
@@ -15,8 +15,13 @@ use super::report::MigrationRow;
 use super::report::{PgCatalog, PgColumn, PgConstraint, PgIndex, PostgresReport};
 
 const SERVER_SHA256: &str = "16bc984910b01a7986f47c3c8f219c9ad63f3fcb847c853faa932fa5b0eef726";
-const LOCKBOX_SHA256: &str = "bac14d1159a1f8eb8bb0503587061acb7b4e4b5dca303f370e640062a7f3db9f";
-const MIGRATION_SHA384: &str = "1b64ae4df869baac77e5193f76403ed309d096769ddc8cbf39570fb7400ff033d26a2f730863cf63330774f78eaa5fae";
+const LOCKBOX_SHA256: &str = "648762925d8176865921b4ff27eeb97ec5e6e3a83c9ebd20bc642b7127fa1a21";
+const MIGRATION_0001_SHA384: &str = "1b64ae4df869baac77e5193f76403ed309d096769ddc8cbf39570fb7400ff033d26a2f730863cf63330774f78eaa5fae";
+const MIGRATION_0002_SHA384: &str = "e4f30397e1abaaa2c43cd3ee9c56f69bc1d77854c61d990b0812504c0408d61435deafaabcd051ddbe98f2975070ba98";
+const MERCURY_MIGRATIONS: &[(i64, &str, &str)] = &[
+    (1, "bip448 schema", MIGRATION_0001_SHA384),
+    (2, "deposit initialization", MIGRATION_0002_SHA384),
+];
 
 pub(super) fn verify(repo_root: &Path, report: &PostgresReport) -> Result<()> {
     verify_source(
@@ -25,9 +30,14 @@ pub(super) fn verify(repo_root: &Path, report: &PostgresReport) -> Result<()> {
         SERVER_SHA256,
     )?;
     verify_source(repo_root, "lockbox/src/db_manager.cpp", LOCKBOX_SHA256)?;
+    verify_migration_source(
+        repo_root,
+        "server/migrations/0002_deposit_initialization.sql",
+        MIGRATION_0002_SHA384,
+    )?;
     compare_catalog("Mercury", &expected_mercury(), &report.mercury)?;
     compare_catalog("lockbox", &expected_lockbox(), &report.lockbox)?;
-    postgres_compare::mercury_migrations(&report.mercury_migrations, MIGRATION_SHA384)?;
+    postgres_compare::mercury_migrations(&report.mercury_migrations, MERCURY_MIGRATIONS)?;
     Ok(())
 }
 
@@ -48,10 +58,20 @@ fn verify_source(root: &Path, relative: &str, expected: &str) -> Result<()> {
     Ok(())
 }
 
+fn verify_migration_source(root: &Path, relative: &str, expected: &str) -> Result<()> {
+    let bytes = fs::read(root.join(relative)).with_context(|| format!("read {relative}"))?;
+    ensure!(
+        hex::encode(Sha384::digest(bytes)) == expected,
+        "protected PostgreSQL migration source drifted: {relative}"
+    );
+    Ok(())
+}
+
 fn expected_mercury() -> PgCatalog {
     catalog(
         &[
             "bip448_signature_data",
+            "deposit_initialization",
             "lightning_latch",
             "signing_nonce_leases",
             "statechain_data",
@@ -137,14 +157,17 @@ fn catalog(
 pub(super) fn exact_report() -> PostgresReport {
     PostgresReport {
         mercury: expected_mercury(),
-        mercury_migrations: vec![MigrationRow {
-            version: 1,
-            description: "bip448 schema".into(),
-            installed_on: "time".into(),
-            success: true,
-            checksum_hex: MIGRATION_SHA384.into(),
-            execution_time: 1,
-        }],
+        mercury_migrations: MERCURY_MIGRATIONS
+            .iter()
+            .map(|&(version, description, checksum)| MigrationRow {
+                version,
+                description: description.into(),
+                installed_on: "time".into(),
+                success: true,
+                checksum_hex: checksum.into(),
+                execution_time: 1,
+            })
+            .collect(),
         lockbox: expected_lockbox(),
     }
 }
@@ -159,10 +182,11 @@ mod tests {
         let exact = exact_report();
         verify(&root, &exact).unwrap();
 
-        assert_eq!(exact.mercury.tables.len(), 6);
-        assert_eq!(exact.mercury.columns.len(), 46);
-        assert_eq!(exact.mercury.constraints.len(), 16);
-        assert_eq!(exact.mercury.indexes.len(), 14);
+        assert_eq!(exact.mercury.tables.len(), 7);
+        assert_eq!(exact.mercury.columns.len(), 54);
+        assert_eq!(exact.mercury.constraints.len(), 23);
+        assert_eq!(exact.mercury.indexes.len(), 16);
+        assert_eq!(exact.mercury_migrations.len(), 2);
         assert_eq!(exact.lockbox.tables.len(), 3);
         assert_eq!(exact.lockbox.columns.len(), 26);
         assert_eq!(exact.lockbox.constraints.len(), 17);
@@ -188,6 +212,21 @@ mod tests {
             .indexes
             .iter()
             .any(|value| value.name == "statechain_data_server_public_key_ukey"));
+        assert!(!exact
+            .mercury
+            .constraints
+            .iter()
+            .any(|value| value.name == "statechain_data_auth_xonly_public_key_ukey"));
+        assert!(!exact
+            .mercury
+            .indexes
+            .iter()
+            .any(|value| value.name == "statechain_data_auth_xonly_public_key_ukey"));
+        assert!(exact
+            .mercury
+            .constraints
+            .iter()
+            .any(|value| value.name == "deposit_initialization_status_key_check"));
         assert_eq!(
             exact
                 .lockbox
@@ -222,7 +261,7 @@ mod tests {
                 "service=Mercury",
                 "dimension=tables",
                 "object=tokens",
-                "index=5",
+                "index=6",
                 "field=object",
                 "actual=\"missing\"",
             ],
@@ -236,7 +275,7 @@ mod tests {
                 "service=Mercury",
                 "dimension=tables",
                 "object=unexpected_table",
-                "index=6",
+                "index=7",
                 "field=object",
                 "expected=\"absent\"",
                 "actual=\"unexpected\"",
@@ -315,7 +354,7 @@ mod tests {
             ],
         );
 
-        let mut value = exact;
+        let mut value = exact.clone();
         value.mercury_migrations[0].checksum_hex.push('0');
         contains_all(
             &error(&value),
@@ -325,6 +364,34 @@ mod tests {
                 "field=checksum_hex",
                 "expected=",
                 "actual=",
+            ],
+        );
+
+        let mut value = exact.clone();
+        value.mercury_migrations.pop();
+        contains_all(
+            &error(&value),
+            &[
+                "service=Mercury",
+                "dimension=migrations",
+                "index=1",
+                "field=object",
+                "actual=\"missing\"",
+            ],
+        );
+
+        let mut value = exact;
+        let mut unexpected = value.mercury_migrations[1].clone();
+        unexpected.version = 3;
+        value.mercury_migrations.push(unexpected);
+        contains_all(
+            &error(&value),
+            &[
+                "service=Mercury",
+                "dimension=migrations",
+                "index=2",
+                "field=object",
+                "unexpected migration version 3",
             ],
         );
     }

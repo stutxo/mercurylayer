@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -21,6 +22,37 @@ constexpr std::size_t BIP448_PUBLIC_NONCE_SIZE = 66;
 using Bip448Scalar = std::array<unsigned char, BIP448_SCALAR_SIZE>;
 using Bip448PublicKey = std::array<unsigned char, BIP448_PUBLIC_KEY_SIZE>;
 using Bip448PublicNonce = std::array<unsigned char, BIP448_PUBLIC_NONCE_SIZE>;
+
+struct GeneratedKeyMaterial {
+    utils::chacha20_poly1305_encrypted_data encrypted_keypair{};
+    Bip448PublicKey server_pubkey{};
+    std::uint64_t key_generation_us{0};
+};
+
+using GeneratedKeyFactory = std::function<GeneratedKeyMaterial()>;
+
+enum class GeneratedKeyOutcome {
+    Created,
+    Existing,
+    InvalidInput,
+    StorageFailure,
+};
+
+struct GeneratedKeyTimings {
+    std::uint64_t open_us{0};
+    std::uint64_t transaction_us{0};
+    std::uint64_t read_us{0};
+    std::uint64_t insert_us{0};
+    std::uint64_t commit_us{0};
+};
+
+struct GeneratedKeyResult {
+    GeneratedKeyOutcome outcome{GeneratedKeyOutcome::StorageFailure};
+    Bip448PublicKey server_pubkey{};
+    GeneratedKeyTimings timings;
+    std::uint64_t key_generation_us{0};
+    std::string failure_phase;
+};
 
 enum class Bip448Outcome {
     Applied,
@@ -97,12 +129,9 @@ bool initialize_database(
     bool allow_initialization);
 bool database_is_ready(std::string& error_message);
 
-bool save_generated_public_key(
-    const utils::chacha20_poly1305_encrypted_data& encrypted_keypair,
-    const unsigned char* server_public_key,
-    std::size_t server_public_key_size,
+GeneratedKeyResult get_or_create_generated_public_key(
     const std::string& statechain_id,
-    std::string& error_message);
+    const GeneratedKeyFactory& generate_key);
 
 bool get_statechain_public_key(
     const std::string& statechain_id,

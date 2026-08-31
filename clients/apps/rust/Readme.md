@@ -99,7 +99,7 @@ in the [client guide](../../../docs/client_guide.md).
   completion while server state remains, and one found only after deletion may
   be unrecoverable. The receiver key-update crash boundary remains unrepaired.
 - Use fresh databases: the client schema has twelve application tables;
-  Mercury has six and lockbox has two. The CLI has sixteen commands, including
+  Mercury has seven and lockbox has two. The CLI has sixteen commands, including
   exact flag `--force-send-with-duplicates`; the intended ignored matrix has
   58 direct entries in eight binaries. This is an Inquisition-dependent proof
   of concept, with no automatic stale-state watcher, Bitcoin mainnet support,

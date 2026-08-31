@@ -33,9 +33,10 @@ an attested `ws://` or `wss://` endpoint instead. Debug attestation is refused
 unless the network is exactly `regtest` and
 `MERCURY_ALLOW_DEBUG_ENCLAVES=1`; `debug = true` is never valid for HTTP(S).
 Mercury verifies authenticated Lockbox readiness before serving requests and
-keeps the SDK's attested channel for normal traffic. Transient transport
-failures re-establish attestation and retry only exact replay-safe requests;
-the normal path remains one Lockbox request.
+keeps the SDK's attested channel active with an authenticated `/health/live`
+request every ten minutes. A failed keepalive reconnects and re-attests against
+the pinned PCRs before the next interval. Transient failures retry only
+operations whose exact request is replay-safe.
 
 When `token_server_url` is set, `/deposit/get_token` proxies token generation
 to that service. When it is absent, the local path creates a free,
@@ -43,6 +44,17 @@ already-confirmed token unless the configured `network` string is literally
 `mainnet`. This exact string comparison is a development guard, not validation
 of Bitcoin network semantics or a production-safety boundary. The fresh
 database schema is documented in [the database reference](../docs/server_db.md).
+
+Deposit initialization reserves its statechain ID and Lockbox index in a
+dedicated PostgreSQL row keyed by the immutable token ID; incomplete
+reservations are never active statechains. Mercury waits up to five seconds for
+key creation, reconnects and re-attests after a failure, then retries the exact
+request once for up to five seconds. The Lockbox's atomic get-or-create operation
+makes that replay return the same key. If both responses are ambiguous, Mercury
+observes durable Lockbox state for up to 12 seconds with bounded exponential
+backoff. One transaction then creates the active statechain, spends the token,
+and retains the completed reservation as an exact-retry receipt. The recovery
+path remains below the browser's 65-second Mercury request limit.
 
 ## Mounted HTTP routes
 
@@ -158,7 +170,7 @@ canonical withdrawal can close the statechain.
   completion while server state remains, and one found only after deletion may
   be unrecoverable. The receiver key-update crash boundary remains unrepaired.
 - Use fresh databases: the client schema has twelve application tables;
-  Mercury has six and lockbox has two. The CLI has sixteen commands, including
+  Mercury has seven and lockbox has two. The CLI has sixteen commands, including
   exact flag `--force-send-with-duplicates`; the intended ignored matrix has
   59 direct entries in eight binaries. This is an Inquisition-dependent proof
   of concept, with no automatic stale-state watcher, Bitcoin mainnet support,

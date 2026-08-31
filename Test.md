@@ -154,7 +154,7 @@ verification step. It checks:
   SQL/CHECKs, three partial unique indexes, zero foreign keys, no legacy backup
   table, two real client loads, and preserved wallet/statechain sentinels;
 - one Mercury PostgreSQL migration row and complete live catalogs: Mercury has
-  6 tables, 46 columns, 16 constraints, and 14 indexes; lockbox has 2 tables,
+  7 tables, 54 columns, 23 constraints, and 16 indexes; lockbox has 2 tables,
   15 columns, 8 constraints, and 4 indexes; and
 - exactly one Mercury restart, followed by readiness, unchanged build
   identity, and exactly equal PostgreSQL catalog reports.

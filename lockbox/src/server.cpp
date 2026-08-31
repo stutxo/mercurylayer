@@ -59,10 +59,6 @@ namespace lockbox {
         return response;
     }
 
-    struct EncryptedBufferGuard {
-        utils::chacha20_poly1305_encrypted_data& value;
-        ~EncryptedBufferGuard() { delete[] value.data; value.data = nullptr; }
-    };
 
     struct SeedGuard {
         explicit SeedGuard(std::vector<uint8_t>& seed) : value(seed) {
@@ -276,15 +272,55 @@ namespace lockbox {
 
     crow::response generate_new_keypair(const std::string& statechain_id, unsigned char* seed) {
         if (!db_manager::valid_statechain_id(statechain_id)) return crow::response(400);
-        try {
-            auto generated = enclave::generate_new_keypair(seed);
-            EncryptedBufferGuard guard{generated.encrypted_data};
-            std::string error;
-            if (!db_manager::save_generated_public_key(generated.encrypted_data, generated.server_pubkey,
-                    sizeof(generated.server_pubkey), statechain_id, error)) return crow::response(500, "Failed to store key");
-            crow::json::wvalue body; body["server_pubkey"] = lower_hex(generated.server_pubkey, sizeof(generated.server_pubkey));
-            return json_response(200, std::move(body));
-        } catch (const std::exception&) { return crow::response(500, "Failed to generate key"); }
+        const auto stored = db_manager::get_or_create_generated_public_key(
+            statechain_id,
+            [seed]() {
+                const auto key_started = std::chrono::steady_clock::now();
+                auto generated = enclave::generate_new_keypair(seed);
+                db_manager::GeneratedKeyMaterial material;
+                material.encrypted_keypair = generated.encrypted_data;
+                std::copy(
+                    std::begin(generated.server_pubkey),
+                    std::end(generated.server_pubkey),
+                    material.server_pubkey.begin()
+                );
+                material.key_generation_us = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - key_started
+                    ).count()
+                );
+                return material;
+            }
+        );
+        if (stored.outcome == db_manager::GeneratedKeyOutcome::InvalidInput) {
+            return crow::response(400, "Invalid generated-key request");
+        }
+        if (stored.outcome == db_manager::GeneratedKeyOutcome::StorageFailure) {
+            crow::json::wvalue failure;
+            failure["code"] = "generated_key_storage_failed";
+            failure["message"] = "Generated key could not be stored";
+            failure["phase"] =
+                stored.failure_phase.empty() ? "unknown" : stored.failure_phase;
+            return json_response(500, std::move(failure));
+        }
+
+        crow::json::wvalue timings;
+        timings["open"] = stored.timings.open_us;
+        timings["transaction"] = stored.timings.transaction_us;
+        timings["read"] = stored.timings.read_us;
+        timings["insert"] = stored.timings.insert_us;
+        timings["commit"] = stored.timings.commit_us;
+
+        crow::json::wvalue body;
+        body["server_pubkey"] =
+            lower_hex(stored.server_pubkey.data(), stored.server_pubkey.size());
+        body["storage_outcome"] =
+            stored.outcome == db_manager::GeneratedKeyOutcome::Created
+                ? "created"
+                : "existing";
+        body["key_generation_us"] = stored.key_generation_us;
+        body["storage_timing_us"] = std::move(timings);
+        return json_response(200, std::move(body));
     }
 
     crow::response verify_statechain(
@@ -468,6 +504,15 @@ namespace lockbox {
                 return unauthorized_response();
             }
             return crow::response(200, "Hello, Crow!");
+        });
+
+        CROW_ROUTE(app, "/health/live")([&authenticator](const crow::request& req) {
+            if (!authenticator.authorized(req.get_header_value("Authorization"))) {
+                return unauthorized_response();
+            }
+            crow::json::wvalue body;
+            body["status"] = "live";
+            return json_response(200, std::move(body));
         });
 
         CROW_ROUTE(app, "/health/ready")([&authenticator](const crow::request& req) {

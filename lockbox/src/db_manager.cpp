@@ -1,6 +1,7 @@
 #include "db_manager.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <iterator>
 #include <limits>
@@ -379,24 +380,95 @@ bool database_is_ready(std::string& error_message) {
     }
 }
 
-bool save_generated_public_key(
-    const utils::chacha20_poly1305_encrypted_data& encrypted_keypair,
-    const unsigned char* server_public_key, std::size_t server_public_key_size,
-    const std::string& statechain_id, std::string& error_message) {
-    if (!valid_statechain_id(statechain_id) || !server_public_key
-        || server_public_key_size != BIP448_PUBLIC_KEY_SIZE) return false;
+GeneratedKeyResult get_or_create_generated_public_key(
+    const std::string& statechain_id,
+    const GeneratedKeyFactory& generate_key
+) {
+    GeneratedKeyResult result;
+    if (!valid_statechain_id(statechain_id) || !generate_key) {
+        result.outcome = GeneratedKeyOutcome::InvalidInput;
+        result.failure_phase = "input";
+        return result;
+    }
+
+    const auto elapsed_us = [](const auto started) {
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - started
+            ).count()
+        );
+    };
+    std::string phase = "open";
     try {
-        const auto sealed = serialize_encrypted(encrypted_keypair);
+        auto started = std::chrono::steady_clock::now();
         pqxx::connection connection(database_url());
+        result.timings.open_us = elapsed_us(started);
+
+        phase = "transaction";
+        started = std::chrono::steady_clock::now();
         pqxx::work txn(connection);
+        result.timings.transaction_us = elapsed_us(started);
+
+        phase = "read";
+        started = std::chrono::steady_clock::now();
         txn.exec_params(
-            "INSERT INTO public.generated_public_key(statechain_id,sealed_keypair,public_key) VALUES($1,$2,$3)",
-            statechain_id, bytes(sealed.data(), sealed.size()), bytes(server_public_key, server_public_key_size));
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            statechain_id
+        );
+        const auto existing = txn.exec_params(
+            "SELECT public_key FROM public.generated_public_key WHERE statechain_id=$1",
+            statechain_id
+        );
+        result.timings.read_us = elapsed_us(started);
+        if (!existing.empty()) {
+            if (existing.size() != 1
+                || !field_array(existing[0]["public_key"], result.server_pubkey)) {
+                result.failure_phase = "read";
+                return result;
+            }
+            result.outcome = GeneratedKeyOutcome::Existing;
+            phase = "commit";
+            started = std::chrono::steady_clock::now();
+            txn.commit();
+            result.timings.commit_us = elapsed_us(started);
+            return result;
+        }
+
+        phase = "generate";
+        auto generated = generate_key();
+        EncryptedBufferGuard guard{generated.encrypted_keypair};
+        result.key_generation_us = generated.key_generation_us;
+
+        phase = "serialize";
+        const auto sealed = serialize_encrypted(generated.encrypted_keypair);
+
+        phase = "insert";
+        started = std::chrono::steady_clock::now();
+        const auto inserted = txn.exec_params(
+            "INSERT INTO public.generated_public_key"
+            "(statechain_id,sealed_keypair,public_key) VALUES($1,$2,$3) "
+            "RETURNING public_key",
+            statechain_id,
+            bytes(sealed.data(), sealed.size()),
+            bytes(generated.server_pubkey.data(), generated.server_pubkey.size())
+        );
+        result.timings.insert_us = elapsed_us(started);
+        if (inserted.size() != 1
+            || !field_array(inserted[0]["public_key"], result.server_pubkey)) {
+            result.failure_phase = "insert";
+            return result;
+        }
+        result.outcome = GeneratedKeyOutcome::Created;
+
+        phase = "commit";
+        started = std::chrono::steady_clock::now();
         txn.commit();
-        return true;
+        result.timings.commit_us = elapsed_us(started);
+        return result;
     } catch (const std::exception&) {
-        error_message = "generated public key could not be stored";
-        return false;
+        result.outcome = GeneratedKeyOutcome::StorageFailure;
+        result.failure_phase = phase;
+        return result;
     }
 }
 
