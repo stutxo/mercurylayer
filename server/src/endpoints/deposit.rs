@@ -321,11 +321,14 @@ struct DepositKeyRequestPolicy {
     observation_max_delay: Duration,
 }
 
+// The deployed Lockbox can take about 33 seconds to durably finish a cold key
+// request. This 53-second worst-case budget stays below the 60-second ingress
+// and 65-second browser request ceilings.
 const DEPOSIT_KEY_REQUEST_POLICY: DepositKeyRequestPolicy = DepositKeyRequestPolicy {
     request_timeout: Duration::from_secs(5),
     recovery_timeout: Duration::from_secs(3),
     retry_timeout: Duration::from_secs(5),
-    observation_window: Duration::from_secs(12),
+    observation_window: Duration::from_secs(40),
     observation_attempt_timeout: Duration::from_secs(3),
     observation_delay: Duration::from_millis(250),
     observation_max_delay: Duration::from_secs(2),
@@ -914,6 +917,22 @@ mod tests {
             .next()
             .unwrap()
             .to_string()
+    }
+
+    #[test]
+    fn production_key_request_budget_covers_cold_lockbox_before_ingress_timeout() {
+        const OBSERVED_COLD_COMPLETION: Duration = Duration::from_secs(34);
+        const SAFETY_MARGIN: Duration = Duration::from_secs(10);
+        const INGRESS_TIMEOUT: Duration = Duration::from_secs(60);
+
+        let policy = DEPOSIT_KEY_REQUEST_POLICY;
+        let total_budget = policy.request_timeout
+            + policy.recovery_timeout
+            + policy.retry_timeout
+            + policy.observation_window;
+
+        assert!(total_budget >= OBSERVED_COLD_COMPLETION + SAFETY_MARGIN);
+        assert!(total_budget < INGRESS_TIMEOUT);
     }
 
     #[test]
