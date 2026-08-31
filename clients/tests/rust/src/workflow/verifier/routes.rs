@@ -105,6 +105,7 @@ const EXPECTED_MERCURY_TOKEN: &[(&str, &str, &str, &str)] = &[
 ];
 const EXPECTED_LOCKBOX: &[(&str, &str)] = &[
     ("GET", "/"),
+    ("GET", "/health/live"),
     ("GET", "/health/ready"),
     ("POST", "/get_public_key"),
     ("POST", "/bip448/get_public_nonce"),
@@ -466,7 +467,7 @@ mod tests {
     fn current_protected_sources_have_exact_lexical_inventory() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let (mercury_token, lockbox) = verify(&root).unwrap();
-        assert_eq!((mercury_token.len(), lockbox.len()), (19, 10));
+        assert_eq!((mercury_token.len(), lockbox.len()), (19, 11));
     }
 
     #[test]
