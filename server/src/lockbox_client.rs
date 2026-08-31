@@ -17,41 +17,14 @@ const LOCKBOX_AUTH_TOKEN_HEX_LENGTH: usize = 64;
 const LOCKBOX_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const LOCKBOX_KEEPALIVE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCKBOX_KEEPALIVE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+const LOCKBOX_READY_PATH: &str = "/health/ready";
+const LOCKBOX_READY_STATUS: &str = "ready";
 
 #[derive(Clone, Copy)]
 enum Method {
     Get,
     Post,
     Delete,
-}
-
-#[derive(Clone, Copy)]
-enum HealthCheck {
-    Live,
-    Ready,
-}
-
-impl HealthCheck {
-    fn path(self) -> &'static str {
-        match self {
-            Self::Live => "/health/live",
-            Self::Ready => "/health/ready",
-        }
-    }
-
-    fn expected_status(self) -> &'static str {
-        match self {
-            Self::Live => "live",
-            Self::Ready => "ready",
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::Live => "liveness",
-            Self::Ready => "readiness",
-        }
-    }
 }
 
 struct EnclaviaSession {
@@ -140,13 +113,12 @@ impl LockboxClients {
                     }
                 }
                 TransportConfig::Enclavia { url, pcrs, debug } => {
-                    let client = connect_enclavia_after_health_check(
+                    let client = connect_enclavia_after_readiness_check(
                         &url,
                         &pcrs,
                         debug,
                         &authorization,
                         index,
-                        HealthCheck::Ready,
                     )
                     .await?;
                     if debug {
@@ -218,7 +190,7 @@ impl LockboxClients {
                 continue;
             }
 
-            let health = self.check_liveness_once(enclave_index).await;
+            let health = self.check_readiness_once(enclave_index).await;
             if health.is_ok() {
                 log::debug!("kept Lockbox enclave {enclave_index} attested channel active");
                 continue;
@@ -249,15 +221,15 @@ impl LockboxClients {
             }
         }
     }
-    async fn check_liveness_once(&self, enclave_index: usize) -> Result<()> {
+    async fn check_readiness_once(&self, enclave_index: usize) -> Result<()> {
         let response = self
             .get_raw_once(
                 enclave_index,
-                HealthCheck::Live.path(),
+                LOCKBOX_READY_PATH,
                 LOCKBOX_KEEPALIVE_ATTEMPT_TIMEOUT,
             )
             .await?;
-        validate_health_response(response, enclave_index, HealthCheck::Live)
+        validate_readiness_response(response, enclave_index)
     }
 
     pub async fn recover_attested_session(&self, enclave_index: usize) -> Result<()> {
@@ -536,13 +508,12 @@ async fn replace_enclavia_session(
     if session.generation != failed_generation {
         return Ok(());
     }
-    let client = connect_enclavia_after_health_check(
+    let client = connect_enclavia_after_readiness_check(
         &transport.url,
         &transport.pcrs,
         transport.debug,
         authorization,
         enclave_index,
-        HealthCheck::Live,
     )
     .await?;
     session.client = client;
@@ -563,13 +534,12 @@ fn enclavia_request_is_replay_safe(method: Method, path: &str) -> bool {
     }
 }
 
-async fn connect_enclavia_after_health_check(
+async fn connect_enclavia_after_readiness_check(
     url: &str,
     pcrs: &enclavia::Pcrs,
     debug: bool,
     authorization: &str,
     enclave_index: usize,
-    health_check: HealthCheck,
 ) -> Result<enclavia::Client> {
     let mut last_error = None;
     for attempt in 1..=LOCKBOX_READY_ATTEMPTS {
@@ -583,34 +553,28 @@ async fn connect_enclavia_after_health_check(
                     format!("connecting to and attesting lockbox enclave {enclave_index} at {url}")
                 })?;
             let response = client
-                .get(health_check.path())
+                .get(LOCKBOX_READY_PATH)
                 .header("Authorization", authorization)
                 .send()
                 .await
                 .with_context(|| {
-                    format!(
-                        "checking {} of lockbox enclave {enclave_index}",
-                        health_check.name()
-                    )
+                    format!("checking readiness of lockbox enclave {enclave_index}")
                 })?;
             let response = LockboxResponse {
                 status: response.status(),
                 body: response
                     .text()
-                    .with_context(|| {
-                        format!("decoding lockbox {} response as UTF-8", health_check.name())
-                    })?
+                    .context("decoding lockbox readiness response as UTF-8")?
                     .to_owned(),
             };
-            validate_health_response(response, enclave_index, health_check)?;
+            validate_readiness_response(response, enclave_index)?;
             Ok::<_, anyhow::Error>(client)
         })
         .await;
         let result = match result {
             Ok(result) => result,
             Err(_) => Err(anyhow!(
-                "lockbox enclave {enclave_index} {} attempt {attempt} timed out after {}s",
-                health_check.name(),
+                "lockbox enclave {enclave_index} readiness attempt {attempt} timed out after {}s",
                 LOCKBOX_READY_ATTEMPT_TIMEOUT.as_secs()
             )),
         };
@@ -619,9 +583,8 @@ async fn connect_enclavia_after_health_check(
             Err(error) => {
                 if attempt < LOCKBOX_READY_ATTEMPTS {
                     log::warn!(
-                        "lockbox enclave {enclave_index} {} attempt \
-                         {attempt}/{LOCKBOX_READY_ATTEMPTS} failed: {error}",
-                        health_check.name()
+                        "lockbox enclave {enclave_index} readiness attempt \
+                         {attempt}/{LOCKBOX_READY_ATTEMPTS} failed: {error}"
                     );
                 }
                 last_error = Some(error);
@@ -629,38 +592,26 @@ async fn connect_enclavia_after_health_check(
         }
     }
 
-    Err(last_error.unwrap_or_else(|| anyhow!("lockbox enclave health check failed"))).with_context(
-        || {
+    Err(last_error.unwrap_or_else(|| anyhow!("lockbox enclave readiness check failed")))
+        .with_context(|| {
             format!(
-                "lockbox enclave {enclave_index} did not pass {} after \
-                 {LOCKBOX_READY_ATTEMPTS} attempts",
-                health_check.name()
+                "lockbox enclave {enclave_index} did not pass readiness after \
+                 {LOCKBOX_READY_ATTEMPTS} attempts"
             )
-        },
-    )
+        })
 }
-fn validate_health_response(
-    response: LockboxResponse,
-    enclave_index: usize,
-    health_check: HealthCheck,
-) -> Result<()> {
+fn validate_readiness_response(response: LockboxResponse, enclave_index: usize) -> Result<()> {
     if response.status != 200 {
         bail!(
-            "lockbox enclave {enclave_index} {} returned HTTP {}: {}",
-            health_check.name(),
+            "lockbox enclave {enclave_index} readiness returned HTTP {}: {}",
             response.status,
             response.body
         );
     }
-    let health: serde_json::Value = serde_json::from_str(&response.body)
-        .with_context(|| format!("decoding lockbox {} response", health_check.name()))?;
-    if health.get("status").and_then(serde_json::Value::as_str)
-        != Some(health_check.expected_status())
-    {
-        bail!(
-            "lockbox enclave {enclave_index} returned an unexpected {} response",
-            health_check.name()
-        );
+    let health: serde_json::Value =
+        serde_json::from_str(&response.body).context("decoding lockbox readiness response")?;
+    if health.get("status").and_then(serde_json::Value::as_str) != Some(LOCKBOX_READY_STATUS) {
+        bail!("lockbox enclave {enclave_index} returned an unexpected readiness response");
     }
     Ok(())
 }
@@ -941,7 +892,7 @@ mod tests {
     }
 
     #[test]
-    fn liveness_probe_uses_the_authenticated_shared_transport() {
+    fn readiness_probe_uses_the_authenticated_shared_transport() {
         let runtime = rocket::tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -963,10 +914,10 @@ mod tests {
                     }
                 }
                 let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
-                assert!(request.starts_with("get /health/live http/1.1\r\n"));
+                assert!(request.starts_with("get /health/ready http/1.1\r\n"));
                 assert!(request.contains(&expected_authorization));
 
-                let body = r#"{"status":"live"}"#;
+                let body = r#"{"status":"ready"}"#;
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
@@ -981,7 +932,7 @@ mod tests {
             )
             .await
             .unwrap();
-            clients.check_liveness_once(0).await.unwrap();
+            clients.check_readiness_once(0).await.unwrap();
             server.await.unwrap();
         });
     }
