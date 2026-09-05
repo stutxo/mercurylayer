@@ -208,14 +208,25 @@ struct TokenStatusResponse {
     err_message: Option<String>,
 }
 
-async fn check_token_status(token_id: &str, client: &reqwest::Client) -> TokenStatusResponse {
-    let config = crate::server_config::ServerConfig::load();
+async fn check_token_status(
+    token_server_url: Option<&str>,
+    token_id: &str,
+    client: &reqwest::Client,
+) -> TokenStatusResponse {
+    let Some(token_server_url) = token_server_url else {
+        return TokenStatusResponse {
+            confirmed: false,
+            spent: false,
+            err: false,
+            status: None,
+            err_message: None,
+        };
+    };
 
     let request = client
         .get(format!(
             "{}/token/token_verify/{}",
-            config.token_server_url.as_ref().unwrap(),
-            token_id
+            token_server_url, token_id
         ))
         .timeout(outbound_request_timeout());
 
@@ -687,8 +698,12 @@ pub async fn post_deposit(
     }
 
     if !token_info.confirmed {
-        let token_status_response =
-            check_token_status(&token_id, &statechain_entity.http_client).await;
+        let token_status_response = check_token_status(
+            statechain_entity.config.token_server_url.as_deref(),
+            &token_id,
+            &statechain_entity.http_client,
+        )
+        .await;
 
         if token_status_response.err {
             let response_body = json!({
@@ -1136,6 +1151,63 @@ mod tests {
             .unwrap_err(),
             "Token signature is invalid."
         );
+    }
+
+    #[test]
+    fn token_status_without_server_remains_unconfirmed() {
+        let runtime = rocket::tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let response = check_token_status(None, "local-token", &reqwest::Client::new()).await;
+
+            assert!(!response.confirmed);
+            assert!(!response.spent);
+            assert!(!response.err);
+            assert_eq!(response.status, None);
+            assert_eq!(response.err_message, None);
+        });
+    }
+
+    #[test]
+    fn token_status_with_server_uses_configured_url() {
+        let runtime = rocket::tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = rocket::tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request_line = read_http_request_line(&mut stream).await;
+                let body = r#"{"confirmed":true,"spent":false}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+                request_line
+            });
+            let token_server_url = format!("http://{address}");
+
+            let response = check_token_status(
+                Some(&token_server_url),
+                "paid-token",
+                &reqwest::Client::new(),
+            )
+            .await;
+
+            assert_eq!(
+                server.await.unwrap(),
+                "GET /token/token_verify/paid-token HTTP/1.1"
+            );
+            assert!(response.confirmed);
+            assert!(!response.spent);
+            assert!(!response.err);
+        });
     }
 
     #[test]
